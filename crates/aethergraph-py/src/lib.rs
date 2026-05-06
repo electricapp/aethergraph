@@ -4,7 +4,6 @@
 // Enables zero-copy graph sampling and feature caching for GNN training.
 
 #![allow(non_local_definitions)] // PyO3 macros generate non-local definitions
-#![allow(deprecated)] // Python::with_gil is needed in async contexts (pyo3-async-runtimes)
 
 mod arrow_utils;
 mod async_feature_store;

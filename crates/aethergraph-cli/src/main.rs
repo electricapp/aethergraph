@@ -1,4 +1,4 @@
-use aethergraph_core::{load_graph, save_graph, Graph, NodeId};
+use aethergraph_core::{Graph, NodeId, load_graph, save_graph};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use tracing::{debug, info, trace, warn};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "aethergraph")]

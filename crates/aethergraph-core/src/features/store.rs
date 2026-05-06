@@ -240,8 +240,10 @@ pub struct FeatureStore {
     telemetry: Option<Arc<RwLock<FeatureLoadTelemetry>>>,
 }
 
-// Safety: FeatureStore is read-only and backed by Arc<Mmap>
+// SAFETY: FeatureStore exposes only read-only views into an Arc<Mmap>; the mmap
+// itself is immutable for the lifetime of the store, so concurrent send/sync is sound.
 unsafe impl Send for FeatureStore {}
+// SAFETY: see Send impl above — read-only Arc<Mmap> with no interior mutability of the mapping.
 unsafe impl Sync for FeatureStore {}
 
 impl FeatureStore {
@@ -256,6 +258,8 @@ impl FeatureStore {
         debug!("Loading feature store from {}", path.display());
 
         let file = File::open(path).context("failed to open feature file")?;
+        // SAFETY: the file remains owned for the duration of the mmap (held in `file` until
+        // the mapping is established); we never mutate the mapped region after creation.
         let mmap = Arc::new(unsafe {
             MmapOptions::new()
                 .map(&file)
@@ -570,11 +574,7 @@ impl FeatureStore {
                 )
             })?;
             let byte_end = byte_start.checked_add(row_bytes).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "index overflow in batch: {} + {}",
-                    byte_start,
-                    row_bytes
-                )
+                anyhow::anyhow!("index overflow in batch: {} + {}", byte_start, row_bytes)
             })?;
             anyhow::ensure!(
                 byte_end <= raw.len(),

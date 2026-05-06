@@ -58,11 +58,7 @@ impl PyAsyncFeatureStore {
     /// ```
     #[staticmethod]
     #[pyo3(signature = (path, telemetry=false))]
-    fn load<'py>(
-        py: Python<'py>,
-        path: String,
-        telemetry: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn load<'py>(py: Python<'py>, path: String, telemetry: bool) -> PyResult<Bound<'py, PyAny>> {
         future_into_py(py, async move {
             let mut inner = CoreAsyncFeatureStore::load(&path).await.map_err(|e| {
                 pyo3::exceptions::PyIOError::new_err(format!(
@@ -117,7 +113,7 @@ impl PyAsyncFeatureStore {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get features: {}", e))
             })?;
 
-            Python::with_gil(|py| Ok(PyArray1::from_vec(py, features).unbind().into_any()))
+            Python::attach(|py| Ok(PyArray1::from_vec(py, features).unbind().into_any()))
         })
     }
 
@@ -154,7 +150,7 @@ impl PyAsyncFeatureStore {
             })?;
 
             // Convert flat Vec<f32> to 2D numpy array
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let arr = PyArray1::from_vec(py, features_flat);
                 let shape = (nodes.len(), feature_dim);
                 let arr_2d = arr.reshape(shape).map_err(|e| {

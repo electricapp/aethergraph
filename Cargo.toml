@@ -69,3 +69,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"

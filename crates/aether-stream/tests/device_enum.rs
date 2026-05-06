@@ -8,7 +8,7 @@
 
 #![cfg(all(target_os = "linux", feature = "rdma"))]
 
-use aether_stream::rdma::context::{enumerate_devices, RdmaContext};
+use aether_stream::rdma::context::{RdmaContext, enumerate_devices};
 
 const ROCE_V2_GID_INDEX: u8 = 1;
 
@@ -43,7 +43,10 @@ fn enumerate_lists_at_least_one_device() {
     }
     // Indices must be 0..len.
     for (i, d) in devs.iter().enumerate() {
-        assert_eq!(d.index, i, "enumerate_devices must return contiguous indices starting at 0");
+        assert_eq!(
+            d.index, i,
+            "enumerate_devices must return contiguous indices starting at 0"
+        );
     }
 }
 

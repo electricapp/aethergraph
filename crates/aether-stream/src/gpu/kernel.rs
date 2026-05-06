@@ -120,8 +120,7 @@ impl SeqlockValidator {
 
         // Read retry count back to host
         let mut count = [0i32];
-        self.stream
-            .memcpy_dtoh(&self.retry_count, &mut count)?;
+        self.stream.memcpy_dtoh(&self.retry_count, &mut count)?;
         Ok(count[0] as usize)
     }
 
@@ -143,8 +142,7 @@ impl SeqlockValidator {
         batch_size: usize,
     ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
         let mut mask = vec![0i32; batch_size];
-        self.stream
-            .memcpy_dtoh(&self.retry_mask, &mut mask)?;
+        self.stream.memcpy_dtoh(&self.retry_mask, &mut mask)?;
         Ok(mask
             .iter()
             .enumerate()

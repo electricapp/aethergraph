@@ -150,11 +150,13 @@ impl XdpSocket {
         let completion = XdpRing::<UmemDesc>::from_mmap(comp_mmap.ptr, &offsets.cr, ring_size);
         ring_mmaps.push(comp_mmap);
 
-        let rx_mmap = mmap_ring::<RxTxDesc>(fd.as_raw_fd(), &offsets.rx, ring_size, XDP_PGOFF_RX_RING)?;
+        let rx_mmap =
+            mmap_ring::<RxTxDesc>(fd.as_raw_fd(), &offsets.rx, ring_size, XDP_PGOFF_RX_RING)?;
         let rx = XdpRing::<RxTxDesc>::from_mmap(rx_mmap.ptr, &offsets.rx, ring_size);
         ring_mmaps.push(rx_mmap);
 
-        let tx_mmap = mmap_ring::<RxTxDesc>(fd.as_raw_fd(), &offsets.tx, ring_size, XDP_PGOFF_TX_RING)?;
+        let tx_mmap =
+            mmap_ring::<RxTxDesc>(fd.as_raw_fd(), &offsets.tx, ring_size, XDP_PGOFF_TX_RING)?;
         let tx = XdpRing::<RxTxDesc>::from_mmap(tx_mmap.ptr, &offsets.tx, ring_size);
         ring_mmaps.push(tx_mmap);
 
@@ -237,8 +239,7 @@ unsafe fn mmap_ring<T>(
     pgoff: u64,
 ) -> std::io::Result<MmapRegion> {
     // Conservative size: desc offset + ring entries + some extra for producer/consumer/flags
-    let mmap_size =
-        offsets.desc as usize + (ring_size as usize) * std::mem::size_of::<T>() + 4096;
+    let mmap_size = offsets.desc as usize + (ring_size as usize) * std::mem::size_of::<T>() + 4096;
 
     let ptr = libc::mmap(
         std::ptr::null_mut(),

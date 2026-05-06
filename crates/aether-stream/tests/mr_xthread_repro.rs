@@ -14,7 +14,7 @@
 use aether_stream::feature_table::FeatureTable;
 use aether_stream::rdma::context::{RdmaContext, RegisteredMr};
 use aether_stream::rdma::ffi::*;
-use aether_stream::rdma::qp::{RdmaQp, RdmaRead, DEFAULT_QP_CAP};
+use aether_stream::rdma::qp::{DEFAULT_QP_CAP, RdmaQp, RdmaRead};
 use std::sync::Arc;
 use std::thread;
 
@@ -60,8 +60,12 @@ fn build_loopback() -> Loopback {
 
     let client_ctx = Arc::new(RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("client open"));
     let client_qp = Arc::new(RdmaQp::create(&client_ctx, &DEFAULT_QP_CAP).expect("client qp"));
-    server_qp.connect(&server_ctx, &client_qp.endpoint(&client_ctx)).expect("server connect");
-    client_qp.connect(&client_ctx, &server_qp.endpoint(&server_ctx)).expect("client connect");
+    server_qp
+        .connect(&server_ctx, &client_qp.endpoint(&client_ctx))
+        .expect("server connect");
+    client_qp
+        .connect(&client_ctx, &server_qp.endpoint(&server_ctx))
+        .expect("client connect");
 
     Loopback {
         _server_ctx: server_ctx,
@@ -78,7 +82,8 @@ fn build_loopback() -> Loopback {
 }
 
 fn post_and_wait(qp: &RdmaQp, reads: &[RdmaRead], cq: *mut IbvCq) -> Result<(), String> {
-    qp.post_reads(reads).map_err(|e| format!("post_reads: {e}"))?;
+    qp.post_reads(reads)
+        .map_err(|e| format!("post_reads: {e}"))?;
     let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 8];
     loop {
         let n = RdmaQp::poll_cq_on(cq, &mut wcs).map_err(|e| format!("poll_cq: {e}"))?;
@@ -148,7 +153,10 @@ fn mr_on_main_post_on_worker() {
 
     match result {
         Ok(buf) => {
-            eprintln!("[A] SUCCESS, first 16 bytes = {:?}", &buf[..16.min(buf.len())]);
+            eprintln!(
+                "[A] SUCCESS, first 16 bytes = {:?}",
+                &buf[..16.min(buf.len())]
+            );
             // Sanity: head field should have advanced past 0.
             let head = u64::from_le_bytes(buf[0..8].try_into().unwrap());
             assert_ne!(head, 0, "[A] read returned zeros");
@@ -190,9 +198,7 @@ fn mr_on_worker_post_on_worker() {
             remote_rkey,
             length: slot_size as u32,
         };
-        eprintln!(
-            "[B] worker-registered: buf_ptr={buf_ptr:p} lkey={lkey} len={slot_size}"
-        );
+        eprintln!("[B] worker-registered: buf_ptr={buf_ptr:p} lkey={lkey} len={slot_size}");
         post_and_wait(&client_qp, &[read], client_ctx.cq)?;
         let _ = mr;
         Ok(buf)
@@ -202,7 +208,10 @@ fn mr_on_worker_post_on_worker() {
 
     match result {
         Ok(buf) => {
-            eprintln!("[B] SUCCESS, first 16 bytes = {:?}", &buf[..16.min(buf.len())]);
+            eprintln!(
+                "[B] SUCCESS, first 16 bytes = {:?}",
+                &buf[..16.min(buf.len())]
+            );
             let head = u64::from_le_bytes(buf[0..8].try_into().unwrap());
             assert_ne!(head, 0, "[B] read returned zeros");
         }

@@ -11,8 +11,8 @@
 use crate::graph::csr::{EdgeOffset, Graph, NodeId};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 struct DendrogramNode {
     left: u32,
@@ -42,7 +42,10 @@ impl ConcurrentUnionFind {
             }
             let gp = self.parent[p as usize].load(Ordering::Relaxed);
             let _ = self.parent[x as usize].compare_exchange_weak(
-                p, gp, Ordering::Relaxed, Ordering::Relaxed,
+                p,
+                gp,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             );
             x = gp;
         }
@@ -62,19 +65,21 @@ impl ConcurrentUnionFind {
             let rank_a = self.rank[ra as usize].load(Ordering::Relaxed);
             let rank_b = self.rank[rb as usize].load(Ordering::Relaxed);
 
-            let (winner, loser) = if rank_a < rank_b {
-                (rb, ra)
-            } else {
-                (ra, rb)
-            };
+            let (winner, loser) = if rank_a < rank_b { (rb, ra) } else { (ra, rb) };
 
             match self.parent[loser as usize].compare_exchange_weak(
-                loser, winner, Ordering::Release, Ordering::Relaxed,
+                loser,
+                winner,
+                Ordering::Release,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     if rank_a == rank_b {
                         let _ = self.rank[winner as usize].compare_exchange_weak(
-                            rank_a, rank_a + 1, Ordering::Relaxed, Ordering::Relaxed,
+                            rank_a,
+                            rank_a + 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
                         );
                     }
                     return Some((winner, loser));
@@ -83,7 +88,6 @@ impl ConcurrentUnionFind {
             }
         }
     }
-
 }
 
 /// Merge log from Rabbit Order phases 1+2.
@@ -157,21 +161,19 @@ impl Graph {
                 let deg_u = degrees_ref[u as usize] as u64;
                 let max_deg_v = m / deg_u.max(1);
 
-                self.neighbors(u)
-                    .iter()
-                    .filter_map(move |&v| {
-                        if u >= v {
-                            return None;
-                        }
-                        let dv = degrees_ref[v as usize] as u64;
-                        if dv >= max_deg_v {
-                            return None;
-                        }
-                        if uf_ref.find(u) == uf_ref.find(v) {
-                            return None;
-                        }
-                        uf_ref.union(u, v)
-                    })
+                self.neighbors(u).iter().filter_map(move |&v| {
+                    if u >= v {
+                        return None;
+                    }
+                    let dv = degrees_ref[v as usize] as u64;
+                    if dv >= max_deg_v {
+                        return None;
+                    }
+                    if uf_ref.find(u) == uf_ref.find(v) {
+                        return None;
+                    }
+                    uf_ref.union(u, v)
+                })
             })
             .collect();
 
@@ -200,9 +202,7 @@ impl Graph {
         // community_dendro[root] = current dendrogram index for that community.
         // Leaves: node i => index i. Internal: n + k.
         let mut community_dendro: Vec<u32> = (0..n as u32).collect();
-        let mut dendrogram: Vec<DendrogramNode> = Vec::with_capacity(
-            merge_log.merges.len(),
-        );
+        let mut dendrogram: Vec<DendrogramNode> = Vec::with_capacity(merge_log.merges.len());
 
         // We need sequential find for dendrogram construction.
         // Convert the concurrent UF's parent array, but rebuild a fresh
@@ -430,8 +430,16 @@ impl Graph {
         let has_timestamps = self.has_timestamps();
 
         let mut new_edges = vec![0u32; num_edges];
-        let mut new_weights = if has_weights { vec![0.0f32; num_edges] } else { Vec::new() };
-        let mut new_timestamps = if has_timestamps { vec![0.0f64; num_edges] } else { Vec::new() };
+        let mut new_weights = if has_weights {
+            vec![0.0f32; num_edges]
+        } else {
+            Vec::new()
+        };
+        let mut new_timestamps = if has_timestamps {
+            vec![0.0f64; num_edges]
+        } else {
+            Vec::new()
+        };
 
         let ep = new_edges.as_mut_ptr() as usize;
         let wp = new_weights.as_mut_ptr() as usize;
@@ -441,29 +449,52 @@ impl Graph {
             let old_id = perm[new_id];
             let dst = new_offsets[new_id] as usize;
             for (j, &old_nbr) in self.neighbors(old_id).iter().enumerate() {
-                unsafe { *(ep as *mut NodeId).add(dst + j) = inv_perm[old_nbr as usize]; }
-            }
-            if has_weights
-                && let Some(w) = self.neighbor_weights(old_id)
-            {
-                for (j, &val) in w.iter().enumerate() {
-                    unsafe { *(wp as *mut f32).add(dst + j) = val; }
+                // SAFETY: dst+j < new_offsets[new_id+1] <= num_edges (loop bounded by degree), so the
+                // pointer stays in-bounds of `new_edges`; each (new_id, j) pair is written by exactly
+                // one rayon task, so the writes don't race.
+                let p = unsafe { (ep as *mut NodeId).add(dst + j) };
+                // SAFETY: p is in-bounds and uniquely owned by this task (see above).
+                unsafe {
+                    *p = inv_perm[old_nbr as usize];
                 }
             }
-            if has_timestamps
-                && let Some(ts) = self.neighbor_timestamps(old_id)
-            {
+            if has_weights && let Some(w) = self.neighbor_weights(old_id) {
+                for (j, &val) in w.iter().enumerate() {
+                    // SAFETY: dst+j is in-bounds of `new_weights` (parallel to edges); unique writer per slot.
+                    let p = unsafe { (wp as *mut f32).add(dst + j) };
+                    // SAFETY: p is in-bounds and uniquely owned by this task.
+                    unsafe {
+                        *p = val;
+                    }
+                }
+            }
+            if has_timestamps && let Some(ts) = self.neighbor_timestamps(old_id) {
                 for (j, &val) in ts.iter().enumerate() {
-                    unsafe { *(tp as *mut f64).add(dst + j) = val; }
+                    // SAFETY: dst+j is in-bounds of `new_timestamps` (parallel to edges); unique writer per slot.
+                    let p = unsafe { (tp as *mut f64).add(dst + j) };
+                    // SAFETY: p is in-bounds and uniquely owned by this task.
+                    unsafe {
+                        *p = val;
+                    }
                 }
             }
         });
 
-        let weights_arc = if has_weights { Some(Arc::from(new_weights)) } else { None };
+        let weights_arc = if has_weights {
+            Some(Arc::from(new_weights))
+        } else {
+            None
+        };
         let mut graph = Graph::from_owned_parts(
-            n, num_edges, new_offsets.into(), new_edges.into(), weights_arc,
+            n,
+            num_edges,
+            new_offsets.into(),
+            new_edges.into(),
+            weights_arc,
         );
-        if has_timestamps { graph.set_timestamps(new_timestamps); }
+        if has_timestamps {
+            graph.set_timestamps(new_timestamps);
+        }
         Ok(graph)
     }
 }
@@ -495,11 +526,15 @@ impl SequentialUnionFind {
     fn union(&mut self, a: u32, b: u32) -> u32 {
         let ra = self.find(a);
         let rb = self.find(b);
-        if ra == rb { return ra; }
+        if ra == rb {
+            return ra;
+        }
         if self.rank[ra as usize] < self.rank[rb as usize] {
-            self.parent[ra as usize] = rb; rb
+            self.parent[ra as usize] = rb;
+            rb
         } else if self.rank[ra as usize] > self.rank[rb as usize] {
-            self.parent[rb as usize] = ra; ra
+            self.parent[rb as usize] = ra;
+            ra
         } else {
             self.parent[rb as usize] = ra;
             self.rank[ra as usize] += 1;
@@ -584,12 +619,16 @@ mod tests {
         let mut edges = Vec::new();
         for i in 0u32..4 {
             for j in 0u32..4 {
-                if i != j { edges.push((i, j)); }
+                if i != j {
+                    edges.push((i, j));
+                }
             }
         }
         for i in 4u32..8 {
             for j in 4u32..8 {
-                if i != j { edges.push((i, j)); }
+                if i != j {
+                    edges.push((i, j));
+                }
             }
         }
         edges.push((3, 4));
@@ -599,20 +638,22 @@ mod tests {
 
     #[test]
     fn test_permute_identity() {
-        let graph = Graph::from_edges(3, &[(0,1),(0,2),(1,2),(2,0)], None).unwrap();
+        let graph = Graph::from_edges(3, &[(0, 1), (0, 2), (1, 2), (2, 0)], None).unwrap();
         let permuted = graph.permute(&[0, 1, 2]).unwrap();
         assert_eq!(permuted.num_nodes(), 3);
         assert_eq!(permuted.num_edges(), graph.num_edges());
         for n in 0..3u32 {
-            let mut a: Vec<_> = graph.neighbors(n).to_vec(); a.sort();
-            let mut b: Vec<_> = permuted.neighbors(n).to_vec(); b.sort();
+            let mut a: Vec<_> = graph.neighbors(n).to_vec();
+            a.sort();
+            let mut b: Vec<_> = permuted.neighbors(n).to_vec();
+            b.sort();
             assert_eq!(a, b);
         }
     }
 
     #[test]
     fn test_permute_reverse() {
-        let graph = Graph::from_edges(3, &[(0,1),(1,2)], None).unwrap();
+        let graph = Graph::from_edges(3, &[(0, 1), (1, 2)], None).unwrap();
         let permuted = graph.permute(&[2, 1, 0]).unwrap();
         assert!(permuted.neighbors(2).contains(&1));
         assert!(permuted.neighbors(1).contains(&0));
@@ -620,7 +661,8 @@ mod tests {
 
     #[test]
     fn test_permute_preserves_weights() {
-        let graph = Graph::from_edges(3, &[(0,1),(0,2),(1,2)], Some(&[1.0, 2.0, 3.0])).unwrap();
+        let graph =
+            Graph::from_edges(3, &[(0, 1), (0, 2), (1, 2)], Some(&[1.0, 2.0, 3.0])).unwrap();
         let permuted = graph.permute(&[2, 1, 0]).unwrap();
         assert!(permuted.weights().is_some());
         assert_eq!(permuted.neighbor_weights(2).unwrap().len(), 2);
@@ -628,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_permute_preserves_timestamps() {
-        let mut graph = Graph::from_edges(3, &[(0,1),(1,2)], None).unwrap();
+        let mut graph = Graph::from_edges(3, &[(0, 1), (1, 2)], None).unwrap();
         graph.set_timestamps(vec![100.0, 200.0]);
         let permuted = graph.permute(&[1, 0, 2]).unwrap();
         assert!((permuted.neighbor_timestamps(1).unwrap()[0] - 100.0).abs() < f64::EPSILON);
@@ -636,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_permute_invalid() {
-        let graph = Graph::from_edges(3, &[(0,1)], None).unwrap();
+        let graph = Graph::from_edges(3, &[(0, 1)], None).unwrap();
         assert!(graph.permute(&[0, 1]).is_err());
         assert!(graph.permute(&[0, 1, 1]).is_err());
         assert!(graph.permute(&[0, 1, 5]).is_err());
@@ -648,7 +690,10 @@ mod tests {
         let perm = graph.reorder_rabbit();
         assert_eq!(perm.len(), 8);
         let mut seen = [false; 8];
-        for &id in &perm { assert!(!seen[id as usize]); seen[id as usize] = true; }
+        for &id in &perm {
+            assert!(!seen[id as usize]);
+            seen[id as usize] = true;
+        }
     }
 
     #[test]
@@ -656,12 +701,16 @@ mod tests {
         let graph = make_two_cliques();
         let perm = graph.reorder_rabbit();
         let mut inv = [0u32; 8];
-        for (i, &old) in perm.iter().enumerate() { inv[old as usize] = i as u32; }
+        for (i, &old) in perm.iter().enumerate() {
+            inv[old as usize] = i as u32;
+        }
 
-        let mut c1: Vec<u32> = (0..4).map(|i| inv[i]).collect(); c1.sort();
+        let mut c1: Vec<u32> = (0..4).map(|i| inv[i]).collect();
+        c1.sort();
         assert_eq!(c1[3] - c1[0], 3, "Clique 1 should be contiguous");
 
-        let mut c2: Vec<u32> = (4..8).map(|i| inv[i]).collect(); c2.sort();
+        let mut c2: Vec<u32> = (4..8).map(|i| inv[i]).collect();
+        c2.sort();
         assert_eq!(c2[3] - c2[0], 3, "Clique 2 should be contiguous");
     }
 
@@ -674,17 +723,33 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_graph() { assert!(Graph::from_edges(0, &[], None).unwrap().reorder_rabbit().is_empty()); }
+    fn test_empty_graph() {
+        assert!(
+            Graph::from_edges(0, &[], None)
+                .unwrap()
+                .reorder_rabbit()
+                .is_empty()
+        );
+    }
 
     #[test]
-    fn test_single_node() { assert_eq!(Graph::from_edges(1, &[], None).unwrap().reorder_rabbit(), vec![0]); }
+    fn test_single_node() {
+        assert_eq!(
+            Graph::from_edges(1, &[], None).unwrap().reorder_rabbit(),
+            vec![0]
+        );
+    }
 
     #[test]
     fn test_disconnected() {
-        let perm = Graph::from_edges(5, &[(0,1)], None).unwrap().reorder_rabbit();
+        let perm = Graph::from_edges(5, &[(0, 1)], None)
+            .unwrap()
+            .reorder_rabbit();
         assert_eq!(perm.len(), 5);
         let mut seen = [false; 5];
-        for &id in &perm { seen[id as usize] = true; }
+        for &id in &perm {
+            seen[id as usize] = true;
+        }
         assert!(seen.iter().all(|&s| s));
     }
 
@@ -788,15 +853,19 @@ mod tests {
         // Verify: within each batch, most nodes share a partition.
         // More precisely: seeds from partition 0 are never split across batches
         // that have partition 2 seeds (no interleaving).
-        let batch_partitions: Vec<Vec<u32>> = batches.iter().map(|b| {
-            b.iter().map(|&s| partitions[s as usize]).collect()
-        }).collect();
+        let batch_partitions: Vec<Vec<u32>> = batches
+            .iter()
+            .map(|b| b.iter().map(|&s| partitions[s as usize]).collect())
+            .collect();
 
         // Partition 0's seeds should all appear before any partition 2 seed.
         let flat: Vec<u32> = batch_partitions.into_iter().flatten().collect();
         let first_p2 = flat.iter().position(|&p| p == 2).unwrap_or(flat.len());
         let last_p0 = flat.iter().rposition(|&p| p == 0).unwrap_or(0);
-        assert!(last_p0 < first_p2, "partition 0 seeds should precede partition 2");
+        assert!(
+            last_p0 < first_p2,
+            "partition 0 seeds should precede partition 2"
+        );
     }
 
     #[test]
@@ -852,9 +921,19 @@ mod tests {
         let c0_batch1 = batches[1].iter().filter(|&&n| n < 4).count();
 
         // One batch should have 3-4 clique-0 nodes, the other 0-1.
-        let (hi, lo) = if c0_batch0 >= c0_batch1 { (c0_batch0, c0_batch1) } else { (c0_batch1, c0_batch0) };
-        assert!(hi >= 3, "expected at least 3 same-clique nodes in aligned batch, got {hi}");
-        assert!(lo <= 1, "expected at most 1 cross-clique node in aligned batch, got {lo}");
+        let (hi, lo) = if c0_batch0 >= c0_batch1 {
+            (c0_batch0, c0_batch1)
+        } else {
+            (c0_batch1, c0_batch0)
+        };
+        assert!(
+            hi >= 3,
+            "expected at least 3 same-clique nodes in aligned batch, got {hi}"
+        );
+        assert!(
+            lo <= 1,
+            "expected at most 1 cross-clique node in aligned batch, got {lo}"
+        );
     }
 
     #[test]

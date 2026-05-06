@@ -581,7 +581,7 @@ mod tests {
 
         let mut warmup = AHashMap::new();
         warmup.insert(0_u32, 100); // node 0 is very hot
-        warmup.insert(1, 1);       // node 1 is cold
+        warmup.insert(1, 1); // node 1 is cold
 
         let config = FeatureCacheConfig {
             gpu_capacity: 2,

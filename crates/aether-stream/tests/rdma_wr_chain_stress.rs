@@ -13,7 +13,7 @@
 use aether_stream::feature_table::FeatureTable;
 use aether_stream::rdma::context::RdmaContext;
 use aether_stream::rdma::ffi::*;
-use aether_stream::rdma::qp::{RdmaQp, RdmaRead, DEFAULT_QP_CAP};
+use aether_stream::rdma::qp::{DEFAULT_QP_CAP, RdmaQp, RdmaRead};
 use std::time::{Duration, Instant};
 
 const ROCE_V2_GID_INDEX: u8 = 1;
@@ -67,8 +67,12 @@ fn build_loopback(node_count: usize, feature_dim: usize, cq_size: i32) -> Loopba
     let client_ctx = RdmaContext::open(cq_size, ROCE_V2_GID_INDEX).expect("client open");
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).expect("server qp");
     let client_qp = RdmaQp::create(&client_ctx, &DEFAULT_QP_CAP).expect("client qp");
-    server_qp.connect(&server_ctx, &client_qp.endpoint(&client_ctx)).unwrap();
-    client_qp.connect(&client_ctx, &server_qp.endpoint(&server_ctx)).unwrap();
+    server_qp
+        .connect(&server_ctx, &client_qp.endpoint(&client_ctx))
+        .unwrap();
+    client_qp
+        .connect(&client_ctx, &server_qp.endpoint(&server_ctx))
+        .unwrap();
 
     Loopback {
         _server_ctx: server_ctx,
@@ -95,7 +99,9 @@ fn drain_n(
     let mut seen = 0usize;
     let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 64];
     while seen < expected {
-        let n = qp.poll_cq(ctx, &mut wcs).map_err(|e| format!("poll: {e}"))?;
+        let n = qp
+            .poll_cq(ctx, &mut wcs)
+            .map_err(|e| format!("poll: {e}"))?;
         for wc in wcs.iter().take(n) {
             if wc.status != IBV_WC_SUCCESS {
                 return Err(format!(
@@ -155,8 +161,13 @@ fn long_wr_chain_at_max_send_wr_per_wr_signal() {
     lb.client_qp
         .post_reads_with_signaling(&reads, 1)
         .expect("post_reads signal=1");
-    drain_n(&lb.client_qp, &lb.client_ctx, BATCH, Duration::from_secs(30))
-        .expect("drain all CQEs");
+    drain_n(
+        &lb.client_qp,
+        &lb.client_ctx,
+        BATCH,
+        Duration::from_secs(30),
+    )
+    .expect("drain all CQEs");
 
     // Verify every slot.
     for i in 0..BATCH {
@@ -284,6 +295,9 @@ fn zero_length_read_succeeds() {
         std::hint::spin_loop();
     }
     // Buffer must be untouched.
-    assert!(buf.iter().all(|&b| b == 0xAA), "zero-len read should not write buf");
+    assert!(
+        buf.iter().all(|&b| b == 0xAA),
+        "zero-len read should not write buf"
+    );
     let _ = lb;
 }

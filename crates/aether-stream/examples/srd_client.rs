@@ -7,13 +7,18 @@
 //!   cargo run --features efa --release -p aether-stream --example srd_client \
 //!       -- --server 172.31.36.137:7100 --iters 1000 --batch 64
 
-#![cfg(all(target_os = "linux", feature = "efa"))]
+#[cfg(not(all(target_os = "linux", feature = "efa")))]
+fn main() {}
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 use aether_stream::rdma::srd::{SrdContext, SrdFeatureClient, SrdShardedFeatureClient};
+#[cfg(all(target_os = "linux", feature = "efa"))]
 use std::time::Instant;
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 const EFA_GID_INDEX: u8 = 0;
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 fn arg(flag: &str, default: Option<&str>) -> Option<String> {
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -24,6 +29,7 @@ fn arg(flag: &str, default: Option<&str>) -> Option<String> {
     default.map(str::to_owned)
 }
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 fn main() {
     let server = arg("--server", None).expect("--server <ip:port> required");
     let iters: usize = arg("--iters", Some("500")).unwrap().parse().unwrap();
@@ -43,9 +49,10 @@ fn main() {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 fn run_single(server: &str, iters: usize, batch: usize, warmup: usize) {
-    let client = SrdFeatureClient::connect(server, EFA_GID_INDEX, batch)
-        .expect("SrdFeatureClient::connect");
+    let client =
+        SrdFeatureClient::connect(server, EFA_GID_INDEX, batch).expect("SrdFeatureClient::connect");
     let schema = client.schema().clone();
     eprintln!(
         "srd_client: 1 shard, slot_size={}B feature_dim={}",
@@ -73,6 +80,7 @@ fn run_single(server: &str, iters: usize, batch: usize, warmup: usize) {
     report("single", iters, batch, schema.slot_size, start.elapsed());
 }
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 fn run_sharded(server: &str, iters: usize, batch: usize, warmup: usize, shards: usize) {
     assert!(batch % shards == 0, "--batch must divide --shards");
     let per_shard = batch / shards;
@@ -114,6 +122,7 @@ fn run_sharded(server: &str, iters: usize, batch: usize, warmup: usize, shards: 
     );
 }
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 fn sample(rng: &mut u64, n: usize, max_node: usize) -> Vec<usize> {
     (0..n)
         .map(|_| {
@@ -125,11 +134,8 @@ fn sample(rng: &mut u64, n: usize, max_node: usize) -> Vec<usize> {
         .collect()
 }
 
-fn verify_slice(
-    dst: &[u8],
-    nodes: &[usize],
-    schema: &aether_stream::feature_table::FeatureSchema,
-) {
+#[cfg(all(target_os = "linux", feature = "efa"))]
+fn verify_slice(dst: &[u8], nodes: &[usize], schema: &aether_stream::feature_table::FeatureSchema) {
     let feat_dim = schema.feature_dim;
     for (i, &node) in nodes.iter().enumerate() {
         let slot_bytes = &dst[i * schema.slot_size..(i + 1) * schema.slot_size];
@@ -147,11 +153,14 @@ fn verify_slice(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        let want: Vec<f32> = (0..feat_dim).map(|d| (node * 1000 + d) as f32 + 0.5).collect();
+        let want: Vec<f32> = (0..feat_dim)
+            .map(|d| (node * 1000 + d) as f32 + 0.5)
+            .collect();
         assert_eq!(got, want, "node {node}: payload mismatch");
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 fn report(label: &str, iters: usize, batch: usize, slot: usize, elapsed: std::time::Duration) {
     let per_iter_us = elapsed.as_secs_f64() * 1e6 / iters as f64;
     let bytes_total = (iters * batch * slot) as f64;

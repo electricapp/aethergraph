@@ -21,7 +21,7 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "rdma")]
 use super::context::RdmaContext;
 #[cfg(feature = "rdma")]
-use super::qp::{QpEndpoint, RdmaQp, DEFAULT_QP_CAP};
+use super::qp::{DEFAULT_QP_CAP, QpEndpoint, RdmaQp};
 
 /// Advertisement sent to GPU nodes over the TCP control channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,7 +136,10 @@ pub fn serve_control_plane_with_qp(
     ctx: &RdmaContext,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
-    tracing::info!(addr = bind_addr, "RDMA control plane (QP exchange) listening");
+    tracing::info!(
+        addr = bind_addr,
+        "RDMA control plane (QP exchange) listening"
+    );
 
     // Hold connected QPs alive for the server's lifetime.
     let mut active_qps: Vec<RdmaQp> = Vec::new();

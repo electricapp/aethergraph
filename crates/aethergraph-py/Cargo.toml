@@ -6,6 +6,9 @@ authors = ["electricapp"]
 license = "MIT OR Apache-2.0"
 description = "Python bindings for AetherGraph high-performance graph sampling"
 
+[lints]
+workspace = true
+
 [features]
 # extension-module tells pyo3 not to link against libpython (the Python
 # interpreter loads this crate as a dylib). Wheel builds go through maturin

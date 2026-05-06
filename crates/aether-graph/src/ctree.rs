@@ -61,9 +61,11 @@ impl CTree {
             return 0;
         }
         if is_leaf(self.root) {
+            // SAFETY: leaf tag bit is clear, so root is a Chunk offset previously returned by Arena::alloc_write.
             let chunk: &Chunk = unsafe { arena.get(self.root) };
             chunk.len()
         } else {
+            // SAFETY: interior tag bit is set; strip_tag yields the Interior offset stored on insert.
             let interior: &Interior = unsafe { arena.get(strip_tag(self.root)) };
             interior.count as usize
         }
@@ -138,9 +140,11 @@ fn strip_tag(offset: u32) -> u32 {
 
 fn visit_chunks<F: FnMut(&Chunk)>(offset: u32, arena: &Arena, f: &mut F) {
     if is_leaf(offset) {
+        // SAFETY: leaf tag is clear, so offset is a Chunk allocated in this arena.
         let chunk: &Chunk = unsafe { arena.get(offset) };
         f(chunk);
     } else {
+        // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
         let node: &Interior = unsafe { arena.get(strip_tag(offset)) };
         visit_chunks(node.left, arena, f);
         visit_chunks(node.right, arena, f);
@@ -149,9 +153,11 @@ fn visit_chunks<F: FnMut(&Chunk)>(offset: u32, arena: &Arena, f: &mut F) {
 
 fn contains_rec(offset: u32, arena: &Arena, val: u32) -> bool {
     if is_leaf(offset) {
+        // SAFETY: leaf tag is clear, so offset is a Chunk allocated in this arena.
         let chunk: &Chunk = unsafe { arena.get(offset) };
         chunk.contains(val)
     } else {
+        // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
         let node: &Interior = unsafe { arena.get(strip_tag(offset)) };
         if val < node.split_key {
             contains_rec(node.left, arena, val)
@@ -165,6 +171,7 @@ fn contains_rec(offset: u32, arena: &Arena, val: u32) -> bool {
 /// Returns None if duplicate or arena full.
 fn insert_rec(offset: u32, arena: &Arena, val: u32) -> Option<u32> {
     if is_leaf(offset) {
+        // SAFETY: leaf tag is clear, so offset is a Chunk allocated in this arena.
         let chunk: &Chunk = unsafe { arena.get(offset) };
 
         if chunk.is_full() {
@@ -199,6 +206,7 @@ fn insert_rec(offset: u32, arena: &Arena, val: u32) -> Option<u32> {
             Some(off)
         }
     } else {
+        // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
         let node: &Interior = unsafe { arena.get(strip_tag(offset)) };
 
         if val < node.split_key {

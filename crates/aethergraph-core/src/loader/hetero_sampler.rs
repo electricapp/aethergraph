@@ -6,8 +6,8 @@
 //! Local node indices are assigned during sampling — no post-sort, no
 //! binary search. Edges are stored with local indices directly.
 
-use crate::graph::hetero::{EdgeTypeId, HeteroGraph, NodeTypeId};
 use crate::graph::NodeId;
+use crate::graph::hetero::{EdgeTypeId, HeteroGraph, NodeTypeId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Ultra-fast wyrand PRNG.
@@ -106,15 +106,9 @@ impl<'a> HeteroNeighborSampler<'a> {
         let local_index: Vec<FxHashMap<NodeId, u32>> = (0..num_nt)
             .map(|_| FxHashMap::with_capacity_and_hasher(256, Default::default()))
             .collect();
-        let node_vecs: Vec<Vec<NodeId>> = (0..num_nt)
-            .map(|_| Vec::with_capacity(256))
-            .collect();
-        let edge_src_buf: Vec<Vec<u32>> = (0..num_et)
-            .map(|_| Vec::with_capacity(1024))
-            .collect();
-        let edge_dst_buf: Vec<Vec<u32>> = (0..num_et)
-            .map(|_| Vec::with_capacity(1024))
-            .collect();
+        let node_vecs: Vec<Vec<NodeId>> = (0..num_nt).map(|_| Vec::with_capacity(256)).collect();
+        let edge_src_buf: Vec<Vec<u32>> = (0..num_et).map(|_| Vec::with_capacity(1024)).collect();
+        let edge_dst_buf: Vec<Vec<u32>> = (0..num_et).map(|_| Vec::with_capacity(1024)).collect();
 
         let mut src_edge_types = vec![Vec::new(); num_nt];
         for (nt, entry) in src_edge_types.iter_mut().enumerate() {
@@ -166,9 +160,7 @@ impl<'a> HeteroNeighborSampler<'a> {
         let st = seed_type as usize;
         for &seed in seeds {
             let idx = self.node_vecs[st].len() as u32;
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                self.local_index[st].entry(seed)
-            {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.local_index[st].entry(seed) {
                 e.insert(idx);
                 self.node_vecs[st].push(seed);
             }
@@ -186,8 +178,7 @@ impl<'a> HeteroNeighborSampler<'a> {
                 // Stack-copy edge type IDs to avoid borrow conflict
                 let mut et_buf = [0u8; 32];
                 let et_count = self.src_edge_types[node_type as usize].len();
-                et_buf[..et_count]
-                    .copy_from_slice(&self.src_edge_types[node_type as usize]);
+                et_buf[..et_count].copy_from_slice(&self.src_edge_types[node_type as usize]);
 
                 // Look up the local index of the source node
                 let src_local_idx = self.local_index[node_type as usize][&local_id];
@@ -278,13 +269,7 @@ impl<'a> HeteroNeighborSampler<'a> {
     }
 
     #[inline]
-    fn take_all(
-        &mut self,
-        neighbors: &[NodeId],
-        src_local: u32,
-        et: usize,
-        dst_type: NodeTypeId,
-    ) {
+    fn take_all(&mut self, neighbors: &[NodeId], src_local: u32, et: usize, dst_type: NodeTypeId) {
         for &dst_id in neighbors {
             let dst_local = self.insert_dst(dst_id, dst_type);
             self.edge_src_buf[et].push(src_local);
@@ -382,8 +367,8 @@ impl<'a> HeteroNeighborSampler<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::hetero::HeteroGraph;
     use crate::graph::Graph;
+    use crate::graph::hetero::HeteroGraph;
 
     fn build_reddit_graph() -> HeteroGraph {
         let mut votes_edges = Vec::new();
@@ -418,7 +403,12 @@ mod tests {
             vec![
                 ("user".into(), "votes".into(), "post".into(), votes_csr),
                 ("user".into(), "writes".into(), "comment".into(), writes_csr),
-                ("post".into(), "belongs_to".into(), "subreddit".into(), belongs_csr),
+                (
+                    "post".into(),
+                    "belongs_to".into(),
+                    "subreddit".into(),
+                    belongs_csr,
+                ),
             ],
         )
     }
@@ -913,11 +903,7 @@ mod tests {
         let empty_csr = Graph::from_edges(20, &[], None).unwrap();
 
         let graph = HeteroGraph::from_parts(
-            vec![
-                ("user".into(), 20),
-                ("post".into(), 20),
-                ("tag".into(), 20),
-            ],
+            vec![("user".into(), 20), ("post".into(), 20), ("tag".into(), 20)],
             vec![
                 ("user".into(), "writes".into(), "post".into(), writes_csr),
                 ("user".into(), "tags".into(), "tag".into(), empty_csr),

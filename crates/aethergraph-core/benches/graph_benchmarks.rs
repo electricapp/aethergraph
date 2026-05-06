@@ -1,7 +1,7 @@
 use aethergraph_core::{
     Graph, NeighborSampler, NodeId, ParallelBatchSampler, SamplingConfig, TemporalStrategy,
 };
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::hint::black_box;
@@ -413,9 +413,7 @@ fn bench_sampling_reordered(c: &mut Criterion) {
     };
 
     let mut rng = StdRng::seed_from_u64(99);
-    let seeds: Vec<NodeId> = (0..512)
-        .map(|_| rng.random_range(0..100_000))
-        .collect();
+    let seeds: Vec<NodeId> = (0..512).map(|_| rng.random_range(0..100_000)).collect();
 
     // Remap seeds for reordered graph
     let inv_perm: Vec<u32> = {

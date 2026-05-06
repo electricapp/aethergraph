@@ -18,10 +18,10 @@
 use aether_stream::feature_table::FeatureTable;
 use aether_stream::rdma::context::RdmaContext;
 use aether_stream::rdma::control::{
-    connect_with_qp, serve_control_plane_with_qp, RdmaAdvertisement,
+    RdmaAdvertisement, connect_with_qp, serve_control_plane_with_qp,
 };
 use aether_stream::rdma::ffi::*;
-use aether_stream::rdma::qp::{RdmaQp, RdmaRead, DEFAULT_QP_CAP};
+use aether_stream::rdma::qp::{DEFAULT_QP_CAP, RdmaQp, RdmaRead};
 use std::net::TcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -167,11 +167,7 @@ fn t1_4_rdma_read_feature_table_bytes_match() {
     let client_len = NODES_READ * schema.slot_size;
     let mut client_buf = vec![0u8; client_len];
     let client_mr = client_ctx
-        .reg_mr(
-            client_buf.as_mut_ptr(),
-            client_len,
-            IBV_ACCESS_LOCAL_WRITE,
-        )
+        .reg_mr(client_buf.as_mut_ptr(), client_len, IBV_ACCESS_LOCAL_WRITE)
         .expect("client reg_mr");
     let client_lkey = client_mr.lkey();
 
@@ -190,8 +186,8 @@ fn t1_4_rdma_read_feature_table_bytes_match() {
     client_qp.post_reads(&reads).expect("post_reads");
 
     // Wait for the single signaled completion (last WR).
-    let wc = drain_one_completion(&client_qp, &client_ctx, Duration::from_secs(5))
-        .expect("CQ drain");
+    let wc =
+        drain_one_completion(&client_qp, &client_ctx, Duration::from_secs(5)).expect("CQ drain");
     assert_eq!(
         wc.status, IBV_WC_SUCCESS,
         "WC status must be SUCCESS, got {}",
@@ -214,11 +210,14 @@ fn t1_4_rdma_read_feature_table_bytes_match() {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(head, tail, "node {i}: torn read — head {head} != tail {tail}");
+        assert_eq!(
+            head, tail,
+            "node {i}: torn read — head {head} != tail {tail}"
+        );
         assert_eq!(head, 2, "node {i}: head must be 2 after one write");
 
-        let feat_bytes = &slot[schema.feature_offset_in_slot
-            ..schema.feature_offset_in_slot + FEATURE_DIM * 4];
+        let feat_bytes =
+            &slot[schema.feature_offset_in_slot..schema.feature_offset_in_slot + FEATURE_DIM * 4];
         let got: Vec<f32> = feat_bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -330,8 +329,12 @@ fn t1_6_cq_error_recovery() {
 
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).unwrap();
     let client_qp = RdmaQp::create(&client_ctx, &DEFAULT_QP_CAP).unwrap();
-    server_qp.connect(&server_ctx, &client_qp.endpoint(&client_ctx)).unwrap();
-    client_qp.connect(&client_ctx, &server_qp.endpoint(&server_ctx)).unwrap();
+    server_qp
+        .connect(&server_ctx, &client_qp.endpoint(&client_ctx))
+        .unwrap();
+    client_qp
+        .connect(&client_ctx, &server_qp.endpoint(&server_ctx))
+        .unwrap();
 
     let mut client_buf = vec![0u8; schema.slot_size];
     let client_mr = client_ctx
@@ -385,8 +388,12 @@ fn t1_6_cq_error_recovery() {
 
     let server_qp2 = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).unwrap();
     let client_qp2 = RdmaQp::create(&client_ctx, &DEFAULT_QP_CAP).unwrap();
-    server_qp2.connect(&server_ctx, &client_qp2.endpoint(&client_ctx)).unwrap();
-    client_qp2.connect(&client_ctx, &server_qp2.endpoint(&server_ctx)).unwrap();
+    server_qp2
+        .connect(&server_ctx, &client_qp2.endpoint(&client_ctx))
+        .unwrap();
+    client_qp2
+        .connect(&client_ctx, &server_qp2.endpoint(&server_ctx))
+        .unwrap();
 
     let good_read = [RdmaRead {
         local_addr: client_buf.as_mut_ptr() as u64,
@@ -395,7 +402,9 @@ fn t1_6_cq_error_recovery() {
         remote_rkey: new_rkey,
         length: schema.slot_size as u32,
     }];
-    client_qp2.post_reads(&good_read).expect("post_reads (fresh)");
+    client_qp2
+        .post_reads(&good_read)
+        .expect("post_reads (fresh)");
     let wc_ok = drain_one_completion(&client_qp2, &client_ctx, Duration::from_secs(5))
         .expect("fresh CQ drain");
     assert_eq!(
@@ -440,8 +449,7 @@ fn bench_rdma_read_latency() {
     const ITERS: usize = 1000;
 
     let server_ctx = RdmaContext::open(1024, ROCE_V2_GID_INDEX).expect("server open");
-    let server_table =
-        FeatureTable::new(NODE_COUNT, FEATURE_DIM, vec![]).expect("alloc table");
+    let server_table = FeatureTable::new(NODE_COUNT, FEATURE_DIM, vec![]).expect("alloc table");
     for n in 0..NODE_COUNT {
         let v: Vec<f32> = (0..FEATURE_DIM).map(|i| (n + i) as f32).collect();
         server_table.write_node(n, &v);
@@ -461,8 +469,12 @@ fn bench_rdma_read_latency() {
     let client_ctx = RdmaContext::open(1024, ROCE_V2_GID_INDEX).expect("client open");
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).unwrap();
     let client_qp = RdmaQp::create(&client_ctx, &DEFAULT_QP_CAP).unwrap();
-    server_qp.connect(&server_ctx, &client_qp.endpoint(&client_ctx)).unwrap();
-    client_qp.connect(&client_ctx, &server_qp.endpoint(&server_ctx)).unwrap();
+    server_qp
+        .connect(&server_ctx, &client_qp.endpoint(&client_ctx))
+        .unwrap();
+    client_qp
+        .connect(&client_ctx, &server_qp.endpoint(&server_ctx))
+        .unwrap();
 
     eprintln!(
         "\n=== SoftRoCE RDMA READ latency ({} nodes, dim={}, slot={}B) ===",
@@ -476,11 +488,7 @@ fn bench_rdma_read_latency() {
         let client_len = batch * schema.slot_size;
         let mut client_buf = vec![0u8; client_len];
         let client_mr = client_ctx
-            .reg_mr(
-                client_buf.as_mut_ptr(),
-                client_len,
-                IBV_ACCESS_LOCAL_WRITE,
-            )
+            .reg_mr(client_buf.as_mut_ptr(), client_len, IBV_ACCESS_LOCAL_WRITE)
             .expect("client reg_mr");
         let client_lkey = client_mr.lkey();
         let client_base = client_buf.as_mut_ptr() as u64;

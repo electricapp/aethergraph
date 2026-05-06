@@ -8,7 +8,9 @@
 
 use aether_stream::feature_table::FeatureTable;
 use aether_stream::rdma::context::RdmaContext;
-use aether_stream::rdma::control::{connect_with_qp, serve_control_plane_with_qp, RdmaAdvertisement};
+use aether_stream::rdma::control::{
+    RdmaAdvertisement, connect_with_qp, serve_control_plane_with_qp,
+};
 use aether_stream::rdma::ffi::*;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -202,8 +204,8 @@ fn server_handles_many_sequential_clients() {
 
     for i in 0..10 {
         let client_ctx = RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("client open");
-        let (got_adv, _qp) = connect_with_qp(&addr, &client_ctx)
-            .unwrap_or_else(|e| panic!("client {i}: {e}"));
+        let (got_adv, _qp) =
+            connect_with_qp(&addr, &client_ctx).unwrap_or_else(|e| panic!("client {i}: {e}"));
         assert_eq!(got_adv.base_addr, adv.base_addr);
         assert_eq!(got_adv.rkey, adv.rkey);
     }

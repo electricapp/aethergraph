@@ -21,9 +21,9 @@
 use super::context::RegisteredMr;
 use super::efa_ffi::*;
 use super::ffi::{
-    IbvAhAttr, IbvContext, IbvGid, IbvGlobalRoute, IbvPd, IbvQp, IbvQpAttr, IbvQpCap,
-    IBV_QPS_INIT, IBV_QPS_RTR, IBV_QPS_RTS, IBV_QP_PKEY_INDEX, IBV_QP_PORT, IBV_QP_QKEY,
-    IBV_QP_SQ_PSN, IBV_QP_STATE, IBV_SEND_SIGNALED,
+    IBV_QP_PKEY_INDEX, IBV_QP_PORT, IBV_QP_QKEY, IBV_QP_SQ_PSN, IBV_QP_STATE, IBV_QPS_INIT,
+    IBV_QPS_RTR, IBV_QPS_RTS, IBV_SEND_SIGNALED, IbvAhAttr, IbvContext, IbvGid, IbvGlobalRoute,
+    IbvPd, IbvQp, IbvQpAttr, IbvQpCap,
 };
 use crate::feature_table::FeatureSchema;
 use serde::{Deserialize, Serialize};
@@ -287,11 +287,7 @@ impl SrdAddressHandle {
                 return Err(io::Error::last_os_error());
             }
             let mut efa = EfadvAhAttr::default();
-            let rc = efadv_query_ah(
-                ah,
-                &mut efa,
-                std::mem::size_of::<EfadvAhAttr>() as u32,
-            );
+            let rc = efadv_query_ah(ah, &mut efa, std::mem::size_of::<EfadvAhAttr>() as u32);
             if rc != 0 {
                 ibv_destroy_ah(ah);
                 return Err(io::Error::new(
@@ -340,11 +336,7 @@ impl SrdQp {
         Self::create_with_qkey(ctx, cap, DEFAULT_SRD_QKEY)
     }
 
-    pub fn create_with_qkey(
-        ctx: &SrdContext,
-        cap: &IbvQpCap,
-        qkey: u32,
-    ) -> io::Result<Self> {
+    pub fn create_with_qkey(ctx: &SrdContext, cap: &IbvQpCap, qkey: u32) -> io::Result<Self> {
         unsafe {
             let cq_plain = aether_ibv_cq_ex_to_cq(ctx.cq_ex);
             let mut attr = IbvQpInitAttrEx::zeroed();
@@ -425,14 +417,20 @@ impl SrdQp {
             let mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY;
             let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, mask);
             if rc != 0 {
-                return Err(io::Error::new(io::ErrorKind::Other, format!("SRD INIT rc={rc}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("SRD INIT rc={rc}"),
+                ));
             }
             // RTR — bare state transition.
             let mut attr: IbvQpAttr = std::mem::zeroed();
             attr.qp_state = IBV_QPS_RTR;
             let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE);
             if rc != 0 {
-                return Err(io::Error::new(io::ErrorKind::Other, format!("SRD RTR rc={rc}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("SRD RTR rc={rc}"),
+                ));
             }
             // RTS — sq_psn only.
             let mut attr: IbvQpAttr = std::mem::zeroed();
@@ -440,7 +438,10 @@ impl SrdQp {
             attr.sq_psn = 0;
             let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE | IBV_QP_SQ_PSN);
             if rc != 0 {
-                return Err(io::Error::new(io::ErrorKind::Other, format!("SRD RTS rc={rc}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("SRD RTS rc={rc}"),
+                ));
             }
         }
         Ok(())
@@ -563,8 +564,8 @@ pub fn serve_srd_control_plane(
 ) -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
     tracing::info!(addr = bind_addr, "SRD control plane listening");
-    let adv_payload = serde_json::to_vec(adv)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let adv_payload =
+        serde_json::to_vec(adv).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     // Hold peer AHs so the underlying EFA peer entries stay valid across
     // many reads. Grows monotonically with connected clients.
     let mut peer_ahs: Vec<SrdAddressHandle> = Vec::new();
@@ -613,15 +614,12 @@ pub fn serve_srd_control_plane(
 /// Connect to a SRD server: send our local endpoint, then receive the
 /// advertisement. Caller is expected to have an `SrdQp` already brought up
 /// so the endpoint it ships is valid.
-pub fn exchange_srd_endpoints(
-    addr: &str,
-    local: &SrdEndpoint,
-) -> io::Result<SrdAdvertisement> {
+pub fn exchange_srd_endpoints(addr: &str, local: &SrdEndpoint) -> io::Result<SrdAdvertisement> {
     let mut conn = TcpStream::connect(addr)?;
     conn.set_read_timeout(Some(SRD_CONTROL_TIMEOUT))?;
     conn.set_write_timeout(Some(SRD_CONTROL_TIMEOUT))?;
-    let local_buf = serde_json::to_vec(local)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let local_buf =
+        serde_json::to_vec(local).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     send_len_prefixed(&mut conn, &local_buf)?;
     let buf = recv_len_prefixed(&mut conn)?;
     serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -664,11 +662,7 @@ impl SrdFeatureClient {
     /// build the destination MR sized for `max_inflight * slot_size`.
     ///
     /// `gid_index`: which GID slot to use locally (typically 0 on EFA).
-    pub fn connect(
-        addr: &str,
-        gid_index: u8,
-        max_inflight: usize,
-    ) -> io::Result<Self> {
+    pub fn connect(addr: &str, gid_index: u8, max_inflight: usize) -> io::Result<Self> {
         let cq_size = (max_inflight as u32).max(16);
         let ctx = SrdContext::open(cq_size, gid_index)?;
         let cap = IbvQpCap {
@@ -726,11 +720,7 @@ impl SrdFeatureClient {
         // Leak the box so it stays alive for the client's lifetime; the MR
         // registration pins the pages and `_dst_mr` owns the dereg via Drop.
         std::mem::forget(dst);
-        let dst_mr = ctx.reg_mr(
-            dst_ptr,
-            dst_len,
-            super::ffi::IBV_ACCESS_LOCAL_WRITE,
-        )?;
+        let dst_mr = ctx.reg_mr(dst_ptr, dst_len, super::ffi::IBV_ACCESS_LOCAL_WRITE)?;
         let dst_lkey = dst_mr.lkey();
 
         Ok(Self {
@@ -814,11 +804,7 @@ impl SrdFeatureClient {
         while drained < nodes.len() {
             let want = nodes.len() - drained;
             let got = unsafe {
-                aether_ibv_poll_cq_ex_many(
-                    self.ctx.cq_ex(),
-                    batch.as_mut_ptr(),
-                    want as u32,
-                )
+                aether_ibv_poll_cq_ex_many(self.ctx.cq_ex(), batch.as_mut_ptr(), want as u32)
             };
             if got < 0 {
                 return Err(io::Error::new(
@@ -938,9 +924,8 @@ impl SrdShardedFeatureClient {
                 })
                 .collect();
             for h in handles {
-                h.join().map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "shard worker panicked")
-                })??;
+                h.join()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "shard worker panicked"))??;
             }
             Ok(())
         })

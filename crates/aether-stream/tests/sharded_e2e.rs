@@ -6,7 +6,7 @@
 use aether_stream::feature_table::FeatureTable;
 use aether_stream::rdma::context::RdmaContext;
 use aether_stream::rdma::ffi::*;
-use aether_stream::rdma::qp::{RdmaQp, RdmaRead, DEFAULT_QP_CAP};
+use aether_stream::rdma::qp::{DEFAULT_QP_CAP, RdmaQp, RdmaRead};
 use aether_stream::rdma::sharded::{ShardedConfig, ShardedQpPool};
 use std::sync::Arc;
 use std::thread;
@@ -87,7 +87,8 @@ fn sharded_concurrent_gather_correctness() {
     for (sqp, cep) in server_qps.iter().zip(&client_eps) {
         sqp.connect(&server_ctx, cep).expect("server connect");
     }
-    pool.connect_all(&client_ctx, &server_eps).expect("client connect_all");
+    pool.connect_all(&client_ctx, &server_eps)
+        .expect("client connect_all");
 
     struct ThreadState {
         buf: Vec<u8>,
@@ -187,7 +188,12 @@ fn sharded_concurrent_gather_correctness() {
         "{} errors observed across {} threads:\n  {}",
         all_errors.len(),
         NUM_CALLER_THREADS,
-        all_errors.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ")
+        all_errors
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
     );
 }
 
@@ -252,7 +258,8 @@ fn sharded_4shard_sequential_gather() {
             remote_rkey: server_rkey,
             length: schema.slot_size as u32,
         };
-        pool.gather(vec![read]).unwrap_or_else(|e| panic!("round {round}: {e}"));
+        pool.gather(vec![read])
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
         let head = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let tail = u64::from_le_bytes(
             buf[schema.tail_offset_in_slot..schema.tail_offset_in_slot + 8]
@@ -327,8 +334,7 @@ fn sharded_single_shard_single_gather() {
     );
     assert_eq!(head, tail, "torn (h={head} t={tail})");
     assert_eq!(head, 2);
-    let got: Vec<f32> = buf
-        [schema.feature_offset_in_slot..schema.feature_offset_in_slot + 8 * 4]
+    let got: Vec<f32> = buf[schema.feature_offset_in_slot..schema.feature_offset_in_slot + 8 * 4]
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
@@ -356,18 +362,22 @@ fn sharded_two_threads_minimal() {
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).unwrap();
 
     let client_ctx = Arc::new(RdmaContext::open(64, ROCE_V2_GID_INDEX).unwrap());
-    let pool = Arc::new(ShardedQpPool::new(
-        &client_ctx,
-        ShardedConfig {
-            num_shards: 1,
-            cq_size: 64,
-            qp_cap: DEFAULT_QP_CAP,
-            worker_cores: vec![],
-        },
-    ).unwrap());
+    let pool = Arc::new(
+        ShardedQpPool::new(
+            &client_ctx,
+            ShardedConfig {
+                num_shards: 1,
+                cq_size: 64,
+                qp_cap: DEFAULT_QP_CAP,
+                worker_cores: vec![],
+            },
+        )
+        .unwrap(),
+    );
     let cep = pool.endpoints(&client_ctx).remove(0);
     server_qp.connect(&server_ctx, &cep).unwrap();
-    pool.connect_all(&client_ctx, &[server_qp.endpoint(&server_ctx)]).unwrap();
+    pool.connect_all(&client_ctx, &[server_qp.endpoint(&server_ctx)])
+        .unwrap();
 
     let server_base = table.base_addr();
     let mut handles = Vec::new();
@@ -378,7 +388,8 @@ fn sharded_two_threads_minimal() {
         handles.push(std::thread::spawn(move || -> Result<u64, String> {
             let mut buf = vec![0u8; schema.slot_size];
             let buf_ptr = buf.as_mut_ptr();
-            let mr = client_ctx.reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
+            let mr = client_ctx
+                .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
                 .map_err(|e| format!("t{tidx} reg_mr: {e}"))?;
             let lkey = mr.lkey();
             let read = RdmaRead {
@@ -388,9 +399,10 @@ fn sharded_two_threads_minimal() {
                 remote_rkey: server_rkey,
                 length: schema.slot_size as u32,
             };
-            pool.gather(vec![read]).map_err(|e| format!("t{tidx} gather: {e}"))?;
+            pool.gather(vec![read])
+                .map_err(|e| format!("t{tidx} gather: {e}"))?;
             let head = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let _ = mr;  // keep alive
+            let _ = mr; // keep alive
             Ok(head)
         }));
     }

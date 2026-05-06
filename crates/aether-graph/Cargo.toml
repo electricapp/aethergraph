@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "Lock-free dynamic graph with C-tree neighbor lists. Single-writer, multi-reader, zero-alloc reads."
 
+[lints]
+workspace = true
+
 [dependencies]
 crossbeam-utils = "0.8"
 

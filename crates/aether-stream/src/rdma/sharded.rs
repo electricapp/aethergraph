@@ -25,13 +25,13 @@
 //! and `tests/mr_xthread_sharded_repro.rs` (16 caller threads × 4 shards ×
 //! 1k iters × 8 reads with MRs pre-registered on the main thread).
 
-use super::context::{create_cq, RdmaContext, RegisteredCq};
+use super::context::{RdmaContext, RegisteredCq, create_cq};
 use super::qp::{QpEndpoint, RdmaQp, RdmaRead};
-use crate::rdma::ffi::{IbvCq, IbvQpCap, IbvWc, IBV_WC_SUCCESS};
-use crossbeam_channel::{bounded, Sender};
+use crate::rdma::ffi::{IBV_WC_SUCCESS, IbvCq, IbvQpCap, IbvWc};
+use crossbeam_channel::{Sender, bounded};
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 /// Configuration for a `ShardedQpPool`.
@@ -116,10 +116,7 @@ impl ShardedQpPool {
 
             let qp_for_worker = Arc::clone(&qp);
             let cq_for_worker = Arc::clone(&cq);
-            let core_id = cfg
-                .worker_cores
-                .get(shard_idx)
-                .copied();
+            let core_id = cfg.worker_cores.get(shard_idx).copied();
 
             let join = thread::Builder::new()
                 .name(format!("aether-shard-{shard_idx}"))

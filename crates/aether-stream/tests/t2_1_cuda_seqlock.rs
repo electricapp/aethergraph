@@ -52,9 +52,7 @@ fn seqlock_kernel_flags_torn_and_compacts_valid() {
     let mut staging: CudaSlice<u8> = stream
         .alloc_zeros(SLOT_SIZE * 3)
         .expect("alloc VRAM staging");
-    stream
-        .memcpy_htod(&host, &mut staging)
-        .expect("H2D memcpy");
+    stream.memcpy_htod(&host, &mut staging).expect("H2D memcpy");
     let staging_ptr = {
         let (p, _g) = staging.device_ptr_mut(&stream);
         p as u64

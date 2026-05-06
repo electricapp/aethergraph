@@ -9,7 +9,7 @@
 use aether_stream::feature_table::FeatureTable;
 use aether_stream::rdma::context::{RdmaContext, RegisteredMr};
 use aether_stream::rdma::ffi::*;
-use aether_stream::rdma::qp::{RdmaQp, RdmaRead, DEFAULT_QP_CAP};
+use aether_stream::rdma::qp::{DEFAULT_QP_CAP, RdmaQp, RdmaRead};
 use aether_stream::rdma::sharded::{ShardedConfig, ShardedQpPool};
 use std::sync::Arc;
 use std::thread;

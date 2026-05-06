@@ -369,9 +369,14 @@ mod tests {
     #[test]
     fn from_edges_batch() {
         let edges: Vec<(u32, u32)> = vec![
-            (0, 1), (0, 2), (0, 3),
-            (1, 0), (1, 2),
-            (2, 0), (2, 1), (2, 3),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 0),
+            (1, 2),
+            (2, 0),
+            (2, 1),
+            (2, 3),
         ];
         let g = DynamicGraph::from_edges(4, &edges, 1 << 20);
         assert_eq!(g.degree(0), 3);

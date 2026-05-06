@@ -409,18 +409,17 @@ impl PyNeighborLoader {
                 ))
             })?;
 
-        let rdma =
-            aether_stream::rdma::gather::RdmaFeatureGather::connect(
-                server_addr,
-                gpu_id,
-                max_batch_nodes,
-                gid_index,
-            )
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to connect RDMA feature gather: {e}"
-                ))
-            })?;
+        let rdma = aether_stream::rdma::gather::RdmaFeatureGather::connect(
+            server_addr,
+            gpu_id,
+            max_batch_nodes,
+            gid_index,
+        )
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to connect RDMA feature gather: {e}"
+            ))
+        })?;
 
         let feature_dim = Some(rdma.feature_dim());
 
@@ -440,16 +439,18 @@ impl PyNeighborLoader {
     ///
     /// Returns None if the prefetcher has been shut down.
     #[cfg(feature = "gpudirect")]
-    fn next_with_gpu_features(&mut self, py: Python<'_>) -> PyResult<Option<(PySampledSubgraph, PyObject)>> {
+    fn next_with_gpu_features(
+        &mut self,
+        py: Python<'_>,
+    ) -> PyResult<Option<(PySampledSubgraph, PyObject)>> {
         let inner = self
             .inner
             .as_ref()
             .ok_or_else(|| sampling_error("Prefetcher has been shut down"))?;
 
-        let rdma = self
-            .rdma_gather
-            .as_mut()
-            .ok_or_else(|| sampling_error("Not an RDMA-enabled loader. Use with_rdma_features()."))?;
+        let rdma = self.rdma_gather.as_mut().ok_or_else(|| {
+            sampling_error("Not an RDMA-enabled loader. Use with_rdma_features().")
+        })?;
 
         // Get next sampled subgraph from the prefetch thread
         let subgraph = match inner.next() {
@@ -460,9 +461,9 @@ impl PyNeighborLoader {
         // Gather features via RDMA into VRAM (~20μs)
         let node_ids: Vec<u32> = subgraph.nodes.iter().map(|&n| n as u32).collect();
         // epoch_version=0: accept any consistent read (no MVCC pinning from Python yet)
-        let gpu_features = rdma.gather(&node_ids, 0).map_err(|e| {
-            sampling_error(format!("RDMA gather failed: {e}"))
-        })?;
+        let gpu_features = rdma
+            .gather(&node_ids, 0)
+            .map_err(|e| sampling_error(format!("RDMA gather failed: {e}")))?;
 
         let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;
 
