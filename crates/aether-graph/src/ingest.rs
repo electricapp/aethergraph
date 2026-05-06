@@ -20,8 +20,8 @@
 //! ```
 
 use crate::graph::{ArenaFull, DynamicGraph};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Ingestion statistics. Lock-free, read from any thread.
 pub struct IngestStats {
@@ -73,10 +73,7 @@ impl Default for IngestStats {
 ///
 /// Single-threaded on the write side (DynamicGraph is single-writer).
 /// Readers can sample concurrently — the graph is lock-free for reads.
-pub fn run(
-    graph: &DynamicGraph,
-    mut next_edge: impl FnMut() -> Option<(u32, u32)>,
-) -> IngestStats {
+pub fn run(graph: &DynamicGraph, mut next_edge: impl FnMut() -> Option<(u32, u32)>) -> IngestStats {
     let stats = IngestStats::new();
     while let Some((src, dst)) = next_edge() {
         stats.received.fetch_add(1, Ordering::Relaxed);
@@ -191,10 +188,7 @@ mod tests {
     #[test]
     fn run_batches_basic() {
         let graph = DynamicGraph::new(100, 1 << 20);
-        let batches = vec![
-            vec![(0, 1), (0, 2)],
-            vec![(1, 2), (2, 0)],
-        ];
+        let batches = vec![vec![(0, 1), (0, 2)], vec![(1, 2), (2, 0)]];
 
         let stats = run_batches(&graph, batches.into_iter());
         assert_eq!(stats.received(), 4);
@@ -207,19 +201,15 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mut counter = 0u32;
 
-        let (handle, stats) = spawn(
-            Arc::clone(&graph),
-            Arc::clone(&stop),
-            move || {
-                if counter < 100 {
-                    let edge = (counter % 10, counter);
-                    counter += 1;
-                    Some(edge)
-                } else {
-                    None // will cause thread to sleep+retry
-                }
-            },
-        );
+        let (handle, stats) = spawn(Arc::clone(&graph), Arc::clone(&stop), move || {
+            if counter < 100 {
+                let edge = (counter % 10, counter);
+                counter += 1;
+                Some(edge)
+            } else {
+                None // will cause thread to sleep+retry
+            }
+        });
 
         // Let it run
         std::thread::sleep(std::time::Duration::from_millis(50));

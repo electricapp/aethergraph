@@ -423,14 +423,18 @@ fn stress_10k_inserts() {
         g.neighbors_into(*src, &mut buf);
         let actual: BTreeSet<u32> = buf.iter().copied().collect();
         assert_eq!(
-            &actual, dsts,
+            &actual,
+            dsts,
             "mismatch for vertex {}: got {} neighbors, expected {}",
-            src, actual.len(), dsts.len()
+            src,
+            actual.len(),
+            dsts.len()
         );
         // Also verify sorted
         assert!(
             is_sorted_strict(&buf),
-            "neighbors of vertex {} not sorted", src
+            "neighbors of vertex {} not sorted",
+            src
         );
     }
 
@@ -439,7 +443,8 @@ fn stress_10k_inserts() {
         assert_eq!(
             g.degree(*src),
             dsts.len(),
-            "degree mismatch for vertex {}", src
+            "degree mismatch for vertex {}",
+            src
         );
     }
 
@@ -448,7 +453,9 @@ fn stress_10k_inserts() {
         for dst in dsts {
             assert!(
                 g.has_edge(*src, *dst),
-                "has_edge({}, {}) returned false", src, dst
+                "has_edge({}, {}) returned false",
+                src,
+                dst
             );
         }
     }

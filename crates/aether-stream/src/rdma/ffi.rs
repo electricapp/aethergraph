@@ -390,11 +390,7 @@ extern "C" {
     // ibv_post_send / ibv_poll_cq are static inline in <infiniband/verbs.h>
     // and are NOT exported as ABI symbols from libibverbs.so.
     #[link_name = "aether_ibv_post_send"]
-    pub fn ibv_post_send(
-        qp: *mut IbvQp,
-        wr: *mut IbvSendWr,
-        bad_wr: *mut *mut IbvSendWr,
-    ) -> i32;
+    pub fn ibv_post_send(qp: *mut IbvQp, wr: *mut IbvSendWr, bad_wr: *mut *mut IbvSendWr) -> i32;
     #[link_name = "aether_ibv_poll_cq"]
     pub fn ibv_poll_cq(cq: *mut IbvCq, num_entries: i32, wc: *mut IbvWc) -> i32;
 

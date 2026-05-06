@@ -231,14 +231,22 @@ impl<'a> NeighborSampler<'a> {
             .fanout
             .iter()
             .fold(128usize, |acc, &f| acc.saturating_mul(f).min(num_nodes));
-        let use_direct = num_nodes <= 100_000
-            || (estimated_sample as f64 / num_nodes as f64) > 0.01;
+        let use_direct =
+            num_nodes <= 100_000 || (estimated_sample as f64 / num_nodes as f64) > 0.01;
         Self {
             graph,
             config,
             rng,
-            node_gen: if use_direct { vec![0u32; num_nodes] } else { Vec::new() },
-            node_local_idx: if use_direct { vec![0u32; num_nodes] } else { Vec::new() },
+            node_gen: if use_direct {
+                vec![0u32; num_nodes]
+            } else {
+                Vec::new()
+            },
+            node_local_idx: if use_direct {
+                vec![0u32; num_nodes]
+            } else {
+                Vec::new()
+            },
             current_gen: 0,
             local_index: FxHashMap::with_capacity_and_hasher(512, Default::default()),
             use_direct,
@@ -417,7 +425,8 @@ impl<'a> NeighborSampler<'a> {
             let node_offset = all_nodes.len() as u32;
 
             // Build local_index for this seed's subgraph
-            let seed_local: FxHashMap<NodeId, u32> = self.node_vec
+            let seed_local: FxHashMap<NodeId, u32> = self
+                .node_vec
                 .iter()
                 .enumerate()
                 .map(|(idx, &id)| (id, idx as u32))
@@ -724,9 +733,10 @@ impl<'a> NeighborSampler<'a> {
                 let take = valid.min(sample_size);
                 if take < valid {
                     // select_nth_unstable: O(n) partial sort — only partition, no full sort
-                    self.temporal_filtered.select_nth_unstable_by(take - 1, |a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    self.temporal_filtered
+                        .select_nth_unstable_by(take - 1, |a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                 }
                 for &(csr_idx, _) in &self.temporal_filtered[..take] {
                     self.sample_buf.push((neighbors[csr_idx], csr_idx));
@@ -1036,7 +1046,8 @@ impl<'a> NeighborSampler<'a> {
 
         // Reuse pre-allocated buffer
         self.weighted_keys.clear();
-        self.weighted_keys.reserve(n.saturating_sub(self.weighted_keys.capacity()));
+        self.weighted_keys
+            .reserve(n.saturating_sub(self.weighted_keys.capacity()));
 
         // Compute keys: key[i] = -ln(u) / w[i], u ~ Uniform(0,1)
         // We use fast_neg_ln: bit-extract log2 approximation (~4x faster than ln())
@@ -1113,8 +1124,7 @@ impl SampledSubgraph {
         num_sampled_nodes: Vec<usize>,
         num_sampled_edges: Vec<usize>,
     ) -> Self {
-        let mut local_index =
-            FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
+        let mut local_index = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
         for (i, &id) in nodes.iter().enumerate() {
             local_index.insert(id, i as u32);
         }
@@ -1173,9 +1183,7 @@ impl SampledSubgraph {
         for src in &self.edge_src {
             match self.local_index.get(src) {
                 Some(&idx) => src_local.push(idx),
-                None => {
-                    return Err(format!("edge src {} not in local_index", src))
-                }
+                None => return Err(format!("edge src {} not in local_index", src)),
             }
         }
 
@@ -1183,9 +1191,7 @@ impl SampledSubgraph {
         for dst in &self.edge_dst {
             match self.local_index.get(dst) {
                 Some(&idx) => dst_local.push(idx),
-                None => {
-                    return Err(format!("edge dst {} not in local_index", dst))
-                }
+                None => return Err(format!("edge dst {} not in local_index", dst)),
             }
         }
 
@@ -1633,13 +1639,7 @@ mod tests {
 
     #[test]
     fn test_weighted_sampling_without_replacement() {
-        let edges = vec![
-            (0, 1),
-            (0, 2),
-            (0, 3),
-            (0, 4),
-            (0, 5),
-        ];
+        let edges = vec![(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)];
         let weights = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let graph = Graph::from_edges(6, &edges, Some(&weights)).unwrap();
 
@@ -1663,7 +1663,11 @@ mod tests {
         assert_eq!(subgraph.num_edges(), 3);
         // Without replacement: all sampled destinations must be unique
         let neighbors: FxHashSet<_> = subgraph.edge_dst.iter().copied().collect();
-        assert_eq!(neighbors.len(), 3, "weighted without replacement should produce unique neighbors");
+        assert_eq!(
+            neighbors.len(),
+            3,
+            "weighted without replacement should produce unique neighbors"
+        );
         // All must be valid neighbors of node 0
         for &dst in &subgraph.edge_dst {
             assert!([1u32, 2, 3, 4, 5].contains(&dst));
@@ -1768,7 +1772,10 @@ mod tests {
         let dsts: FxHashSet<_> = subgraph.edge_dst.iter().copied().collect();
         assert!(dsts.contains(&1), "edge 0->1 (t=1.0) should be sampled");
         assert!(dsts.contains(&2), "edge 0->2 (t=2.0) should be sampled");
-        assert!(!dsts.contains(&3), "edge 0->3 (t=3.0) should NOT be sampled (t >= 2.5)");
+        assert!(
+            !dsts.contains(&3),
+            "edge 0->3 (t=3.0) should NOT be sampled (t >= 2.5)"
+        );
     }
 
     #[test]
@@ -1797,9 +1804,18 @@ mod tests {
         assert_eq!(subgraph.num_edges(), 2);
         let dsts: FxHashSet<_> = subgraph.edge_dst.iter().copied().collect();
         // Last strategy should pick the 2 most recent valid edges
-        assert!(dsts.contains(&3), "edge 0->3 (t=3.0, most recent) should be sampled");
-        assert!(dsts.contains(&2), "edge 0->2 (t=2.0, second most recent) should be sampled");
-        assert!(!dsts.contains(&1), "edge 0->1 (t=1.0, oldest) should NOT be sampled");
+        assert!(
+            dsts.contains(&3),
+            "edge 0->3 (t=3.0, most recent) should be sampled"
+        );
+        assert!(
+            dsts.contains(&2),
+            "edge 0->2 (t=2.0, second most recent) should be sampled"
+        );
+        assert!(
+            !dsts.contains(&1),
+            "edge 0->1 (t=1.0, oldest) should NOT be sampled"
+        );
     }
 
     #[test]
@@ -1866,7 +1882,10 @@ mod tests {
         let all_nodes: FxHashSet<_> = subgraph.nodes.iter().copied().collect();
         assert!(all_nodes.contains(&0), "seed should be present");
         assert!(all_nodes.contains(&1), "hop-1 neighbor should be present");
-        assert!(all_nodes.contains(&3), "hop-2 neighbor via edge t=5<10 should be present");
+        assert!(
+            all_nodes.contains(&3),
+            "hop-2 neighbor via edge t=5<10 should be present"
+        );
         assert!(
             !all_nodes.contains(&4),
             "node 4 should NOT be present: edge 1->4 has t=15.0 >= node 1's time 10.0"
@@ -1898,14 +1917,22 @@ mod tests {
         let subgraph = sampler.sample_neighbors_temporal(&[0], &[100.0]);
 
         // All 5 edges have t < 100.0, but fanout=2 so exactly 2 should be sampled
-        assert_eq!(subgraph.num_edges(), 2, "fanout=2 should produce exactly 2 edges");
+        assert_eq!(
+            subgraph.num_edges(),
+            2,
+            "fanout=2 should produce exactly 2 edges"
+        );
         // Sampled destinations should be valid neighbors
         for &dst in &subgraph.edge_dst {
             assert!([1u32, 2, 3, 4, 5].contains(&dst));
         }
         // Without replacement, the 2 destinations should be unique
         let dsts: FxHashSet<_> = subgraph.edge_dst.iter().copied().collect();
-        assert_eq!(dsts.len(), 2, "without replacement, destinations should be unique");
+        assert_eq!(
+            dsts.len(),
+            2,
+            "without replacement, destinations should be unique"
+        );
     }
 
     // =========================================================================
@@ -1933,7 +1960,10 @@ mod tests {
         let subgraph = sampler.sample_neighbors_disjoint(&[0, 1], None);
 
         // batch should be Some and have one entry per node
-        assert!(subgraph.batch.is_some(), "disjoint mode should produce a batch vector");
+        assert!(
+            subgraph.batch.is_some(),
+            "disjoint mode should produce a batch vector"
+        );
         let batch = subgraph.batch.as_ref().unwrap();
         assert_eq!(
             batch.len(),
@@ -1943,7 +1973,10 @@ mod tests {
 
         // Every batch value should be 0 or 1 (2 seeds)
         for &b in batch {
-            assert!(b == 0 || b == 1, "batch values should map to seed indices 0 or 1");
+            assert!(
+                b == 0 || b == 1,
+                "batch values should map to seed indices 0 or 1"
+            );
         }
 
         // Seeds vector should be preserved
@@ -1991,10 +2024,14 @@ mod tests {
         let seed0_set: FxHashSet<_> = seed0_nodes.iter().copied().collect();
         let seed1_set: FxHashSet<_> = seed1_nodes.iter().copied().collect();
 
-        assert!(seed0_set.contains(&2) && seed0_set.contains(&3),
-            "seed 0 should have neighbors 2 and 3");
-        assert!(seed1_set.contains(&2) && seed1_set.contains(&3),
-            "seed 1 should have neighbors 2 and 3");
+        assert!(
+            seed0_set.contains(&2) && seed0_set.contains(&3),
+            "seed 0 should have neighbors 2 and 3"
+        );
+        assert!(
+            seed1_set.contains(&2) && seed1_set.contains(&3),
+            "seed 1 should have neighbors 2 and 3"
+        );
 
         // The total node count should be greater than the unique count
         // (because shared nodes are duplicated)
@@ -2040,10 +2077,20 @@ mod tests {
         // All local indices should be valid (< total nodes in combined subgraph)
         let num_nodes = subgraph.nodes.len() as u32;
         for &s in src_local {
-            assert!(s < num_nodes, "local src index {} should be < {}", s, num_nodes);
+            assert!(
+                s < num_nodes,
+                "local src index {} should be < {}",
+                s,
+                num_nodes
+            );
         }
         for &d in dst_local {
-            assert!(d < num_nodes, "local dst index {} should be < {}", d, num_nodes);
+            assert!(
+                d < num_nodes,
+                "local dst index {} should be < {}",
+                d,
+                num_nodes
+            );
         }
 
         // Verify that local indices correctly map back to global IDs
@@ -2094,13 +2141,13 @@ mod tests {
         let mut sampler = NeighborSampler::new(&graph, config);
         // Seed 0 with time 2.5: only 0->1 (t=1.0) and 0->2 (t=2.0) valid
         // Seed 1 with time 4.5: only 1->2 (t=4.0) valid (1->3 has t=5.0 >= 4.5)
-        let subgraph = sampler.sample_neighbors_disjoint(
-            &[0, 1],
-            Some(&[2.5, 4.5]),
-        );
+        let subgraph = sampler.sample_neighbors_disjoint(&[0, 1], Some(&[2.5, 4.5]));
 
         // batch should exist
-        assert!(subgraph.batch.is_some(), "disjoint+temporal should produce batch");
+        assert!(
+            subgraph.batch.is_some(),
+            "disjoint+temporal should produce batch"
+        );
         let batch = subgraph.batch.as_ref().unwrap();
         assert_eq!(batch.len(), subgraph.nodes.len());
 
@@ -2122,12 +2169,27 @@ mod tests {
         }
 
         // Seed 0 (time=2.5): edges 0->1 (t=1.0), 0->2 (t=2.0)
-        assert!(seed0_dsts.contains(&1), "seed 0 should sample 0->1 (t=1.0 < 2.5)");
-        assert!(seed0_dsts.contains(&2), "seed 0 should sample 0->2 (t=2.0 < 2.5)");
-        assert!(!seed0_dsts.contains(&3), "seed 0 should NOT sample 0->3 (t=3.0 >= 2.5)");
+        assert!(
+            seed0_dsts.contains(&1),
+            "seed 0 should sample 0->1 (t=1.0 < 2.5)"
+        );
+        assert!(
+            seed0_dsts.contains(&2),
+            "seed 0 should sample 0->2 (t=2.0 < 2.5)"
+        );
+        assert!(
+            !seed0_dsts.contains(&3),
+            "seed 0 should NOT sample 0->3 (t=3.0 >= 2.5)"
+        );
 
         // Seed 1 (time=4.5): edges 1->2 (t=4.0) valid, 1->3 (t=5.0) NOT valid
-        assert!(seed1_dsts.contains(&2), "seed 1 should sample 1->2 (t=4.0 < 4.5)");
-        assert!(!seed1_dsts.contains(&3), "seed 1 should NOT sample 1->3 (t=5.0 >= 4.5)");
+        assert!(
+            seed1_dsts.contains(&2),
+            "seed 1 should sample 1->2 (t=4.0 < 4.5)"
+        );
+        assert!(
+            !seed1_dsts.contains(&3),
+            "seed 1 should NOT sample 1->3 (t=5.0 >= 4.5)"
+        );
     }
 }

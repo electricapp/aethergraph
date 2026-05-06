@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::error::cache_error;
 
 /// Python wrapper for FeatureCacheConfig.
-#[pyclass(name = "FeatureCacheConfig")]
+#[pyclass(name = "FeatureCacheConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyFeatureCacheConfig {
     inner: FeatureCacheConfig,
@@ -132,7 +132,7 @@ impl PyFeatureCache {
                 cache_error(format!("Failed to get features for node {}: {}", node, e))
             })?;
 
-            Ok(Python::with_gil(|py| {
+            Ok(Python::attach(|py| {
                 PyArray1::from_vec(py, features).unbind().into_any()
             }))
         })
@@ -156,7 +156,7 @@ impl PyFeatureCache {
                 .await
                 .map_err(|e| cache_error(format!("Failed to get batch features: {}", e)))?;
 
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 // Convert Vec<Vec<f32>> to 2D numpy array
                 let num_nodes = features_vec.len();
                 let feature_dim = if num_nodes > 0 {

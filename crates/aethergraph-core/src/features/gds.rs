@@ -14,7 +14,7 @@
 //! submission so file offsets are monotonically increasing, maximizing
 //! NVMe sequential prefetch.
 
-use crate::features::header::{parse_feature_header, FeatureDtype};
+use crate::features::header::{FeatureDtype, parse_feature_header};
 use crate::graph::NodeId;
 use anyhow::{Context, Result, ensure};
 use std::ffi::c_void;
@@ -69,17 +69,17 @@ mod ffi {
     /// Each entry describes one read or write operation.
     #[repr(C)]
     pub struct CUfileIOParams {
-        pub mode: c_int,             // CUFILE_READ or CUFILE_WRITE
-        pub pad: [u8; 4],           // padding for alignment
-        pub fh: CUfileHandle,       // registered file handle
-        pub opcode: c_int,          // internal, set to 0
-        pub status: c_int,          // completion status (output)
-        pub cookie: *mut c_void,    // user cookie (unused)
+        pub mode: c_int,               // CUFILE_READ or CUFILE_WRITE
+        pub pad: [u8; 4],              // padding for alignment
+        pub fh: CUfileHandle,          // registered file handle
+        pub opcode: c_int,             // internal, set to 0
+        pub status: c_int,             // completion status (output)
+        pub cookie: *mut c_void,       // user cookie (unused)
         pub dev_ptr_base: *mut c_void, // registered GPU buffer base
-        pub file_offset: i64,       // offset in file
-        pub dev_ptr_offset: i64,    // offset within GPU buffer
-        pub size: usize,            // bytes to transfer
-        pub bytes_done: isize,      // bytes actually transferred (output)
+        pub file_offset: i64,          // offset in file
+        pub dev_ptr_offset: i64,       // offset within GPU buffer
+        pub size: usize,               // bytes to transfer
+        pub bytes_done: isize,         // bytes actually transferred (output)
     }
 
     /// Opaque batch handle.
@@ -90,17 +90,10 @@ mod ffi {
         pub fn cuFileDriverOpen() -> CUfileError;
         pub fn cuFileDriverClose() -> CUfileError;
 
-        pub fn cuFileHandleRegister(
-            fh: *mut CUfileHandle,
-            descr: *mut CUfileDescr,
-        ) -> CUfileError;
+        pub fn cuFileHandleRegister(fh: *mut CUfileHandle, descr: *mut CUfileDescr) -> CUfileError;
         pub fn cuFileHandleDeregister(fh: CUfileHandle);
 
-        pub fn cuFileBufRegister(
-            dev_ptr: *const c_void,
-            size: usize,
-            flags: c_int,
-        ) -> CUfileError;
+        pub fn cuFileBufRegister(dev_ptr: *const c_void, size: usize, flags: c_int) -> CUfileError;
         pub fn cuFileBufDeregister(dev_ptr: *const c_void) -> CUfileError;
 
         // Single-read fallback (kept for small batches where overhead matters less)
@@ -281,9 +274,7 @@ impl GdsFeatureStore {
             fs_ops: std::ptr::null(),
         };
 
-        let err = unsafe {
-            ffi::cuFileHandleRegister(&raw mut file_handle, &raw mut descr)
-        };
+        let err = unsafe { ffi::cuFileHandleRegister(&raw mut file_handle, &raw mut descr) };
         ensure!(
             err.err == ffi::CU_FILE_SUCCESS,
             "cuFileHandleRegister failed: err={}, cu_err={}",
@@ -418,8 +409,12 @@ impl GdsFeatureStore {
 
         // Sort by node ID for sequential file access. Track original index
         // so output lands in the caller's expected order.
-        let mut sorted: Vec<(NodeId, usize)> =
-            nodes.iter().copied().enumerate().map(|(i, n)| (n, i)).collect();
+        let mut sorted: Vec<(NodeId, usize)> = nodes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, n)| (n, i))
+            .collect();
         sorted.sort_unstable_by_key(|&(n, _)| n);
 
         // Small batches: skip batch API overhead.
@@ -430,9 +425,7 @@ impl GdsFeatureStore {
         // Set up batch handle.
         let num_entries = sorted.len() as u32;
         let mut batch_handle: ffi::CUfileBatchHandle = std::ptr::null_mut();
-        let err = unsafe {
-            ffi::cuFileBatchIOSetUp(&raw mut batch_handle, num_entries)
-        };
+        let err = unsafe { ffi::cuFileBatchIOSetUp(&raw mut batch_handle, num_entries) };
         ensure!(
             err.err == ffi::CU_FILE_SUCCESS,
             "cuFileBatchIOSetUp failed: err={}, cu_err={}",
@@ -444,10 +437,9 @@ impl GdsFeatureStore {
         let mut io_params: Vec<ffi::CUfileIOParams> = sorted
             .iter()
             .map(|&(node, orig_idx)| {
-                let file_offset = self.features_start_offset as i64
-                    + (node as i64) * (feature_size as i64);
-                let dev_offset =
-                    (base_dev_offset + orig_idx * feature_size) as i64;
+                let file_offset =
+                    self.features_start_offset as i64 + (node as i64) * (feature_size as i64);
+                let dev_offset = (base_dev_offset + orig_idx * feature_size) as i64;
 
                 ffi::CUfileIOParams {
                     mode: ffi::CUFILE_READ,
@@ -467,12 +459,7 @@ impl GdsFeatureStore {
 
         // Submit all reads in one kernel crossing.
         let err = unsafe {
-            ffi::cuFileBatchIOSubmit(
-                batch_handle,
-                num_entries,
-                io_params.as_mut_ptr(),
-                0,
-            )
+            ffi::cuFileBatchIOSubmit(batch_handle, num_entries, io_params.as_mut_ptr(), 0)
         };
         if err.err != ffi::CU_FILE_SUCCESS {
             unsafe { ffi::cuFileBatchIODestroy(batch_handle) };
@@ -544,10 +531,9 @@ impl GdsFeatureStore {
         let mut total_bytes: usize = 0;
 
         for &(node, orig_idx) in sorted {
-            let file_offset = self.features_start_offset as i64
-                + (node as i64) * (feature_size as i64);
-            let dev_offset =
-                (base_dev_offset + orig_idx * feature_size) as i64;
+            let file_offset =
+                self.features_start_offset as i64 + (node as i64) * (feature_size as i64);
+            let dev_offset = (base_dev_offset + orig_idx * feature_size) as i64;
 
             let n = unsafe {
                 ffi::cuFileRead(
@@ -560,11 +546,7 @@ impl GdsFeatureStore {
             };
 
             if n < 0 {
-                anyhow::bail!(
-                    "cuFileRead failed for node {}: returned {}",
-                    node,
-                    n,
-                );
+                anyhow::bail!("cuFileRead failed for node {}: returned {}", node, n,);
             }
             let n = n as usize;
             if n != feature_size {

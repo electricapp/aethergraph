@@ -15,8 +15,8 @@
 //!                                           the page cache, measuring disk I/O
 //!                                           rather than cached reads.
 
-use aethergraph_core::{save_graph, AsyncCsrGraph, Graph, NodeId};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use aethergraph_core::{AsyncCsrGraph, Graph, NodeId, save_graph};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;

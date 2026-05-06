@@ -17,7 +17,7 @@
 
 use aether_stream::rdma::ffi::{IBV_ACCESS_LOCAL_WRITE, IBV_ACCESS_REMOTE_READ, IBV_WC_SUCCESS};
 use aether_stream::rdma::srd::{
-    LocalBuf, SrdAddressHandle, SrdContext, SrdQp, DEFAULT_SRD_QKEY, DEFAULT_SRD_QP_CAP,
+    DEFAULT_SRD_QKEY, DEFAULT_SRD_QP_CAP, LocalBuf, SrdAddressHandle, SrdContext, SrdQp,
 };
 use std::time::{Duration, Instant};
 
@@ -239,8 +239,9 @@ fn srd_qp_cap_ablation() {
             .unwrap_or_else(|e| panic!("shape {name}: ctx open cq={cq}: {e}"));
         let qp = SrdQp::create(&ctx, &cap)
             .unwrap_or_else(|e| panic!("shape {name}: qp create {send_wr}/{recv_wr}: {e}"));
-        qp.bring_up()
-            .unwrap_or_else(|e| panic!("shape {name}: bring_up cq={cq} send={send_wr} recv={recv_wr}: {e}"));
+        qp.bring_up().unwrap_or_else(|e| {
+            panic!("shape {name}: bring_up cq={cq} send={send_wr} recv={recv_wr}: {e}")
+        });
         eprintln!("shape {name}: OK cq={cq} send_wr={send_wr} recv_wr={recv_wr}");
     }
 }
@@ -254,7 +255,10 @@ fn bench_memcpy_baseline() {
     const ITERS: usize = 20_000;
     let sizes: [usize; 5] = [64, 512, 4096, 16 * 1024, 64 * 1024];
     eprintln!("\n=== memcpy baseline (loopback floor) ===");
-    eprintln!("  {:>6}  {:>10}  {:>10}  {:>10}", "bytes", "ns/iter", "MB/s", "min ns");
+    eprintln!(
+        "  {:>6}  {:>10}  {:>10}  {:>10}",
+        "bytes", "ns/iter", "MB/s", "min ns"
+    );
     for &sz in &sizes {
         let src = vec![0xAAu8; sz];
         let mut dst = vec![0u8; sz];
@@ -299,7 +303,10 @@ fn bench_tcp_rpc_baseline() {
     let max_sz = *sizes.iter().max().unwrap();
 
     eprintln!("\n=== Localhost TCP RPC baseline (naive remote-fetch) ===");
-    eprintln!("  {:>6}  {:>10}  {:>10}  {:>10}", "bytes", "µs/iter", "MB/s", "min µs");
+    eprintln!(
+        "  {:>6}  {:>10}  {:>10}  {:>10}",
+        "bytes", "µs/iter", "MB/s", "min µs"
+    );
 
     // --- server thread: request = [u32 len]; reply = len bytes of 0xAA --
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -351,7 +358,10 @@ fn bench_tcp_rpc_baseline() {
         let elapsed = start.elapsed();
         let per_us = elapsed.as_secs_f64() * 1e6 / ITERS as f64;
         let mb = (sz as f64) * ITERS as f64 / elapsed.as_secs_f64() / 1e6;
-        eprintln!("  {sz:>6}  {per_us:>10.2}  {mb:>10.0}  {:>10.2}", min_ns as f64 / 1e3);
+        eprintln!(
+            "  {sz:>6}  {per_us:>10.2}  {mb:>10.0}  {:>10.2}",
+            min_ns as f64 / 1e3
+        );
         assert!(dst.iter().all(|&b| b == 0xAA), "TCP payload mismatch");
     }
     // Tell server to exit.
@@ -382,7 +392,10 @@ fn bench_srd_rdma_read_latency() {
     let ah = SrdAddressHandle::create(&ctx, &ctx.gid()).expect("ah");
 
     eprintln!("\n=== EFA SRD RDMA READ latency (1 inflight, loopback) ===");
-    eprintln!("  {:>6}  {:>10}  {:>10}  {:>10}", "bytes", "µs/iter", "MB/s", "min µs");
+    eprintln!(
+        "  {:>6}  {:>10}  {:>10}  {:>10}",
+        "bytes", "µs/iter", "MB/s", "min µs"
+    );
 
     for &sz in &sizes {
         let buf_len = sz as usize;

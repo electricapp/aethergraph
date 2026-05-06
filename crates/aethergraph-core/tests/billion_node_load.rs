@@ -11,8 +11,8 @@
 //!         cargo test --release -p aethergraph-core --test billion_node_load \
 //!         -- --nocapture --ignored
 
-use aethergraph_core::{load_graph, load_graph_mmap, GraphValidationMode};
-use rand::{rngs::SmallRng, RngExt, SeedableRng};
+use aethergraph_core::{GraphValidationMode, load_graph, load_graph_mmap};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -140,8 +140,7 @@ fn billion_node_mmap_load_and_walk() {
     drop(g);
 
     let t0 = Instant::now();
-    let g = load_graph_mmap(&path, GraphValidationMode::HeaderOnly)
-        .expect("load_graph HeaderOnly");
+    let g = load_graph_mmap(&path, GraphValidationMode::HeaderOnly).expect("load_graph HeaderOnly");
     let header_only_secs = t0.elapsed().as_secs_f64();
     eprintln!("load_graph (HeaderOnly):  {:.3}s", header_only_secs);
 

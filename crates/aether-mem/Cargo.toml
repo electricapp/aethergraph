@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "Lock-free slab allocator with HugePages and pluggable memory hooks"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 parallel-prefault = ["dep:rayon"]

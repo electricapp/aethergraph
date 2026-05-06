@@ -30,7 +30,7 @@
 
 use crate::graph::hetero::HeteroGraph;
 use crate::graph::{EdgeOffset, Graph, NodeId};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use memmap2::MmapOptions;
 use std::fs::File;
 use std::io::Write;
@@ -117,6 +117,8 @@ pub fn save_hetero_graph(graph: &HeteroGraph, path: impl AsRef<Path>) -> Result<
 pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
     let path = path.as_ref();
     let file = File::open(path).context("open file")?;
+    // SAFETY: file is owned for the duration of the mapping; the Arc keeps the read-only
+    // mmap alive and we never mutate its pages.
     let mmap = Arc::new(unsafe { MmapOptions::new().map(&file)? });
 
     if mmap.len() < HEADER_SIZE {
@@ -259,14 +261,8 @@ mod tests {
 
         assert_eq!(loaded.node_type_count(), 3);
         assert_eq!(loaded.edge_type_count(), 2);
-        assert_eq!(
-            loaded.num_nodes(loaded.node_type_id("user").unwrap()),
-            10
-        );
-        assert_eq!(
-            loaded.num_nodes(loaded.node_type_id("post").unwrap()),
-            20
-        );
+        assert_eq!(loaded.num_nodes(loaded.node_type_id("user").unwrap()), 10);
+        assert_eq!(loaded.num_nodes(loaded.node_type_id("post").unwrap()), 20);
         assert_eq!(
             loaded.num_edges(loaded.edge_type_id("user", "votes", "post").unwrap()),
             30
@@ -368,8 +364,7 @@ mod tests {
     fn test_save_load_empty_edge_type() {
         // Edge type with 0 edges: verify structure is preserved.
         let empty_csr = Graph::from_edges(5, &[], None).unwrap();
-        let nonempty_csr =
-            Graph::from_edges(5, &[(0, 1), (1, 2)], None).unwrap();
+        let nonempty_csr = Graph::from_edges(5, &[(0, 1), (1, 2)], None).unwrap();
 
         let graph = HeteroGraph::from_parts(
             vec![("a".into(), 5), ("b".into(), 3)],
@@ -539,11 +534,13 @@ mod tests {
         let result = load_hetero_graph(&path);
         // Should either error or produce a graph with no/partial weights
         // (mmap won't crash but the range will be out of bounds)
-        assert!(result.is_err() || {
-            // If it loads, the weights range extends past EOF — mmap will SIGBUS on access
-            // which we can't test cleanly. Accepting either error or success here.
-            true
-        });
+        assert!(
+            result.is_err() || {
+                // If it loads, the weights range extends past EOF — mmap will SIGBUS on access
+                // which we can't test cleanly. Accepting either error or success here.
+                true
+            }
+        );
     }
 
     #[test]
@@ -615,12 +612,7 @@ mod tests {
                 ("user".into(), "buys".into(), "item".into(), buys_csr),
                 ("user".into(), "likes".into(), "item".into(), likes_csr),
                 ("item".into(), "tagged".into(), "tag".into(), tagged_csr),
-                (
-                    "user".into(),
-                    "follows".into(),
-                    "user".into(),
-                    follows_csr,
-                ),
+                ("user".into(), "follows".into(), "user".into(), follows_csr),
             ],
         );
 

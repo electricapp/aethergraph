@@ -13,13 +13,13 @@ mod store;
 use crate::graph::NodeId;
 
 pub use async_store::AsyncFeatureStore;
-pub use cache::{count_node_frequencies, CacheStats, FeatureCache, FeatureCacheConfig};
+pub use cache::{CacheStats, FeatureCache, FeatureCacheConfig, count_node_frequencies};
 #[cfg(feature = "gds")]
-pub use gds::{gds_driver_close, gds_driver_open, GdsFeatureStore, GdsReadResult};
+pub use gds::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
 pub use header::FeatureDtype;
 pub use store::{
-    create_features, save_feature_data, save_features, save_features_f16, save_features_ndarray,
-    FeatureData, FeatureLoadTelemetry, FeatureStore,
+    FeatureData, FeatureLoadTelemetry, FeatureStore, create_features, save_feature_data,
+    save_features, save_features_f16, save_features_ndarray,
 };
 
 /// Trait for reading node features from any backing store.

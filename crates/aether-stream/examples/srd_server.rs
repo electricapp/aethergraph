@@ -12,16 +12,22 @@
 //! Pair with `cargo run … --example srd_client` on another box in the same
 //! subnet (same security group so EFA traffic is allowed).
 
-#![cfg(all(target_os = "linux", feature = "efa"))]
+#[cfg(not(all(target_os = "linux", feature = "efa")))]
+fn main() {}
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 use aether_stream::feature_table::FeatureTable;
+#[cfg(all(target_os = "linux", feature = "efa"))]
 use aether_stream::rdma::ffi::{IBV_ACCESS_LOCAL_WRITE, IBV_ACCESS_REMOTE_READ};
+#[cfg(all(target_os = "linux", feature = "efa"))]
 use aether_stream::rdma::srd::{
-    serve_srd_control_plane, SrdAdvertisement, SrdContext, SrdQp, DEFAULT_SRD_QP_CAP,
+    DEFAULT_SRD_QP_CAP, SrdAdvertisement, SrdContext, SrdQp, serve_srd_control_plane,
 };
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 const EFA_GID_INDEX: u8 = 0;
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 fn arg(flag: &str, default: Option<&str>) -> Option<String> {
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -32,6 +38,7 @@ fn arg(flag: &str, default: Option<&str>) -> Option<String> {
     default.map(str::to_owned)
 }
 
+#[cfg(all(target_os = "linux", feature = "efa"))]
 fn main() {
     let bind = arg("--bind", Some("0.0.0.0:7100")).unwrap();
     let node_count: usize = arg("--nodes", Some("4096")).unwrap().parse().unwrap();
@@ -40,7 +47,9 @@ fn main() {
     // Build the feature table with a recognizable per-node signature.
     let table = FeatureTable::new(node_count, feature_dim, vec![]).expect("table alloc");
     for n in 0..node_count {
-        let v: Vec<f32> = (0..feature_dim).map(|i| (n * 1000 + i) as f32 + 0.5).collect();
+        let v: Vec<f32> = (0..feature_dim)
+            .map(|i| (n * 1000 + i) as f32 + 0.5)
+            .collect();
         table.write_node(n, &v);
     }
     let schema = table.schema();

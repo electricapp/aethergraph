@@ -8,7 +8,7 @@
 #![cfg(target_os = "linux")]
 
 use anyhow::{Context, Result};
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::fs::File;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;

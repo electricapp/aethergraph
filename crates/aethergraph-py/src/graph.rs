@@ -1,7 +1,7 @@
 use aethergraph_core::Graph;
 use aethergraph_core::{
-    load_graph, load_graph_mmap, load_graph_owned, load_graph_with_validation, save_graph,
-    GraphValidationMode,
+    GraphValidationMode, load_graph, load_graph_mmap, load_graph_owned, load_graph_with_validation,
+    save_graph,
 };
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -130,7 +130,7 @@ impl PyCsrGraph {
     /// Returns:
     ///     numpy.ndarray: uint32 array where perm[new_id] = old_id.
     fn reorder_rabbit<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
-        let perm = py.allow_threads(|| self.inner.reorder_rabbit());
+        let perm = py.detach(|| self.inner.reorder_rabbit());
         PyArray1::from_vec(py, perm)
     }
 

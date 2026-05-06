@@ -16,7 +16,7 @@ use crate::graph::PyCsrGraph;
 ///
 /// Thread-safe, lock-free metrics collection with zero overhead.
 /// Call `summary()` to get current metrics on-demand.
-#[pyclass(name = "SamplingTelemetry")]
+#[pyclass(name = "SamplingTelemetry", from_py_object)]
 #[derive(Clone)]
 pub struct PySamplingTelemetry {
     inner: Arc<SamplingTelemetry>,
@@ -71,7 +71,7 @@ impl PySamplingTelemetry {
 }
 
 /// Python wrapper for SamplingConfig.
-#[pyclass(name = "SamplingConfig")]
+#[pyclass(name = "SamplingConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PySamplingConfig {
     inner: SamplingConfig,
@@ -128,9 +128,9 @@ impl PySamplingConfig {
             "bidirectional" => SubgraphType::Bidirectional,
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Invalid subgraph_type '{}'. Must be 'directional', 'induced', or 'bidirectional'",
-                subgraph_type
-            )))
+                    "Invalid subgraph_type '{}'. Must be 'directional', 'induced', or 'bidirectional'",
+                    subgraph_type
+                )));
             }
         };
 
@@ -142,7 +142,7 @@ impl PySamplingConfig {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid temporal_strategy '{}'. Must be 'uniform' or 'last'",
                     other
-                )))
+                )));
             }
         };
 
@@ -233,7 +233,16 @@ impl PySamplingConfig {
     fn __repr__(&self) -> String {
         format!(
             "SamplingConfig(num_neighbors={:?}, replace={}, seed={:?}, max_degree={:?}, cumulative={}, weighted={}, subgraph_type={:?}, track_edge_ids={}, temporal_strategy={:?}, disjoint={})",
-            self.inner.fanout, self.inner.replace, self.inner.seed, self.inner.max_degree, self.inner.cumulative, self.inner.weighted, self.subgraph_type(), self.inner.track_edge_ids, self.temporal_strategy(), self.inner.disjoint
+            self.inner.fanout,
+            self.inner.replace,
+            self.inner.seed,
+            self.inner.max_degree,
+            self.inner.cumulative,
+            self.inner.weighted,
+            self.subgraph_type(),
+            self.inner.track_edge_ids,
+            self.temporal_strategy(),
+            self.inner.disjoint
         )
     }
 }
@@ -654,10 +663,7 @@ impl PyNeighborSampler {
         };
 
         let subgraph = if self.config.inner.disjoint {
-            let times = input_times
-                .as_ref()
-                .map(|t| t.as_slice())
-                .transpose()?;
+            let times = input_times.as_ref().map(|t| t.as_slice()).transpose()?;
             sampler.sample_neighbors_disjoint(&seeds_vec, times)
         } else if self.config.inner.temporal_strategy.is_some() {
             let times = input_times

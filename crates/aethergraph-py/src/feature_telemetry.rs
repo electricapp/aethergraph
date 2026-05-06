@@ -7,7 +7,7 @@ use pyo3::types::PyDict;
 /// Python wrapper for feature loading telemetry.
 ///
 /// Tracks performance metrics for feature loading operations.
-#[pyclass(name = "FeatureLoadTelemetry")]
+#[pyclass(name = "FeatureLoadTelemetry", from_py_object)]
 #[derive(Clone)]
 pub struct PyFeatureLoadTelemetry {
     pub(crate) inner: CoreFeatureLoadTelemetry,

@@ -16,8 +16,8 @@
 #![cfg(target_os = "linux")]
 
 use aether_stream::feature_table::FeatureTable;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,11 +37,11 @@ const MAX_RUNTIME: Duration = Duration::from_secs(10);
 /// verify consistency without coordination. features[0] = generation;
 /// features[i] = generation + (i as u32) * (node_id + 1) for i in 1..DIM.
 #[inline]
-fn encode(node: u32, gen: u32) -> [f32; FEATURE_DIM] {
+fn encode(node: u32, gen_id: u32) -> [f32; FEATURE_DIM] {
     let mut out = [0f32; FEATURE_DIM];
-    out[0] = gen as f32;
+    out[0] = gen_id as f32;
     for i in 1..FEATURE_DIM {
-        let v = (gen as u64).wrapping_add(i as u64 * (node as u64 + 1));
+        let v = (gen_id as u64).wrapping_add(i as u64 * (node as u64 + 1));
         out[i] = (v & 0x00FF_FFFF) as f32; // keep within f32 exact-integer range
     }
     out
@@ -51,15 +51,15 @@ fn encode(node: u32, gen: u32) -> [f32; FEATURE_DIM] {
 /// Returns Some(generation) on success, None if the data is torn / mixed.
 #[inline]
 fn verify(node: u32, features: &[f32]) -> Option<u32> {
-    let gen = features[0] as u64 as u32;
+    let gen_id = features[0] as u64 as u32;
     for i in 1..FEATURE_DIM {
-        let expected_v = (gen as u64).wrapping_add(i as u64 * (node as u64 + 1)) & 0x00FF_FFFF;
+        let expected_v = (gen_id as u64).wrapping_add(i as u64 * (node as u64 + 1)) & 0x00FF_FFFF;
         let got_v = features[i] as u64;
         if got_v != expected_v {
             return None;
         }
     }
-    Some(gen)
+    Some(gen_id)
 }
 
 #[test]
@@ -87,15 +87,15 @@ fn stress_seqlock_concurrent_writers_readers() {
         workers.push(thread::spawn(move || {
             let lo = w * SHARD;
             let hi = lo + SHARD;
-            let mut gen: u32 = 1;
+            let mut gen_id: u32 = 1;
             let mut writes_local: u64 = 0;
             while !stop.load(Ordering::Relaxed) {
                 for node in lo..hi {
-                    let feats = encode(node as u32, gen);
+                    let feats = encode(node as u32, gen_id);
                     table.write_node(node, &feats);
                     writes_local += 1;
                 }
-                gen = gen.wrapping_add(1);
+                gen_id = gen_id.wrapping_add(1);
                 if writes_local % 100_000 == 0 {
                     total_writes.fetch_add(writes_local, Ordering::Relaxed);
                     writes_local = 0;
@@ -180,13 +180,20 @@ fn stress_seqlock_concurrent_writers_readers() {
     // architecture — most likely the Acquire fence in write_node / read_node
     // is missing or mis-ordered.
     assert_eq!(
-        torn, 0,
+        torn,
+        0,
         "{torn} torn reads passed read_node()'s head==tail gate — seqlock fence ordering is broken on {}",
         std::env::consts::ARCH
     );
 
     // Sanity: the workload actually ran. Don't pass the assertion above by
     // virtue of having done nothing.
-    assert!(reads >= 1_000_000, "ran only {reads} reads — workload didn't get going");
-    assert!(writes >= 100_000, "ran only {writes} writes — writer threads didn't make progress");
+    assert!(
+        reads >= 1_000_000,
+        "ran only {reads} reads — workload didn't get going"
+    );
+    assert!(
+        writes >= 100_000,
+        "ran only {writes} writes — writer threads didn't make progress"
+    );
 }

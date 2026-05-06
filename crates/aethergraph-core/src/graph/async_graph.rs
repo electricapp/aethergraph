@@ -184,7 +184,12 @@ impl AsyncCsrGraph {
         // we support (x86_64 + aarch64) native byte order is LE so the bytes
         // land in the right shape. A big-endian host would need a byte-swap
         // pass here — asserted below so future ports don't silently miscorrupt.
-        const { assert!(cfg!(target_endian = "little"), "graph file is little-endian") };
+        const {
+            assert!(
+                cfg!(target_endian = "little"),
+                "graph file is little-endian"
+            )
+        };
         let mut offsets: Vec<EdgeOffset> = vec![0; num_nodes + 1];
         {
             let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut offsets[..]);
@@ -268,7 +273,10 @@ impl AsyncCsrGraph {
         let mut handles = Vec::with_capacity(pool_size);
 
         for idx in 0..pool_size {
-            let mut handle = match UringHandle::new_sqpoll_only(crate::internal::uring::DEFAULT_RING_ENTRIES, 1000) {
+            let mut handle = match UringHandle::new_sqpoll_only(
+                crate::internal::uring::DEFAULT_RING_ENTRIES,
+                1000,
+            ) {
                 Ok(h) => h,
                 Err(e) => {
                     if idx == 0 {
@@ -318,9 +326,7 @@ impl AsyncCsrGraph {
     pub fn io_uring_active(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            self.uring_pool
-                .as_ref()
-                .map_or(false, |p| !p.is_empty())
+            self.uring_pool.as_ref().map_or(false, |p| !p.is_empty())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -362,9 +368,7 @@ impl AsyncCsrGraph {
 
         trace!(
             "Reading {} neighbors for node {} at offset {}",
-            num_neighbors,
-            node,
-            byte_offset
+            num_neighbors, node, byte_offset
         );
 
         // Read from file asynchronously
@@ -578,7 +582,7 @@ impl AsyncCsrGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{save_graph, Graph};
+    use crate::{Graph, save_graph};
     use tempfile::NamedTempFile;
 
     async fn create_test_graph_file() -> NamedTempFile {

@@ -1,9 +1,9 @@
 //! Python bindings for FeatureStore with zero-copy numpy integration.
 
 use aethergraph_core::{
+    FeatureData as CoreFeatureData, FeatureStore as CoreFeatureStore, NodeId,
     create_features as core_create_features, save_feature_data as core_save_feature_data,
-    save_features as core_save_features, FeatureData as CoreFeatureData,
-    FeatureStore as CoreFeatureStore, NodeId,
+    save_features as core_save_features,
 };
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;

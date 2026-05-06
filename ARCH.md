@@ -34,6 +34,14 @@ CSR-backed graph with SIMD-accelerated sampling. Memory-mapped from NVMe, instan
 - Per-edge-type fanout. Stack-copied edge type IDs in the hot loop to avoid borrow conflicts. 
 - Macro-inlined Floyd's to avoid `&mut self` conflicts with bitmap.
 
+**Cache-locality reordering (Rabbit Order, Arai et al. IPDPS 2016):**
+- Phase 1 (parallel over V): each node picks its lowest-degree neighbor as a merge candidate.
+- Phase 2 (parallel over E): lock-free concurrent union-find with `AtomicU32` parent + rank, path-splitting `find`, CAS `union`. Logs `(winner, loser)` pairs in merge order.
+- Phase 3 (sequential O(V)): replay the merge log into a dendrogram and emit the permutation by in-order traversal.
+- Community partitions are a free byproduct of the merge log — `rabbit_partitions()` runs a sequential UF replay without rebuilding the dendrogram. `reorder_rabbit_with_partitions()` returns both in one pass.
+- `partition_aligned_batches` uses the partition labels to construct seed batches whose neighborhoods overlap, amortizing destination-array reads across the batch.
+- Measured in `benches/graph_benchmarks.rs::reorder_sampling_speedup` — sampling throughput delta on the same seeds before vs. after permutation.
+
 ## aether-graph — Dynamic Graph Engine
 
 Lock-free C-tree for live-updating graphs. Single-writer, multi-reader via functional persistence.
@@ -183,6 +191,8 @@ HeteroNeighborSampler:
 | `HeteroGraph`           | core          | Multi-relational CSR (one per edge type)      |
 | `DynamicGraph`          | aether-graph  | Lock-free C-tree, concurrent R/W              |
 | `NeighborSampler`       | core          | Floyd's O(k) sampling, zero-alloc             |
+| `reorder_rabbit`        | core          | Rabbit Order permutation (parallel UF merge)  |
+| `rabbit_partitions`     | core          | Community labels (free byproduct of merge log)|
 | `HeteroNeighborSampler` | core          | Typed multi-hop, pre-computed local indices   |
 | `NeighborLoader`        | core          | Prefetch thread, io_uring features            |
 | `FeatureTable`          | aether-stream | Seqlock feature table for RDMA                |

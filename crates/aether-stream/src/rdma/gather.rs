@@ -63,7 +63,11 @@ impl RdmaFeatureGather {
     ///
     /// `epoch_version`: pass 0 for latest features, or a version number
     /// to pin features to a specific epoch (MVCC snapshot isolation).
-    pub fn gather(&mut self, node_ids: &[u32], epoch_version: u64) -> Result<GpuFeatures, Box<dyn std::error::Error>> {
+    pub fn gather(
+        &mut self,
+        node_ids: &[u32],
+        epoch_version: u64,
+    ) -> Result<GpuFeatures, Box<dyn std::error::Error>> {
         self.client.gather(node_ids, epoch_version)?;
 
         let stream = self.client.validator().stream();

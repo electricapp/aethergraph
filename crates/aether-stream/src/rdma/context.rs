@@ -93,10 +93,7 @@ impl RdmaContext {
             let pd = ibv_alloc_pd(context);
             if pd.is_null() {
                 ibv_close_device(context);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "ibv_alloc_pd failed",
-                ));
+                return Err(io::Error::new(io::ErrorKind::Other, "ibv_alloc_pd failed"));
             }
 
             // Create completion queue
@@ -104,10 +101,7 @@ impl RdmaContext {
             if cq.is_null() {
                 ibv_dealloc_pd(pd);
                 ibv_close_device(context);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "ibv_create_cq failed",
-                ));
+                return Err(io::Error::new(io::ErrorKind::Other, "ibv_create_cq failed"));
             }
 
             // Query port 1 for LID
@@ -250,10 +244,7 @@ pub fn create_cq(ctx: &RdmaContext, cq_size: i32) -> io::Result<RegisteredCq> {
     unsafe {
         let cq = ibv_create_cq(ctx.context, cq_size, ptr::null_mut(), ptr::null_mut(), 0);
         if cq.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "ibv_create_cq failed",
-            ));
+            return Err(io::Error::new(io::ErrorKind::Other, "ibv_create_cq failed"));
         }
         Ok(RegisteredCq { cq })
     }

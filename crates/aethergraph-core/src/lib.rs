@@ -19,8 +19,8 @@ pub mod loader;
 
 // Primary public exports
 pub use graph::{
-    partition_aligned_batches, AsyncCsrGraph, EdgeOffset, EdgeTypeId, EdgeTypeMeta, Graph,
-    GraphStats, GraphValidationMode, HeteroGraph, NodeId, NodeTypeId, NodeTypeMeta,
+    AsyncCsrGraph, EdgeOffset, EdgeTypeId, EdgeTypeMeta, Graph, GraphStats, GraphValidationMode,
+    HeteroGraph, NodeId, NodeTypeId, NodeTypeMeta, partition_aligned_batches,
 };
 pub use loader::{
     HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig, NeighborLoader,
@@ -30,14 +30,14 @@ pub use loader::{
 
 // Feature store exports (needed for file-backed features)
 pub use features::{
-    create_features, save_feature_data, save_features, save_features_f16, save_features_ndarray,
-};
-pub use features::{
     AsyncFeatureStore, FeatureData, FeatureDtype, FeatureLoadTelemetry, FeatureStore,
     NodeFeatureSource,
 };
 #[cfg(feature = "gds")]
-pub use features::{gds_driver_close, gds_driver_open, GdsFeatureStore, GdsReadResult};
+pub use features::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
+pub use features::{
+    create_features, save_feature_data, save_features, save_features_f16, save_features_ndarray,
+};
 
 // Internal utilities (re-exported for backward compatibility, will be removed)
 pub use internal::mmap::{

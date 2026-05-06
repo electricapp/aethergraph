@@ -7,13 +7,9 @@
 //! ```
 
 use aethergraph_core::graph::hetero::HeteroGraph;
-use aethergraph_core::loader::hetero_sampler::{
-    HeteroNeighborSampler, HeteroSamplingConfig,
-};
+use aethergraph_core::loader::hetero_sampler::{HeteroNeighborSampler, HeteroSamplingConfig};
 use aethergraph_core::{Graph, NodeId};
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::hint::black_box;
@@ -38,9 +34,17 @@ fn reddit_graph() -> HeteroGraph {
 
     let mut rng = StdRng::seed_from_u64(42);
 
-    let make_edges = |rng: &mut StdRng, count: usize, max_src: usize, max_dst: usize| -> (Vec<NodeId>, Vec<NodeId>) {
-        let src: Vec<NodeId> = (0..count).map(|_| rng.random_range(0..max_src as NodeId)).collect();
-        let dst: Vec<NodeId> = (0..count).map(|_| rng.random_range(0..max_dst as NodeId)).collect();
+    let make_edges = |rng: &mut StdRng,
+                      count: usize,
+                      max_src: usize,
+                      max_dst: usize|
+     -> (Vec<NodeId>, Vec<NodeId>) {
+        let src: Vec<NodeId> = (0..count)
+            .map(|_| rng.random_range(0..max_src as NodeId))
+            .collect();
+        let dst: Vec<NodeId> = (0..count)
+            .map(|_| rng.random_range(0..max_dst as NodeId))
+            .collect();
         (src, dst)
     };
 
@@ -56,7 +60,8 @@ fn reddit_graph() -> HeteroGraph {
 
     let build_csr = |src: &[NodeId], dst: &[NodeId], max_src: usize, max_dst: usize| -> Graph {
         let num_nodes = max_src.max(max_dst);
-        let edges: Vec<(NodeId, NodeId)> = src.iter().zip(dst.iter()).map(|(&s, &d)| (s, d)).collect();
+        let edges: Vec<(NodeId, NodeId)> =
+            src.iter().zip(dst.iter()).map(|(&s, &d)| (s, d)).collect();
         Graph::from_edges(num_nodes, &edges, None).unwrap()
     };
 
@@ -75,8 +80,18 @@ fn reddit_graph() -> HeteroGraph {
         vec![
             ("user".into(), "votes".into(), "post".into(), votes_csr),
             ("user".into(), "writes".into(), "comment".into(), writes_csr),
-            ("comment".into(), "reply_to".into(), "comment".into(), replies_csr),
-            ("post".into(), "belongs_to".into(), "subreddit".into(), belongs_csr),
+            (
+                "comment".into(),
+                "reply_to".into(),
+                "comment".into(),
+                replies_csr,
+            ),
+            (
+                "post".into(),
+                "belongs_to".into(),
+                "subreddit".into(),
+                belongs_csr,
+            ),
         ],
     )
 }
@@ -97,7 +112,9 @@ fn make_config(graph: &HeteroGraph, fanout: &[usize]) -> HeteroSamplingConfig {
 
 fn random_seeds(count: usize, max: usize) -> Vec<NodeId> {
     let mut rng = StdRng::seed_from_u64(99);
-    (0..count).map(|_| rng.random_range(0..max as NodeId)).collect()
+    (0..count)
+        .map(|_| rng.random_range(0..max as NodeId))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +233,12 @@ fn bench_hetero_graph_construction(c: &mut Criterion) {
     let num_nodes = 10_000usize;
     let num_edges = 100_000usize;
 
-    let src: Vec<NodeId> = (0..num_edges).map(|_| rng.random_range(0..num_nodes as NodeId)).collect();
-    let dst: Vec<NodeId> = (0..num_edges).map(|_| rng.random_range(0..num_nodes as NodeId)).collect();
+    let src: Vec<NodeId> = (0..num_edges)
+        .map(|_| rng.random_range(0..num_nodes as NodeId))
+        .collect();
+    let dst: Vec<NodeId> = (0..num_edges)
+        .map(|_| rng.random_range(0..num_nodes as NodeId))
+        .collect();
 
     let mut group = c.benchmark_group("hetero_construction");
     group.warm_up_time(std::time::Duration::from_millis(500));
@@ -226,7 +247,8 @@ fn bench_hetero_graph_construction(c: &mut Criterion) {
 
     group.bench_function("single_edge_type_10k", |b| {
         b.iter(|| {
-            let edges: Vec<(NodeId, NodeId)> = src.iter().zip(dst.iter()).map(|(&s, &d)| (s, d)).collect();
+            let edges: Vec<(NodeId, NodeId)> =
+                src.iter().zip(dst.iter()).map(|(&s, &d)| (s, d)).collect();
             let csr = Graph::from_edges(num_nodes, &edges, None).unwrap();
             let g = HeteroGraph::from_parts(
                 vec![("a".into(), num_nodes), ("b".into(), num_nodes)],

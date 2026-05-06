@@ -14,7 +14,7 @@
 
 #![allow(non_camel_case_types)]
 
-use super::ffi::{IbvCq, IbvContext, IbvMr, IbvPd, IbvQp, IbvQpCap};
+use super::ffi::{IbvContext, IbvCq, IbvMr, IbvPd, IbvQp, IbvQpCap};
 
 // ---------------------------------------------------------------------------
 // Opaque extended-verbs handles
@@ -196,10 +196,7 @@ pub const EFADV_DEVICE_ATTR_CAPS_RDMA_READ: u32 = 1 << 0;
 #[link(name = "ibverbs")]
 extern "C" {
     /// Create an address handle from an `ibv_ah_attr`.
-    pub fn ibv_create_ah(
-        pd: *mut IbvPd,
-        attr: *mut super::ffi::IbvAhAttr,
-    ) -> *mut IbvAh;
+    pub fn ibv_create_ah(pd: *mut IbvPd, attr: *mut super::ffi::IbvAhAttr) -> *mut IbvAh;
     pub fn ibv_destroy_ah(ah: *mut IbvAh) -> i32;
 }
 
@@ -208,28 +205,17 @@ extern "C" {
 // the C shim instead.
 extern "C" {
     #[link_name = "aether_ibv_create_cq_ex"]
-    pub fn ibv_create_cq_ex(
-        context: *mut IbvContext,
-        attr: *mut IbvCqInitAttrEx,
-    ) -> *mut IbvCqEx;
+    pub fn ibv_create_cq_ex(context: *mut IbvContext, attr: *mut IbvCqInitAttrEx) -> *mut IbvCqEx;
 }
 
 #[link(name = "efa")]
 extern "C" {
     /// Query EFA-specific caps.
-    pub fn efadv_query_device(
-        ctx: *mut IbvContext,
-        attr: *mut EfadvDeviceAttr,
-        inlen: u32,
-    ) -> i32;
+    pub fn efadv_query_device(ctx: *mut IbvContext, attr: *mut EfadvDeviceAttr, inlen: u32) -> i32;
 
     /// Query the EFA-specific attrs of an address handle — produces the AHN
     /// we ship over the control plane.
-    pub fn efadv_query_ah(
-        ah: *mut IbvAh,
-        attr: *mut EfadvAhAttr,
-        inlen: u32,
-    ) -> i32;
+    pub fn efadv_query_ah(ah: *mut IbvAh, attr: *mut EfadvAhAttr, inlen: u32) -> i32;
 
     /// Create an SRD QP via the extended API. Unlike `ibv_create_qp_ex`, this
     /// one additionally takes the EFA-specific attrs (driver_qp_type = SRD).
@@ -286,10 +272,7 @@ extern "C" {
     ///   0 on success (out populated)
     ///   ENOENT (2) when CQ is empty
     ///   other errno on hard error.
-    pub fn aether_ibv_poll_cq_ex_one(
-        cqx: *mut IbvCqEx,
-        out: *mut AetherCqeSnapshot,
-    ) -> i32;
+    pub fn aether_ibv_poll_cq_ex_one(cqx: *mut IbvCqEx, out: *mut AetherCqeSnapshot) -> i32;
 
     /// Drain up to `max_out` CQEs into the array in a single FFI call.
     /// Returns the number drained (0 if CQ was empty). Uses `ibv_next_poll`

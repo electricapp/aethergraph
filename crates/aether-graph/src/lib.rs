@@ -7,16 +7,16 @@
 //! cache-line-sized chunks. 90% of nodes (degree < 15) are a single
 //! chunk — one cache line read, identical cost to static CSR.
 
-mod chunk;
 mod arena;
+mod chunk;
 mod ctree;
 mod embedding_cache;
 mod graph;
 mod historical;
 pub mod ingest;
 
-pub use chunk::Chunk;
 pub use arena::Arena;
+pub use chunk::Chunk;
 pub use ctree::CTree;
 pub use embedding_cache::EmbeddingCache;
 pub use graph::{ArenaFull, DynamicGraph};

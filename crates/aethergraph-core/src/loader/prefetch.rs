@@ -36,15 +36,15 @@
 //!    - Still faster than sequential sync I/O due to batching
 
 use super::sampler::{NeighborSampler, SampledSubgraph, SamplingConfig};
-use crate::features::header::{parse_feature_header, FeatureDtype};
+use crate::features::header::{FeatureDtype, parse_feature_header};
 use crate::graph::{Graph, NodeId};
-use half::f16;
 use crate::internal::hint;
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
+use half::f16;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use tracing::{debug, trace, warn};
 
@@ -135,10 +135,8 @@ impl SyncFeatureStore {
         let (file, direct_io) = {
             use crate::internal::uring::{is_layout_direct_io_compatible, open_direct_or_fallback};
 
-            let layout_compatible = is_layout_direct_io_compatible(
-                header.features_start_offset,
-                header.feature_size,
-            );
+            let layout_compatible =
+                is_layout_direct_io_compatible(header.features_start_offset, header.feature_size);
 
             if layout_compatible {
                 // Layout is aligned, try O_DIRECT
@@ -153,11 +151,13 @@ impl SyncFeatureStore {
                 (f, direct)
             } else {
                 // Layout not aligned, O_DIRECT would fail with EINVAL
-                warn!("Feature layout not O_DIRECT compatible: offset={} (aligned={}), size={} (aligned={})",
-                      header.features_start_offset,
-                      header.features_start_offset % 512 == 0,
-                      header.feature_size,
-                      header.feature_size % 512 == 0);
+                warn!(
+                    "Feature layout not O_DIRECT compatible: offset={} (aligned={}), size={} (aligned={})",
+                    header.features_start_offset,
+                    header.features_start_offset % 512 == 0,
+                    header.feature_size,
+                    header.feature_size % 512 == 0
+                );
                 (header_file, false)
             }
         };
@@ -287,7 +287,7 @@ impl SyncFeatureStore {
         direct_io: bool,
         dtype: FeatureDtype,
     ) -> anyhow::Result<Vec<f32>> {
-        use crate::internal::uring::{batch_read, AlignedBufferPool};
+        use crate::internal::uring::{AlignedBufferPool, batch_read};
 
         if nodes.is_empty() {
             return Ok(Vec::new());
@@ -458,16 +458,19 @@ fn worker_loop_sampler(
             Err(_) => break,
         };
 
-        trace!(batch_idx = work.batch_idx, seeds = work.seeds.len(), "sampling");
+        trace!(
+            batch_idx = work.batch_idx,
+            seeds = work.seeds.len(),
+            "sampling"
+        );
         let t0 = std::time::Instant::now();
         let subgraph = sampler.sample_neighbors(&work.seeds);
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        stats.sample_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        stats
+            .sample_time_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
 
-        let msg = SampledWork {
-            work,
-            subgraph,
-        };
+        let msg = SampledWork { work, subgraph };
 
         if sample_tx.send(msg).is_err() {
             break;
@@ -532,7 +535,9 @@ fn worker_loop_feature_loader(
             }
         };
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        stats.feature_load_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        stats
+            .feature_load_time_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
 
         let result = PrefetchResult {
             batch_idx: sampled.work.batch_idx,
@@ -675,7 +680,13 @@ impl NeighborLoader {
             thread::Builder::new()
                 .name("aethergraph-feat-loader".into())
                 .spawn(move || {
-                    worker_loop_feature_loader(sample_rx, result_tx, shutdown, feature_store, stats);
+                    worker_loop_feature_loader(
+                        sample_rx,
+                        result_tx,
+                        shutdown,
+                        feature_store,
+                        stats,
+                    );
                 })
                 .map_err(|e| anyhow::anyhow!("failed to spawn feature loader thread: {}", e))?
         };
@@ -831,7 +842,9 @@ impl NeighborLoader {
                 {
                     Ok(r) => Some(r.subgraph),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        warn!("Prefetch timeout after 30s - worker may have deadlocked or I/O is very slow");
+                        warn!(
+                            "Prefetch timeout after 30s - worker may have deadlocked or I/O is very slow"
+                        );
                         None
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
@@ -893,7 +906,9 @@ impl NeighborLoader {
                 {
                     Ok(r) => Some((r.subgraph, r.features)),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        warn!("Prefetch timeout after 30s - worker may have deadlocked or I/O is very slow");
+                        warn!(
+                            "Prefetch timeout after 30s - worker may have deadlocked or I/O is very slow"
+                        );
                         None
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,

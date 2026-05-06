@@ -27,6 +27,8 @@ pub struct Arena {
 // Concurrent readers access previously-allocated nodes which are immutable
 // after creation (functional data structure — nodes are never modified in place).
 unsafe impl Send for Arena {}
+// SAFETY: see Send impl above — single writer + immutable nodes after allocation
+// allow concurrent shared access from any thread.
 unsafe impl Sync for Arena {}
 
 impl Arena {
@@ -34,10 +36,13 @@ impl Arena {
     pub fn new(capacity: usize) -> Self {
         // Allocate aligned to 64 bytes for cache-line chunks
         let layout = std::alloc::Layout::from_size_align(capacity, 64).unwrap();
+        // SAFETY: layout has non-zero size (capacity > 0 enforced by caller-acceptable use; alloc_zeroed handles zero-init).
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
+        // SAFETY: ptr came from the global allocator with the same capacity/alignment;
+        // the Vec takes ownership and will free via Layout-compatible dealloc on drop.
         let data = unsafe { Vec::from_raw_parts(ptr, capacity, capacity) };
         Self {
             data: UnsafeCell::new(data),
@@ -70,8 +75,11 @@ impl Arena {
         let size = std::mem::size_of::<T>();
         let align = std::mem::align_of::<T>();
         let offset = self.alloc(size, align)?;
+        // SAFETY: alloc returned a fresh, in-bounds offset of `size` bytes aligned for T.
+        let ptr = unsafe { self.ptr_at(offset) };
+        // SAFETY: ptr points to `size_of::<T>()` bytes of uninitialized arena storage
+        // aligned for T (alignment guaranteed by alloc above); the writer thread is single.
         unsafe {
-            let ptr = self.ptr_at(offset);
             std::ptr::write(ptr as *mut T, val);
         }
         Some(offset)
@@ -83,8 +91,11 @@ impl Arena {
     /// Offset must be within bounds and point to a valid, initialized value.
     #[inline(always)]
     pub unsafe fn ptr_at(&self, offset: u32) -> *const u8 {
-        let data = &*self.data.get();
-        data.as_ptr().add(offset as usize)
+        // SAFETY: single-writer invariant means no &mut alias exists while readers hold &Arena;
+        // UnsafeCell deref produces a shared view of the immutable backing buffer.
+        let data = unsafe { &*self.data.get() };
+        // SAFETY: caller asserts offset is within the allocated capacity.
+        unsafe { data.as_ptr().add(offset as usize) }
     }
 
     /// Get a typed reference at `offset`.
@@ -93,7 +104,11 @@ impl Arena {
     /// Offset must point to a properly aligned, initialized `T`.
     #[inline(always)]
     pub unsafe fn get<T>(&self, offset: u32) -> &T {
-        &*(self.ptr_at(offset) as *const T)
+        // SAFETY: caller asserts offset points to a properly aligned, initialized T;
+        // ptr_at returns a pointer into the immutable backing region.
+        let ptr = unsafe { self.ptr_at(offset) };
+        // SAFETY: caller-asserted invariants make `ptr as *const T` dereferenceable.
+        unsafe { &*(ptr as *const T) }
     }
 
     /// Bytes currently allocated.
@@ -140,6 +155,7 @@ mod tests {
         let chunk = Chunk::from_sorted(&[10, 20, 30]);
 
         let off = arena.alloc_write(chunk).unwrap();
+        // SAFETY: off was just returned by alloc_write::<Chunk>, so it points to a valid Chunk.
         let read: &Chunk = unsafe { arena.get(off) };
         assert_eq!(read.as_slice(), &[10, 20, 30]);
     }
@@ -166,6 +182,7 @@ mod tests {
         let arena = Arena::new(4096);
         let _ = arena.alloc(64, 64).unwrap();
         assert_eq!(arena.used(), 64);
+        // SAFETY: test holds no live references into the arena across this call.
         unsafe { arena.reset() };
         assert_eq!(arena.used(), 0);
     }

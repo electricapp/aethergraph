@@ -82,7 +82,7 @@ impl PyDynamicGraph {
     /// Raises RuntimeError if the arena is full.
     fn insert_edge(&self, py: Python<'_>, src: u32, dst: u32) -> PyResult<bool> {
         let inner = Arc::clone(&self.inner);
-        py.allow_threads(move || {
+        py.detach(move || {
             inner
                 .insert_edge(src, dst)
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("C-tree arena is full"))
@@ -121,7 +121,7 @@ impl PyDynamicGraph {
         let dst_vec: Vec<u32> = dst_slice.to_vec();
         let inner = Arc::clone(&self.inner);
 
-        py.allow_threads(move || {
+        py.detach(move || {
             let mut count = 0usize;
             for (&s, &d) in src_vec.iter().zip(dst_vec.iter()) {
                 match inner.insert_edge(s, d) {
@@ -130,7 +130,7 @@ impl PyDynamicGraph {
                     Err(_) => {
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(
                             "C-tree arena is full",
-                        ))
+                        ));
                     }
                 }
             }

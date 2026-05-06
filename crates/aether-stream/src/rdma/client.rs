@@ -63,8 +63,7 @@ impl RdmaFeatureClient {
         let stream = cuda_ctx.default_stream();
 
         // Allocate VRAM staging buffer
-        let buffer =
-            GpuGatherBuffer::new(&rdma_ctx, &cuda_ctx, &stream, max_batch_size, &schema)?;
+        let buffer = GpuGatherBuffer::new(&rdma_ctx, &cuda_ctx, &stream, max_batch_size, &schema)?;
 
         // Compile GPU validation kernel
         let validator =
@@ -93,7 +92,11 @@ impl RdmaFeatureClient {
     /// for the entire epoch even while writers update the FeatureTable.
     ///
     /// Handles seqlock validation and automatic retry for torn reads.
-    pub fn gather(&mut self, node_ids: &[u32], epoch_version: u64) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn gather(
+        &mut self,
+        node_ids: &[u32],
+        epoch_version: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         assert!(node_ids.len() <= self.buffer.max_batch_size());
 
         let batch_size = node_ids.len();

@@ -779,11 +779,13 @@ mod tests {
         let edges = vec![(5, 0)];
         let result = Graph::from_edges(3, &edges, None);
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("source node 5 exceeds num_nodes 3"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("source node 5 exceeds num_nodes 3")
+        );
     }
 
     #[test]

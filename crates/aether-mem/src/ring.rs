@@ -485,8 +485,12 @@ impl<'a> RingSlot<'a> {
             self.ring.slot_size
         );
 
-        self.write_with(data.len(), |dst| unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+        self.write_with(data.len(), |dst| {
+            // SAFETY: dst points to slot_size bytes (asserted above), data.len() <= slot_size,
+            // and src/dst regions don't overlap (dst is in the ring's exclusive slot).
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+            }
         });
     }
 
@@ -682,8 +686,8 @@ mod tests {
 
     #[test]
     fn test_hook_lifecycle() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         struct TestHook {
             alloc_called: Arc<AtomicBool>,

@@ -88,8 +88,7 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         feature_dim_u64,
         MAX_FEATURE_DIM
     );
-    let num_nodes =
-        usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;
+    let num_nodes = usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;
     let feature_dim =
         usize::try_from(feature_dim_u64).context("feature_dim does not fit in usize")?;
 

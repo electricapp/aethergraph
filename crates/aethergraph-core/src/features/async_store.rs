@@ -22,7 +22,7 @@
 //! an aligned payload offset, but legacy files may still use offset 32. For those
 //! legacy files, we fall back to SQPOLL-only mode (tier 2).
 
-use super::header::{parse_feature_header, FeatureDtype};
+use super::header::{FeatureDtype, parse_feature_header};
 use super::store::FeatureLoadTelemetry;
 use crate::graph::NodeId;
 use anyhow::{Context, Result};
@@ -112,10 +112,8 @@ impl AsyncFeatureStore {
         let (std_file, direct_io) = {
             use crate::internal::uring::is_layout_direct_io_compatible;
 
-            let layout_compatible = is_layout_direct_io_compatible(
-                header.features_start_offset,
-                header.feature_size,
-            );
+            let layout_compatible =
+                is_layout_direct_io_compatible(header.features_start_offset, header.feature_size);
 
             if layout_compatible {
                 // Layout is aligned, try O_DIRECT

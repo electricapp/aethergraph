@@ -208,6 +208,8 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
     );
 
     let file = File::open(path).context("failed to open graph file")?;
+    // SAFETY: the underlying file is owned through this scope and is treated as read-only;
+    // we never mutate the mapped pages.
     let mmap = unsafe {
         MmapOptions::new()
             .map(&file)
@@ -235,6 +237,8 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
 pub fn load_graph_owned(path: impl AsRef<Path>, validation: GraphValidationMode) -> Result<Graph> {
     let path = path.as_ref();
     let file = File::open(path).context("failed to open graph file")?;
+    // SAFETY: file outlives the temporary mmap used for parsing; mapping is read-only
+    // and the data is consumed (copied) by load_graph_from_mmap_with_validation.
     let mmap = unsafe {
         MmapOptions::new()
             .map(&file)
@@ -610,9 +614,11 @@ mod tests {
 
         let result = load_graph_from_mmap_with_validation(&bytes, GraphValidationMode::OffsetsOnly);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
     }
 }

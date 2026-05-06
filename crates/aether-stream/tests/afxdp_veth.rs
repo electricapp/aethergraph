@@ -34,11 +34,7 @@ fn ifindex_of(name: &str) -> Option<u32> {
     let cname = CString::new(name).ok()?;
     // SAFETY: cname is a valid C string for the lifetime of this call.
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-    if idx == 0 {
-        None
-    } else {
-        Some(idx)
-    }
+    if idx == 0 { None } else { Some(idx) }
 }
 
 fn skip_if_no_veth() -> Option<u32> {
@@ -79,7 +75,6 @@ fn t1_7_umem_allocation_4096() {
     assert_eq!(p1 - p0, 4096, "stride must match registered chunk_size");
 }
 
-
 #[test]
 #[should_panic(expected = "supports only 4096-byte frames")]
 fn t1_7_umem_rejects_2048_frame_size() {
@@ -103,7 +98,11 @@ fn t1_7_umem_acquire_release_roundtrip() {
     while let Some(idx) = umem.acquire_frame() {
         taken.push(idx);
     }
-    assert_eq!(taken.len(), 8, "pool should yield exactly frame_count frames");
+    assert_eq!(
+        taken.len(),
+        8,
+        "pool should yield exactly frame_count frames"
+    );
     assert!(umem.acquire_frame().is_none(), "pool must be exhausted");
     // Return one and re-acquire.
     umem.release_frame(taken[0]);
@@ -123,7 +122,9 @@ fn t1_7_xdp_socket_create_on_veth() {
     let umem = match Umem::new(256, 4096, vec![]) {
         Some(u) => u,
         None => {
-            eprintln!("skipping: UMEM alloc failed (likely RLIMIT_MEMLOCK too low — re-login or `ulimit -l unlimited`)");
+            eprintln!(
+                "skipping: UMEM alloc failed (likely RLIMIT_MEMLOCK too low — re-login or `ulimit -l unlimited`)"
+            );
             return;
         }
     };
@@ -134,10 +135,10 @@ fn t1_7_xdp_socket_create_on_veth() {
             umem.base_addr() as *mut u8,
             umem.total_size(),
             umem.frame_size(),
-            64,         // ring size — power of two
+            64, // ring size — power of two
             ifindex,
-            0,          // queue id
-            XDP_COPY,   // veth doesn't support ZEROCOPY
+            0,        // queue id
+            XDP_COPY, // veth doesn't support ZEROCOPY
         )
     };
 
@@ -158,13 +159,13 @@ fn t1_7_xdp_socket_create_on_veth() {
             // program. Documented in TEST_PLAN.md alongside T1.7/T1.8.
             eprintln!("skipping E2E: bind(AF_XDP) → EINVAL — no BPF redirect program loaded.");
         }
-        Err(e) if e.raw_os_error() == Some(libc::EPERM) || e.raw_os_error() == Some(libc::EACCES) => {
+        Err(e)
+            if e.raw_os_error() == Some(libc::EPERM) || e.raw_os_error() == Some(libc::EACCES) =>
+        {
             eprintln!(
                 "skipping: AF_XDP needs CAP_NET_RAW. Re-run as root or with that capability."
             );
         }
-        Err(e) => panic!(
-            "XdpSocket::create failed against {VETH_RX} with unexpected error: {e}"
-        ),
+        Err(e) => panic!("XdpSocket::create failed against {VETH_RX} with unexpected error: {e}"),
     }
 }

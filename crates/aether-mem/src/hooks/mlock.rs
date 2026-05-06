@@ -29,6 +29,7 @@ impl MemoryHook for MlockHook {
 
     fn on_dealloc(&self, ptr: *mut u8, size: usize) {
         #[cfg(unix)]
+        // SAFETY: ptr/size match a region previously passed to mlock; munlock tolerates non-locked regions.
         unsafe {
             let _ = libc::munlock(ptr as *const libc::c_void, size);
         }

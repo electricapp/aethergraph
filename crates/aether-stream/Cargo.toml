@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "Kernel-bypass streaming engine: AF_XDP ingestion, seqlock feature table, RDMA one-sided reads"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 rdma = ["aether-mem/rdma"]

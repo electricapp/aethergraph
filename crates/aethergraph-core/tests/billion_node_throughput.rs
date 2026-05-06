@@ -14,7 +14,7 @@
 //!         --test billion_node_throughput -- --nocapture --ignored
 
 use aethergraph_core::{AsyncCsrGraph, NodeId};
-use rand::{rngs::SmallRng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::time::{Duration, Instant};
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -93,8 +93,8 @@ fn billion_node_async_throughput() {
     let total = t_total.elapsed();
 
     per_batch.sort();
-    let mean_ns: u128 = per_batch.iter().map(|d| d.as_nanos()).sum::<u128>()
-        / per_batch.len() as u128;
+    let mean_ns: u128 =
+        per_batch.iter().map(|d| d.as_nanos()).sum::<u128>() / per_batch.len() as u128;
     let batches_per_sec = num_batches as f64 / total.as_secs_f64();
     let seeds_per_sec = batches_per_sec * batch_size as f64;
 
@@ -109,9 +109,18 @@ fn billion_node_async_throughput() {
     eprintln!();
     eprintln!("Per-batch latency:");
     eprintln!("  mean = {:>8.1} µs", mean_ns as f64 / 1_000.0);
-    eprintln!("  p50  = {:>8.1} µs", p_nanos(&per_batch, 0.50) as f64 / 1_000.0);
-    eprintln!("  p90  = {:>8.1} µs", p_nanos(&per_batch, 0.90) as f64 / 1_000.0);
-    eprintln!("  p99  = {:>8.1} µs", p_nanos(&per_batch, 0.99) as f64 / 1_000.0);
+    eprintln!(
+        "  p50  = {:>8.1} µs",
+        p_nanos(&per_batch, 0.50) as f64 / 1_000.0
+    );
+    eprintln!(
+        "  p90  = {:>8.1} µs",
+        p_nanos(&per_batch, 0.90) as f64 / 1_000.0
+    );
+    eprintln!(
+        "  p99  = {:>8.1} µs",
+        p_nanos(&per_batch, 0.99) as f64 / 1_000.0
+    );
     eprintln!(
         "  max  = {:>8.1} µs",
         per_batch.last().unwrap().as_nanos() as f64 / 1_000.0

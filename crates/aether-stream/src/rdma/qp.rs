@@ -92,10 +92,7 @@ impl RdmaQp {
 
             let qp = ibv_create_qp(ctx.pd, &mut init_attr);
             if qp.is_null() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "ibv_create_qp failed",
-                ));
+                return Err(io::Error::new(io::ErrorKind::Other, "ibv_create_qp failed"));
             }
 
             Ok(Self { qp })

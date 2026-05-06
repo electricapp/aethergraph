@@ -1,7 +1,7 @@
 //! Benchmarks for aether-graph C-tree dynamic graph.
 
 use aether_graph::DynamicGraph;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 use std::hint::black_box;
@@ -51,17 +51,13 @@ fn bench_neighbor_read(c: &mut Criterion) {
         let mut buf = Vec::with_capacity(256);
 
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::new("nodes", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let v = rng.random_range(0..n as u32);
-                    g.neighbors_into(v, &mut buf);
-                    black_box(buf.len());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("nodes", n), &n, |b, _| {
+            b.iter(|| {
+                let v = rng.random_range(0..n as u32);
+                g.neighbors_into(v, &mut buf);
+                black_box(buf.len());
+            });
+        });
     }
     group.finish();
 }
@@ -103,5 +99,11 @@ fn bench_degree(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_insert, bench_neighbor_read, bench_has_edge, bench_degree);
+criterion_group!(
+    benches,
+    bench_insert,
+    bench_neighbor_read,
+    bench_has_edge,
+    bench_degree
+);
 criterion_main!(benches);

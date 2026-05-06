@@ -8,12 +8,12 @@
 //! ownership to numpy without memcpy. The only per-element work is the
 //! u32→i64 widening required by PyTorch.
 
-use aethergraph_core::graph::hetero::{EdgeTypeId, HeteroGraph, NodeTypeId};
+use aethergraph_core::Graph;
 use aethergraph_core::graph::NodeId;
+use aethergraph_core::graph::hetero::{EdgeTypeId, HeteroGraph, NodeTypeId};
 use aethergraph_core::loader::hetero_sampler::{
     HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig,
 };
-use aethergraph_core::Graph;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -26,6 +26,15 @@ use crate::error::sampling_error;
 // HeteroCsrGraph
 // ---------------------------------------------------------------------------
 
+/// (src_type, edge_type, dst_type, src_ids, dst_ids) — one COO edge bundle.
+type EdgeArrayTuple<'py> = (
+    String,
+    String,
+    String,
+    PyReadonlyArray1<'py, u32>,
+    PyReadonlyArray1<'py, u32>,
+);
+
 #[pyclass(name = "HeteroCsrGraph")]
 pub struct PyHeteroCsrGraph {
     pub(crate) inner: Arc<HeteroGraph>,
@@ -36,13 +45,7 @@ impl PyHeteroCsrGraph {
     #[staticmethod]
     fn from_edge_arrays(
         node_types: &Bound<'_, PyDict>,
-        edge_types: Vec<(
-            String,
-            String,
-            String,
-            PyReadonlyArray1<u32>,
-            PyReadonlyArray1<u32>,
-        )>,
+        edge_types: Vec<EdgeArrayTuple<'_>>,
     ) -> PyResult<Self> {
         let mut nt_vec: Vec<(String, usize)> = Vec::with_capacity(node_types.len());
         for (key, value) in node_types.iter() {
@@ -52,8 +55,7 @@ impl PyHeteroCsrGraph {
         }
 
         let nt_counts: HashMap<String, usize> = nt_vec.iter().cloned().collect();
-        let mut et_vec: Vec<(String, String, String, Graph)> =
-            Vec::with_capacity(edge_types.len());
+        let mut et_vec: Vec<(String, String, String, Graph)> = Vec::with_capacity(edge_types.len());
 
         for (src_type, rel, dst_type, src_arr, dst_arr) in edge_types {
             let src_slice = src_arr.as_slice()?;
@@ -98,7 +100,11 @@ impl PyHeteroCsrGraph {
     }
 
     fn node_types(&self) -> Vec<String> {
-        self.inner.node_type_names().into_iter().map(|s| s.to_owned()).collect()
+        self.inner
+            .node_type_names()
+            .into_iter()
+            .map(|s| s.to_owned())
+            .collect()
     }
 
     fn edge_types(&self) -> Vec<(String, String, String)> {
@@ -117,11 +123,14 @@ impl PyHeteroCsrGraph {
     }
 
     fn num_edges(&self, src_type: &str, rel: &str, dst_type: &str) -> PyResult<usize> {
-        let id = self.inner.edge_type_id(src_type, rel, dst_type).ok_or_else(|| {
-            pyo3::exceptions::PyKeyError::new_err(format!(
-                "unknown edge type ('{src_type}', '{rel}', '{dst_type}')"
-            ))
-        })?;
+        let id = self
+            .inner
+            .edge_type_id(src_type, rel, dst_type)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "unknown edge type ('{src_type}', '{rel}', '{dst_type}')"
+                ))
+            })?;
         Ok(self.inner.num_edges(id))
     }
 
@@ -154,7 +163,7 @@ impl PyHeteroCsrGraph {
 // HeteroSamplingConfig
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "HeteroSamplingConfig")]
+#[pyclass(name = "HeteroSamplingConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyHeteroSamplingConfig {
     pub(crate) num_neighbors: HashMap<(String, String, String), Vec<usize>>,
@@ -185,7 +194,12 @@ impl PyHeteroSamplingConfig {
                 "all edge types must have the same number of hops",
             ));
         }
-        Ok(Self { num_neighbors, replace, seed, max_degree })
+        Ok(Self {
+            num_neighbors,
+            replace,
+            seed,
+            max_degree,
+        })
     }
 
     #[getter]
@@ -225,7 +239,11 @@ impl PyHeteroSamplingConfig {
 
 impl PyHeteroSamplingConfig {
     pub fn num_hops(&self) -> usize {
-        self.num_neighbors.values().next().map(|v| v.len()).unwrap_or(0)
+        self.num_neighbors
+            .values()
+            .next()
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// Convert Python config to core config, resolving string type names
@@ -379,8 +397,7 @@ impl PyHeteroNeighborSampler {
         // This is safe because `graph_arc` (an Arc) is stored in the same
         // struct and will keep the HeteroGraph alive for the sampler's
         // entire lifetime. The sampler is never exposed outside this struct.
-        let graph_ref: &'static HeteroGraph =
-            unsafe { &*(Arc::as_ptr(&graph_arc) as *const HeteroGraph) };
+        let graph_ref: &'static HeteroGraph = unsafe { &*Arc::as_ptr(&graph_arc) };
         let sampler = HeteroNeighborSampler::new(graph_ref, core_config);
 
         Ok(Self {
@@ -395,24 +412,29 @@ impl PyHeteroNeighborSampler {
         seed_type: &str,
         seeds: &Bound<'_, PyAny>,
     ) -> PyResult<PyHeteroSampledSubgraph> {
-        let seed_type_id = self.graph.node_type_id(seed_type).ok_or_else(|| {
-            sampling_error(format!("unknown seed type '{seed_type}'"))
-        })?;
+        let seed_type_id = self
+            .graph
+            .node_type_id(seed_type)
+            .ok_or_else(|| sampling_error(format!("unknown seed type '{seed_type}'")))?;
 
         let seeds_vec: Vec<u32> = if let Ok(arr) = seeds.extract::<PyReadonlyArray1<u32>>() {
             arr.as_slice()?.to_vec()
         } else if let Ok(arr) = seeds.extract::<PyReadonlyArray1<i64>>() {
             arr.as_slice()?
                 .iter()
-                .map(|&x| u32::try_from(x).map_err(|_| {
-                    sampling_error(format!("seed {x} out of u32 range"))
-                }))
+                .map(|&x| {
+                    u32::try_from(x)
+                        .map_err(|_| sampling_error(format!("seed {x} out of u32 range")))
+                })
                 .collect::<PyResult<Vec<u32>>>()?
         } else {
             seeds.extract::<Vec<u32>>()?
         };
 
-        let sub = self.sampler.inner.sample_neighbors(seed_type_id, &seeds_vec);
+        let sub = self
+            .sampler
+            .inner
+            .sample_neighbors(seed_type_id, &seeds_vec);
 
         Ok(PyHeteroSampledSubgraph {
             inner: sub,

@@ -15,8 +15,8 @@
 //! ```
 
 use crate::graph::{Graph, NodeId};
-use anyhow::{bail, Context, Result};
-use arrow_array::{cast::AsArray, RecordBatch, UInt32Array};
+use anyhow::{Context, Result, bail};
+use arrow_array::{RecordBatch, UInt32Array, cast::AsArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::Path;
 use tracing::info;
@@ -36,11 +36,10 @@ pub fn from_parquet(
     num_nodes: usize,
 ) -> Result<Graph> {
     let path = path.as_ref();
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
 
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .context("read parquet metadata")?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).context("read parquet metadata")?;
 
     let reader = builder.build().context("build parquet reader")?;
 
@@ -60,10 +59,7 @@ pub fn from_parquet(
         "read edges from parquet"
     );
 
-    let edges: Vec<(NodeId, NodeId)> = all_src
-        .into_iter()
-        .zip(all_dst)
-        .collect();
+    let edges: Vec<(NodeId, NodeId)> = all_src.into_iter().zip(all_dst).collect();
 
     Graph::from_edges(num_nodes, &edges, None)
 }
@@ -83,13 +79,13 @@ pub fn from_parquet_files(
 
     for path in paths {
         let path = path.as_ref();
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
 
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .with_context(|| format!("read metadata: {}", path.display()))?;
 
-        let reader = builder.build()
+        let reader = builder
+            .build()
             .with_context(|| format!("build reader: {}", path.display()))?;
 
         for batch_result in reader {
@@ -106,12 +102,12 @@ pub fn from_parquet_files(
         );
     }
 
-    info!(total_edges = all_src.len(), "building CSR from parquet data");
+    info!(
+        total_edges = all_src.len(),
+        "building CSR from parquet data"
+    );
 
-    let edges: Vec<(NodeId, NodeId)> = all_src
-        .into_iter()
-        .zip(all_dst)
-        .collect();
+    let edges: Vec<(NodeId, NodeId)> = all_src.into_iter().zip(all_dst).collect();
 
     Graph::from_edges(num_nodes, &edges, None)
 }
@@ -139,10 +135,7 @@ fn extract_edge_columns(
 }
 
 /// Convert an Arrow array column to Vec<u32>.
-fn arrow_col_to_u32(
-    col: &dyn arrow_array::Array,
-    name: &str,
-) -> Result<Vec<NodeId>> {
+fn arrow_col_to_u32(col: &dyn arrow_array::Array, name: &str) -> Result<Vec<NodeId>> {
     use arrow_schema::DataType;
 
     match col.data_type() {
@@ -162,7 +155,11 @@ fn arrow_col_to_u32(
             let arr = col.as_primitive::<arrow_array::types::UInt64Type>();
             Ok(arr.values().iter().map(|&v| v as u32).collect())
         }
-        other => bail!("column '{}' has unsupported type {:?} (need int32/int64/uint32/uint64)", name, other),
+        other => bail!(
+            "column '{}' has unsupported type {:?} (need int32/int64/uint32/uint64)",
+            name,
+            other
+        ),
     }
 }
 
