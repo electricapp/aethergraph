@@ -1,0 +1,354 @@
+//! Seqlock-protected SoA feature table in HugePage RAM.
+//!
+//! Each node gets a compact slot with head and tail version counters
+//! wrapping the feature vector. Writers bump head to odd, write features,
+//! then set tail and head to the next even version.
+//!
+//! This head/tail layout is RDMA-safe: a one-sided read of the full slot
+//! lets the reader detect torn reads by comparing head != tail.
+//!
+//! This table is backed by a separate `SharedMemoryRing` (not the UMEM).
+//! When RDMA is enabled, the memory is registered with the HCA so GPU nodes
+//! can do one-sided reads at <5μs without waking the CPU.
+
+use aether_mem::hooks::MlockHook;
+use aether_mem::{MemoryHook, SharedMemoryRing};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Feature offset within a slot (immediately after head_version u64).
+const FEATURE_OFFSET: usize = 8;
+
+/// Per-node slot layout:
+/// ```text
+/// [0..8]         head_version: AtomicU64  (odd=writing, even=ready, 0=uninit)
+/// [8..8+N]       features: [f32; feature_dim]   (N = feature_dim * 4)
+/// [8+N+P..16+N+P] tail_version: AtomicU64       (P = padding to 8-byte align)
+/// ```
+///
+/// Slot size = 16 + N + P, rounded up to page boundary by SharedMemoryRing.
+/// The 56-byte cache-line padding is removed — compactness is critical for
+/// RDMA bandwidth.
+pub struct FeatureTable {
+    ring: SharedMemoryRing,
+    node_count: usize,
+    feature_dim: usize,
+    /// Byte offset from slot start to the tail_version field.
+    tail_offset: usize,
+}
+
+/// Schema metadata for RDMA advertisement.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FeatureSchema {
+    pub node_count: usize,
+    pub feature_dim: usize,
+    pub slot_size: usize,
+    pub feature_offset_in_slot: usize,
+    pub tail_offset_in_slot: usize,
+}
+
+/// Compute tail version offset for a given feature_dim.
+///
+/// tail_offset = 8 (head) + feature_dim * 4, rounded up to 8-byte alignment.
+#[inline]
+fn compute_tail_offset(feature_dim: usize) -> usize {
+    let after_features = FEATURE_OFFSET + feature_dim * std::mem::size_of::<f32>();
+    // Round up to 8-byte alignment for AtomicU64
+    (after_features + 7) & !7
+}
+
+/// Compute raw slot size (before page-rounding by SharedMemoryRing).
+#[inline]
+fn compute_slot_size(feature_dim: usize) -> usize {
+    compute_tail_offset(feature_dim) + 8 // tail_version is 8 bytes
+}
+
+impl FeatureTable {
+    /// Allocate a new feature table.
+    ///
+    /// `node_count` is rounded up to the next power of two.
+    /// `feature_dim` is the number of f32 features per node.
+    pub fn new(
+        node_count: usize,
+        feature_dim: usize,
+        extra_hooks: Vec<Box<dyn MemoryHook>>,
+    ) -> Option<Self> {
+        assert!(node_count > 0);
+        assert!(feature_dim > 0);
+
+        let slot_count = node_count.next_power_of_two();
+        let tail_offset = compute_tail_offset(feature_dim);
+        let slot_size = compute_slot_size(feature_dim);
+
+        let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook)];
+        hooks.extend(extra_hooks);
+
+        let ring = SharedMemoryRing::new(slot_count, slot_size, hooks)?;
+
+        // We access slots positionally by node ID, not via the free list.
+        // The ring is used for its allocation + hooks.
+
+        Some(Self {
+            ring,
+            node_count,
+            feature_dim,
+            tail_offset,
+        })
+    }
+
+    /// Write features for a node. Head/tail seqlock protocol:
+    ///
+    /// 1. head → odd (writing)
+    /// 2. copy features
+    /// 3. tail → next even
+    /// 4. head → next even (= tail)
+    ///
+    /// # Safety
+    /// Multiple concurrent writers to the *same* node produce torn reads.
+    /// Different nodes can be written concurrently without issue.
+    pub fn write_node(&self, node: usize, features: &[f32]) {
+        debug_assert!(node < self.node_count);
+        debug_assert_eq!(features.len(), self.feature_dim);
+
+        let base = self.slot_ptr(node);
+
+        unsafe {
+            let head = &*(base as *const AtomicU64);
+            let tail = &*(base.add(self.tail_offset) as *const AtomicU64);
+
+            // Step 1: head → odd (signals write in progress)
+            // AcqRel: Release orders prior writes before head goes odd.
+            // Acquire prevents the feature copy below from being reordered
+            // before this RMW — without it, a reader could see even head
+            // while features are being overwritten (torn read that passes
+            // the h == t check).
+            let prev = head.fetch_add(1, Ordering::AcqRel);
+            let target = prev + 2; // next even version
+
+            // Step 2: write features
+            let feat_ptr = base.add(FEATURE_OFFSET) as *mut f32;
+            std::ptr::copy_nonoverlapping(features.as_ptr(), feat_ptr, self.feature_dim);
+
+            // Step 3: tail → target (even)
+            tail.store(target, Ordering::Release);
+
+            // Step 4: head → target (even, matches tail)
+            head.store(target, Ordering::Release);
+        }
+    }
+
+    /// Read features for a node into `out`. Returns `true` if the node has been
+    /// written at least once, `false` if uninitialized.
+    ///
+    /// Local readers MUST detect torn writes that complete during the feature
+    /// copy. Naively just `head == tail` is insufficient — the writer's plain
+    /// `Release` stores can sit in its CPU's store buffer, so the reader can
+    /// observe both the old `tail` AND the old `head` even though the writer's
+    /// `RMW` (head→odd) has already taken effect. The standard fix (used by
+    /// the Linux kernel seqlock) is to RE-LOAD HEAD after the data copy:
+    /// because the writer's first action is a LOCK-prefixed RMW that drains
+    /// its store buffer and is globally visible immediately, any writer that
+    /// touched the slot during our copy is guaranteed to leave a head value
+    /// different from the snapshot we started with.
+    ///
+    /// We keep the `head == tail` check too — it's still required for the
+    /// RDMA path (one-shot read of the entire slot, no second load possible)
+    /// and provides a cheap early-out here.
+    pub fn read_node(&self, node: usize, out: &mut [f32]) -> bool {
+        debug_assert!(node < self.node_count);
+        debug_assert!(out.len() >= self.feature_dim);
+
+        let base = self.slot_ptr(node);
+
+        unsafe {
+            let head = &*(base as *const AtomicU64);
+            let tail = &*(base.add(self.tail_offset) as *const AtomicU64);
+
+            loop {
+                let h1 = head.load(Ordering::Acquire);
+                if h1 == 0 {
+                    return false; // never written
+                }
+                if h1 & 1 != 0 {
+                    std::hint::spin_loop();
+                    continue; // writer in progress
+                }
+
+                // Read features (non-atomic).
+                let feat_ptr = base.add(FEATURE_OFFSET) as *const f32;
+                std::ptr::copy_nonoverlapping(feat_ptr, out.as_mut_ptr(), self.feature_dim);
+
+                // Ensure all feature reads complete before we read tail/head.
+                // Without this fence, ARM/RISC-V can reorder the non-atomic
+                // feature reads past the version loads.
+                std::sync::atomic::fence(Ordering::Acquire);
+
+                // Two checks:
+                //   1. h1 == t  — RDMA-compatible, catches torn writes whose
+                //      tail.store has propagated.
+                //   2. h1 == h2 — local-only, catches writers that started a
+                //      new generation during our copy. Since the writer's
+                //      first op is a LOCK-RMW that's immediately globally
+                //      visible, h2 cannot equal the old even h1 if a writer
+                //      ran. This is what the previous protocol missed.
+                let t = tail.load(Ordering::Acquire);
+                let h2 = head.load(Ordering::Acquire);
+                if h1 == t && h1 == h2 {
+                    return true;
+                }
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Feature dimension.
+    pub fn feature_dim(&self) -> usize {
+        self.feature_dim
+    }
+
+    /// Number of nodes this table can hold (original, before rounding to power-of-two).
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    /// Schema for RDMA advertisement.
+    pub fn schema(&self) -> FeatureSchema {
+        FeatureSchema {
+            node_count: self.node_count,
+            feature_dim: self.feature_dim,
+            slot_size: self.ring.slot_size(),
+            feature_offset_in_slot: FEATURE_OFFSET,
+            tail_offset_in_slot: self.tail_offset,
+        }
+    }
+
+    /// Base address of the table (for RDMA registration).
+    pub fn base_addr(&self) -> u64 {
+        self.ring.base_addr() as u64
+    }
+
+    /// Total allocated size.
+    pub fn total_size(&self) -> usize {
+        self.ring.total_size()
+    }
+
+    /// Raw pointer to a node's slot.
+    #[inline]
+    fn slot_ptr(&self, node: usize) -> *mut u8 {
+        self.ring.slot_ptr_for_ffi(node)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_then_read() {
+        let table = FeatureTable::new(4, 8, vec![]).unwrap();
+        let features = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        table.write_node(0, &features);
+
+        let mut out = vec![0.0f32; 8];
+        assert!(table.read_node(0, &mut out));
+        assert_eq!(out, features);
+    }
+
+    #[test]
+    fn uninitialized_returns_false() {
+        let table = FeatureTable::new(4, 8, vec![]).unwrap();
+        let mut out = vec![0.0f32; 8];
+        assert!(!table.read_node(0, &mut out));
+    }
+
+    #[test]
+    fn multiple_nodes() {
+        let table = FeatureTable::new(4, 4, vec![]).unwrap();
+
+        let f0 = vec![1.0f32, 2.0, 3.0, 4.0];
+        let f1 = vec![5.0f32, 6.0, 7.0, 8.0];
+        table.write_node(0, &f0);
+        table.write_node(1, &f1);
+
+        let mut out = vec![0.0f32; 4];
+        assert!(table.read_node(0, &mut out));
+        assert_eq!(out, f0);
+
+        assert!(table.read_node(1, &mut out));
+        assert_eq!(out, f1);
+    }
+
+    #[test]
+    fn overwrite() {
+        let table = FeatureTable::new(4, 4, vec![]).unwrap();
+
+        let f1 = vec![1.0f32, 2.0, 3.0, 4.0];
+        let f2 = vec![10.0f32, 20.0, 30.0, 40.0];
+        table.write_node(0, &f1);
+        table.write_node(0, &f2);
+
+        let mut out = vec![0.0f32; 4];
+        assert!(table.read_node(0, &mut out));
+        assert_eq!(out, f2);
+    }
+
+    #[test]
+    fn schema_correct() {
+        let table = FeatureTable::new(100, 768, vec![]).unwrap();
+        let schema = table.schema();
+        assert_eq!(schema.node_count, 100);
+        assert_eq!(schema.feature_dim, 768);
+        assert_eq!(schema.feature_offset_in_slot, 8);
+        // 768 * 4 = 3072, 8 + 3072 = 3080, aligned to 8 = 3080
+        assert_eq!(schema.tail_offset_in_slot, 3080);
+    }
+
+    #[test]
+    fn tail_offset_alignment() {
+        // Even feature_dim (common for GNN): N is divisible by 8, no padding
+        assert_eq!(compute_tail_offset(128), 8 + 128 * 4); // 520
+        assert_eq!(compute_tail_offset(256), 8 + 256 * 4); // 1032
+        assert_eq!(compute_tail_offset(512), 8 + 512 * 4); // 2056
+        assert_eq!(compute_tail_offset(768), 8 + 768 * 4); // 3080
+
+        // Odd feature_dim: needs padding to 8-byte align
+        // feature_dim=3: after_features = 8 + 12 = 20, round to 24
+        assert_eq!(compute_tail_offset(3), 24);
+        // feature_dim=5: after_features = 8 + 20 = 28, round to 32
+        assert_eq!(compute_tail_offset(5), 32);
+    }
+
+    #[test]
+    fn slot_size_computation() {
+        // feature_dim=4: tail_offset = 8 + 16 = 24, slot_size = 24 + 8 = 32
+        assert_eq!(compute_slot_size(4), 32);
+        // feature_dim=768: tail_offset = 3080, slot_size = 3088
+        assert_eq!(compute_slot_size(768), 3088);
+    }
+
+    #[test]
+    fn head_tail_versions_match_after_write() {
+        let table = FeatureTable::new(4, 4, vec![]).unwrap();
+        let features = vec![1.0f32, 2.0, 3.0, 4.0];
+
+        table.write_node(0, &features);
+
+        // Verify head and tail are both 2 (first even version after write)
+        let base = table.slot_ptr(0);
+        unsafe {
+            let head = &*(base as *const AtomicU64);
+            let tail = &*(base.add(table.tail_offset) as *const AtomicU64);
+            assert_eq!(head.load(Ordering::Relaxed), 2);
+            assert_eq!(tail.load(Ordering::Relaxed), 2);
+        }
+
+        // Write again — should be 4
+        table.write_node(0, &features);
+        unsafe {
+            let head = &*(base as *const AtomicU64);
+            let tail = &*(base.add(table.tail_offset) as *const AtomicU64);
+            assert_eq!(head.load(Ordering::Relaxed), 4);
+            assert_eq!(tail.load(Ordering::Relaxed), 4);
+        }
+    }
+}

@@ -1,0 +1,62 @@
+[package]
+name = "aethergraph-py"
+version = "0.1.0"
+edition = "2024"
+authors = ["electricapp"]
+license = "MIT OR Apache-2.0"
+description = "Python bindings for AetherGraph high-performance graph sampling"
+
+[features]
+# extension-module tells pyo3 not to link against libpython (the Python
+# interpreter loads this crate as a dylib). Wheel builds go through maturin
+# which turns this on via `[tool.maturin].features` in python/pyproject.toml.
+# Plain `cargo test` omits it so unit tests can link against libpython
+# normally and run as a standalone test binary.
+default = []
+extension-module = ["pyo3/extension-module"]
+gpudirect = ["aether-stream/gpudirect"]
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+# `test = false` is NOT set here — we want plain `cargo test -p aethergraph-py`
+# to pick up the unit tests. Maturin turns on `pyo3/extension-module` via
+# pyproject.toml's `[tool.maturin]` when building wheels, which skips libpython
+# linking; plain cargo test omits that flag and links libpython normally so
+# tests run as a standalone binary.
+doctest = false
+
+[dependencies]
+aethergraph-core = { path = "../aethergraph-core" }
+aether-graph = { path = "../aether-graph" }
+
+# PyO3 for Python bindings. `extension-module` is conditionally enabled via
+# this crate's `extension-module` feature (above) so `cargo test` links
+# normally while `maturin build` still skips libpython linking.
+pyo3 = { version = "0.28", features = ["abi3-py38"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+
+# Apache Arrow for zero-copy data transfer
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
+
+# Numpy integration
+numpy = "0.28"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+
+# Serialization for Python
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Other utilities
+parking_lot = "0.12"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aether-stream = { path = "../aether-stream", optional = true }

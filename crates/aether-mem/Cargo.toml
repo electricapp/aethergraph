@@ -1,0 +1,23 @@
+[package]
+name = "aether-mem"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lock-free slab allocator with HugePages and pluggable memory hooks"
+
+[features]
+default = []
+parallel-prefault = ["dep:rayon"]
+tracing = ["dep:tracing"]
+rdma = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+libc    = "0.2"
+rayon   = { version = "1.12", optional = true }
+tracing = { version = "0.1", optional = true }
+cudarc  = { version = "0.19", features = ["cuda-12050"], optional = true }
+
+[dev-dependencies]
+proptest = "1"

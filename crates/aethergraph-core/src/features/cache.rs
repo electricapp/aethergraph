@@ -1,0 +1,638 @@
+//! Feature cache with GPU/CPU/NVMe tiering for billion-scale GNN training.
+//!
+//! Node features (embeddings) for large graphs can exceed GPU memory. This module
+//! implements a three-tier cache:
+//! - Hot tier: GPU memory (limited, fast access)
+//! - Warm tier: CPU RAM (larger, medium latency)
+//! - Cold tier: NVMe SSD (unlimited, high latency)
+//!
+//! Uses frequency-weighted eviction to keep hot nodes in faster tiers.
+//! When warmup frequencies are provided, the hottest nodes are pinned in GPU.
+
+use crate::graph::{Graph, NodeId};
+use crate::loader::{NeighborSampler, SamplingConfig};
+use ahash::AHashMap;
+use anyhow::{Context, Result};
+use parking_lot::RwLock;
+use rustc_hash::FxHashSet;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{debug, trace, warn};
+
+/// Feature dimension
+pub type FeatureDim = usize;
+
+/// A node feature vector (e.g., 128-dim embedding)
+pub type FeatureVector = Vec<f32>;
+
+/// Configuration for the feature cache
+#[derive(Debug, Clone)]
+pub struct FeatureCacheConfig {
+    /// Maximum number of features in GPU cache
+    pub gpu_capacity: usize,
+
+    /// Maximum number of features in CPU cache
+    pub cpu_capacity: usize,
+
+    /// Feature dimension
+    pub feature_dim: FeatureDim,
+
+    /// Path to NVMe storage for cold features (required, no default)
+    pub nvme_path: Option<PathBuf>,
+
+    /// Pre-computed node access frequencies from warmup pass.
+    /// If provided, the cache uses frequency-weighted eviction and pins
+    /// the hottest nodes in GPU tier.
+    pub warmup_frequencies: Option<Arc<AHashMap<NodeId, u32>>>,
+
+    /// Fraction of GPU capacity to pin for hot nodes (default 0.8).
+    /// Only used when warmup_frequencies is provided.
+    pub pin_ratio: f64,
+}
+
+impl Default for FeatureCacheConfig {
+    fn default() -> Self {
+        Self {
+            gpu_capacity: 10_000,
+            cpu_capacity: 1_000_000,
+            feature_dim: 128,
+            nvme_path: None,
+            warmup_frequencies: None,
+            pin_ratio: 0.8,
+        }
+    }
+}
+
+/// Frequency-weighted cache for a single tier.
+///
+/// Replaces the old LRU cache. `get()` is O(1) instead of O(n).
+/// Eviction pops the lowest-frequency unpinned node from a min-heap.
+/// The heap uses lazy deletion -- stale entries are skipped on pop.
+struct FreqCache {
+    capacity: usize,
+    cache: AHashMap<NodeId, FeatureVector>,
+    /// Static frequencies from warmup (set once, never mutated after init)
+    warmup_freq: AHashMap<NodeId, u32>,
+    /// Runtime access counts
+    access_counts: AHashMap<NodeId, u32>,
+    /// Pinned nodes (never evicted)
+    pinned: FxHashSet<NodeId>,
+    /// Min-heap: (frequency, node_id). Lazy deletion on pop.
+    eviction_heap: BinaryHeap<Reverse<(u32, NodeId)>>,
+}
+
+impl FreqCache {
+    fn new(capacity: usize, warmup_freq: AHashMap<NodeId, u32>) -> Self {
+        Self {
+            capacity,
+            cache: AHashMap::with_capacity(capacity),
+            warmup_freq,
+            access_counts: AHashMap::with_capacity(capacity),
+            pinned: FxHashSet::default(),
+            eviction_heap: BinaryHeap::with_capacity(capacity),
+        }
+    }
+
+    fn freq(&self, node: NodeId) -> u32 {
+        self.warmup_freq.get(&node).copied().unwrap_or(0)
+            + self.access_counts.get(&node).copied().unwrap_or(0)
+    }
+
+    fn get(&mut self, node: NodeId) -> Option<&FeatureVector> {
+        if self.cache.contains_key(&node) {
+            *self.access_counts.entry(node).or_insert(0) += 1;
+            // Push updated frequency into heap (stale entries handled lazily).
+            // Compact if heap grows too large relative to cache size to bound memory.
+            self.eviction_heap.push(Reverse((self.freq(node), node)));
+            // TODO: tune compaction threshold under real workloads. 4x is a
+            // heuristic -- too low thrashes on high-churn caches, too high
+            // wastes memory. Profile with Reddit-scale access patterns.
+            if self.eviction_heap.len() > self.capacity * 4 {
+                self.compact_heap();
+            }
+            self.cache.get(&node)
+        } else {
+            None
+        }
+    }
+
+    /// Rebuild the heap with only current cache entries at their true frequencies.
+    fn compact_heap(&mut self) {
+        self.eviction_heap.clear();
+        for &node in self.cache.keys() {
+            self.eviction_heap.push(Reverse((self.freq(node), node)));
+        }
+    }
+
+    fn insert(&mut self, node: NodeId, features: FeatureVector) -> Option<(NodeId, FeatureVector)> {
+        if self.cache.contains_key(&node) {
+            *self.access_counts.entry(node).or_insert(0) += 1;
+            self.cache.insert(node, features);
+            return None;
+        }
+
+        // Evict if at capacity
+        let evicted = if self.cache.len() >= self.capacity {
+            self.evict_one()
+        } else {
+            None
+        };
+
+        // Insert new entry
+        self.cache.insert(node, features);
+        let freq = self.freq(node);
+        self.eviction_heap.push(Reverse((freq, node)));
+
+        evicted
+    }
+
+    /// Pop lowest-frequency unpinned node. Lazy deletion: skip stale entries.
+    fn evict_one(&mut self) -> Option<(NodeId, FeatureVector)> {
+        while let Some(Reverse((_, node))) = self.eviction_heap.pop() {
+            // Skip if no longer in cache (already evicted)
+            if !self.cache.contains_key(&node) {
+                continue;
+            }
+            // Skip pinned nodes -- re-insert so they stay in the heap
+            if self.pinned.contains(&node) {
+                let freq = self.freq(node);
+                self.eviction_heap.push(Reverse((freq, node)));
+                continue;
+            }
+            // Evict this node
+            let features = self.cache.remove(&node)?;
+            self.access_counts.remove(&node);
+            return Some((node, features));
+        }
+        None
+    }
+
+    fn pin(&mut self, node: NodeId) {
+        self.pinned.insert(node);
+    }
+
+    #[allow(dead_code)]
+    fn unpin(&mut self, node: NodeId) {
+        self.pinned.remove(&node);
+    }
+
+    fn is_pinned(&self, node: NodeId) -> bool {
+        self.pinned.contains(&node)
+    }
+
+    fn len(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+/// Three-tier feature cache for GNN training
+pub struct FeatureCache {
+    config: FeatureCacheConfig,
+
+    /// Validated NVMe path (extracted from config)
+    nvme_path: PathBuf,
+
+    /// GPU tier (hot)
+    gpu_cache: Arc<RwLock<FreqCache>>,
+
+    /// CPU tier (warm)
+    cpu_cache: Arc<RwLock<FreqCache>>,
+
+    /// Stats
+    stats: Arc<RwLock<CacheStats>>,
+}
+
+/// Cache statistics for monitoring
+#[derive(Debug, Default, Clone)]
+pub struct CacheStats {
+    pub gpu_hits: u64,
+    pub cpu_hits: u64,
+    pub nvme_hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    /// Hits on pinned nodes (measures pin effectiveness)
+    pub pinned_hits: u64,
+}
+
+impl FeatureCache {
+    /// Create a new feature cache with the given configuration
+    pub async fn new(config: FeatureCacheConfig) -> Result<Self> {
+        let nvme_path = config
+            .nvme_path
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("nvme_path must be configured"))?;
+
+        tokio::fs::create_dir_all(&nvme_path)
+            .await
+            .context("failed to create NVMe cache directory")?;
+
+        debug!("Initialized feature cache:");
+        debug!("  GPU capacity: {} features", config.gpu_capacity);
+        debug!("  CPU capacity: {} features", config.cpu_capacity);
+        debug!("  Feature dim: {}", config.feature_dim);
+        debug!("  NVMe path: {}", nvme_path.display());
+
+        let warmup = config
+            .warmup_frequencies
+            .as_ref()
+            .map_or_else(AHashMap::new, |m| (**m).clone());
+
+        let mut gpu = FreqCache::new(config.gpu_capacity, warmup.clone());
+        let cpu = FreqCache::new(config.cpu_capacity, warmup);
+
+        // Pin hottest nodes in GPU tier when warmup frequencies are provided
+        if let Some(ref freq_map) = config.warmup_frequencies {
+            let pin_count = ((config.gpu_capacity as f64) * config.pin_ratio) as usize;
+            let mut nodes_by_freq: Vec<_> = freq_map.iter().collect();
+            nodes_by_freq.sort_unstable_by(|a, b| b.1.cmp(a.1));
+            for &(&node, _) in nodes_by_freq.iter().take(pin_count) {
+                gpu.pin(node);
+            }
+            debug!(
+                "  Pinned {} hot nodes in GPU tier (pin_ratio={:.2})",
+                pin_count.min(nodes_by_freq.len()),
+                config.pin_ratio
+            );
+        }
+
+        Ok(Self {
+            gpu_cache: Arc::new(RwLock::new(gpu)),
+            cpu_cache: Arc::new(RwLock::new(cpu)),
+            config,
+            nvme_path,
+            stats: Arc::new(RwLock::new(CacheStats::default())),
+        })
+    }
+
+    /// Get features for a node, loading from slower tiers if needed
+    pub async fn get(&self, node: NodeId) -> Result<FeatureVector> {
+        // Try GPU cache first (hot tier)
+        {
+            let mut gpu = self.gpu_cache.write();
+            if let Some(features) = gpu.get(node) {
+                let features = features.clone();
+                let pinned = gpu.is_pinned(node);
+                let mut stats = self.stats.write();
+                stats.gpu_hits += 1;
+                if pinned {
+                    stats.pinned_hits += 1;
+                }
+                trace!("GPU cache hit for node {}", node);
+                return Ok(features);
+            }
+        }
+
+        // Try CPU cache (warm tier)
+        let cpu_features = {
+            let mut cpu = self.cpu_cache.write();
+            cpu.get(node).cloned()
+        };
+
+        if let Some(features) = cpu_features {
+            self.stats.write().cpu_hits += 1;
+            trace!("CPU cache hit for node {}", node);
+            self.promote_to_gpu(node, features.clone()).await;
+            return Ok(features);
+        }
+
+        // Load from NVMe (cold tier)
+        trace!("Loading node {} from NVMe", node);
+        match self.load_from_nvme(node).await {
+            Ok(features) => {
+                self.stats.write().nvme_hits += 1;
+                self.promote_to_cpu(node, features.clone()).await;
+                Ok(features)
+            }
+            Err(e) => {
+                self.stats.write().misses += 1;
+                Err(e).with_context(|| format!("failed to load features for node {}", node))
+            }
+        }
+    }
+
+    /// Get features for multiple nodes in batch (more efficient)
+    pub async fn get_batch(&self, nodes: &[NodeId]) -> Result<Vec<FeatureVector>> {
+        trace!("Batch fetching {} node features", nodes.len());
+
+        let tasks: Vec<_> = nodes
+            .iter()
+            .map(|&node| {
+                let cache = self.clone_arc();
+                tokio::spawn(async move { cache.get(node).await })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(nodes.len());
+        for task in tasks {
+            results.push(task.await.context("task panicked")??);
+        }
+
+        Ok(results)
+    }
+
+    /// Insert features for a node into the cache
+    pub async fn insert(&self, node: NodeId, features: FeatureVector) -> Result<()> {
+        self.promote_to_gpu(node, features.clone()).await;
+        self.save_to_nvme(node, &features).await?;
+        Ok(())
+    }
+
+    /// Promote features to GPU cache (with eviction if needed)
+    async fn promote_to_gpu(&self, node: NodeId, features: FeatureVector) {
+        let evicted = {
+            let mut gpu = self.gpu_cache.write();
+            gpu.insert(node, features)
+        };
+
+        if let Some((evicted_node, evicted_features)) = evicted {
+            self.stats.write().evictions += 1;
+            trace!("Evicting node {} from GPU to CPU", evicted_node);
+            self.promote_to_cpu(evicted_node, evicted_features).await;
+        }
+    }
+
+    /// Promote features to CPU cache (with eviction if needed)
+    async fn promote_to_cpu(&self, node: NodeId, features: FeatureVector) {
+        let evicted = {
+            let mut cpu = self.cpu_cache.write();
+            cpu.insert(node, features)
+        };
+
+        if let Some((evicted_node, evicted_features)) = evicted {
+            self.stats.write().evictions += 1;
+            trace!("Evicting node {} from CPU to NVMe", evicted_node);
+            if let Err(e) = self.save_to_nvme(evicted_node, &evicted_features).await {
+                warn!("Failed to save evicted features to NVMe: {}", e);
+            }
+        }
+    }
+
+    /// Load features from NVMe storage
+    async fn load_from_nvme(&self, node: NodeId) -> Result<FeatureVector> {
+        let path = self.nvme_feature_path(node);
+
+        let mut file = File::open(&path)
+            .await
+            .with_context(|| format!("failed to open NVMe feature file: {}", path.display()))?;
+
+        let expected_bytes = self.config.feature_dim * std::mem::size_of::<f32>();
+        let mut buffer = vec![0u8; expected_bytes];
+
+        file.read_exact(&mut buffer)
+            .await
+            .context("failed to read features from NVMe")?;
+
+        let features: Vec<f32> = buffer
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        Ok(features)
+    }
+
+    /// Save features to NVMe storage
+    async fn save_to_nvme(&self, node: NodeId, features: &[f32]) -> Result<()> {
+        let path = self.nvme_feature_path(node);
+
+        let mut file = File::create(&path)
+            .await
+            .with_context(|| format!("failed to create NVMe feature file: {}", path.display()))?;
+
+        let bytes: Vec<u8> = features.iter().flat_map(|&f| f.to_le_bytes()).collect();
+
+        file.write_all(&bytes)
+            .await
+            .context("failed to write features to NVMe")?;
+
+        file.sync_all().await.context("failed to sync NVMe file")?;
+
+        Ok(())
+    }
+
+    /// Get NVMe path for a node's features
+    fn nvme_feature_path(&self, node: NodeId) -> PathBuf {
+        self.nvme_path.join(format!("node_{}.bin", node))
+    }
+
+    /// Get cache statistics
+    pub fn stats(&self) -> CacheStats {
+        self.stats.read().clone()
+    }
+
+    /// Helper to clone Arc references for async tasks
+    fn clone_arc(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            nvme_path: self.nvme_path.clone(),
+            gpu_cache: Arc::clone(&self.gpu_cache),
+            cpu_cache: Arc::clone(&self.cpu_cache),
+            stats: Arc::clone(&self.stats),
+        }
+    }
+
+    /// Print cache statistics
+    pub fn print_stats(&self) {
+        let stats = self.stats();
+        let total_requests = stats.gpu_hits + stats.cpu_hits + stats.nvme_hits + stats.misses;
+
+        if total_requests == 0 {
+            debug!("No cache requests yet");
+            return;
+        }
+
+        let gpu_hit_rate = (stats.gpu_hits as f64 / total_requests as f64) * 100.0;
+        let cpu_hit_rate = (stats.cpu_hits as f64 / total_requests as f64) * 100.0;
+        let nvme_hit_rate = (stats.nvme_hits as f64 / total_requests as f64) * 100.0;
+
+        debug!("Feature Cache Statistics:");
+        debug!("  Total requests: {}", total_requests);
+        debug!("  GPU hits:  {} ({:.2}%)", stats.gpu_hits, gpu_hit_rate);
+        debug!("  CPU hits:  {} ({:.2}%)", stats.cpu_hits, cpu_hit_rate);
+        debug!("  NVMe hits: {} ({:.2}%)", stats.nvme_hits, nvme_hit_rate);
+        debug!(
+            "  Misses:    {} ({:.2}%)",
+            stats.misses,
+            (stats.misses as f64 / total_requests as f64) * 100.0
+        );
+        debug!("  Evictions: {}", stats.evictions);
+        debug!("  Pinned hits: {}", stats.pinned_hits);
+
+        let gpu_cache = self.gpu_cache.read();
+        let cpu_cache = self.cpu_cache.read();
+        debug!(
+            "  GPU cache size: {} / {}",
+            gpu_cache.len(),
+            self.config.gpu_capacity
+        );
+        debug!(
+            "  CPU cache size: {} / {}",
+            cpu_cache.len(),
+            self.config.cpu_capacity
+        );
+    }
+}
+
+/// Run one epoch of sampling to count node access frequencies.
+/// Returns a map from `NodeId` to access count across all batches.
+pub fn count_node_frequencies(
+    graph: &Graph,
+    config: &SamplingConfig,
+    epoch_seeds: &[Vec<NodeId>],
+) -> AHashMap<NodeId, u32> {
+    let mut sampler = NeighborSampler::new(graph, config.clone());
+    let mut freq: AHashMap<NodeId, u32> = AHashMap::new();
+
+    for seeds in epoch_seeds {
+        let subgraph = sampler.sample_neighbors(seeds);
+        for &node in &subgraph.nodes {
+            *freq.entry(node).or_insert(0) += 1;
+        }
+    }
+
+    freq
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_feature_cache_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = FeatureCacheConfig {
+            gpu_capacity: 2,
+            cpu_capacity: 5,
+            feature_dim: 4,
+            nvme_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let cache = FeatureCache::new(config).await.unwrap();
+
+        let features = vec![1.0, 2.0, 3.0, 4.0];
+        cache.insert(0, features.clone()).await.unwrap();
+
+        let retrieved = cache.get(0).await.unwrap();
+        assert_eq!(retrieved, features);
+
+        let stats = cache.stats();
+        assert_eq!(stats.gpu_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = FeatureCacheConfig {
+            gpu_capacity: 2,
+            cpu_capacity: 5,
+            feature_dim: 4,
+            nvme_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let cache = FeatureCache::new(config).await.unwrap();
+
+        for i in 0..3 {
+            let features = vec![i as f32; 4];
+            cache.insert(i, features).await.unwrap();
+        }
+
+        let retrieved = cache.get(0).await.unwrap();
+        assert_eq!(retrieved, vec![0.0; 4]);
+
+        let stats = cache.stats();
+        assert!(stats.cpu_hits > 0 || stats.nvme_hits > 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = FeatureCacheConfig {
+            gpu_capacity: 10,
+            cpu_capacity: 20,
+            feature_dim: 4,
+            nvme_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let cache = FeatureCache::new(config).await.unwrap();
+
+        for i in 0..5 {
+            let features = vec![i as f32; 4];
+            cache.insert(i, features).await.unwrap();
+        }
+
+        let nodes = vec![0, 1, 2, 3, 4];
+        let batch = cache.get_batch(&nodes).await.unwrap();
+
+        assert_eq!(batch.len(), 5);
+        for (i, features) in batch.iter().enumerate() {
+            assert_eq!(features[0], i as f32);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pinned_nodes_not_evicted() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut warmup = AHashMap::new();
+        warmup.insert(0_u32, 100); // node 0 is very hot
+        warmup.insert(1, 1);       // node 1 is cold
+
+        let config = FeatureCacheConfig {
+            gpu_capacity: 2,
+            cpu_capacity: 5,
+            feature_dim: 4,
+            nvme_path: Some(dir.path().to_path_buf()),
+            warmup_frequencies: Some(Arc::new(warmup)),
+            pin_ratio: 0.5, // pin 1 of 2 GPU slots
+        };
+
+        let cache = FeatureCache::new(config).await.unwrap();
+
+        // Insert node 0 (pinned) and node 1
+        cache.insert(0, vec![0.0; 4]).await.unwrap();
+        cache.insert(1, vec![1.0; 4]).await.unwrap();
+
+        // Insert node 2 -- should evict node 1 (cold, unpinned), not node 0 (pinned)
+        cache.insert(2, vec![2.0; 4]).await.unwrap();
+
+        // Node 0 should still be in GPU
+        let retrieved = cache.get(0).await.unwrap();
+        assert_eq!(retrieved, vec![0.0; 4]);
+
+        let stats = cache.stats();
+        assert_eq!(stats.gpu_hits, 1); // node 0 hit in GPU, not demoted
+    }
+
+    #[tokio::test]
+    async fn test_pinned_hits_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut warmup = AHashMap::new();
+        warmup.insert(0_u32, 100);
+
+        let config = FeatureCacheConfig {
+            gpu_capacity: 5,
+            cpu_capacity: 5,
+            feature_dim: 4,
+            nvme_path: Some(dir.path().to_path_buf()),
+            warmup_frequencies: Some(Arc::new(warmup)),
+            pin_ratio: 1.0,
+        };
+
+        let cache = FeatureCache::new(config).await.unwrap();
+        cache.insert(0, vec![0.0; 4]).await.unwrap();
+
+        // Access pinned node
+        let _ = cache.get(0).await.unwrap();
+        let _ = cache.get(0).await.unwrap();
+
+        let stats = cache.stats();
+        assert_eq!(stats.pinned_hits, 2);
+    }
+}

@@ -1,0 +1,63 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+.Python
+env/
+venv/
+ENV/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Documentation
+/doc/
+*.html
+*.pdf
+
+# Benchmarks
+/benches/results/
+
+# Test artifacts
+*.profdata
+*.profraw
+
+# Generated graph binaries (keep test_data/)
+*.bin
+!test_data/*.bin
+
+# Local configuration
+.env
+.env.local
+config.local.*

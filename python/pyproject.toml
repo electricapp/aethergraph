@@ -1,0 +1,104 @@
+[project]
+name = "aethergraph"
+version = "0.1.0"
+description = "High-performance graph sampling for GNN training with Ray Data integration"
+authors = [{name = "electricapp"}]
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT OR Apache-2.0"}
+keywords = ["graph", "gnn", "deep-learning", "ray", "pytorch", "graph-neural-networks"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "numpy>=2.2.6",
+    "rich>=14.2.0",
+    "typer>=0.9",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+ray = ["ray[data]>=2.9"]
+pytorch-geometric = ["torch-geometric>=2.4", "torch>=2.0"]
+otel = [
+    "opentelemetry-api>=1.41.0",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
+]
+all = ["torch>=2.0", "ray[data]>=2.9", "torch-geometric>=2.4"]
+
+[project.scripts]
+aethergraph = "aethergraph.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/electricapp/aethergraph"
+Repository = "https://github.com/electricapp/aethergraph"
+Documentation = "https://github.com/electricapp/aethergraph#readme"
+
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+# Forward through our crate's `extension-module` feature rather than pyo3's
+# directly; that keeps `cargo test` able to link libpython (so unit tests
+# run) while wheel builds still skip libpython linking.
+features = ["extension-module"]
+python-source = "."
+module-name = "aethergraph._core"
+manifest-path = "../crates/aethergraph-py/Cargo.toml"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    # Upstream issues - cannot fix from our code:
+    # PyG imports deprecated torch_geometric.distributed internally
+    "ignore:.*torch_geometric.distributed.*:DeprecationWarning",
+    # Ray DataContext uses deprecated config names internally
+    "ignore:.*use_push_based_shuffle.*:DeprecationWarning",
+    "ignore:.*use_polars.*:DeprecationWarning",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+namespace_packages = true
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.151.13",
+    "maturin>=1.10.2",
+    "mypy>=1.19.1",
+    "opentelemetry-api>=1.41.0",
+    "opentelemetry-exporter-otlp>=1.39.1",
+    "opentelemetry-sdk>=1.39.1",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.14.10",
+]
+test = [
+    "torch>=2.9.1",
+    "torch-geometric>=2.7.0",
+    "ray[data]>=2.53.0",
+]

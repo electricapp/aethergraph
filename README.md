@@ -1,0 +1,365 @@
+```
+█████╗ ███████╗████████╗██╗  ██╗███████╗██████╗  ██████╗ ██████╗  █████╗ ██████╗ ██╗  ██╗
+██╔══██╗██╔════╝╚══██╔══╝██║  ██║██╔════╝██╔══██╗██╔════╝ ██╔══██╗██╔══██╗██╔══██╗██║  ██║
+███████║█████╗     ██║   ███████║█████╗  ██████╔╝██║  ███╗██████╔╝███████║██████╔╝███████║
+██╔══██║██╔══╝     ██║   ██╔══██║██╔══╝  ██╔══██╗██║   ██║██╔══██╗██╔══██║██╔═══╝ ██╔══██║
+██║  ██║███████╗   ██║   ██║  ██║███████╗██║  ██║╚██████╔╝██║  ██║██║  ██║██║     ██║  ██║
+╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝
+```
+
+**Rust core + Python bindings.** High-performance graph sampling and real-time feature serving for GNN training on billion-scale evolving graphs.
+
+> *"Because the CSR layout is simply 3 arrays, it scales on a single computer: a CSR matrix can be laid out on a disk instead of in-memory. You simply memory map the 3 arrays and use them on-disk from there.*
+>
+> *With modern NVMe drives random seeks aren't slow anymore, much faster than distributed network calls like you do when scaling the linked list-based graph. **I haven't seen anyone actually implement this yet**, but it's in the roadmap for my implementation at least."*
+>
+> — [VodkaHaze, r/MachineLearning](https://www.reddit.com/r/MachineLearning/comments/kqazpd/d_why_im_lukewarm_on_graph_neural_networks/) (2021)
+
+## Quick Start
+
+```python
+from aethergraph import Graph
+from aethergraph.pytorch import NeighborLoader
+
+# Static graph (CSR, mmap'd from NVMe)
+graph = Graph.load("graph.bin")
+graph.load_features("features.bin")
+
+loader = NeighborLoader(graph, num_neighbors=[15, 10], batch_size=128)
+for batch in loader:
+    out = model(batch.x, batch.edge_index)
+```
+
+```python
+from aethergraph import DynamicGraph
+
+# Live graph (C-tree, lock-free concurrent reads + writes)
+graph = DynamicGraph(num_vertices=2_000_000_000, arena_mb=8192)
+graph.insert_edge(user_id, post_id)  # from Kafka consumer
+# Training reads concurrently — no locks, no stale snapshots
+```
+
+```python
+from aethergraph import HeteroGraph
+from aethergraph.pytorch import HeteroNeighborLoader
+
+# Heterogeneous graph (Reddit: users, posts, comments, subreddits)
+loader = HeteroNeighborLoader(
+    hetero_graph,
+    num_neighbors={
+        ("user", "votes", "post"): [15, 10],
+        ("user", "writes", "comment"): [10, 5],
+        ("post", "belongs_to", "subreddit"): [3, 2],
+    },
+    input_nodes=("user", train_user_ids),
+    batch_size=128,
+)
+for batch in loader:  # yields PyG HeteroData
+    user_x = batch["user"].x
+    edge_index = batch["user", "votes", "post"].edge_index
+```
+
+## Why AetherGraph?
+
+Traditional GNN frameworks load entire graphs into GPU memory, hitting the VRAM wall at ~40M nodes. AetherGraph keeps topology on disk and streams neighborhoods via memory-mapping + `io_uring`, enabling 100B+ edge graphs on commodity hardware.
+
+|                    | PyTorch Geometric    | AetherGraph                  |
+|--------------------|----------------------|------------------------------|
+| Max graph size     | ~40M nodes (VRAM)    | 2B+ nodes (NVMe)             |
+| Graph updates      | Full rebuild         | O(1) lock-free edge insert   |
+| Feature loading    | All in RAM           | Streamed on-demand           |
+| Feature serving    | N/A                  | GPUDirect RDMA (<5us)        |
+| Hetero graphs      | Python-level looping | Rust-native typed sampling   |
+| Startup time       | Minutes (load all)   | Instant (mmap)               |
+| Sampling (1M nodes)| 341 us/batch         | 240 us/batch (1.4x faster)   |
+
+**How it works:**
+- **Static CSR**: Graph stored as 3 arrays (offsets, destinations, weights) — O(1) neighbor lookup, mmap'd from NVMe
+- **Dynamic C-tree**: Lock-free balanced tree of cache-line-sized chunks — O(1) edge insert, concurrent reads, functional persistence for snapshot isolation
+- **io_uring (Linux)**: Batched async NVMe reads, ~10us per random access
+- **AF_XDP + RDMA**: Kernel-bypass ingestion and GPUDirect feature serving
+- **Rust core**: Zero-copy data pipeline from disk to PyTorch tensors
+
+## Crates
+
+| Crate              | Purpose                                                                    |
+|--------------------|----------------------------------------------------------------------------|
+| `aethergraph-core` | Static CSR graph, homogeneous + heterogeneous sampling, feature store      |
+| `aethergraph-cli`  | CLI tools (convert, info, stats)                                           |
+| `aethergraph-py`   | PyO3 Python bindings                                                       |
+| `aether-graph`     | Dynamic graph with C-tree neighbor lists, lock-free concurrent reads       |
+| `aether-mem`       | Lock-free slab allocator with HugePages and pluggable memory hooks         |
+| `aether-stream`    | Kernel-bypass streaming: AF_XDP ingestion, seqlock feature table, RDMA     |
+
+## Three Graph Modes
+
+### 1. Static Graph (CSR) — `Graph`
+
+For graphs that don't change during training. Memory-mapped from NVMe, instant startup.
+
+```python
+graph = Graph.load("reddit_2B.bin")  # instant, no loading
+loader = NeighborLoader(graph, num_neighbors=[15, 10], batch_size=128)
+```
+
+### 2. Dynamic Graph (C-tree) — `DynamicGraph`
+
+For graphs that evolve during training. Lock-free concurrent reads and writes. Edges arrive from Kafka/Flink while training reads neighborhoods.
+
+```python
+graph = DynamicGraph(num_vertices=2_000_000_000, arena_mb=8192)
+
+# Writer thread (Kafka consumer)
+for edge in kafka_stream:
+    graph.insert_edge(edge.src, edge.dst)
+
+# Reader thread (training, concurrent)
+neighbors = graph.neighbors(node_id)  # lock-free, consistent snapshot
+```
+
+### 3. Heterogeneous Graph — `HeteroGraph`
+
+For multi-relational graphs (users, posts, comments, subreddits). Typed k-hop sampling with per-edge-type fanout. Drop-in replacement for PyG's HeteroData NeighborLoader.
+
+```python
+loader = HeteroNeighborLoader(
+    hetero_graph,
+    num_neighbors={("user", "votes", "post"): [15, 10], ...},
+    input_nodes=("user", train_ids),
+    batch_size=128,
+)
+```
+
+## Live Features via RDMA
+
+For real-time models (fraud detection, feed ranking), features change with every user interaction. AetherGraph serves live features directly into GPU memory via GPUDirect RDMA, bypassing CPU entirely.
+
+```
+NIC (AF_XDP)                  GPU Node
+    │                             │
+    ▼                             │
+Ingestion Loop                    │
+(busy-poll, per-queue thread)     │
+    │                             │
+    ▼                             │
+FeatureTable                      │
+(seqlock, HugePage RAM)           │
+    │                             │
+    ├── TCP Control Plane ──────► Discover base_addr + rkey
+    │                             │
+    └── RDMA READ ◄───────────── GPUDirect (NIC → PCIe → VRAM)
+                                  │
+                                  ▼
+                            GPU Kernel
+                        (validate + compact)
+                                  │
+                                  ▼
+                          [batch, feature_dim]
+                            output tensor
+```
+
+```python
+# One config change — features arrive via RDMA instead of from disk
+loader = NeighborLoader(
+    graph, num_neighbors=[15, 10], batch_size=128,
+    feature_source="rdma://10.0.0.1:9999",
+)
+for batch in loader:
+    batch.x  # CUDA tensor, arrived via GPUDirect RDMA in <5us
+```
+
+## Installation
+
+```bash
+pip install aethergraph
+```
+
+For PyTorch Geometric integration:
+```bash
+pip install aethergraph[pytorch-geometric]
+```
+
+## Ray Data (Distributed Training)
+
+Replicated Topology: graph on each worker's NVMe, only gradients cross the network.
+
+```
+Traditional:  Worker 1 ←── graph edges ──→ Worker 2   # Terabytes over network
+AetherGraph:  Worker 1 ←── gradients ──→ Worker 2     # Megabytes over network
+                  │                          │
+                NVMe                       NVMe        # Graph is local
+```
+
+```python
+import ray
+from aethergraph.ray import create_sampling_dataset, collate_to_pyg
+
+ray.init()
+dataset = create_sampling_dataset(graph_path="graph.bin", num_neighbors=[25, 10], batch_size=1024)
+for batch in dataset.iter_batches(batch_format="pyarrow"):
+    data = collate_to_pyg(batch)
+    out = model(data.x, data.edge_index)
+```
+
+## API Reference
+
+### Graph (Static CSR)
+
+```python
+from aethergraph import Graph
+
+graph = Graph.load("graph.bin")            # mmap, instant startup
+graph = Graph.from_edges(num_nodes, src, dst)
+graph.save("graph.bin")
+graph.load_features("features.bin")
+graph.num_nodes  # int
+graph.num_edges  # int
+```
+
+### DynamicGraph (C-tree)
+
+```python
+from aethergraph import DynamicGraph
+
+graph = DynamicGraph(num_vertices=2_000_000_000, arena_mb=8192)
+graph.insert_edge(src, dst)                # O(1), lock-free for readers
+graph.insert_edges(src_array, dst_array)   # batch insert from numpy
+graph.neighbors(node)                      # sorted numpy array
+graph.degree(node)                         # O(1)
+graph.has_edge(src, dst)                   # O(log degree)
+```
+
+### NeighborLoader (Homogeneous)
+
+```python
+from aethergraph.pytorch import NeighborLoader
+
+loader = NeighborLoader(
+    graph,
+    num_neighbors=[15, 10],
+    batch_size=128,
+    input_nodes=train_idx,
+    shuffle=True,
+)
+
+for batch in loader:
+    batch.x                  # [num_nodes, feat_dim] node features
+    batch.edge_index         # [2, num_edges] COO edges
+    batch.n_id               # [num_nodes] original node IDs
+    batch.batch_size         # number of seed nodes
+    batch.input_id           # seed indices in batch
+    batch.num_sampled_nodes  # nodes per hop [num_hops]
+    batch.num_sampled_edges  # edges per hop [num_hops]
+```
+
+### HeteroNeighborLoader (Heterogeneous)
+
+```python
+from aethergraph.pytorch import HeteroNeighborLoader
+
+loader = HeteroNeighborLoader(
+    hetero_graph,
+    num_neighbors={
+        ("user", "votes", "post"): [15, 10],
+        ("user", "writes", "comment"): [10, 5],
+    },
+    input_nodes=("user", train_user_ids),
+    batch_size=128,
+)
+
+for batch in loader:  # yields PyG HeteroData
+    batch["user"].x
+    batch["user", "votes", "post"].edge_index
+```
+
+### Differences from PyTorch Geometric
+
+AetherGraph is a **high-performance replacement** for PyG's data loading pipeline.
+
+**Supported (homogeneous + heterogeneous):**
+- `num_neighbors` (list or per-edge-type dict)
+- `input_nodes` (Tensor, array, list, or `(node_type, Tensor)` for hetero)
+- `batch_size`, `shuffle`, `replace`, `transform`
+- `pin_memory`, `prefetch_factor`
+- Weighted sampling (`weighted=True`, uses edge weights)
+- Temporal sampling (`input_time`, `temporal_strategy="uniform"|"last"`)
+- Disjoint subgraphs (`disjoint=True`, per-seed isolation with `batch` vector)
+- Custom samplers (`neighbor_sampler=callable` to bypass Rust backend)
+- Yields standard PyG `Data` / `HeteroData` objects
+
+**Unique to AetherGraph:**
+- Live graph updates via `DynamicGraph` (C-tree, concurrent R/W)
+- `feature_source="rdma://..."` for GPUDirect RDMA live features
+- mmap'd CSR for instant startup on billion-node graphs
+- io_uring feature loading at NVMe line rate
+- 1.2-1.5x faster sampling than PyG's pyg-lib C++ kernel
+
+## CLI
+
+```bash
+aethergraph convert -i edges.csv -o graph.bin -n 1000000
+aethergraph info graph.bin
+aethergraph stats graph.bin
+```
+
+## Architecture
+
+```
+                     ┌───────────────────────────────────────┐
+                     │             Python API                │
+                     │  Graph, DynamicGraph, HeteroGraph     │
+                     │  NeighborLoader, HeteroNeighborLoader │
+                     └──────────────────┬────────────────────┘
+                                        │ PyO3
+              ┌─────────────────────────┼─────────────────────────┐
+              │                         │                         │
+   ┌──────────▼──────────┐   ┌──────────▼──────────┐   ┌──────────▼──────────┐
+   │   aethergraph-core  │   │    aether-graph     │   │   aether-stream     │
+   │  Static CSR graph   │   │  Dynamic C-tree     │   │  AF_XDP ingestion   │
+   │  Homo + hetero      │   │  Lock-free R/W      │   │  Seqlock features   │
+   │  sampling           │   │  Arena bump-alloc   │   │  RDMA + GPUDirect   │
+   │  mmap, io_uring     │   │  Snapshot isolation │   │  DLPack → PyTorch   │
+   └─────────────────────┘   └─────────────────────┘   └─────────────────────┘
+              │
+   ┌──────────▼──────────┐
+   │     aether-mem      │
+   │  HugePages, mlock   │
+   │  RDMA/CUDA hooks    │
+   └─────────────────────┘
+```
+
+See [ARCH.md](ARCH.md) for detailed component documentation.
+
+## Benchmarks
+
+Measured on Apple M-series, Python 3.12, PyG 2.6.1 with pyg-lib.
+
+### Sampling (2-hop, fanout [15, 10], batch_size=128)
+
+| Scale       | AetherGraph | PyG (pyg-lib C++) | Speedup |
+|-------------|-------------|-------------------|---------|
+| 10K nodes   | 170 us      | 210 us            | 1.23x   |
+| 100K nodes  | 185 us      | 218 us            | 1.18x   |
+| 1M nodes    | 240 us      | 341 us            | 1.43x   |
+| 10M nodes   | 302 us      | 358 us            | 1.17x   |
+
+### Dynamic Graph (C-tree, 100K nodes / 1M edges)
+
+| Operation       | Latency | Throughput      |
+|-----------------|---------|-----------------|
+| Edge insert     | 111 ns  | 9M inserts/sec  |
+| Neighbor read   | 26 ns   | 38M reads/sec   |
+| Edge lookup     | 16 ns   | 63M lookups/sec |
+| Degree query    | 3.4 ns  | 294M queries/sec|
+
+### Heterogeneous Sampling (4 edge types, 2-hop, batch=128)
+
+| Operation                     | Latency |
+|-------------------------------|---------|
+| Typed multi-hop sampling      | 130 us  |
+| Edge index local remapping    | 3 us    |
+| Full Python roundtrip         | 130 us  |
+
+## License
+
+MIT OR Apache-2.0

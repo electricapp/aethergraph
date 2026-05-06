@@ -1,0 +1,60 @@
+[package]
+name = "aethergraph-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+io-uring = []
+gds = []
+parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
+
+[dependencies]
+memmap2.workspace = true
+bytemuck.workspace = true
+rayon.workspace = true
+postcard.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+wide.workspace = true
+rand.workspace = true
+rustc-hash.workspace = true
+ahash.workspace = true
+tracing.workspace = true
+crossbeam-channel.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+futures.workspace = true
+ndarray.workspace = true
+half.workspace = true
+libc = "0.2"
+bitflags = "2.11"
+parquet = { version = "58", optional = true, default-features = false, features = ["arrow"] }
+arrow-array = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = "0.5"
+io-uring = "0.7"
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "graph_benchmarks"
+harness = false
+
+[[bench]]
+name = "async_io_benchmark"
+harness = false
+
+[[bench]]
+name = "sync_scalability"
+harness = false
+
+[[bench]]
+name = "hetero_benchmarks"
+harness = false
