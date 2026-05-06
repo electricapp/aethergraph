@@ -87,7 +87,7 @@ namespace_packages = true
 
 [dependency-groups]
 dev = [
-    "hypothesis>=6.151.13",
+    "hypothesis>=6.152.4",
     "maturin>=1.10.2",
     "mypy>=1.19.1",
     "opentelemetry-api>=1.41.0",
