@@ -47,7 +47,7 @@ rustc-hash = "2.1"  # Faster hashing than std HashMap
 ahash = "0.8"       # Alternative fast hasher
 
 # SIMD
-wide = "1.3"
+wide = "1.4"
 
 # Lock-free channels for prefetching
 crossbeam-channel = "0.5"
