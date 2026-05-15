@@ -148,8 +148,7 @@ impl XdpSocket {
             mmap_ring::<UmemDesc>(fd.as_raw_fd(), &offsets.fr, ring_size, XDP_PGOFF_FILL_RING)?
         };
         // SAFETY: fill_mmap.ptr is a valid mmap region for the fill ring.
-        let fill =
-            unsafe { XdpRing::<UmemDesc>::from_mmap(fill_mmap.ptr, &offsets.fr, ring_size) };
+        let fill = unsafe { XdpRing::<UmemDesc>::from_mmap(fill_mmap.ptr, &offsets.fr, ring_size) };
         ring_mmaps.push(fill_mmap);
 
         // SAFETY: `fd` is the AF_XDP socket; `offsets` came from getsockopt above.

@@ -349,9 +349,9 @@ impl Graph {
             return 0;
         }
         let offsets = self.offsets_slice();
-        // Safe indexing: bounds are verified by construction (offsets.len() == num_nodes + 1),
-        // but we use safe indexing to catch any invariant violations.
-        (offsets[idx + 1] - offsets[idx]) as usize
+        // saturating_sub guards against non-monotonic offsets that slipped past
+        // HeaderOnly validation — without it the fuzz target trips a panic.
+        (offsets[idx + 1].saturating_sub(offsets[idx])) as usize
     }
 
     /// Returns the neighbor IDs for a given node as a slice.
