@@ -80,12 +80,16 @@ jobs:
           cargo clippy --workspace --all-targets --no-deps \
             --features "${{ matrix.features }}" -- -D warnings
 
-      - name: xdp_bpf compile check
+      - name: Install ubuntu system deps
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libbpf-dev pkg-config
-          cargo check -p aether-stream --tests --features xdp_bpf
+          sudo apt-get install -y --no-install-recommends \
+            clang libbpf-dev pkg-config libibverbs-dev libnuma-dev
+
+      - name: xdp_bpf compile check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check -p aether-stream --tests --features xdp_bpf
 
       - name: cargo test --lib
         run: |
@@ -252,12 +256,13 @@ jobs:
         with:
           key: python-${{ matrix.os }}
       - name: Sync test deps
-        # --no-install-project: uv 0.11+ build isolation can drop cargo off PATH; build separately.
+        # uv 0.11+ build isolation drops cargo off PATH; install deps without
+        # the project, then build the wheel without re-syncing.
         working-directory: python
-        run: uv sync --group test --no-install-project
+        run: uv sync --group test --group dev --no-install-project
       - name: Build extension
         working-directory: python
-        run: uv run maturin develop --release
+        run: uv run --no-sync maturin develop --release
       - name: Run pytest
         working-directory: python
         run: uv run pytest tests/ -v --tb=short
