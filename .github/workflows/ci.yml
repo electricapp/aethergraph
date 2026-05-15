@@ -115,8 +115,10 @@ jobs:
         run: cargo check --workspace --benches
 
       - name: bench smoke
+        # Exclude aethergraph-py: its `_core` cdylib has no criterion benches
+        # and rejects `--quick` from the default test harness.
         if: matrix.label == 'ubuntu-stable-default'
-        run: cargo bench --workspace --no-fail-fast -- --quick --noplot
+        run: cargo bench --workspace --exclude aethergraph-py --no-fail-fast -- --quick --noplot
 
       - name: Coverage summary
         if: always()
