@@ -35,7 +35,6 @@ use aya::maps::XskMap;
 use aya::programs::{Xdp, XdpFlags};
 use crossbeam_channel::bounded;
 use std::ffi::CString;
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
