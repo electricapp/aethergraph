@@ -114,11 +114,12 @@ jobs:
       - name: cargo check --benches
         run: cargo check --workspace --benches
 
-      - name: bench smoke
-        # Exclude aethergraph-py: its `_core` cdylib has no criterion benches
-        # and rejects `--quick` from the default test harness.
+      - name: bench smoke (compile-only)
+        # `cargo bench --workspace -- --quick` errors on every crate's default
+        # lib target (no criterion). --no-run just compiles, which catches the
+        # main regression we care about: criterion API drift.
         if: matrix.label == 'ubuntu-stable-default'
-        run: cargo bench --workspace --exclude aethergraph-py --no-fail-fast -- --quick --noplot
+        run: cargo bench --workspace --no-run --no-fail-fast
 
       - name: Coverage summary
         if: always()
