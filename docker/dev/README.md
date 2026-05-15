@@ -38,11 +38,3 @@ Docker Desktop on macOS / Windows does **not** expose an RDMA fabric to
 containers — Mac users can build with `--features rdma` (verifies the link
 graph) but cannot run the gated tests. CI's `rdma-hardware` job uses a
 self-hosted Linux runner for that.
-
-## Why a container?
-
-`aether-stream`'s `Cargo.toml` gates every dep with
-`[target.'cfg(target_os = "linux")'.dependencies]`. On macOS the crate compiles
-to an empty shell, and 41 tests across 11 files become invisible to
-`cargo test`. The container restores that visibility without needing a remote
-dev box.

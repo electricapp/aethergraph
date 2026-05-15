@@ -212,33 +212,31 @@ mod tests {
     fn arena_full_returns_none() {
         let arena = Arena::new(128);
         // SAFETY: test is single-threaded.
-        unsafe {
-            let _ = arena.alloc(64, 64).unwrap();
-            let _ = arena.alloc(64, 64).unwrap();
-            assert!(arena.alloc(64, 64).is_none());
-        }
+        let _ = unsafe { arena.alloc(64, 64) }.unwrap();
+        // SAFETY: test is single-threaded.
+        let _ = unsafe { arena.alloc(64, 64) }.unwrap();
+        // SAFETY: test is single-threaded.
+        assert!(unsafe { arena.alloc(64, 64) }.is_none());
     }
 
     #[test]
     fn alignment() {
         let arena = Arena::new(4096);
         // SAFETY: test is single-threaded.
-        unsafe {
-            let _ = arena.alloc(1, 1).unwrap();
-            let off = arena.alloc(64, 64).unwrap();
-            assert_eq!(off % 64, 0);
-        }
+        let _ = unsafe { arena.alloc(1, 1) }.unwrap();
+        // SAFETY: test is single-threaded.
+        let off = unsafe { arena.alloc(64, 64) }.unwrap();
+        assert_eq!(off % 64, 0);
     }
 
     #[test]
     fn reset() {
         let arena = Arena::new(4096);
         // SAFETY: test is single-threaded.
-        unsafe {
-            let _ = arena.alloc(64, 64).unwrap();
-            assert_eq!(arena.used(), 64);
-            arena.reset();
-        }
+        let _ = unsafe { arena.alloc(64, 64) }.unwrap();
+        assert_eq!(arena.used(), 64);
+        // SAFETY: test is single-threaded.
+        unsafe { arena.reset() };
         assert_eq!(arena.used(), 0);
     }
 

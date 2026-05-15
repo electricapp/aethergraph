@@ -369,10 +369,8 @@ mod tests {
         let arena = make_arena();
         let tree = insert_assert(CTree::empty(), &arena, 42);
         // SAFETY: test is single-threaded.
-        assert!(matches!(
-            unsafe { tree.insert(&arena, 42) },
-            InsertResult::Duplicate
-        ));
+        let result = unsafe { tree.insert(&arena, 42) };
+        assert!(matches!(result, InsertResult::Duplicate));
     }
 
     #[test]

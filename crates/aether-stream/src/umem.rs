@@ -47,7 +47,8 @@ impl Umem {
         let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook)];
         hooks.extend(extra_hooks);
 
-        let ring = SharedMemoryRing::new(frame_count, frame_size as usize, hooks)?;
+        let (ring, _hook_failures) =
+            SharedMemoryRing::new(frame_count, frame_size as usize, hooks).ok()?;
 
         Some(Self { ring, frame_size })
     }

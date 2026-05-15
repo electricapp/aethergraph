@@ -304,6 +304,7 @@ impl SharedMemoryRing {
     /// Try to allocate using huge pages (Linux only).
     /// Returns `Err(hooks)` on failure so they can be reused by the fallback path.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::type_complexity)]
     fn try_alloc_huge(
         slot_count: usize,
         slot_size: usize,

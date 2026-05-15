@@ -7,10 +7,6 @@
 //!
 //! Run with:
 //!     cargo +nightly miri test -p aether-graph --test miri_smoke
-//!
-//! TODO(ci): wire `cargo miri test` into the workflow once the runners have
-//! a nightly toolchain pinned. The test itself is miri-clean as of today; the
-//! gap is purely the CI step.
 
 use aether_graph::{Arena, CTree, Chunk, DynamicGraph, InsertResult};
 
@@ -18,24 +14,23 @@ use aether_graph::{Arena, CTree, Chunk, DynamicGraph, InsertResult};
 fn arena_alloc_write_read_roundtrip() {
     let arena = Arena::new(4096);
     // SAFETY: single-threaded test.
-    unsafe {
-        let off = arena.alloc_write::<u64>(0x1234_5678_9abc_def0).unwrap();
-        let read: &u64 = arena.get(off);
-        assert_eq!(*read, 0x1234_5678_9abc_def0);
-    }
+    let off = unsafe { arena.alloc_write::<u64>(0x1234_5678_9abc_def0) }.unwrap();
+    // SAFETY: single-threaded test; `off` was just returned by `alloc_write`.
+    let read: &u64 = unsafe { arena.get(off) };
+    assert_eq!(*read, 0x1234_5678_9abc_def0);
 }
 
 #[test]
 fn arena_alignment_holds_across_allocations() {
     let arena = Arena::new(8192);
-    // SAFETY: single-threaded test; alloc requires power-of-two alignment.
-    unsafe {
-        let _ = arena.alloc(1, 1).unwrap();
-        let off = arena.alloc(64, 64).unwrap();
-        assert_eq!(off % 64, 0);
-        let off2 = arena.alloc(128, 128).unwrap();
-        assert_eq!(off2 % 128, 0);
-    }
+    // SAFETY: single-threaded test; alignment is a power of two.
+    let _ = unsafe { arena.alloc(1, 1) }.unwrap();
+    // SAFETY: single-threaded test; alignment is a power of two.
+    let off = unsafe { arena.alloc(64, 64) }.unwrap();
+    assert_eq!(off % 64, 0);
+    // SAFETY: single-threaded test; alignment is a power of two.
+    let off2 = unsafe { arena.alloc(128, 128) }.unwrap();
+    assert_eq!(off2 % 128, 0);
 }
 
 #[test]

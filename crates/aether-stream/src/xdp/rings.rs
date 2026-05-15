@@ -71,10 +71,16 @@ impl<T: Copy> XdpRing<T> {
     /// - `ring_size` must be a power of two
     pub unsafe fn from_mmap(base: *mut u8, offsets: &XdpRingOffset, ring_size: u32) -> Self {
         debug_assert!(ring_size.is_power_of_two());
+        // SAFETY: per the function's safety contract above.
+        let producer = unsafe { base.add(offsets.producer as usize) } as *const AtomicU32;
+        // SAFETY: per the function's safety contract above.
+        let consumer = unsafe { base.add(offsets.consumer as usize) } as *const AtomicU32;
+        // SAFETY: per the function's safety contract above.
+        let ring = unsafe { base.add(offsets.desc as usize) } as *mut T;
         Self {
-            producer: base.add(offsets.producer as usize) as *const AtomicU32,
-            consumer: base.add(offsets.consumer as usize) as *const AtomicU32,
-            ring: base.add(offsets.desc as usize) as *mut T,
+            producer,
+            consumer,
+            ring,
             mask: ring_size - 1,
         }
     }
@@ -94,9 +100,11 @@ impl<T: Copy> XdpRing<T> {
     /// Caller must ensure `offset < available()`.
     #[inline]
     pub unsafe fn peek(&self, offset: u32) -> T {
-        let cons = (*self.consumer).load(Ordering::Acquire);
+        // SAFETY: ring pointers are valid for the ring's lifetime.
+        let cons = unsafe { (*self.consumer).load(Ordering::Acquire) };
         let idx = (cons.wrapping_add(offset)) & self.mask;
-        *self.ring.add(idx as usize)
+        // SAFETY: caller guarantees `offset < available()`, so `idx` is in-bounds.
+        unsafe { *self.ring.add(idx as usize) }
     }
 
     /// Advance the consumer pointer by `count`.
@@ -105,8 +113,10 @@ impl<T: Copy> XdpRing<T> {
     /// Caller must have consumed `count` entries via `peek`.
     #[inline]
     pub unsafe fn advance_consumer(&self, count: u32) {
-        let cons = (*self.consumer).load(Ordering::Relaxed);
-        (*self.consumer).store(cons.wrapping_add(count), Ordering::Release);
+        // SAFETY: ring pointers are valid for the ring's lifetime.
+        let cons = unsafe { (*self.consumer).load(Ordering::Relaxed) };
+        // SAFETY: ring pointers are valid for the ring's lifetime.
+        unsafe { (*self.consumer).store(cons.wrapping_add(count), Ordering::Release) };
     }
 
     /// Number of free slots for production.
@@ -123,9 +133,11 @@ impl<T: Copy> XdpRing<T> {
     /// Caller must ensure `offset < free_slots()`.
     #[inline]
     pub unsafe fn enqueue_at(&self, offset: u32, entry: T) {
-        let prod = (*self.producer).load(Ordering::Relaxed);
+        // SAFETY: ring pointers are valid for the ring's lifetime.
+        let prod = unsafe { (*self.producer).load(Ordering::Relaxed) };
         let idx = (prod.wrapping_add(offset)) & self.mask;
-        *self.ring.add(idx as usize) = entry;
+        // SAFETY: caller guarantees `offset < free_slots()`, so `idx` is in-bounds.
+        unsafe { *self.ring.add(idx as usize) = entry };
     }
 
     /// Advance the producer pointer by `count`.
@@ -134,7 +146,9 @@ impl<T: Copy> XdpRing<T> {
     /// Caller must have written `count` entries via `enqueue_at`.
     #[inline]
     pub unsafe fn advance_producer(&self, count: u32) {
-        let prod = (*self.producer).load(Ordering::Relaxed);
-        (*self.producer).store(prod.wrapping_add(count), Ordering::Release);
+        // SAFETY: ring pointers are valid for the ring's lifetime.
+        let prod = unsafe { (*self.producer).load(Ordering::Relaxed) };
+        // SAFETY: ring pointers are valid for the ring's lifetime.
+        unsafe { (*self.producer).store(prod.wrapping_add(count), Ordering::Release) };
     }
 }

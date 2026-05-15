@@ -15,7 +15,7 @@ crossbeam-utils = "0.8"
 tracing.workspace = true
 # Optional WAL durability — gated behind the `wal` feature so binaries that
 # only want in-memory operation pay no compile / link cost for it.
-crc32fast = { version = "1.4", optional = true }
+crc32fast = { version = "1.5", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"

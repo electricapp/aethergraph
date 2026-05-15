@@ -350,7 +350,7 @@ pub const IBV_WC_SUCCESS: u32 = 0;
 // ---------------------------------------------------------------------------
 
 #[link(name = "ibverbs")]
-extern "C" {
+unsafe extern "C" {
     // Device enumeration
     pub fn ibv_get_device_list(num_devices: *mut i32) -> *mut *mut IbvDevice;
     pub fn ibv_free_device_list(list: *mut *mut IbvDevice);

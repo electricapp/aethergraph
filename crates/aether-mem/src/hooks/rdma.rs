@@ -45,8 +45,9 @@ pub struct IbvMr {
     pub rkey: u32,
 }
 
-// SAFETY: ibv_mr handles are thread-safe after registration
+// SAFETY: ibv_mr handles are thread-safe after registration.
 unsafe impl Send for MrPtr {}
+// SAFETY: ibv_mr handles are thread-safe after registration.
 unsafe impl Sync for MrPtr {}
 
 struct MrPtr(*mut IbvMr);
@@ -76,8 +77,9 @@ pub struct RdmaRegHook {
     mr: Mutex<Option<MrPtr>>,
 }
 
-// SAFETY: Protection domain handles are thread-safe in ibverbs
+// SAFETY: Protection domain handles are thread-safe in ibverbs.
 unsafe impl Send for RdmaRegHook {}
+// SAFETY: Protection domain handles are thread-safe in ibverbs.
 unsafe impl Sync for RdmaRegHook {}
 
 impl RdmaRegHook {

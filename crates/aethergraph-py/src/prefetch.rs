@@ -133,7 +133,7 @@ pub struct PyNeighborLoader {
     // Feature dimension (if loading features)
     feature_dim: Option<usize>,
     // RDMA feature gather (gpudirect path)
-    #[cfg(feature = "gpudirect")]
+    #[cfg(all(target_os = "linux", feature = "gpudirect"))]
     rdma_gather: Option<aether_stream::rdma::gather::RdmaFeatureGather>,
 }
 
@@ -163,7 +163,7 @@ impl PyNeighborLoader {
             inner: Some(inner),
             _graph: graph_arc,
             feature_dim: None,
-            #[cfg(feature = "gpudirect")]
+            #[cfg(all(target_os = "linux", feature = "gpudirect"))]
             rdma_gather: None,
         })
     }
@@ -205,7 +205,7 @@ impl PyNeighborLoader {
             inner: Some(inner),
             _graph: graph_arc,
             feature_dim,
-            #[cfg(feature = "gpudirect")]
+            #[cfg(all(target_os = "linux", feature = "gpudirect"))]
             rdma_gather: None,
         })
     }
@@ -250,7 +250,7 @@ impl PyNeighborLoader {
             inner: Some(inner),
             _graph: Arc::new(Graph::empty()), // Placeholder - graph is file-backed
             feature_dim: None,
-            #[cfg(feature = "gpudirect")]
+            #[cfg(all(target_os = "linux", feature = "gpudirect"))]
             rdma_gather: None,
         })
     }
@@ -404,7 +404,7 @@ impl PyNeighborLoader {
     ///         typical IPv4-mapped GID on Linux; verify with `show_gids`)
     #[staticmethod]
     #[pyo3(signature = (graph, config, server_addr, gpu_id=0, max_batch_nodes=65536, prefetch_depth=2, gid_index=1))]
-    #[cfg(feature = "gpudirect")]
+    #[cfg(all(target_os = "linux", feature = "gpudirect"))]
     fn with_rdma_features(
         graph: &PyCsrGraph,
         config: &PySamplingConfig,
@@ -452,11 +452,11 @@ impl PyNeighborLoader {
     /// managed tensor. Use `torch.from_dlpack(capsule)` in Python.
     ///
     /// Returns None if the prefetcher has been shut down.
-    #[cfg(feature = "gpudirect")]
+    #[cfg(all(target_os = "linux", feature = "gpudirect"))]
     fn next_with_gpu_features(
         &mut self,
         py: Python<'_>,
-    ) -> PyResult<Option<(PySampledSubgraph, PyObject)>> {
+    ) -> PyResult<Option<(PySampledSubgraph, Py<PyAny>)>> {
         let inner = self
             .inner
             .as_ref()

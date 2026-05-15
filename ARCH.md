@@ -358,17 +358,6 @@ version before issuing a multi-source read.
 
 Python: `DynamicGraph.current_epoch` is a `@property` returning `int`.
 
-What this primitive does NOT do today:
-
-- Subsystems other than `DynamicGraph` do not yet bump it.
-- `FeatureStore` is read-only (mmap of an immutable file) — no versioning yet.
-- No "wait for epoch N" primitive — readers either accept the current version or
-  busy-loop.
-
-The point of shipping the primitive now is to establish the type so future work
-(WAL, MVCC feature store, time-travel queries) all join on the same counter
-rather than inventing parallel versioning schemes.
-
 ## Observability
 
 Three independent layers, each used independently.

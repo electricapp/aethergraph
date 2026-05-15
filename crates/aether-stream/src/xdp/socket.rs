@@ -98,11 +98,13 @@ impl XdpSocket {
         }
 
         // 1. Create socket
-        let fd = libc::socket(AF_XDP, libc::SOCK_RAW, 0);
+        // SAFETY: standard socket(2) call; arguments are valid kernel constants.
+        let fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW, 0) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let fd = OwnedFd::from_raw_fd(fd);
+        // SAFETY: socket() just succeeded and we have not consumed `fd`.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
         // 2. Register UMEM
         let umem_reg = XdpUmemReg {
@@ -141,28 +143,43 @@ impl XdpSocket {
         // 5. mmap each ring
         let mut ring_mmaps = Vec::with_capacity(4);
 
-        let fill_mmap =
-            mmap_ring::<UmemDesc>(fd.as_raw_fd(), &offsets.fr, ring_size, XDP_PGOFF_FILL_RING)?;
-        let fill = XdpRing::<UmemDesc>::from_mmap(fill_mmap.ptr, &offsets.fr, ring_size);
+        // SAFETY: `fd` is the AF_XDP socket; `offsets` came from getsockopt above.
+        let fill_mmap = unsafe {
+            mmap_ring::<UmemDesc>(fd.as_raw_fd(), &offsets.fr, ring_size, XDP_PGOFF_FILL_RING)?
+        };
+        // SAFETY: fill_mmap.ptr is a valid mmap region for the fill ring.
+        let fill =
+            unsafe { XdpRing::<UmemDesc>::from_mmap(fill_mmap.ptr, &offsets.fr, ring_size) };
         ring_mmaps.push(fill_mmap);
 
-        let comp_mmap = mmap_ring::<UmemDesc>(
-            fd.as_raw_fd(),
-            &offsets.cr,
-            ring_size,
-            XDP_PGOFF_COMPLETION_RING,
-        )?;
-        let completion = XdpRing::<UmemDesc>::from_mmap(comp_mmap.ptr, &offsets.cr, ring_size);
+        // SAFETY: `fd` is the AF_XDP socket; `offsets` came from getsockopt above.
+        let comp_mmap = unsafe {
+            mmap_ring::<UmemDesc>(
+                fd.as_raw_fd(),
+                &offsets.cr,
+                ring_size,
+                XDP_PGOFF_COMPLETION_RING,
+            )?
+        };
+        // SAFETY: comp_mmap.ptr is a valid mmap region for the completion ring.
+        let completion =
+            unsafe { XdpRing::<UmemDesc>::from_mmap(comp_mmap.ptr, &offsets.cr, ring_size) };
         ring_mmaps.push(comp_mmap);
 
-        let rx_mmap =
-            mmap_ring::<RxTxDesc>(fd.as_raw_fd(), &offsets.rx, ring_size, XDP_PGOFF_RX_RING)?;
-        let rx = XdpRing::<RxTxDesc>::from_mmap(rx_mmap.ptr, &offsets.rx, ring_size);
+        // SAFETY: `fd` is the AF_XDP socket; `offsets` came from getsockopt above.
+        let rx_mmap = unsafe {
+            mmap_ring::<RxTxDesc>(fd.as_raw_fd(), &offsets.rx, ring_size, XDP_PGOFF_RX_RING)?
+        };
+        // SAFETY: rx_mmap.ptr is a valid mmap region for the rx ring.
+        let rx = unsafe { XdpRing::<RxTxDesc>::from_mmap(rx_mmap.ptr, &offsets.rx, ring_size) };
         ring_mmaps.push(rx_mmap);
 
-        let tx_mmap =
-            mmap_ring::<RxTxDesc>(fd.as_raw_fd(), &offsets.tx, ring_size, XDP_PGOFF_TX_RING)?;
-        let tx = XdpRing::<RxTxDesc>::from_mmap(tx_mmap.ptr, &offsets.tx, ring_size);
+        // SAFETY: `fd` is the AF_XDP socket; `offsets` came from getsockopt above.
+        let tx_mmap = unsafe {
+            mmap_ring::<RxTxDesc>(fd.as_raw_fd(), &offsets.tx, ring_size, XDP_PGOFF_TX_RING)?
+        };
+        // SAFETY: tx_mmap.ptr is a valid mmap region for the tx ring.
+        let tx = unsafe { XdpRing::<RxTxDesc>::from_mmap(tx_mmap.ptr, &offsets.tx, ring_size) };
         ring_mmaps.push(tx_mmap);
 
         // 6. Bind to NIC queue
@@ -173,11 +190,14 @@ impl XdpSocket {
             sxdp_queue_id: queue_id,
             sxdp_shared_umem_fd: 0,
         };
-        let ret = libc::bind(
-            fd.as_raw_fd(),
-            &addr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<SockaddrXdp>() as u32,
-        );
+        // SAFETY: `fd` is valid; `addr` is a kernel-defined sockaddr_xdp struct.
+        let ret = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrXdp>() as u32,
+            )
+        };
         if ret < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -246,14 +266,18 @@ unsafe fn mmap_ring<T>(
     // Conservative size: desc offset + ring entries + some extra for producer/consumer/flags
     let mmap_size = offsets.desc as usize + (ring_size as usize) * std::mem::size_of::<T>() + 4096;
 
-    let ptr = libc::mmap(
-        std::ptr::null_mut(),
-        mmap_size,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_SHARED | libc::MAP_POPULATE,
-        fd,
-        pgoff as i64,
-    );
+    // SAFETY: `fd` is the AF_XDP socket; `pgoff` selects a kernel-known ring
+    // region whose size is at most `mmap_size`.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mmap_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_POPULATE,
+            fd,
+            pgoff as i64,
+        )
+    };
 
     if ptr == libc::MAP_FAILED {
         return Err(std::io::Error::last_os_error());

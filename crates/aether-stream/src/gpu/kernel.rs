@@ -155,7 +155,7 @@ impl SeqlockValidator {
         Ok(mask
             .iter()
             .enumerate()
-            .filter(|(_, &v)| v != 0)
+            .filter(|&(_, &v)| v != 0)
             .map(|(i, _)| i)
             .collect())
     }

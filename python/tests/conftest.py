@@ -10,6 +10,10 @@ import os
 import tempfile
 
 os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
+# Ray's uv hook auto-bundles the working dir into the worker runtime env when
+# the driver is run under `uv run`. Tests don't need that bundling and the
+# hook crashes on `working_dir=None`. Disable the hook outright.
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any

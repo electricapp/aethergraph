@@ -119,6 +119,7 @@ impl PyFeatureStore {
         // reallocated. Passing `slf` as the numpy container increfs the
         // PyFeatureStore so the mmap outlives the returned array.
         let view = unsafe { ArrayView1::from_shape_ptr(len, ptr) };
+        // SAFETY: same backing mmap; `slf.into_any()` is the lifetime anchor.
         Ok(unsafe { PyArray1::borrow_from_array(&view, slf.into_any()) })
     }
 
@@ -195,6 +196,7 @@ impl PyFeatureStore {
         // Passing `slf` as the container keeps the PyFeatureStore — and thus
         // the mmap — alive for as long as Python holds the array.
         let view = unsafe { ArrayView2::from_shape_ptr((num_nodes, feature_dim), ptr) };
+        // SAFETY: same backing mmap; `slf.into_any()` is the lifetime anchor.
         Ok(unsafe { PyArray2::borrow_from_array(&view, slf.into_any()) })
     }
 

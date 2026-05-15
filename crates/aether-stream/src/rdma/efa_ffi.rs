@@ -194,7 +194,7 @@ pub const EFADV_DEVICE_ATTR_CAPS_RDMA_READ: u32 = 1 << 0;
 // ---------------------------------------------------------------------------
 
 #[link(name = "ibverbs")]
-extern "C" {
+unsafe extern "C" {
     /// Create an address handle from an `ibv_ah_attr`.
     pub fn ibv_create_ah(pd: *mut IbvPd, attr: *mut super::ffi::IbvAhAttr) -> *mut IbvAh;
     pub fn ibv_destroy_ah(ah: *mut IbvAh) -> i32;
@@ -203,13 +203,13 @@ extern "C" {
 // `ibv_create_cq_ex` is `static inline` in <infiniband/verbs.h> (dispatches
 // through `context->ops.create_cq_ex`) so it has no ABI symbol — linked via
 // the C shim instead.
-extern "C" {
+unsafe extern "C" {
     #[link_name = "aether_ibv_create_cq_ex"]
     pub fn ibv_create_cq_ex(context: *mut IbvContext, attr: *mut IbvCqInitAttrEx) -> *mut IbvCqEx;
 }
 
 #[link(name = "efa")]
-extern "C" {
+unsafe extern "C" {
     /// Query EFA-specific caps.
     pub fn efadv_query_device(ctx: *mut IbvContext, attr: *mut EfadvDeviceAttr, inlen: u32) -> i32;
 
@@ -228,7 +228,7 @@ extern "C" {
 }
 
 // Linked via csrc/ibv_shim.c when built with AETHER_EFA_SHIM.
-extern "C" {
+unsafe extern "C" {
     pub fn aether_ibv_cq_ex_to_cq(cqx: *mut IbvCqEx) -> *mut IbvCq;
     pub fn aether_ibv_qp_to_qp_ex(qp: *mut IbvQp) -> *mut IbvQpEx;
 

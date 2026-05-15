@@ -66,11 +66,15 @@ unsafe extern "C" fn dlpack_deleter(managed: *mut DLManagedTensor) {
     if managed.is_null() {
         return;
     }
-    let ctx = (*managed).manager_ctx as *mut DlpackContext;
+    // SAFETY: `managed` was non-null per the check above; pointers were valid
+    // when handed off to PyCapsule_New, and torch only calls the deleter once.
+    let ctx = unsafe { (*managed).manager_ctx } as *mut DlpackContext;
     if !ctx.is_null() {
-        drop(Box::from_raw(ctx));
+        // SAFETY: `ctx` originated from `Box::into_raw` in `build_managed_tensor`.
+        drop(unsafe { Box::from_raw(ctx) });
     }
-    drop(Box::from_raw(managed));
+    // SAFETY: `managed` originated from `Box::into_raw` in `build_managed_tensor`.
+    drop(unsafe { Box::from_raw(managed) });
 }
 
 /// Build the raw `DLManagedTensor` Box for a CUDA f32 `(num_nodes, feature_dim)`
@@ -151,7 +155,7 @@ pub fn dlpack_capsule_from_cuda_ptr_py(
     num_nodes: usize,
     feature_dim: usize,
     gpu_id: i32,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     create_dlpack_capsule(py, ptr, num_nodes, feature_dim, gpu_id)
 }
 
@@ -169,28 +173,24 @@ pub fn create_dlpack_capsule(
     num_nodes: usize,
     feature_dim: usize,
     gpu_id: i32,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let managed_ptr = build_managed_tensor(ptr, num_nodes, feature_dim, gpu_id);
 
     // Create PyCapsule with name "dltensor" (required by DLPack spec)
     let name = CString::new("dltensor").unwrap();
-    // SAFETY: PyCapsule_New requires the GIL. `Python<'_>` proves the GIL is held.
-    // `name` lives for the duration of this call (the CString stays in scope).
-    // Destructor is `None`: cleanup is driven by the DLPack `deleter` field on
-    // the managed tensor, which the consumer invokes when releasing.
-    let capsule = unsafe {
-        let raw = pyffi::PyCapsule_New(managed_ptr as *mut c_void, name.as_ptr(), None);
-        if raw.is_null() {
-            // On capsule-creation failure, drive cleanup through the same
-            // deleter the consumer would call — single source of truth for
-            // freeing the DLManagedTensor + context.
-            dlpack_deleter(managed_ptr);
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Failed to create DLPack PyCapsule",
-            ));
-        }
-        PyObject::from_owned_ptr(py, raw)
-    };
+    // SAFETY: PyCapsule_New requires the GIL, which `Python<'_>` proves.
+    // `name` outlives the call. Destructor is `None` — cleanup is driven by the
+    // DLPack `deleter` field, which the consumer invokes when releasing.
+    let raw = unsafe { pyffi::PyCapsule_New(managed_ptr as *mut c_void, name.as_ptr(), None) };
+    if raw.is_null() {
+        // SAFETY: `managed_ptr` was just returned by `build_managed_tensor`.
+        unsafe { dlpack_deleter(managed_ptr) };
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Failed to create DLPack PyCapsule",
+        ));
+    }
+    // SAFETY: `raw` is a non-null PyCapsule we own; GIL is held.
+    let capsule = unsafe { Bound::from_owned_ptr(py, raw) }.unbind();
 
     Ok(capsule)
 }
@@ -220,43 +220,41 @@ mod tests {
         let managed_ptr = build_managed_tensor(PTR, NUM_NODES, FEATURE_DIM, GPU_ID);
         assert!(!managed_ptr.is_null());
 
-        // SAFETY: build_managed_tensor returns a valid heap allocation; we
-        // hand it back to dlpack_deleter at end of scope, matching how a
-        // PyCapsule consumer would clean up.
-        unsafe {
-            let managed = &*managed_ptr;
-            let t = &managed.dl_tensor;
+        // SAFETY: `managed_ptr` is a valid heap allocation from build_managed_tensor.
+        let managed = unsafe { &*managed_ptr };
+        let t = &managed.dl_tensor;
 
-            assert_eq!(t.data as u64, PTR, "tensor data pointer");
-            assert_eq!(t.device.device_type, KDLCUDA, "device_type must be kDLCUDA");
-            assert_eq!(t.device.device_id, GPU_ID, "device_id");
-            assert_eq!(t.ndim, 2, "2D tensor (num_nodes, feature_dim)");
-            assert_eq!(t.dtype.code, KDLFLOAT, "dtype code must be kDLFloat");
-            assert_eq!(t.dtype.bits, 32, "f32 → 32 bits");
-            assert_eq!(t.dtype.lanes, 1, "scalar lanes");
-            assert_eq!(t.byte_offset, 0);
+        assert_eq!(t.data as u64, PTR, "tensor data pointer");
+        assert_eq!(t.device.device_type, KDLCUDA, "device_type must be kDLCUDA");
+        assert_eq!(t.device.device_id, GPU_ID, "device_id");
+        assert_eq!(t.ndim, 2, "2D tensor (num_nodes, feature_dim)");
+        assert_eq!(t.dtype.code, KDLFLOAT, "dtype code must be kDLFloat");
+        assert_eq!(t.dtype.bits, 32, "f32 → 32 bits");
+        assert_eq!(t.dtype.lanes, 1, "scalar lanes");
+        assert_eq!(t.byte_offset, 0);
 
-            let shape = std::slice::from_raw_parts(t.shape, t.ndim as usize);
-            let strides = std::slice::from_raw_parts(t.strides, t.ndim as usize);
-            assert_eq!(shape, &[NUM_NODES as i64, FEATURE_DIM as i64]);
-            assert_eq!(
-                strides,
-                &[FEATURE_DIM as i64, 1],
-                "row-major: stride[0]=feature_dim, stride[1]=1"
-            );
+        // SAFETY: shape/strides point into the boxed DlpackContext owned by `managed`.
+        let shape = unsafe { std::slice::from_raw_parts(t.shape, t.ndim as usize) };
+        // SAFETY: same.
+        let strides = unsafe { std::slice::from_raw_parts(t.strides, t.ndim as usize) };
+        assert_eq!(shape, &[NUM_NODES as i64, FEATURE_DIM as i64]);
+        assert_eq!(
+            strides,
+            &[FEATURE_DIM as i64, 1],
+            "row-major: stride[0]=feature_dim, stride[1]=1"
+        );
 
-            assert!(
-                managed.deleter.is_some(),
-                "PyTorch rejects capsules without a deleter"
-            );
-            assert!(
-                !managed.manager_ctx.is_null(),
-                "deleter needs the DlpackContext to free shape/strides"
-            );
+        assert!(
+            managed.deleter.is_some(),
+            "PyTorch rejects capsules without a deleter"
+        );
+        assert!(
+            !managed.manager_ctx.is_null(),
+            "deleter needs the DlpackContext to free shape/strides"
+        );
 
-            // Fire the deleter — frees DlpackContext + DLManagedTensor Boxes.
-            // Leaking here would hide deleter-wiring bugs.
-            dlpack_deleter(managed_ptr);
-        }
+        // SAFETY: `managed_ptr` came from `build_managed_tensor`; we drop the
+        // borrow `managed` here and hand back ownership.
+        unsafe { dlpack_deleter(managed_ptr) };
     }
 }

@@ -1,8 +1,7 @@
 # scripts/
 
 Operational scripts for spinning up a fresh AWS instance and pushing the repo
-onto it. Keep these committed so future runs don't retype the same commands —
-see the `/commit` history for how the bootstrap evolves.
+onto it.
 
 ## `bootstrap_node.sh`
 
