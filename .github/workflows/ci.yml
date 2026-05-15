@@ -252,8 +252,9 @@ jobs:
         with:
           key: python-${{ matrix.os }}
       - name: Sync test deps
+        # --no-install-project: uv 0.11+ build isolation can drop cargo off PATH; build separately.
         working-directory: python
-        run: uv sync --group test
+        run: uv sync --group test --no-install-project
       - name: Build extension
         working-directory: python
         run: uv run maturin develop --release

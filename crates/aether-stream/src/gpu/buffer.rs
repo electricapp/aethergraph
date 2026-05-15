@@ -37,9 +37,10 @@ pub struct GpuGatherBuffer {
     _allocation: CudaSlice<u8>,
 }
 
-// SAFETY: VRAM allocation + RegisteredMr are valid for the buffer's lifetime.
+// SAFETY: VRAM allocation + RegisteredMr are valid for the buffer's lifetime;
 // CUDA device pointers and ibverbs MRs are safe to share across threads.
 unsafe impl Send for GpuGatherBuffer {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for GpuGatherBuffer {}
 
 impl GpuGatherBuffer {
@@ -62,7 +63,7 @@ impl GpuGatherBuffer {
         // Allocate VRAM
         let allocation: CudaSlice<u8> = stream
             .alloc_zeros(total_bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("cuMemAlloc failed: {e}")))?;
+            .map_err(|e| io::Error::other(format!("cuMemAlloc failed: {e}")))?;
 
         // Get raw device pointer. Scope the borrow guard so it drops
         // before we move `allocation` into Self.

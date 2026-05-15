@@ -40,9 +40,9 @@ const MAX_RUNTIME: Duration = Duration::from_secs(10);
 fn encode(node: u32, gen_id: u32) -> [f32; FEATURE_DIM] {
     let mut out = [0f32; FEATURE_DIM];
     out[0] = gen_id as f32;
-    for i in 1..FEATURE_DIM {
+    for (i, slot) in out.iter_mut().enumerate().skip(1) {
         let v = (gen_id as u64).wrapping_add(i as u64 * (node as u64 + 1));
-        out[i] = (v & 0x00FF_FFFF) as f32; // keep within f32 exact-integer range
+        *slot = (v & 0x00FF_FFFF) as f32; // keep within f32 exact-integer range
     }
     out
 }
@@ -52,9 +52,9 @@ fn encode(node: u32, gen_id: u32) -> [f32; FEATURE_DIM] {
 #[inline]
 fn verify(node: u32, features: &[f32]) -> Option<u32> {
     let gen_id = features[0] as u64 as u32;
-    for i in 1..FEATURE_DIM {
+    for (i, &f) in features.iter().enumerate().take(FEATURE_DIM).skip(1) {
         let expected_v = (gen_id as u64).wrapping_add(i as u64 * (node as u64 + 1)) & 0x00FF_FFFF;
-        let got_v = features[i] as u64;
+        let got_v = f as u64;
         if got_v != expected_v {
             return None;
         }
@@ -96,7 +96,7 @@ fn stress_seqlock_concurrent_writers_readers() {
                     writes_local += 1;
                 }
                 gen_id = gen_id.wrapping_add(1);
-                if writes_local % 100_000 == 0 {
+                if writes_local.is_multiple_of(100_000) {
                     total_writes.fetch_add(writes_local, Ordering::Relaxed);
                     writes_local = 0;
                 }
@@ -117,10 +117,10 @@ fn stress_seqlock_concurrent_writers_readers() {
             let mut buf = vec![0f32; FEATURE_DIM];
             let mut reads_local: u64 = 0;
             loop {
-                if reads_local % 8192 == 0 {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
+                if reads_local.is_multiple_of(8192) && stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if reads_local.is_multiple_of(8192) {
                     let cur = total_reads.fetch_add(reads_local, Ordering::Relaxed) + reads_local;
                     reads_local = 0;
                     if cur >= TARGET_ITERS {
@@ -132,12 +132,10 @@ fn stress_seqlock_concurrent_writers_readers() {
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
                 let node = (rng as usize) % NODE_COUNT;
-                if table.read_node(node, &mut buf) {
-                    if verify(node as u32, &buf).is_none() {
-                        // CRITICAL: torn read passed read_node()'s head==tail check
-                        // but the feature payload is internally inconsistent.
-                        torn_observed.fetch_add(1, Ordering::Relaxed);
-                    }
+                if table.read_node(node, &mut buf) && verify(node as u32, &buf).is_none() {
+                    // CRITICAL: torn read passed read_node()'s head==tail check
+                    // but the feature payload is internally inconsistent.
+                    torn_observed.fetch_add(1, Ordering::Relaxed);
                 }
                 reads_local += 1;
             }

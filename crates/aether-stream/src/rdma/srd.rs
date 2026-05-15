@@ -98,7 +98,9 @@ pub struct SrdContext {
     gid_index: u8,
 }
 
+// SAFETY: SrdContext owns ibverbs PD/CQ handles that are thread-safe to share.
 unsafe impl Send for SrdContext {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for SrdContext {}
 
 impl SrdContext {
@@ -150,7 +152,7 @@ impl SrdContext {
             let pd = super::ffi::ibv_alloc_pd(context);
             if pd.is_null() {
                 super::ffi::ibv_close_device(context);
-                return Err(io::Error::new(io::ErrorKind::Other, "ibv_alloc_pd"));
+                return Err(io::Error::other("ibv_alloc_pd"));
             }
 
             let mut cq_attr = IbvCqInitAttrEx::zeroed();
@@ -160,7 +162,7 @@ impl SrdContext {
             if cq_ex.is_null() {
                 super::ffi::ibv_dealloc_pd(pd);
                 super::ffi::ibv_close_device(context);
-                return Err(io::Error::new(io::ErrorKind::Other, "ibv_create_cq_ex"));
+                return Err(io::Error::other("ibv_create_cq_ex"));
             }
 
             let mut port_gid: IbvGid = std::mem::zeroed();
@@ -171,10 +173,9 @@ impl SrdContext {
                 super::ffi::ibv_destroy_cq(cq_plain);
                 super::ffi::ibv_dealloc_pd(pd);
                 super::ffi::ibv_close_device(context);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("ibv_query_gid({gid_index}) rc={rc}"),
-                ));
+                return Err(io::Error::other(format!(
+                    "ibv_query_gid({gid_index}) rc={rc}"
+                )));
             }
 
             Ok(Self {
@@ -235,10 +236,7 @@ impl SrdContext {
         match rc {
             0 => Ok(Some(out)),
             2 => Ok(None), // ENOENT — empty CQ
-            other => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("poll_cq_ex rc={other}"),
-            )),
+            other => Err(io::Error::other(format!("poll_cq_ex rc={other}"))),
         }
     }
 }
@@ -264,7 +262,9 @@ pub struct SrdAddressHandle {
     ahn: u16,
 }
 
+// SAFETY: ibverbs AH handles are thread-safe to share.
 unsafe impl Send for SrdAddressHandle {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for SrdAddressHandle {}
 
 impl SrdAddressHandle {
@@ -290,10 +290,7 @@ impl SrdAddressHandle {
             let rc = efadv_query_ah(ah, &mut efa, std::mem::size_of::<EfadvAhAttr>() as u32);
             if rc != 0 {
                 ibv_destroy_ah(ah);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("efadv_query_ah rc={rc}"),
-                ));
+                return Err(io::Error::other(format!("efadv_query_ah rc={rc}")));
             }
             Ok(Self { ah, ahn: efa.ahn })
         }
@@ -326,7 +323,10 @@ pub struct SrdQp {
     qkey: u32,
 }
 
+// SAFETY: ibverbs QP/QpEx handles are thread-safe after creation;
+// posting from a single worker thread is the established invariant.
 unsafe impl Send for SrdQp {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for SrdQp {}
 
 impl SrdQp {
@@ -361,18 +361,15 @@ impl SrdQp {
                 std::mem::size_of::<EfadvQpInitAttr>() as u32,
             );
             if qp.is_null() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("efadv_create_qp_ex failed: {}", io::Error::last_os_error()),
-                ));
+                return Err(io::Error::other(format!(
+                    "efadv_create_qp_ex failed: {}",
+                    io::Error::last_os_error()
+                )));
             }
             let qp_ex = aether_ibv_qp_to_qp_ex(qp);
             if qp_ex.is_null() {
                 super::ffi::ibv_destroy_qp(qp);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "ibv_qp_to_qp_ex failed",
-                ));
+                return Err(io::Error::other("ibv_qp_to_qp_ex failed"));
             }
             Ok(Self { qp, qp_ex, qkey })
         }
@@ -417,20 +414,14 @@ impl SrdQp {
             let mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY;
             let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, mask);
             if rc != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("SRD INIT rc={rc}"),
-                ));
+                return Err(io::Error::other(format!("SRD INIT rc={rc}")));
             }
             // RTR — bare state transition.
             let mut attr: IbvQpAttr = std::mem::zeroed();
             attr.qp_state = IBV_QPS_RTR;
             let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE);
             if rc != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("SRD RTR rc={rc}"),
-                ));
+                return Err(io::Error::other(format!("SRD RTR rc={rc}")));
             }
             // RTS — sq_psn only.
             let mut attr: IbvQpAttr = std::mem::zeroed();
@@ -438,10 +429,7 @@ impl SrdQp {
             attr.sq_psn = 0;
             let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE | IBV_QP_SQ_PSN);
             if rc != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("SRD RTS rc={rc}"),
-                ));
+                return Err(io::Error::other(format!("SRD RTS rc={rc}")));
             }
         }
         Ok(())
@@ -477,10 +465,7 @@ impl SrdQp {
             )
         };
         if rc != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("post_rdma_read_srd rc={rc}"),
-            ));
+            return Err(io::Error::other(format!("post_rdma_read_srd rc={rc}")));
         }
         Ok(())
     }
@@ -648,10 +633,11 @@ pub struct SrdFeatureClient {
     dst_len: usize,
 }
 
-unsafe impl Send for SrdFeatureClient {}
 // SAFETY: all ibverbs handles inside are thread-safe to share read-only;
 // mutation on the hot path happens inside the worker thread that owns the
 // `Arc<SrdFeatureClient>` dispatched by `SrdShardedFeatureClient`.
+unsafe impl Send for SrdFeatureClient {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for SrdFeatureClient {}
 
 impl SrdFeatureClient {
@@ -791,10 +777,9 @@ impl SrdFeatureClient {
             )
         };
         if rc != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("post_rdma_reads_srd_batch rc={rc}"),
-            ));
+            return Err(io::Error::other(format!(
+                "post_rdma_reads_srd_batch rc={rc}"
+            )));
         }
         // EFA SRD signals every WR — drain N CQEs via the batched poll
         // shim (one FFI crossing per drain burst instead of N).
@@ -807,20 +792,14 @@ impl SrdFeatureClient {
                 aether_ibv_poll_cq_ex_many(self.ctx.cq_ex(), batch.as_mut_ptr(), want as u32)
             };
             if got < 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("poll_cq_ex_many rc={got}"),
-                ));
+                return Err(io::Error::other(format!("poll_cq_ex_many rc={got}")));
             }
             for snap in batch.iter().take(got as usize) {
                 if snap.status != super::ffi::IBV_WC_SUCCESS {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
-                            "SRD WC failed at wr_id {}: status={} vendor_err={}",
-                            snap.wr_id, snap.status, snap.vendor_err
-                        ),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "SRD WC failed at wr_id {}: status={} vendor_err={}",
+                        snap.wr_id, snap.status, snap.vendor_err
+                    )));
                 }
             }
             drained += got as usize;
@@ -925,7 +904,7 @@ impl SrdShardedFeatureClient {
                 .collect();
             for h in handles {
                 h.join()
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "shard worker panicked"))??;
+                    .map_err(|_| io::Error::other("shard worker panicked"))??;
             }
             Ok(())
         })

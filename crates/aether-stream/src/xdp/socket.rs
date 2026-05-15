@@ -63,8 +63,9 @@ impl Drop for MmapRegion {
     }
 }
 
-// SAFETY: mmap regions are not aliased
+// SAFETY: mmap regions are not aliased.
 unsafe impl Send for MmapRegion {}
+// SAFETY: mmap regions are not aliased.
 unsafe impl Sync for MmapRegion {}
 
 impl XdpSocket {

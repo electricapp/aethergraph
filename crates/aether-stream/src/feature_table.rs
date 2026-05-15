@@ -152,43 +152,46 @@ impl FeatureTable {
 
         let base = self.slot_ptr(node);
 
-        // SAFETY: `base` is a valid slot pointer (`slot_ptr` bounds-checks
-        // `node`); the head/tail atomic refs are derived from it via
-        // documented slot layout (see FEATURE_OFFSET / tail_offset).
+        let head_ptr = base as *const AtomicU64;
+        // SAFETY: tail_offset lies within the slot; `base` is bounds-checked.
+        let tail_ptr = unsafe { base.add(self.tail_offset) } as *const AtomicU64;
+        // SAFETY: `head_ptr` references the head AtomicU64 inside the slot.
+        let head = unsafe { &*head_ptr };
+        // SAFETY: `tail_ptr` references the tail AtomicU64 inside the slot.
+        let tail = unsafe { &*tail_ptr };
+
+        // Step 1: head → odd. AcqRel: Release orders prior writes before
+        // head goes odd; Acquire prevents the feature copy below from
+        // being reordered before this RMW.
+        let prev = head.fetch_add(1, Ordering::AcqRel);
+        let target = prev + 2;
+
+        // Arm the panic-recovery guard. From here through the explicit
+        // disarm below, ANY panic restores head to `target` (even),
+        // releasing waiting readers.
+        let guard = SeqlockWriteGuard {
+            head,
+            tail,
+            target,
+            disarmed: false,
+        };
+
+        // Step 2: copy features (non-atomic).
+        // SAFETY: FEATURE_OFFSET is within the slot.
+        let feat_ptr = unsafe { base.add(FEATURE_OFFSET) } as *mut f32;
+        // SAFETY: `feat_ptr` points to `feature_dim` f32 slots inside the slot;
+        // `features` has the same length (debug_assert above).
         unsafe {
-            let head_ptr = base as *const AtomicU64;
-            let tail_ptr = base.add(self.tail_offset) as *const AtomicU64;
-            let head = &*head_ptr;
-            let tail = &*tail_ptr;
-
-            // Step 1: head → odd. AcqRel: Release orders prior writes before
-            // head goes odd; Acquire prevents the feature copy below from
-            // being reordered before this RMW.
-            let prev = head.fetch_add(1, Ordering::AcqRel);
-            let target = prev + 2;
-
-            // Arm the panic-recovery guard. From here through the explicit
-            // disarm below, ANY panic restores head to `target` (even),
-            // releasing waiting readers.
-            let guard = SeqlockWriteGuard {
-                head,
-                tail,
-                target,
-                disarmed: false,
-            };
-
-            // Step 2: copy features (non-atomic).
-            let feat_ptr = base.add(FEATURE_OFFSET) as *mut f32;
             std::ptr::copy_nonoverlapping(features.as_ptr(), feat_ptr, self.feature_dim);
-
-            // Step 3: tail → target.
-            tail.store(target, Ordering::Release);
-
-            // Step 4: head → target. Disarm the guard so its Drop is a
-            // no-op on the success path.
-            head.store(target, Ordering::Release);
-            std::mem::forget(guard);
         }
+
+        // Step 3: tail → target.
+        tail.store(target, Ordering::Release);
+
+        // Step 4: head → target. Disarm the guard so its Drop is a
+        // no-op on the success path.
+        head.store(target, Ordering::Release);
+        std::mem::forget(guard);
     }
 
     /// Read features for a node into `out`. Returns `true` if the node has been
@@ -214,44 +217,51 @@ impl FeatureTable {
 
         let base = self.slot_ptr(node);
 
-        unsafe {
-            let head = &*(base as *const AtomicU64);
-            let tail = &*(base.add(self.tail_offset) as *const AtomicU64);
+        // SAFETY: `base` points to head AtomicU64 at offset 0 of the slot.
+        let head = unsafe { &*(base as *const AtomicU64) };
+        // SAFETY: `tail_offset` lies within the slot.
+        let tail_ptr = unsafe { base.add(self.tail_offset) } as *const AtomicU64;
+        // SAFETY: `tail_ptr` references the tail AtomicU64 inside the slot.
+        let tail = unsafe { &*tail_ptr };
 
-            loop {
-                let h1 = head.load(Ordering::Acquire);
-                if h1 == 0 {
-                    return false; // never written
-                }
-                if h1 & 1 != 0 {
-                    std::hint::spin_loop();
-                    continue; // writer in progress
-                }
-
-                // Read features (non-atomic).
-                let feat_ptr = base.add(FEATURE_OFFSET) as *const f32;
-                std::ptr::copy_nonoverlapping(feat_ptr, out.as_mut_ptr(), self.feature_dim);
-
-                // Ensure all feature reads complete before we read tail/head.
-                // Without this fence, ARM/RISC-V can reorder the non-atomic
-                // feature reads past the version loads.
-                std::sync::atomic::fence(Ordering::Acquire);
-
-                // Two checks:
-                //   1. h1 == t  — RDMA-compatible, catches torn writes whose
-                //      tail.store has propagated.
-                //   2. h1 == h2 — local-only, catches writers that started a
-                //      new generation during our copy. Since the writer's
-                //      first op is a LOCK-RMW that's immediately globally
-                //      visible, h2 cannot equal the old even h1 if a writer
-                //      ran concurrently.
-                let t = tail.load(Ordering::Acquire);
-                let h2 = head.load(Ordering::Acquire);
-                if h1 == t && h1 == h2 {
-                    return true;
-                }
-                std::hint::spin_loop();
+        loop {
+            let h1 = head.load(Ordering::Acquire);
+            if h1 == 0 {
+                return false; // never written
             }
+            if h1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue; // writer in progress
+            }
+
+            // Read features (non-atomic).
+            // SAFETY: FEATURE_OFFSET is within the slot.
+            let feat_ptr = unsafe { base.add(FEATURE_OFFSET) } as *const f32;
+            // SAFETY: `feat_ptr` covers `feature_dim` f32s; `out` has
+            // `>= feature_dim` slots (debug_assert above).
+            unsafe {
+                std::ptr::copy_nonoverlapping(feat_ptr, out.as_mut_ptr(), self.feature_dim);
+            }
+
+            // Ensure all feature reads complete before we read tail/head.
+            // Without this fence, ARM/RISC-V can reorder the non-atomic
+            // feature reads past the version loads.
+            std::sync::atomic::fence(Ordering::Acquire);
+
+            // Two checks:
+            //   1. h1 == t  — RDMA-compatible, catches torn writes whose
+            //      tail.store has propagated.
+            //   2. h1 == h2 — local-only, catches writers that started a
+            //      new generation during our copy. Since the writer's
+            //      first op is a LOCK-RMW that's immediately globally
+            //      visible, h2 cannot equal the old even h1 if a writer
+            //      ran concurrently.
+            let t = tail.load(Ordering::Acquire);
+            let h2 = head.load(Ordering::Acquire);
+            if h1 == t && h1 == h2 {
+                return true;
+            }
+            std::hint::spin_loop();
         }
     }
 
@@ -329,9 +339,12 @@ mod tests {
         let result = catch_unwind(AssertUnwindSafe(|| {
             let base = table_for_panic.slot_ptr(0);
             // SAFETY: same slot layout as write_node uses.
-            unsafe {
-                let head = &*(base as *const AtomicU64);
-                let tail = &*(base.add(table_for_panic.tail_offset) as *const AtomicU64);
+            let head = unsafe { &*(base as *const AtomicU64) };
+            // SAFETY: tail_offset is within the slot.
+            let tail_ptr = unsafe { base.add(table_for_panic.tail_offset) } as *const AtomicU64;
+            // SAFETY: `tail_ptr` refs the tail AtomicU64.
+            let tail = unsafe { &*tail_ptr };
+            {
                 let prev = head.fetch_add(1, Ordering::AcqRel);
                 let target = prev + 2;
                 // Arm the guard but don't disarm — `panic!` below triggers
@@ -435,20 +448,18 @@ mod tests {
 
         // Verify head and tail are both 2 (first even version after write)
         let base = table.slot_ptr(0);
-        unsafe {
-            let head = &*(base as *const AtomicU64);
-            let tail = &*(base.add(table.tail_offset) as *const AtomicU64);
-            assert_eq!(head.load(Ordering::Relaxed), 2);
-            assert_eq!(tail.load(Ordering::Relaxed), 2);
-        }
+        // SAFETY: `base` points to head AtomicU64 at offset 0.
+        let head = unsafe { &*(base as *const AtomicU64) };
+        // SAFETY: tail_offset is within the slot.
+        let tail_ptr = unsafe { base.add(table.tail_offset) } as *const AtomicU64;
+        // SAFETY: `tail_ptr` refs the tail AtomicU64.
+        let tail = unsafe { &*tail_ptr };
+        assert_eq!(head.load(Ordering::Relaxed), 2);
+        assert_eq!(tail.load(Ordering::Relaxed), 2);
 
         // Write again — should be 4
         table.write_node(0, &features);
-        unsafe {
-            let head = &*(base as *const AtomicU64);
-            let tail = &*(base.add(table.tail_offset) as *const AtomicU64);
-            assert_eq!(head.load(Ordering::Relaxed), 4);
-            assert_eq!(tail.load(Ordering::Relaxed), 4);
-        }
+        assert_eq!(head.load(Ordering::Relaxed), 4);
+        assert_eq!(tail.load(Ordering::Relaxed), 4);
     }
 }

@@ -326,7 +326,7 @@ impl AsyncCsrGraph {
     pub fn io_uring_active(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            self.uring_pool.as_ref().map_or(false, |p| !p.is_empty())
+            self.uring_pool.as_ref().is_some_and(|p| !p.is_empty())
         }
         #[cfg(not(target_os = "linux"))]
         {

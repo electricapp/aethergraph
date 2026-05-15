@@ -43,8 +43,9 @@ pub const DIRECT_IO_OFFSET_ALIGNMENT: usize = 512;
 ///
 /// If either is not aligned, O_DIRECT reads will fail with EINVAL.
 pub fn is_layout_direct_io_compatible(features_start_offset: u64, feature_size: usize) -> bool {
-    let offset_aligned = features_start_offset as usize % DIRECT_IO_OFFSET_ALIGNMENT == 0;
-    let size_aligned = feature_size % DIRECT_IO_OFFSET_ALIGNMENT == 0;
+    let offset_aligned =
+        (features_start_offset as usize).is_multiple_of(DIRECT_IO_OFFSET_ALIGNMENT);
+    let size_aligned = feature_size.is_multiple_of(DIRECT_IO_OFFSET_ALIGNMENT);
     offset_aligned && size_aligned
 }
 
@@ -155,6 +156,7 @@ impl AlignedBuffer {
     /// # Panics
     /// Panics if allocation fails (out of memory).
     #[cfg(test)]
+    #[allow(dead_code)]
     #[inline]
     pub fn new(len: usize, alignment: usize) -> Self {
         Self::try_new(len, alignment).expect("AlignedBuffer allocation failed")
@@ -201,6 +203,7 @@ impl AlignedBuffer {
 
     /// Check if buffer is empty.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -213,8 +216,9 @@ impl Drop for AlignedBuffer {
     }
 }
 
-// SAFETY: AlignedBuffer owns its memory and doesn't share it
+// SAFETY: AlignedBuffer owns its memory and doesn't share it.
 unsafe impl Send for AlignedBuffer {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for AlignedBuffer {}
 
 /// A collection of aligned buffers for batch operations.
@@ -477,11 +481,13 @@ impl UringHandle {
 
     /// Get access to submission queue (shared proxy; owned wrapper in io-uring 0.7).
     pub fn submission(&mut self) -> io_uring::squeue::SubmissionQueue<'_> {
+        // SAFETY: `&mut self` ensures no other reference to the shared SQ exists.
         unsafe { self.ring.submission_shared() }
     }
 
     /// Get access to completion queue (shared proxy; owned wrapper in io-uring 0.7).
     pub fn completion(&mut self) -> io_uring::cqueue::CompletionQueue<'_> {
+        // SAFETY: `&mut self` ensures no other reference to the shared CQ exists.
         unsafe { self.ring.completion_shared() }
     }
 
@@ -615,6 +621,8 @@ pub fn batch_read(
             .user_data(i as u64);
 
             // Push to SQ, submitting if full
+            // SAFETY: `entry` and `buffer` referenced by the SQE live for the
+            // duration of this batch (until we drain the CQ below).
             unsafe {
                 while sq.push(&entry).is_err() {
                     sq.sync();

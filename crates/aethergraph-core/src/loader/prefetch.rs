@@ -277,6 +277,7 @@ impl SyncFeatureStore {
 
     /// Batch read using io_uring with proper SQPOLL and aligned buffers.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     fn batch_read_uring_aligned(
         file: &File,
         nodes: &[NodeId],
@@ -328,6 +329,7 @@ impl SyncFeatureStore {
             let buf_ptr = if direct_io {
                 aligned_pool.as_mut().unwrap().slot_ptr(i)
             } else {
+                // SAFETY: regular_buffer is `nodes.len() * feature_size` bytes; `i < nodes.len()`.
                 unsafe { regular_buffer.as_mut_ptr().add(i * feature_size) }
             };
             reads.push((file_offset, buf_ptr, feature_size));

@@ -45,6 +45,7 @@ pub struct RdmaQp {
 
 // SAFETY: QP is thread-safe after creation (single-threaded posting assumed).
 unsafe impl Send for RdmaQp {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for RdmaQp {}
 
 /// Default PSN for new QPs.
@@ -83,26 +84,28 @@ impl RdmaQp {
         send_cq: *mut IbvCq,
         recv_cq: *mut IbvCq,
     ) -> io::Result<Self> {
-        unsafe {
-            let mut init_attr: IbvQpInitAttr = std::mem::zeroed();
-            init_attr.send_cq = send_cq;
-            init_attr.recv_cq = recv_cq;
-            init_attr.qp_type = IBV_QPT_RC;
-            init_attr.cap = *cap;
+        // SAFETY: zeroed init of a POD ibverbs struct is sound.
+        let mut init_attr: IbvQpInitAttr = unsafe { std::mem::zeroed() };
+        init_attr.send_cq = send_cq;
+        init_attr.recv_cq = recv_cq;
+        init_attr.qp_type = IBV_QPT_RC;
+        init_attr.cap = *cap;
 
-            let qp = ibv_create_qp(ctx.pd, &mut init_attr);
-            if qp.is_null() {
-                return Err(io::Error::new(io::ErrorKind::Other, "ibv_create_qp failed"));
-            }
-
-            Ok(Self { qp })
+        // SAFETY: `ctx.pd` is alive; `init_attr` is a valid out-param.
+        let qp = unsafe { ibv_create_qp(ctx.pd, &mut init_attr) };
+        if qp.is_null() {
+            return Err(io::Error::other("ibv_create_qp failed"));
         }
+
+        Ok(Self { qp })
     }
 
     /// Get local endpoint for exchange over TCP control plane.
     pub fn endpoint(&self, ctx: &RdmaContext) -> QpEndpoint {
+        // SAFETY: `self.qp` is alive for this RdmaQp's lifetime.
+        let qpn = unsafe { (*self.qp).qp_num };
         QpEndpoint {
-            qpn: unsafe { (*self.qp).qp_num },
+            qpn,
             lid: ctx.port_lid,
             gid: ctx.port_gid.raw,
             psn: DEFAULT_PSN,
@@ -165,6 +168,7 @@ impl RdmaQp {
 
         let last = reads.len() - 1;
         for (i, read) in reads.iter().enumerate() {
+            // SAFETY: zeroed init of a POD ibverbs struct is sound.
             let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
             wr.wr_id = i as u64;
             wr.sg_list = &mut sges[i] as *mut IbvSge;
@@ -195,12 +199,10 @@ impl RdmaQp {
         // Last WR has next = null (already zeroed)
 
         let mut bad_wr: *mut IbvSendWr = ptr::null_mut();
+        // SAFETY: `self.qp` is alive; `wrs[0]` is the head of a valid WR chain.
         let ret = unsafe { ibv_post_send(self.qp, &mut wrs[0], &mut bad_wr) };
         if ret != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("ibv_post_send failed: {ret}"),
-            ));
+            return Err(io::Error::other(format!("ibv_post_send failed: {ret}")));
         }
 
         Ok(())
@@ -209,18 +211,20 @@ impl RdmaQp {
     /// Poll the context's shared CQ for completions. Use `poll_cq_on` if this
     /// QP was created with a dedicated CQ via `create_with_cqs`.
     pub fn poll_cq(&self, ctx: &RdmaContext, wcs: &mut [IbvWc]) -> io::Result<usize> {
-        Self::poll_cq_on(ctx.cq, wcs)
+        // SAFETY: `ctx.cq` is alive for as long as `ctx` is borrowed.
+        unsafe { Self::poll_cq_on(ctx.cq, wcs) }
     }
 
     /// Poll an explicit CQ — for sharded designs where each worker thread
     /// owns its own CQ and must not see other workers' completions.
-    pub fn poll_cq_on(cq: *mut IbvCq, wcs: &mut [IbvWc]) -> io::Result<usize> {
+    ///
+    /// # Safety
+    /// `cq` must be a live `*mut IbvCq` that hasn't been destroyed.
+    pub unsafe fn poll_cq_on(cq: *mut IbvCq, wcs: &mut [IbvWc]) -> io::Result<usize> {
+        // SAFETY: `cq` validity is the caller's contract above.
         let ret = unsafe { ibv_poll_cq(cq, wcs.len() as i32, wcs.as_mut_ptr()) };
         if ret < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("ibv_poll_cq failed: {ret}"),
-            ));
+            return Err(io::Error::other(format!("ibv_poll_cq failed: {ret}")));
         }
         Ok(ret as usize)
     }
@@ -231,21 +235,18 @@ impl RdmaQp {
 
     /// RESET → INIT
     fn to_init(&self, ctx: &RdmaContext) -> io::Result<()> {
-        unsafe {
-            let mut attr: IbvQpAttr = std::mem::zeroed();
-            attr.qp_state = IBV_QPS_INIT;
-            attr.pkey_index = 0;
-            attr.port_num = 1;
-            attr.qp_access_flags = IBV_ACCESS_REMOTE_READ as u32 | IBV_ACCESS_LOCAL_WRITE as u32;
+        // SAFETY: zeroed init of a POD ibverbs struct is sound.
+        let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
+        attr.qp_state = IBV_QPS_INIT;
+        attr.pkey_index = 0;
+        attr.port_num = 1;
+        attr.qp_access_flags = IBV_ACCESS_REMOTE_READ as u32 | IBV_ACCESS_LOCAL_WRITE as u32;
 
-            let mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
-            let ret = ibv_modify_qp(self.qp, &mut attr, mask);
-            if ret != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("QP RESET→INIT failed: {ret}"),
-                ));
-            }
+        let mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
+        // SAFETY: `self.qp` is alive; `attr` is a valid in-param.
+        let ret = unsafe { ibv_modify_qp(self.qp, &mut attr, mask) };
+        if ret != 0 {
+            return Err(io::Error::other(format!("QP RESET→INIT failed: {ret}")));
         }
         let _ = ctx; // port_num is hardcoded to 1
         Ok(())
@@ -253,47 +254,44 @@ impl RdmaQp {
 
     /// INIT → RTR (Ready to Receive)
     fn to_rtr(&self, ctx: &RdmaContext, remote: &QpEndpoint) -> io::Result<()> {
-        unsafe {
-            let mut attr: IbvQpAttr = std::mem::zeroed();
-            attr.qp_state = IBV_QPS_RTR;
-            attr.path_mtu = IBV_MTU_4096;
-            attr.dest_qp_num = remote.qpn;
-            attr.rq_psn = remote.psn;
-            attr.max_dest_rd_atomic = 16;
-            attr.min_rnr_timer = 12;
+        // SAFETY: zeroed init of a POD ibverbs struct is sound.
+        let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
+        attr.qp_state = IBV_QPS_RTR;
+        attr.path_mtu = IBV_MTU_4096;
+        attr.dest_qp_num = remote.qpn;
+        attr.rq_psn = remote.psn;
+        attr.max_dest_rd_atomic = 16;
+        attr.min_rnr_timer = 12;
 
-            // Address handle
-            attr.ah_attr.port_num = 1;
-            attr.ah_attr.dlid = remote.lid;
-            attr.ah_attr.sl = 0;
+        // Address handle
+        attr.ah_attr.port_num = 1;
+        attr.ah_attr.dlid = remote.lid;
+        attr.ah_attr.sl = 0;
 
-            // Use GRH for RoCE or if GID is non-zero
-            let gid_nonzero = remote.gid.iter().any(|&b| b != 0);
-            if gid_nonzero {
-                attr.ah_attr.is_global = 1;
-                attr.ah_attr.grh.dgid = IbvGid { raw: remote.gid };
-                // sgid_index must point at the local GID we advertise — using
-                // index 0 unconditionally would mismatch when the routable GID
-                // lives at a different index (e.g. RoCEv2 IPv4-mapped at 1).
-                attr.ah_attr.grh.sgid_index = ctx.gid_index;
-                attr.ah_attr.grh.hop_limit = 64;
-                attr.ah_attr.grh.traffic_class = 0;
-            }
+        // Use GRH for RoCE or if GID is non-zero
+        let gid_nonzero = remote.gid.iter().any(|&b| b != 0);
+        if gid_nonzero {
+            attr.ah_attr.is_global = 1;
+            attr.ah_attr.grh.dgid = IbvGid { raw: remote.gid };
+            // sgid_index must point at the local GID we advertise — using
+            // index 0 unconditionally would mismatch when the routable GID
+            // lives at a different index (e.g. RoCEv2 IPv4-mapped at 1).
+            attr.ah_attr.grh.sgid_index = ctx.gid_index;
+            attr.ah_attr.grh.hop_limit = 64;
+            attr.ah_attr.grh.traffic_class = 0;
+        }
 
-            let mask = IBV_QP_STATE
-                | IBV_QP_AV
-                | IBV_QP_PATH_MTU
-                | IBV_QP_DEST_QPN
-                | IBV_QP_RQ_PSN
-                | IBV_QP_MAX_DEST_RD_ATOMIC
-                | IBV_QP_MIN_RNR_TIMER;
-            let ret = ibv_modify_qp(self.qp, &mut attr, mask);
-            if ret != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("QP INIT→RTR failed: {ret}"),
-                ));
-            }
+        let mask = IBV_QP_STATE
+            | IBV_QP_AV
+            | IBV_QP_PATH_MTU
+            | IBV_QP_DEST_QPN
+            | IBV_QP_RQ_PSN
+            | IBV_QP_MAX_DEST_RD_ATOMIC
+            | IBV_QP_MIN_RNR_TIMER;
+        // SAFETY: `self.qp` is alive; `attr` is a valid in-param.
+        let ret = unsafe { ibv_modify_qp(self.qp, &mut attr, mask) };
+        if ret != 0 {
+            return Err(io::Error::other(format!("QP INIT→RTR failed: {ret}")));
         }
         let _ = ctx;
         Ok(())
@@ -301,28 +299,25 @@ impl RdmaQp {
 
     /// RTR → RTS (Ready to Send)
     fn to_rts(&self) -> io::Result<()> {
-        unsafe {
-            let mut attr: IbvQpAttr = std::mem::zeroed();
-            attr.qp_state = IBV_QPS_RTS;
-            attr.sq_psn = DEFAULT_PSN;
-            attr.timeout = 14;
-            attr.retry_cnt = 7;
-            attr.rnr_retry = 7;
-            attr.max_rd_atomic = 16;
+        // SAFETY: zeroed init of a POD ibverbs struct is sound.
+        let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
+        attr.qp_state = IBV_QPS_RTS;
+        attr.sq_psn = DEFAULT_PSN;
+        attr.timeout = 14;
+        attr.retry_cnt = 7;
+        attr.rnr_retry = 7;
+        attr.max_rd_atomic = 16;
 
-            let mask = IBV_QP_STATE
-                | IBV_QP_SQ_PSN
-                | IBV_QP_TIMEOUT
-                | IBV_QP_RETRY_CNT
-                | IBV_QP_RNR_RETRY
-                | IBV_QP_MAX_QP_RD_ATOMIC;
-            let ret = ibv_modify_qp(self.qp, &mut attr, mask);
-            if ret != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("QP RTR→RTS failed: {ret}"),
-                ));
-            }
+        let mask = IBV_QP_STATE
+            | IBV_QP_SQ_PSN
+            | IBV_QP_TIMEOUT
+            | IBV_QP_RETRY_CNT
+            | IBV_QP_RNR_RETRY
+            | IBV_QP_MAX_QP_RD_ATOMIC;
+        // SAFETY: `self.qp` is alive; `attr` is a valid in-param.
+        let ret = unsafe { ibv_modify_qp(self.qp, &mut attr, mask) };
+        if ret != 0 {
+            return Err(io::Error::other(format!("QP RTR→RTS failed: {ret}")));
         }
         Ok(())
     }
@@ -330,9 +325,8 @@ impl RdmaQp {
 
 impl Drop for RdmaQp {
     fn drop(&mut self) {
-        unsafe {
-            ibv_destroy_qp(self.qp);
-        }
+        // SAFETY: `self.qp` was returned by `ibv_create_qp` and is live until now.
+        unsafe { ibv_destroy_qp(self.qp) };
     }
 }
 
@@ -366,6 +360,7 @@ mod tests {
         }
 
         for (i, read) in reads.iter().enumerate() {
+            // SAFETY: zeroed init of a POD ibverbs struct is sound.
             let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
             wr.wr_id = i as u64;
             wr.sg_list = &mut sges[i] as *mut IbvSge;
@@ -407,10 +402,11 @@ mod tests {
         // Verify addresses
         assert_eq!(sges[0].addr, 0x1000);
         assert_eq!(sges[1].addr, 0x1000 + 4096);
-        // SAFETY: we just wrote the rdma variant above
-        unsafe {
-            assert_eq!(wrs[0].wr.rdma.remote_addr, 0xDEAD_0000);
-            assert_eq!(wrs[1].wr.rdma.remote_addr, 0xDEAD_0000 + 4096);
-        }
+        // SAFETY: we just wrote the rdma variant above.
+        let r0 = unsafe { wrs[0].wr.rdma.remote_addr };
+        // SAFETY: same as above.
+        let r1 = unsafe { wrs[1].wr.rdma.remote_addr };
+        assert_eq!(r0, 0xDEAD_0000);
+        assert_eq!(r1, 0xDEAD_0000 + 4096);
     }
 }

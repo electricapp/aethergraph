@@ -88,6 +88,7 @@ impl GraphFileView {
 
     fn drop_page_cache(&self) {
         #[cfg(target_os = "linux")]
+        // SAFETY: fadvise on an owned, open fd is sound.
         unsafe {
             libc::posix_fadvise(self.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
         }

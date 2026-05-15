@@ -84,22 +84,23 @@ fn build_loopback() -> Loopback {
 fn post_and_wait(qp: &RdmaQp, reads: &[RdmaRead], cq: *mut IbvCq) -> Result<(), String> {
     qp.post_reads(reads)
         .map_err(|e| format!("post_reads: {e}"))?;
+    // SAFETY: zeroed init of POD `IbvWc` is sound.
     let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 8];
-    loop {
-        let n = RdmaQp::poll_cq_on(cq, &mut wcs).map_err(|e| format!("poll_cq: {e}"))?;
-        for wc in wcs.iter().take(n) {
-            if wc.status != IBV_WC_SUCCESS {
-                return Err(format!(
-                    "wc status={} vendor_err={} wr_id={} opcode={}",
-                    wc.status, wc.vendor_err, wc.wr_id, wc.opcode
-                ));
-            }
-            return Ok(());
+    let wc = loop {
+        // SAFETY: `cq` is the live CQ for this test harness.
+        let n = unsafe { RdmaQp::poll_cq_on(cq, &mut wcs) }.map_err(|e| format!("poll_cq: {e}"))?;
+        if n > 0 {
+            break wcs[0];
         }
-        if n == 0 {
-            std::hint::spin_loop();
-        }
+        std::hint::spin_loop();
+    };
+    if wc.status != IBV_WC_SUCCESS {
+        return Err(format!(
+            "wc status={} vendor_err={} wr_id={} opcode={}",
+            wc.status, wc.vendor_err, wc.wr_id, wc.opcode
+        ));
     }
+    Ok(())
 }
 
 /// Scenario A: MR allocated + registered on the main thread, buffer + lkey
@@ -278,10 +279,11 @@ fn mr_on_main_touched_by_worker_then_post_on_main() {
     let buf_len = buf.len();
     thread::spawn(move || {
         let p = buf_addr as *mut u8;
-        unsafe {
-            for i in 0..buf_len {
-                p.add(i).write(0xA5);
-            }
+        for i in 0..buf_len {
+            // SAFETY: `buf_addr` points to `buf_len` bytes owned by the test.
+            let slot = unsafe { p.add(i) };
+            // SAFETY: `slot` is in-bounds; write is exclusive within this thread.
+            unsafe { slot.write(0xA5) };
         }
     })
     .join()

@@ -59,7 +59,7 @@ impl RdmaFeatureClient {
 
         // Initialize CUDA context + stream
         let cuda_ctx = CudaContext::new(gpu_id)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("CUDA init failed: {e}")))?;
+            .map_err(|e| io::Error::other(format!("CUDA init failed: {e}")))?;
         let stream = cuda_ctx.default_stream();
 
         // Allocate VRAM staging buffer

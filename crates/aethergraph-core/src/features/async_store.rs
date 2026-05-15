@@ -433,6 +433,7 @@ impl AsyncFeatureStore {
                         feature_size,
                         regular_buffer.len()
                     );
+                    // SAFETY: `offset + feature_size` ≤ buffer length per the assert above.
                     unsafe { regular_buffer.as_mut_ptr().add(offset) }
                 };
                 reads.push((file_offset, buf_ptr, feature_size));

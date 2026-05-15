@@ -60,6 +60,7 @@ pub struct XdpRing<T: Copy> {
 // SAFETY: XdpRing pointers come from mmap and are accessed by one
 // producer + one consumer thread with atomic coordination.
 unsafe impl<T: Copy> Send for XdpRing<T> {}
+// SAFETY: same as Send — atomic producer/consumer coordination.
 unsafe impl<T: Copy> Sync for XdpRing<T> {}
 
 impl<T: Copy> XdpRing<T> {
@@ -88,8 +89,9 @@ impl<T: Copy> XdpRing<T> {
     /// Number of entries available for consumption.
     #[inline]
     pub fn available(&self) -> u32 {
-        // SAFETY: pointers are valid for the ring's lifetime
+        // SAFETY: ring pointers are valid for the ring's lifetime.
         let prod = unsafe { (*self.producer).load(Ordering::Acquire) };
+        // SAFETY: ring pointers are valid for the ring's lifetime.
         let cons = unsafe { (*self.consumer).load(Ordering::Acquire) };
         prod.wrapping_sub(cons)
     }
@@ -104,7 +106,9 @@ impl<T: Copy> XdpRing<T> {
         let cons = unsafe { (*self.consumer).load(Ordering::Acquire) };
         let idx = (cons.wrapping_add(offset)) & self.mask;
         // SAFETY: caller guarantees `offset < available()`, so `idx` is in-bounds.
-        unsafe { *self.ring.add(idx as usize) }
+        let slot = unsafe { self.ring.add(idx as usize) };
+        // SAFETY: `slot` is a valid pointer into the ring.
+        unsafe { *slot }
     }
 
     /// Advance the consumer pointer by `count`.
@@ -122,7 +126,9 @@ impl<T: Copy> XdpRing<T> {
     /// Number of free slots for production.
     #[inline]
     pub fn free_slots(&self) -> u32 {
+        // SAFETY: ring pointers are valid for the ring's lifetime.
         let prod = unsafe { (*self.producer).load(Ordering::Acquire) };
+        // SAFETY: ring pointers are valid for the ring's lifetime.
         let cons = unsafe { (*self.consumer).load(Ordering::Acquire) };
         (self.mask + 1).wrapping_sub(prod.wrapping_sub(cons))
     }
@@ -137,7 +143,9 @@ impl<T: Copy> XdpRing<T> {
         let prod = unsafe { (*self.producer).load(Ordering::Relaxed) };
         let idx = (prod.wrapping_add(offset)) & self.mask;
         // SAFETY: caller guarantees `offset < free_slots()`, so `idx` is in-bounds.
-        unsafe { *self.ring.add(idx as usize) = entry };
+        let slot = unsafe { self.ring.add(idx as usize) };
+        // SAFETY: `slot` is a valid mutable pointer into the ring.
+        unsafe { *slot = entry };
     }
 
     /// Advance the producer pointer by `count`.

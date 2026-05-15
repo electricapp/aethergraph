@@ -27,6 +27,7 @@ pub struct RdmaContext {
 
 // SAFETY: ibverbs resources are thread-safe after creation.
 unsafe impl Send for RdmaContext {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for RdmaContext {}
 
 impl RdmaContext {
@@ -56,90 +57,119 @@ impl RdmaContext {
     ///
     /// Creates a protection domain and completion queue with `cq_size` entries.
     pub fn open_on_device(cq_size: i32, device_index: usize, gid_index: u8) -> io::Result<Self> {
-        unsafe {
-            // Enumerate devices
-            let mut num_devices: i32 = 0;
-            let device_list = ibv_get_device_list(&mut num_devices);
-            if device_list.is_null() || num_devices == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "no RDMA devices found",
-                ));
-            }
-            if device_index >= num_devices as usize {
-                ibv_free_device_list(device_list);
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "device_index {} out of range ({} devices found)",
-                        device_index, num_devices
-                    ),
-                ));
-            }
-
-            // Open the requested device
-            let device = *device_list.add(device_index);
-            let context = ibv_open_device(device);
-            ibv_free_device_list(device_list);
-
-            if context.is_null() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "ibv_open_device failed",
-                ));
-            }
-
-            // Allocate protection domain
-            let pd = ibv_alloc_pd(context);
-            if pd.is_null() {
-                ibv_close_device(context);
-                return Err(io::Error::new(io::ErrorKind::Other, "ibv_alloc_pd failed"));
-            }
-
-            // Create completion queue
-            let cq = ibv_create_cq(context, cq_size, ptr::null_mut(), ptr::null_mut(), 0);
-            if cq.is_null() {
-                ibv_dealloc_pd(pd);
-                ibv_close_device(context);
-                return Err(io::Error::new(io::ErrorKind::Other, "ibv_create_cq failed"));
-            }
-
-            // Query port 1 for LID
-            let mut port_attr: IbvPortAttr = std::mem::zeroed();
-            let ret = ibv_query_port(context, 1, &mut port_attr);
-            if ret != 0 {
-                ibv_destroy_cq(cq);
-                ibv_dealloc_pd(pd);
-                ibv_close_device(context);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "ibv_query_port failed",
-                ));
-            }
-
-            // Query the caller-specified GID index. No fallback or probing —
-            // the caller is responsible for picking a routable GID.
-            let mut gid: IbvGid = std::mem::zeroed();
-            let ret = ibv_query_gid(context, 1, gid_index as i32, &mut gid);
-            if ret != 0 {
-                ibv_destroy_cq(cq);
-                ibv_dealloc_pd(pd);
-                ibv_close_device(context);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("ibv_query_gid({gid_index}) failed"),
-                ));
-            }
-
-            Ok(Self {
-                context,
-                pd,
-                cq,
-                port_lid: port_attr.lid,
-                port_gid: gid,
-                gid_index,
-            })
+        // Enumerate devices.
+        let mut num_devices: i32 = 0;
+        // SAFETY: ibverbs FFI; `num_devices` is a valid out-param.
+        let device_list = unsafe { ibv_get_device_list(&mut num_devices) };
+        if device_list.is_null() || num_devices == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no RDMA devices found",
+            ));
         }
+        if device_index >= num_devices as usize {
+            // SAFETY: `device_list` is non-null per the check above.
+            unsafe { ibv_free_device_list(device_list) };
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "device_index {} out of range ({} devices found)",
+                    device_index, num_devices
+                ),
+            ));
+        }
+
+        // Open the requested device.
+        // SAFETY: `device_index < num_devices` checked above.
+        let device_slot = unsafe { device_list.add(device_index) };
+        // SAFETY: `device_slot` is in-bounds; the list is non-null.
+        let device = unsafe { *device_slot };
+        // SAFETY: `device` is a valid device pointer from the list.
+        let context = unsafe { ibv_open_device(device) };
+        // SAFETY: `device_list` is non-null and not yet freed.
+        unsafe { ibv_free_device_list(device_list) };
+
+        if context.is_null() {
+            return Err(io::Error::other("ibv_open_device failed"));
+        }
+
+        // Allocate protection domain.
+        // SAFETY: `context` is the just-opened device context.
+        let pd = unsafe { ibv_alloc_pd(context) };
+        if pd.is_null() {
+            // SAFETY: `context` is non-null and not yet closed.
+            unsafe { ibv_close_device(context) };
+            return Err(io::Error::other("ibv_alloc_pd failed"));
+        }
+
+        // Create completion queue.
+        // SAFETY: `context` is open; channel + cq_context null is allowed.
+        let cq = unsafe { ibv_create_cq(context, cq_size, ptr::null_mut(), ptr::null_mut(), 0) };
+        if cq.is_null() {
+            // SAFETY: pd/context still live, not yet freed.
+            unsafe {
+                ibv_dealloc_pd(pd);
+            }
+            // SAFETY: pd/context still live, not yet freed.
+            unsafe {
+                ibv_close_device(context);
+            }
+            return Err(io::Error::other("ibv_create_cq failed"));
+        }
+
+        // Query port 1 for LID.
+        // SAFETY: zeroed init of POD struct is sound.
+        let mut port_attr: IbvPortAttr = unsafe { std::mem::zeroed() };
+        // SAFETY: `context` is open; `port_attr` is a valid out-param.
+        let ret = unsafe { ibv_query_port(context, 1, &mut port_attr) };
+        if ret != 0 {
+            // SAFETY: all three handles still live.
+            unsafe {
+                ibv_destroy_cq(cq);
+            }
+            // SAFETY: see above.
+            unsafe {
+                ibv_dealloc_pd(pd);
+            }
+            // SAFETY: see above.
+            unsafe {
+                ibv_close_device(context);
+            }
+            return Err(io::Error::other("ibv_query_port failed"));
+        }
+
+        // Query the caller-specified GID index. No fallback or probing —
+        // the caller is responsible for picking a routable GID.
+        // SAFETY: zeroed init of POD struct is sound.
+        let mut gid: IbvGid = unsafe { std::mem::zeroed() };
+        // SAFETY: `context` is open; `gid` is a valid out-param.
+        let ret = unsafe { ibv_query_gid(context, 1, gid_index as i32, &mut gid) };
+        if ret != 0 {
+            // SAFETY: all three handles still live.
+            unsafe {
+                ibv_destroy_cq(cq);
+            }
+            // SAFETY: see above.
+            unsafe {
+                ibv_dealloc_pd(pd);
+            }
+            // SAFETY: see above.
+            unsafe {
+                ibv_close_device(context);
+            }
+            return Err(io::Error::other(format!(
+                "ibv_query_gid({gid_index}) failed"
+            )));
+        }
+
+        Ok(Self {
+            context,
+            pd,
+            cq,
+            port_lid: port_attr.lid,
+            port_gid: gid,
+            gid_index,
+        })
     }
 
     /// Register memory for RDMA access (host or GPU via nvidia-peermem).
@@ -151,13 +181,12 @@ impl RdmaContext {
     /// context, declared *before* the context field, gives the right Drop order
     /// (Rust drops fields in declaration order).
     pub fn reg_mr(&self, addr: *mut u8, len: usize, access: i32) -> io::Result<RegisteredMr> {
-        unsafe {
-            let mr = ibv_reg_mr(self.pd, addr as *mut libc::c_void, len, access);
-            if mr.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(RegisteredMr { mr })
+        // SAFETY: `self.pd` is alive; `addr/len/access` are the caller's contract.
+        let mr = unsafe { ibv_reg_mr(self.pd, addr as *mut libc::c_void, len, access) };
+        if mr.is_null() {
+            return Err(io::Error::last_os_error());
         }
+        Ok(RegisteredMr { mr })
     }
 
     /// Raw ibverbs context pointer (for creating QPs on this device).
@@ -189,36 +218,44 @@ pub struct RdmaDeviceInfo {
 /// threads + memory. Cross-NUMA RDMA costs 2–3× latency on real hardware,
 /// so the placement decision is the caller's job.
 pub fn enumerate_devices() -> io::Result<Vec<RdmaDeviceInfo>> {
-    unsafe {
-        let mut num_devices: i32 = 0;
-        let list = ibv_get_device_list(&mut num_devices);
-        if list.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "ibv_get_device_list returned null",
-            ));
-        }
-        let mut out = Vec::with_capacity(num_devices as usize);
-        for i in 0..num_devices as usize {
-            let dev = *list.add(i);
-            // ibv_get_device_name is typically a real ABI symbol (not inline);
-            // returns a `const char *` valid for the device list's lifetime.
-            let name_ptr = ibv_get_device_name(dev);
-            let name = if name_ptr.is_null() {
-                String::new()
-            } else {
-                CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
-            };
-            let numa_node = read_numa_node(&name);
-            out.push(RdmaDeviceInfo {
-                index: i,
-                name,
-                numa_node,
-            });
-        }
-        ibv_free_device_list(list);
-        Ok(out)
+    let mut num_devices: i32 = 0;
+    // SAFETY: ibverbs FFI; `num_devices` is a valid out-param.
+    let list = unsafe { ibv_get_device_list(&mut num_devices) };
+    if list.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "ibv_get_device_list returned null",
+        ));
     }
+    let mut out = Vec::with_capacity(num_devices as usize);
+    for i in 0..num_devices as usize {
+        // SAFETY: `i < num_devices`; `list` is non-null.
+        let dev_slot = unsafe { list.add(i) };
+        // SAFETY: `dev_slot` is in-bounds.
+        let dev = unsafe { *dev_slot };
+        // ibv_get_device_name is typically a real ABI symbol (not inline);
+        // returns a `const char *` valid for the device list's lifetime.
+        // SAFETY: `dev` is a valid device pointer from the list.
+        let name_ptr = unsafe { ibv_get_device_name(dev) };
+        let name = if name_ptr.is_null() {
+            String::new()
+        } else {
+            // SAFETY: `name_ptr` is a NUL-terminated string owned by ibverbs,
+            // valid for the list's lifetime.
+            unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        let numa_node = read_numa_node(&name);
+        out.push(RdmaDeviceInfo {
+            index: i,
+            name,
+            numa_node,
+        });
+    }
+    // SAFETY: `list` is non-null and not yet freed.
+    unsafe { ibv_free_device_list(list) };
+    Ok(out)
 }
 
 fn read_numa_node(dev_name: &str) -> Option<i32> {
@@ -228,11 +265,12 @@ fn read_numa_node(dev_name: &str) -> Option<i32> {
 
 impl Drop for RdmaContext {
     fn drop(&mut self) {
-        unsafe {
-            ibv_destroy_cq(self.cq);
-            ibv_dealloc_pd(self.pd);
-            ibv_close_device(self.context);
-        }
+        // SAFETY: handles were created in `open_on_device` and are live until now.
+        unsafe { ibv_destroy_cq(self.cq) };
+        // SAFETY: see above.
+        unsafe { ibv_dealloc_pd(self.pd) };
+        // SAFETY: see above.
+        unsafe { ibv_close_device(self.context) };
     }
 }
 
@@ -241,13 +279,12 @@ impl Drop for RdmaContext {
 /// don't contend on a single CQ. Returns an RAII `RegisteredCq` that destroys
 /// the CQ on drop. Callers MUST drop the CQ before this context.
 pub fn create_cq(ctx: &RdmaContext, cq_size: i32) -> io::Result<RegisteredCq> {
-    unsafe {
-        let cq = ibv_create_cq(ctx.context, cq_size, ptr::null_mut(), ptr::null_mut(), 0);
-        if cq.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "ibv_create_cq failed"));
-        }
-        Ok(RegisteredCq { cq })
+    // SAFETY: `ctx.context` is alive for as long as `ctx` is borrowed.
+    let cq = unsafe { ibv_create_cq(ctx.context, cq_size, ptr::null_mut(), ptr::null_mut(), 0) };
+    if cq.is_null() {
+        return Err(io::Error::other("ibv_create_cq failed"));
     }
+    Ok(RegisteredCq { cq })
 }
 
 /// RAII wrapper around `*mut IbvCq`. Drop calls `ibv_destroy_cq`.
@@ -259,7 +296,9 @@ pub struct RegisteredCq {
     cq: *mut IbvCq,
 }
 
+// SAFETY: ibverbs CQ is thread-safe after creation.
 unsafe impl Send for RegisteredCq {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for RegisteredCq {}
 
 impl RegisteredCq {
@@ -272,9 +311,8 @@ impl RegisteredCq {
 
 impl Drop for RegisteredCq {
     fn drop(&mut self) {
-        unsafe {
-            ibv_destroy_cq(self.cq);
-        }
+        // SAFETY: `self.cq` was returned by `ibv_create_cq` and is live until now.
+        unsafe { ibv_destroy_cq(self.cq) };
     }
 }
 
@@ -287,7 +325,9 @@ pub struct RegisteredMr {
     mr: *mut IbvMr,
 }
 
+// SAFETY: ibverbs MR is thread-safe after creation.
 unsafe impl Send for RegisteredMr {}
+// SAFETY: see Send impl above.
 unsafe impl Sync for RegisteredMr {}
 
 impl RegisteredMr {

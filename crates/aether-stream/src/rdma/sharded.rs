@@ -133,7 +133,7 @@ impl ShardedQpPool {
                     }
                     worker_loop(qp_for_worker, cq_for_worker, work_rx);
                 })
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shard: {e}")))?;
+                .map_err(|e| io::Error::other(format!("spawn shard: {e}")))?;
 
             qps.push(qp);
             cqs.push(cq);
@@ -242,20 +242,21 @@ fn post_and_drain(qp: &RdmaQp, cq: *mut IbvCq, reads: &[RdmaRead]) -> io::Result
     }
     qp.post_reads(reads)?;
     let signaled_wr_id = (reads.len() - 1) as u64;
+    // SAFETY: zeroed init of POD `IbvWc` is sound.
     let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 32];
     let mut first_error: Option<(u32, u32)> = None;
     loop {
-        let n = RdmaQp::poll_cq_on(cq, &mut wcs)?;
+        // SAFETY: `cq` is the live CQ borrowed for this gather batch.
+        let n = unsafe { RdmaQp::poll_cq_on(cq, &mut wcs) }?;
         for wc in wcs.iter().take(n) {
             if wc.status != IBV_WC_SUCCESS && first_error.is_none() {
                 first_error = Some((wc.status, wc.vendor_err));
             }
             if wc.wr_id == signaled_wr_id {
                 if let Some((status, vendor_err)) = first_error {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("RDMA READ failed: status={status}, vendor_err={vendor_err}"),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "RDMA READ failed: status={status}, vendor_err={vendor_err}"
+                    )));
                 }
                 return Ok(());
             }

@@ -3,16 +3,23 @@
 version = 4
 
 [[package]]
+name = "aether-epoch"
+version = "0.1.0"
+
+[[package]]
 name = "aether-graph"
 version = "0.1.0"
 dependencies = [
+ "aether-epoch",
  "crossbeam-utils",
+ "tracing",
 ]
 
 [[package]]
 name = "aethergraph-core"
 version = "0.1.0"
 dependencies = [
+ "aether-epoch",
  "ahash",
  "anyhow",
  "bitflags 2.11.1",
