@@ -68,6 +68,13 @@ jobs:
         with:
           key: ${{ matrix.label }}
 
+      - name: Install ubuntu system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libbpf-dev pkg-config libibverbs-dev libnuma-dev
+
       - name: rustfmt
         run: cargo fmt --all -- --check
 
@@ -79,13 +86,6 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --no-deps \
             --features "${{ matrix.features }}" -- -D warnings
-
-      - name: Install ubuntu system deps
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang libbpf-dev pkg-config libibverbs-dev libnuma-dev
 
       - name: xdp_bpf compile check
         if: matrix.os == 'ubuntu-latest'
