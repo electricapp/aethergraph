@@ -9,6 +9,9 @@ description = "Kernel-bypass streaming engine: AF_XDP ingestion, seqlock feature
 [lints]
 workspace = true
 
+[lib]
+bench = false
+
 [features]
 default = []
 rdma = ["aether-mem/rdma"]

@@ -28,6 +28,7 @@ crate-type = ["cdylib"]
 # linking; plain cargo test omits that flag and links libpython normally so
 # tests run as a standalone binary.
 doctest = false
+bench = false
 
 [dependencies]
 aethergraph-core = { path = "../aethergraph-core", version = "0.1" }

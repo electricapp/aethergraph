@@ -114,12 +114,9 @@ jobs:
       - name: cargo check --benches
         run: cargo check --workspace --benches
 
-      - name: bench smoke (compile-only)
-        # `cargo bench --workspace -- --quick` errors on every crate's default
-        # lib target (no criterion). --no-run just compiles, which catches the
-        # main regression we care about: criterion API drift.
+      - name: bench smoke
         if: matrix.label == 'ubuntu-stable-default'
-        run: cargo bench --workspace --no-run --no-fail-fast
+        run: cargo bench --workspace --no-fail-fast -- --quick --noplot
 
       - name: Coverage summary
         if: always()

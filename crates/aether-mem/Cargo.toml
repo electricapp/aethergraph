@@ -9,6 +9,9 @@ description = "Lock-free slab allocator with HugePages and pluggable memory hook
 [lints]
 workspace = true
 
+[lib]
+bench = false
+
 [features]
 default = []
 parallel-prefault = ["dep:rayon"]

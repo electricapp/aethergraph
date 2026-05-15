@@ -8,6 +8,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "aethergraph-cli"
+path = "src/main.rs"
+bench = false
+
 [dependencies]
 aethergraph-core = { path = "../aethergraph-core", version = "0.1" }
 clap.workspace = true

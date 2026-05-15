@@ -9,6 +9,9 @@ description = "Shared monotonic version clock for cross-subsystem read consisten
 [lints]
 workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 
 [dev-dependencies]

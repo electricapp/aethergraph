@@ -9,6 +9,9 @@ description = "Lock-free dynamic graph with C-tree neighbor lists. Single-writer
 [lints]
 workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 aether-epoch = { path = "../aether-epoch", version = "0.1" }
 crossbeam-utils = "0.8"
