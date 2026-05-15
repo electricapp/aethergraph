@@ -21,7 +21,7 @@ classifiers = [
 
 dependencies = [
     "numpy>=2.2.6",
-    "rich>=14.2.0",
+    "rich>=15.0.0",
     "typer>=0.25.1",
 ]
 
