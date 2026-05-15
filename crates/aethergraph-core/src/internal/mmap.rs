@@ -188,6 +188,7 @@ pub fn save_graph(graph: &Graph, path: impl AsRef<Path>) -> Result<()> {
 
 /// Loads a graph from file using automatic validation mode selection.
 #[inline]
+#[tracing::instrument(skip(path), fields(path = %path.as_ref().display()))]
 pub fn load_graph(path: impl AsRef<Path>) -> Result<Graph> {
     let path = path.as_ref();
     let file_size = std::fs::metadata(path)

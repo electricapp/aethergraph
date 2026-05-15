@@ -35,11 +35,20 @@ impl Chunk {
         }
     }
 
-    /// Create a chunk from a sorted slice. Panics if len > CHUNK_CAP.
+    /// Create a chunk from a sorted slice.
+    ///
+    /// # Panics
+    /// Panics if `sorted.len() > CHUNK_CAP`. The slice is also expected to be
+    /// sorted ascending (debug-asserted).
     #[inline]
     pub fn from_sorted(sorted: &[u32]) -> Self {
-        debug_assert!(sorted.len() <= CHUNK_CAP);
-        debug_assert!(is_sorted(sorted));
+        assert!(
+            sorted.len() <= CHUNK_CAP,
+            "chunk: input len {} exceeds CHUNK_CAP {}",
+            sorted.len(),
+            CHUNK_CAP
+        );
+        debug_assert!(is_sorted(sorted), "chunk input must be sorted");
         let mut c = Self::empty();
         c.count = sorted.len() as u8;
         c.data[..sorted.len()].copy_from_slice(sorted);
@@ -112,17 +121,27 @@ impl Chunk {
     }
 
     /// Merge two sorted chunks into one. Panics if combined length > CHUNK_CAP.
+    ///
+    /// Requires the two inputs' key ranges to be disjoint — chunks are
+    /// strictly sorted with unique keys, so a shared boundary key (e.g.
+    /// `a=[1,5]`, `b=[5,9]`) would produce a duplicate `5` and violate the
+    /// chunk invariant. The strict `<` comparison below would silently drop
+    /// the `a` copy in that case; a debug assertion checks for it explicitly.
     #[inline]
     pub fn merge(a: &Chunk, b: &Chunk) -> Chunk {
         let an = a.len();
         let bn = b.len();
         debug_assert!(an + bn <= CHUNK_CAP);
+        debug_assert!(
+            an == 0 || bn == 0 || a.max() < b.min() || b.max() < a.min(),
+            "Chunk::merge inputs must have disjoint key ranges",
+        );
         let mut c = Chunk::empty();
         let mut ai = 0;
         let mut bi = 0;
         let mut ci = 0;
         while ai < an && bi < bn {
-            if a.data[ai] <= b.data[bi] {
+            if a.data[ai] < b.data[bi] {
                 c.data[ci] = a.data[ai];
                 ai += 1;
             } else {

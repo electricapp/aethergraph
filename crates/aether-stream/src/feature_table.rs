@@ -46,6 +46,36 @@ pub struct FeatureSchema {
     pub tail_offset_in_slot: usize,
 }
 
+/// RAII guard armed during the odd-head window of a seqlock write. If the
+/// writer panics between `head→odd` and `head→even`, this guard's `Drop`
+/// runs as the stack unwinds and forces head to an even target value,
+/// releasing readers that would otherwise spin forever.
+///
+/// `disarmed = true` is set explicitly on the success path so the guard's
+/// Drop is a no-op (the writer already wrote the final `target` value).
+struct SeqlockWriteGuard<'a> {
+    head: &'a AtomicU64,
+    tail: &'a AtomicU64,
+    target: u64,
+    disarmed: bool,
+}
+
+impl Drop for SeqlockWriteGuard<'_> {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // We're unwinding from a panic between the head→odd RMW and
+        // head→even store. Force tail then head to `target` (even) — the
+        // feature payload is logically abandoned (readers will see a
+        // valid-version copy of whatever was in the slot last). Without
+        // this, the odd head would trap every future reader in the
+        // spin-on-odd loop.
+        self.tail.store(self.target, Ordering::Release);
+        self.head.store(self.target, Ordering::Release);
+    }
+}
+
 /// Compute tail version offset for a given feature_dim.
 ///
 /// tail_offset = 8 (head) + feature_dim * 4, rounded up to 8-byte alignment.
@@ -67,13 +97,17 @@ impl FeatureTable {
     ///
     /// `node_count` is rounded up to the next power of two.
     /// `feature_dim` is the number of f32 features per node.
+    ///
+    /// Returns `None` if `node_count == 0`, `feature_dim == 0`, or the
+    /// underlying allocation fails.
     pub fn new(
         node_count: usize,
         feature_dim: usize,
         extra_hooks: Vec<Box<dyn MemoryHook>>,
     ) -> Option<Self> {
-        assert!(node_count > 0);
-        assert!(feature_dim > 0);
+        if node_count == 0 || feature_dim == 0 {
+            return None;
+        }
 
         let slot_count = node_count.next_power_of_two();
         let tail_offset = compute_tail_offset(feature_dim);
@@ -82,11 +116,10 @@ impl FeatureTable {
         let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook)];
         hooks.extend(extra_hooks);
 
-        let ring = SharedMemoryRing::new(slot_count, slot_size, hooks)?;
+        let (ring, _hook_failures) = SharedMemoryRing::new(slot_count, slot_size, hooks).ok()?;
 
-        // We access slots positionally by node ID, not via the free list.
-        // The ring is used for its allocation + hooks.
-
+        // We access slots positionally by node ID, not via the free list;
+        // the ring is used for its allocation + hooks only.
         Some(Self {
             ring,
             node_count,
@@ -97,12 +130,20 @@ impl FeatureTable {
 
     /// Write features for a node. Head/tail seqlock protocol:
     ///
-    /// 1. head → odd (writing)
-    /// 2. copy features
+    /// 1. head → odd (signals "writer in progress")
+    /// 2. copy features (non-atomic)
     /// 3. tail → next even
-    /// 4. head → next even (= tail)
+    /// 4. head → next even (matches tail)
     ///
-    /// # Safety
+    /// # Panic safety
+    /// If the user-supplied `features` slice access — or any code path inside
+    /// this function — panics between steps 1 and 4, an internal
+    /// [`SeqlockWriteGuard`] still runs and forces head to an even value
+    /// (`prev + 2`, abandoning the in-progress generation). Without this,
+    /// any reader that observed the odd head would spin forever waiting for
+    /// the write to complete.
+    ///
+    /// # Concurrency
     /// Multiple concurrent writers to the *same* node produce torn reads.
     /// Different nodes can be written concurrently without issue.
     pub fn write_node(&self, node: usize, features: &[f32]) {
@@ -111,28 +152,42 @@ impl FeatureTable {
 
         let base = self.slot_ptr(node);
 
+        // SAFETY: `base` is a valid slot pointer (`slot_ptr` bounds-checks
+        // `node`); the head/tail atomic refs are derived from it via
+        // documented slot layout (see FEATURE_OFFSET / tail_offset).
         unsafe {
-            let head = &*(base as *const AtomicU64);
-            let tail = &*(base.add(self.tail_offset) as *const AtomicU64);
+            let head_ptr = base as *const AtomicU64;
+            let tail_ptr = base.add(self.tail_offset) as *const AtomicU64;
+            let head = &*head_ptr;
+            let tail = &*tail_ptr;
 
-            // Step 1: head → odd (signals write in progress)
-            // AcqRel: Release orders prior writes before head goes odd.
-            // Acquire prevents the feature copy below from being reordered
-            // before this RMW — without it, a reader could see even head
-            // while features are being overwritten (torn read that passes
-            // the h == t check).
+            // Step 1: head → odd. AcqRel: Release orders prior writes before
+            // head goes odd; Acquire prevents the feature copy below from
+            // being reordered before this RMW.
             let prev = head.fetch_add(1, Ordering::AcqRel);
-            let target = prev + 2; // next even version
+            let target = prev + 2;
 
-            // Step 2: write features
+            // Arm the panic-recovery guard. From here through the explicit
+            // disarm below, ANY panic restores head to `target` (even),
+            // releasing waiting readers.
+            let guard = SeqlockWriteGuard {
+                head,
+                tail,
+                target,
+                disarmed: false,
+            };
+
+            // Step 2: copy features (non-atomic).
             let feat_ptr = base.add(FEATURE_OFFSET) as *mut f32;
             std::ptr::copy_nonoverlapping(features.as_ptr(), feat_ptr, self.feature_dim);
 
-            // Step 3: tail → target (even)
+            // Step 3: tail → target.
             tail.store(target, Ordering::Release);
 
-            // Step 4: head → target (even, matches tail)
+            // Step 4: head → target. Disarm the guard so its Drop is a
+            // no-op on the success path.
             head.store(target, Ordering::Release);
+            std::mem::forget(guard);
         }
     }
 
@@ -189,7 +244,7 @@ impl FeatureTable {
                 //      new generation during our copy. Since the writer's
                 //      first op is a LOCK-RMW that's immediately globally
                 //      visible, h2 cannot equal the old even h1 if a writer
-                //      ran. This is what the previous protocol missed.
+                //      ran concurrently.
                 let t = tail.load(Ordering::Acquire);
                 let h2 = head.load(Ordering::Acquire);
                 if h1 == t && h1 == h2 {
@@ -252,6 +307,51 @@ mod tests {
         let mut out = vec![0.0f32; 8];
         assert!(table.read_node(0, &mut out));
         assert_eq!(out, features);
+    }
+
+    #[test]
+    fn seqlock_recovers_from_panic_mid_write() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::Arc;
+
+        // Wrap the table in Arc so we can share it between the panicking
+        // closure and the post-panic reader.
+        let table = Arc::new(FeatureTable::new(4, 4, vec![]).unwrap());
+        let baseline = vec![1.0_f32, 2.0, 3.0, 4.0];
+        table.write_node(0, &baseline);
+
+        // Simulate a panic mid-write by handing `write_node` a feature
+        // slice from a struct whose Drop panics during the copy. We can't
+        // inject a panic *inside* the copy directly without exposing
+        // internals, so instead we use the simpler model: take a
+        // SeqlockWriteGuard manually, then drop it without disarming.
+        let table_for_panic = Arc::clone(&table);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let base = table_for_panic.slot_ptr(0);
+            // SAFETY: same slot layout as write_node uses.
+            unsafe {
+                let head = &*(base as *const AtomicU64);
+                let tail = &*(base.add(table_for_panic.tail_offset) as *const AtomicU64);
+                let prev = head.fetch_add(1, Ordering::AcqRel);
+                let target = prev + 2;
+                // Arm the guard but don't disarm — `panic!` below triggers
+                // the guard's Drop, which must restore head to `target`.
+                let _guard = SeqlockWriteGuard {
+                    head,
+                    tail,
+                    target,
+                    disarmed: false,
+                };
+                panic!("simulated mid-write panic");
+            }
+        }));
+        assert!(result.is_err(), "the simulated panic should propagate");
+
+        // After unwinding, the guard's Drop should have left head at the
+        // post-write even value. A reader must NOT spin forever.
+        let mut out = vec![0.0_f32; 4];
+        let got = table.read_node(0, &mut out);
+        assert!(got, "reader must complete (not spin) after writer panic");
     }
 
     #[test]

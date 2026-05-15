@@ -13,5 +13,5 @@ pub use prefetch::{
 };
 pub use sampler::{
     NeighborSampler, ParallelBatchSampler, SampledSubgraph, SamplingConfig, SubgraphType,
-    TemporalStrategy,
+    TemporalSamplingError, TemporalStrategy,
 };

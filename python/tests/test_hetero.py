@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 from aethergraph import HeteroGraph
@@ -46,22 +47,30 @@ def reddit_graph(rng: np.random.Generator) -> HeteroCsrGraph:
         node_types={"user": 100, "post": 500, "comment": 1000, "subreddit": 50},
         edge_types=[
             (
-                "user", "votes", "post",
+                "user",
+                "votes",
+                "post",
                 rng.integers(0, 100, 2000).astype(np.uint32),
                 rng.integers(0, 500, 2000).astype(np.uint32),
             ),
             (
-                "user", "writes", "comment",
+                "user",
+                "writes",
+                "comment",
                 rng.integers(0, 100, 3000).astype(np.uint32),
                 rng.integers(0, 1000, 3000).astype(np.uint32),
             ),
             (
-                "comment", "reply_to", "comment",
+                "comment",
+                "reply_to",
+                "comment",
                 rng.integers(0, 1000, 1500).astype(np.uint32),
                 rng.integers(0, 1000, 1500).astype(np.uint32),
             ),
             (
-                "post", "belongs_to", "subreddit",
+                "post",
+                "belongs_to",
+                "subreddit",
                 rng.integers(0, 500, 500).astype(np.uint32),
                 rng.integers(0, 50, 500).astype(np.uint32),
             ),
@@ -70,16 +79,23 @@ def reddit_graph(rng: np.random.Generator) -> HeteroCsrGraph:
 
 
 @pytest.fixture
-def reddit_hetero_graph(reddit_graph: HeteroCsrGraph, rng: np.random.Generator) -> HeteroGraph:
-    """Python HeteroGraph wrapper with per-type features."""
-    g = HeteroGraph.__new__(HeteroGraph)
-    g._inner = reddit_graph
-    g._feature_paths = {}
-    g._features = {
+def reddit_hetero_graph(reddit_graph: HeteroCsrGraph) -> HeteroGraph:
+    """Python HeteroGraph builder around the Rust CSR fixture."""
+    return HeteroGraph(reddit_graph)
+
+
+@pytest.fixture
+def reddit_hetero_features(
+    rng: np.random.Generator,
+) -> dict[str, npt.NDArray[np.float32]]:
+    """Per-node-type feature arrays sized to the reddit hetero fixture.
+
+    Kept separate from the graph fixture so tests opt in to features
+    explicitly, mirroring the homo `small_graph_with_features` pattern."""
+    return {
         "user": rng.standard_normal((100, 64)).astype(np.float32),
         "post": rng.standard_normal((500, 128)).astype(np.float32),
     }
-    return g
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +157,13 @@ class TestHeteroCsrGraph:
         g = HeteroCsrGraph.from_edge_arrays(
             node_types={"node": 50},
             edge_types=[
-                ("node", "connects", "node",
-                 np.array([0, 1, 2], dtype=np.uint32),
-                 np.array([1, 2, 0], dtype=np.uint32)),
+                (
+                    "node",
+                    "connects",
+                    "node",
+                    np.array([0, 1, 2], dtype=np.uint32),
+                    np.array([1, 2, 0], dtype=np.uint32),
+                ),
             ],
         )
         assert g.num_edges("node", "connects", "node") == 3
@@ -168,8 +188,8 @@ class TestHeteroSampler:
         seeds = np.array([0, 1, 2], dtype=np.uint32)
         sub = sampler.sample("user", seeds)
 
-        assert sub.seed_type() == "user"
-        assert list(sub.seeds()) == [0, 1, 2]
+        assert sub.seed_type == "user"
+        assert list(sub.seeds) == [0, 1, 2]
         # Should have sampled users (seeds) + posts + comments
         assert len(sub.nodes("user")) >= 3  # at least the seeds
 
@@ -204,7 +224,7 @@ class TestHeteroSampler:
         sampler = HeteroNeighborSampler(reddit_graph, config)
         sub = sampler.sample("user", np.array([0, 1], dtype=np.uint32))
 
-        for src, rel, dst in sub.edge_types():
+        for src, rel, dst in sub.edge_types:
             ei = sub.edge_index_local(src, rel, dst)
             assert ei.ndim == 2
             assert ei.shape[0] == 2
@@ -226,7 +246,7 @@ class TestHeteroSampler:
         )
         sampler = HeteroNeighborSampler(reddit_graph, config)
         sub = sampler.sample("user", np.array([], dtype=np.uint32))
-        assert len(sub.seeds()) == 0
+        assert len(sub.seeds) == 0
 
     def test_reproducible_with_seed(self, reddit_graph: HeteroCsrGraph) -> None:
         config = HeteroSamplingConfig(
@@ -246,7 +266,7 @@ class TestHeteroSampler:
         s2 = HeteroNeighborSampler(reddit_graph, config)
         sub2 = s2.sample("user", seeds)
 
-        for nt in sub1.node_types():
+        for nt in sub1.node_types:
             np.testing.assert_array_equal(sub1.nodes(nt), sub2.nodes(nt))
 
     def test_single_edge_type(self) -> None:
@@ -254,9 +274,13 @@ class TestHeteroSampler:
         g = HeteroCsrGraph.from_edge_arrays(
             node_types={"user": 50, "post": 100},
             edge_types=[
-                ("user", "likes", "post",
-                 np.arange(50, dtype=np.uint32) % 50,
-                 np.arange(50, dtype=np.uint32) % 100),
+                (
+                    "user",
+                    "likes",
+                    "post",
+                    np.arange(50, dtype=np.uint32) % 50,
+                    np.arange(50, dtype=np.uint32) % 100,
+                ),
             ],
         )
         config = HeteroSamplingConfig(
@@ -278,21 +302,18 @@ class TestHeteroGraphPython:
         g = HeteroGraph.from_edge_arrays(
             node_types={"a": 10, "b": 20},
             edge_types=[
-                ("a", "connects", "b",
-                 np.array([0, 1, 2], dtype=np.uint32),
-                 np.array([5, 6, 7], dtype=np.uint32)),
+                (
+                    "a",
+                    "connects",
+                    "b",
+                    np.array([0, 1, 2], dtype=np.uint32),
+                    np.array([5, 6, 7], dtype=np.uint32),
+                ),
             ],
         )
         assert set(g.node_types) == {"a", "b"}
         assert g.num_nodes("a") == 10
         assert g.num_nodes("b") == 20
-
-    def test_feature_loading(self, reddit_hetero_graph: HeteroGraph) -> None:
-        g = reddit_hetero_graph
-        assert "user" in g.features
-        assert g.features["user"].shape == (100, 64)
-        assert "post" in g.features
-        assert g.features["post"].shape == (500, 128)
 
     def test_properties(self, reddit_hetero_graph: HeteroGraph) -> None:
         g = reddit_hetero_graph
@@ -338,7 +359,11 @@ class TestHeteroNeighborLoader:
             ei = batch["user", "votes", "post"].edge_index
             assert ei.shape[0] == 2
 
-    def test_features_attached(self, reddit_hetero_graph: HeteroGraph) -> None:
+    def test_features_attached(
+        self,
+        reddit_hetero_graph: HeteroGraph,
+        reddit_hetero_features: dict[str, npt.NDArray[np.float32]],
+    ) -> None:
         import torch
         from aethergraph.pytorch import HeteroNeighborLoader
 
@@ -352,6 +377,7 @@ class TestHeteroNeighborLoader:
             },
             input_nodes=("user", torch.arange(10)),
             batch_size=10,
+            features=reddit_hetero_features,
         )
 
         batch = next(iter(loader))
@@ -403,8 +429,8 @@ class TestHeteroNeighborLoader:
             shuffle=True,
         )
 
-        epoch1_seeds = [b["user"].n_id[:b["user"].batch_size].numpy() for b in loader]
-        epoch2_seeds = [b["user"].n_id[:b["user"].batch_size].numpy() for b in loader]
+        epoch1_seeds = [b["user"].n_id[: b["user"].batch_size].numpy() for b in loader]
+        epoch2_seeds = [b["user"].n_id[: b["user"].batch_size].numpy() for b in loader]
 
         # With shuffle, at least one batch should have different seeds
         any_different = any(

@@ -27,10 +27,10 @@ try:
     import ray
     import torch
     import torch.nn.functional as F
-    from torch_geometric.data import Data  # type: ignore[import-untyped]
-    from torch_geometric.nn import SAGEConv  # type: ignore[import-untyped]
+    from torch_geometric.data import Data
+    from torch_geometric.nn import SAGEConv
 
-    from aethergraph import Graph
+    from aethergraph import Graph, save_features
     from aethergraph.ray import collate_to_pyg, create_sampling_dataset
 except ImportError:
     logger.error("Requires Ray and PyG. Install: pip install aethergraph[ray,pytorch-geometric]")
@@ -101,15 +101,20 @@ def train_batch(
 
 
 def create_synthetic_graph(
-    num_nodes: int, num_edges: int, feature_dim: int, graph_path: Path
+    num_nodes: int,
+    num_edges: int,
+    feature_dim: int,
+    graph_path: Path,
+    features_path: Path,
 ) -> tuple[torch.Tensor, int]:
-    """Create and save a synthetic graph for training.
+    """Create and save a synthetic graph + features for training.
 
     Args:
         num_nodes: Number of nodes in the graph.
         num_edges: Number of edges in the graph.
         feature_dim: Dimension of node features.
         graph_path: Path to save the graph binary file.
+        features_path: Path to save the feature binary file (read by Ray workers).
 
     Returns:
         Tuple of (labels tensor, number of classes).
@@ -121,10 +126,11 @@ def create_synthetic_graph(
     dst = rng.integers(0, num_nodes, size=num_edges, dtype=np.uint32)
     graph = Graph.from_edges(num_nodes, src, dst)
 
-    graph.features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
+    features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
     labels = torch.from_numpy(rng.integers(0, num_classes, num_nodes)).long()
 
     graph.save(graph_path)
+    save_features(features_path, features)
     logger.info(f"Created graph: {num_nodes:,} nodes, {num_edges:,} edges")
 
     return labels, num_classes
@@ -150,7 +156,10 @@ def main() -> None:
     torch.manual_seed(42)
     num_nodes, num_edges, feature_dim = 100_000, 500_000, 64
     graph_path = Path("/tmp/aethergraph_distributed_example.bin")
-    labels, num_classes = create_synthetic_graph(num_nodes, num_edges, feature_dim, graph_path)
+    features_path = Path("/tmp/aethergraph_distributed_example.feats.bin")
+    labels, num_classes = create_synthetic_graph(
+        num_nodes, num_edges, feature_dim, graph_path, features_path
+    )
 
     train_nodes = np.arange(int(num_nodes * 0.8), dtype=np.int64)
     val_nodes = np.arange(int(num_nodes * 0.8), num_nodes, dtype=np.int64)
@@ -173,6 +182,7 @@ def main() -> None:
             input_nodes=train_nodes,
             batch_size=batch_size,
             parallelism=num_cpus,
+            features_path=features_path,
         )
 
         total_loss, num_batches = 0.0, 0

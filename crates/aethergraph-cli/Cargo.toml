@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-aethergraph-core = { path = "../aethergraph-core" }
+aethergraph-core = { path = "../aethergraph-core", version = "0.1" }
 clap.workspace = true
 anyhow.workspace = true
 indicatif.workspace = true

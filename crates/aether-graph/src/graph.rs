@@ -7,11 +7,24 @@
 //!
 //! Read path (sampling): zero allocations, lock-free.
 //! Write path (edge insert): arena bump-alloc only, no locks.
+//!
+//! The single-writer invariant is enforced at runtime by [`Writer`] —
+//! `DynamicGraph::writer()` returns `None` if a writer already exists.
 
 use crate::arena::Arena;
 use crate::chunk::Chunk;
-use crate::ctree::CTree;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::ctree::{CTree, InsertResult};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use aether_epoch::{Epoch, EpochClock};
+
+#[cfg(feature = "wal")]
+use crate::wal::{EdgeRecord, WalError, WalWriter};
+#[cfg(feature = "wal")]
+use std::path::Path;
+#[cfg(feature = "wal")]
+use std::sync::Mutex;
 
 /// Dirty-node bitmap for historical embedding tracking.
 ///
@@ -19,38 +32,58 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// Lock-free: writers set bits with `fetch_or`, readers load with Acquire.
 struct DirtyBitmap {
     words: Vec<AtomicU64>,
+    /// Number of vertices addressable. Caps the per-vertex bit index.
+    num_vertices: usize,
 }
 
 impl DirtyBitmap {
     fn new(num_vertices: usize) -> Self {
-        let num_words = num_vertices.div_ceil(64);
+        let num_words = num_vertices.div_ceil(64).max(1);
         let mut words = Vec::with_capacity(num_words);
         for _ in 0..num_words {
             words.push(AtomicU64::new(0));
         }
-        Self { words }
+        Self {
+            words,
+            num_vertices,
+        }
     }
 
     /// Mark a vertex as dirty. Lock-free (atomic fetch_or).
+    /// Returns `false` if `vertex` is out of bounds (no bit was set).
     #[inline]
-    fn mark(&self, vertex: u32) {
-        let word = vertex as usize / 64;
-        let bit = vertex as usize % 64;
-        self.words[word].fetch_or(1 << bit, Ordering::Release);
+    fn mark(&self, vertex: u32) -> bool {
+        let v = vertex as usize;
+        if v >= self.num_vertices {
+            return false;
+        }
+        let word = v / 64;
+        let bit = v % 64;
+        self.words[word].fetch_or(1u64 << bit, Ordering::Release);
+        true
     }
 
-    /// Check if a vertex is dirty.
+    /// Check if a vertex is dirty. Returns `false` if `vertex` is out of bounds.
     #[inline]
     fn is_dirty(&self, vertex: u32) -> bool {
-        let word = vertex as usize / 64;
-        let bit = vertex as usize % 64;
-        self.words[word].load(Ordering::Acquire) & (1 << bit) != 0
+        let v = vertex as usize;
+        if v >= self.num_vertices {
+            return false;
+        }
+        let word = v / 64;
+        let bit = v % 64;
+        self.words[word].load(Ordering::Acquire) & (1u64 << bit) != 0
     }
 
     /// Clear all dirty bits (epoch boundary).
+    ///
+    /// Uses `swap(0, AcqRel)` per word so a `mark()` racing on the same word
+    /// is not silently lost: the `fetch_or` either lands before our swap (its
+    /// bit is included in the discarded value) or after (its bit survives in
+    /// the cleared word). A plain `store(0)` would clobber the racing bit.
     fn clear_all(&self) {
         for w in &self.words {
-            w.store(0, Ordering::Release);
+            w.swap(0, Ordering::AcqRel);
         }
     }
 
@@ -63,11 +96,15 @@ impl DirtyBitmap {
             if bits == 0 {
                 continue;
             }
-            let base = (i * 64) as u32;
+            let base = (i as u64) * 64;
             let mut remaining = bits;
             while remaining != 0 {
-                let bit = remaining.trailing_zeros();
-                result.push(base + bit);
+                let bit = remaining.trailing_zeros() as u64;
+                let id = base + bit;
+                // Mask off bits past num_vertices (last word can over-allocate).
+                if (id as usize) < self.num_vertices {
+                    result.push(id as u32);
+                }
                 remaining &= remaining - 1; // clear lowest set bit
             }
         }
@@ -101,6 +138,28 @@ pub struct DynamicGraph {
     /// Dirty-node bitmap for historical embedding tracking.
     /// Set on edge insert, cleared at epoch boundary.
     dirty: DirtyBitmap,
+    /// Single-writer guard. `true` while a `Writer` exists.
+    writer_locked: AtomicBool,
+    /// Poison flag — set when a `Writer` is dropped during unwinding (a
+    /// panic mid-insert). Once poisoned, the graph's internal invariants
+    /// (per-vertex root pointers, dirty bitmap, num_edges counter, arena
+    /// cursor) may all be in inconsistent states. New `writer()` calls
+    /// return [`WriterError::Poisoned`]; reads (`degree`, `neighbors_into`,
+    /// `has_edge`) keep working at their last consistent state.
+    poisoned: AtomicBool,
+    /// Shared monotonic version clock. Advanced once per successful writer
+    /// drop (skipped on panic-poisoned drops). Readers pin the current
+    /// epoch to coordinate consistent multi-source reads with subsystems
+    /// like the feature store; today it's an opaque counter, but the same
+    /// `Arc<EpochClock>` is the join point for future MVCC.
+    epoch: Arc<EpochClock>,
+    /// Optional write-ahead log. When present, every successful
+    /// `Writer::insert_edge` appends a record; `Writer::drop` fsyncs.
+    /// The `Mutex` is uncontended in practice (the surrounding `Writer`
+    /// guard already enforces single-writer), but we still need interior
+    /// mutability since the inserts go through `&self`.
+    #[cfg(feature = "wal")]
+    wal: Option<Mutex<WalWriter>>,
 }
 
 impl DynamicGraph {
@@ -109,7 +168,23 @@ impl DynamicGraph {
     /// `arena_bytes` controls the arena capacity. At ~80 bytes per edge
     /// (chunk amortized + interior node overhead), 1GB supports ~12M edges.
     /// For 100M edges, use ~8GB.
+    ///
+    /// The graph owns a private [`EpochClock`]. Use [`new_with_epoch`] to
+    /// share a clock with another subsystem (e.g. a feature store).
+    ///
+    /// [`new_with_epoch`]: Self::new_with_epoch
     pub fn new(num_vertices: usize, arena_bytes: usize) -> Self {
+        Self::new_with_epoch(num_vertices, arena_bytes, Arc::new(EpochClock::new()))
+    }
+
+    /// Create a graph that shares the given [`EpochClock`] with other
+    /// subsystems. Each successful writer-guard drop advances the clock.
+    pub fn new_with_epoch(num_vertices: usize, arena_bytes: usize, epoch: Arc<EpochClock>) -> Self {
+        // Vertex IDs are u32 throughout the API.
+        assert!(
+            num_vertices <= u32::MAX as usize,
+            "num_vertices {num_vertices} exceeds u32::MAX"
+        );
         let mut roots = Vec::with_capacity(num_vertices);
         for _ in 0..num_vertices {
             roots.push(AtomicU32::new(crate::ctree::NULL));
@@ -120,7 +195,140 @@ impl DynamicGraph {
             num_vertices,
             num_edges: AtomicU64::new(0),
             dirty: DirtyBitmap::new(num_vertices),
+            writer_locked: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+            epoch,
+            #[cfg(feature = "wal")]
+            wal: None,
         }
+    }
+
+    /// Open a graph backed by an append-only write-ahead log. If the WAL
+    /// at `path` already contains records (a previous run's edges), they
+    /// are replayed into the in-memory state before this returns; if the
+    /// WAL ends in a torn record (mid-write crash), the file is
+    /// truncated to the last clean record. After this returns the graph
+    /// is at the same epoch the prior run had reached, ready to accept
+    /// new writers.
+    #[cfg(feature = "wal")]
+    pub fn open_with_wal(
+        path: impl AsRef<Path>,
+        num_vertices: usize,
+        arena_bytes: usize,
+    ) -> Result<Self, WalError> {
+        Self::open_with_wal_and_epoch(path, num_vertices, arena_bytes, Arc::new(EpochClock::new()))
+    }
+
+    /// Like [`open_with_wal`], but the graph shares the provided clock
+    /// rather than minting a private one.
+    ///
+    /// [`open_with_wal`]: Self::open_with_wal
+    #[cfg(feature = "wal")]
+    pub fn open_with_wal_and_epoch(
+        path: impl AsRef<Path>,
+        num_vertices: usize,
+        arena_bytes: usize,
+        epoch: Arc<EpochClock>,
+    ) -> Result<Self, WalError> {
+        let path = path.as_ref();
+
+        // Build a fresh in-memory graph, then replay records into it
+        // before opening the WalWriter that will accept new appends. We
+        // deliberately leave `graph.wal = None` during replay — we do
+        // NOT want to re-log records we're reading from the log.
+        //
+        // One writer-guard per record: cheap (a single CAS to acquire,
+        // a single CAS to release, plus an epoch advance). The
+        // per-record advance is exactly what we want — after replay
+        // `current_epoch()` equals the number of records recovered,
+        // giving callers a deterministic "where did we end up" signal.
+        let mut graph = Self::new_with_epoch(num_vertices, arena_bytes, Arc::clone(&epoch));
+
+        let outcome = crate::wal::replay(path, |rec| {
+            let mut w = graph.writer_or_panic();
+            let _ = w.insert_edge(rec.src, rec.dst);
+            let _ = rec.epoch; // reserved for future MVCC pinning
+        })?;
+
+        // If the WAL ended in a torn record, truncate so future appends
+        // sit on top of clean data.
+        if let Some(off) = outcome.truncate_to {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_len(off))
+                .map_err(WalError::Io)?;
+        }
+
+        let writer = WalWriter::create_or_open(path)?;
+        graph.wal = Some(Mutex::new(writer));
+        Ok(graph)
+    }
+
+    /// Read the current epoch. Use this to pin a version before issuing a
+    /// multi-source read; later calls into subsystems sharing the same
+    /// [`EpochClock`] can be range-checked against this pin.
+    #[inline]
+    pub fn current_epoch(&self) -> Epoch {
+        self.epoch.current()
+    }
+
+    /// Access the shared epoch clock. Other subsystems clone the `Arc` to
+    /// observe writer commits.
+    #[inline]
+    pub fn epoch_clock(&self) -> &Arc<EpochClock> {
+        &self.epoch
+    }
+
+    /// Acquire the single-writer guard.
+    ///
+    /// Holding a `Writer` is the only way to insert edges. The guard releases
+    /// on drop, allowing another acquirer.
+    ///
+    /// # Errors
+    /// - [`WriterError::Busy`] if another `Writer` is currently held.
+    /// - [`WriterError::Poisoned`] if a previous writer was dropped during
+    ///   a panic. Once poisoned, the graph is read-only forever — the
+    ///   internal arena cursor / per-vertex roots / dirty bitmap may all
+    ///   be in mutually-inconsistent states. Recovery requires destroying
+    ///   the graph and rebuilding from a checkpoint (see the WAL story).
+    pub fn writer(&self) -> Result<Writer<'_>, WriterError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(WriterError::Poisoned);
+        }
+        self.writer_locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| WriterError::Busy)?;
+        // Re-check poison: a previous Writer may have set the flag between
+        // our first check and our CAS. Without this we would briefly hold
+        // `writer_locked=true` on a poisoned graph; we release immediately.
+        if self.poisoned.load(Ordering::Acquire) {
+            self.writer_locked.store(false, Ordering::Release);
+            return Err(WriterError::Poisoned);
+        }
+        Ok(Writer {
+            graph: self,
+            #[cfg(feature = "wal")]
+            wal_failed: false,
+        })
+    }
+
+    /// Acquire the writer guard, panicking on any error.
+    ///
+    /// Convenience for tests and bulk-load paths that should not contend
+    /// AND don't worry about poisoning. Production callers should match
+    /// on [`Self::writer`].
+    pub fn writer_or_panic(&self) -> Writer<'_> {
+        match self.writer() {
+            Ok(w) => w,
+            Err(e) => panic!("DynamicGraph::writer failed: {e}"),
+        }
+    }
+
+    /// Has this graph been poisoned by a panicking writer?
+    #[inline]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
     }
 
     /// Number of vertices.
@@ -133,35 +341,6 @@ impl DynamicGraph {
     #[inline(always)]
     pub fn num_edges(&self) -> u64 {
         self.num_edges.load(Ordering::Relaxed)
-    }
-
-    /// Insert a directed edge from `src` to `dst`.
-    ///
-    /// Returns `true` if the edge was new, `false` if it already existed.
-    /// Returns `Err` if the arena is full.
-    ///
-    /// Single-writer only. The new C-tree root is atomically published
-    /// so concurrent readers see a consistent snapshot.
-    pub fn insert_edge(&self, src: u32, dst: u32) -> Result<bool, ArenaFull> {
-        debug_assert!((src as usize) < self.num_vertices);
-        debug_assert!((dst as usize) < self.num_vertices);
-
-        let current_root = self.roots[src as usize].load(Ordering::Acquire);
-        let tree = CTree { root: current_root };
-
-        match tree.insert(&self.arena, dst) {
-            Some(new_tree) => {
-                // Atomically publish new root. Release ordering ensures
-                // all arena writes (new nodes) are visible before the
-                // root pointer becomes visible to readers.
-                self.roots[src as usize].store(new_tree.root, Ordering::Release);
-                self.num_edges.fetch_add(1, Ordering::Relaxed);
-                self.dirty.mark(src);
-                self.dirty.mark(dst);
-                Ok(true)
-            }
-            None => Ok(false), // duplicate edge
-        }
     }
 
     /// Get the C-tree root for a vertex.
@@ -181,7 +360,7 @@ impl DynamicGraph {
     /// Iterate a vertex's neighbors in sorted order. Calls `f` for each chunk.
     ///
     /// Zero allocations. The chunks are read directly from the arena.
-    /// Safe to call concurrently with `insert_edge` — readers see a
+    /// Safe to call concurrently with edge inserts — readers see a
     /// consistent snapshot (the tree that was current when they read the root).
     #[inline]
     pub fn for_each_chunk(&self, vertex: u32, f: impl FnMut(&Chunk)) {
@@ -224,7 +403,7 @@ impl DynamicGraph {
     ///
     /// # Concurrency
     ///
-    /// Safe to call concurrently with `insert_edge`. Each vertex's neighbor
+    /// Safe to call concurrently with edge inserts. Each vertex's neighbor
     /// list is read from the C-tree root that was current at read time, so
     /// the snapshot is a consistent (though not globally atomic) view.
     pub fn snapshot_csr(&self) -> (Vec<u64>, Vec<u32>) {
@@ -233,8 +412,9 @@ impl DynamicGraph {
         let mut buf = Vec::new();
 
         offsets.push(0);
-        for v in 0..self.num_vertices as u32 {
-            self.neighbors_into(v, &mut buf);
+        // Iterate via usize to avoid u32 truncation when num_vertices is large.
+        for v in 0..self.num_vertices {
+            self.neighbors_into(v as u32, &mut buf);
             edges.extend_from_slice(&buf);
             offsets.push(edges.len() as u64);
         }
@@ -266,22 +446,161 @@ impl DynamicGraph {
         self.dirty.clear_all();
     }
 
-    /// Build from a batch of edges. More efficient than individual inserts
-    /// because edges are sorted per-vertex and chunks are built directly.
+    /// Build from a batch of edges.
     pub fn from_edges(num_vertices: usize, edges: &[(u32, u32)], arena_bytes: usize) -> Self {
         let graph = Self::new(num_vertices, arena_bytes);
-
-        // Group edges by source vertex
-        // For truly optimal bulk loading, we'd build C-trees directly from
-        // sorted neighbor lists. For now, sequential inserts are fine since
-        // each insert is O(log degree) amortized.
-        for &(src, dst) in edges {
-            let _ = graph.insert_edge(src, dst);
+        {
+            let mut writer = graph.writer_or_panic();
+            for &(src, dst) in edges {
+                let _ = writer.insert_edge(src, dst);
+            }
         }
-
         graph
     }
 }
+
+/// Single-writer guard for [`DynamicGraph`].
+///
+/// Created by [`DynamicGraph::writer`]. Releases the writer slot on drop.
+/// Only one `Writer` may exist at a time — this is enforced at runtime by
+/// a CAS-based flag and is the primary safety invariant of the crate.
+pub struct Writer<'a> {
+    graph: &'a DynamicGraph,
+    /// True if any WAL append failed during this writer's lifetime. The
+    /// drop path consults this to poison the graph rather than advance the
+    /// epoch on data that isn't durable.
+    #[cfg(feature = "wal")]
+    wal_failed: bool,
+}
+
+impl<'a> Writer<'a> {
+    /// Insert a directed edge from `src` to `dst`.
+    ///
+    /// Returns `Ok(true)` if the edge was new, `Ok(false)` if it already
+    /// existed (no allocation occurred), or `Err(ArenaFull)` if the arena
+    /// has no remaining capacity.
+    pub fn insert_edge(&mut self, src: u32, dst: u32) -> Result<bool, ArenaFull> {
+        if (src as usize) >= self.graph.num_vertices || (dst as usize) >= self.graph.num_vertices {
+            // Out-of-range vertices are silently dropped to keep insert_edge
+            // hot-path branchless under the documented contract that callers
+            // pre-validate IDs. We still panic in debug to catch test bugs.
+            debug_assert!(false, "insert_edge: vertex out of range");
+            return Ok(false);
+        }
+
+        let current_root = self.graph.roots[src as usize].load(Ordering::Acquire);
+        let tree = CTree { root: current_root };
+
+        // SAFETY: Writer existence guarantees single-writer access to the arena.
+        match unsafe { tree.insert(&self.graph.arena, dst) } {
+            InsertResult::Inserted(new_tree) => {
+                // Release ordering ensures all arena writes (new nodes) are
+                // visible before the root pointer becomes visible to readers.
+                self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
+                self.graph.num_edges.fetch_add(1, Ordering::Relaxed);
+                // Out-of-range src/dst are already rejected by the bounds
+                // check at the top of `insert_edge`, so both marks succeed.
+                let _ = self.graph.dirty.mark(src);
+                let _ = self.graph.dirty.mark(dst);
+
+                // WAL append (buffered; fsync happens in `Writer::drop`).
+                // Errors here mean the in-memory state is ahead of the log
+                // — we record the error so `Writer::drop` can poison the
+                // graph instead of silently bumping the epoch on lossy
+                // state.
+                #[cfg(feature = "wal")]
+                if let Some(wal_mu) = self.graph.wal.as_ref() {
+                    let rec = EdgeRecord {
+                        epoch: self.graph.epoch.current().as_u64(),
+                        src,
+                        dst,
+                    };
+                    // Mutex is uncontended (we hold the only Writer).
+                    let mut w = wal_mu.lock().expect("WAL mutex poisoned");
+                    if let Err(e) = w.append_edge(rec) {
+                        // Record the failure so `Writer::drop` can poison.
+                        self.wal_failed = true;
+                        tracing::error!(error = %e, "WAL append failed");
+                    }
+                }
+
+                Ok(true)
+            }
+            InsertResult::Duplicate => Ok(false),
+            InsertResult::ArenaFull => Err(ArenaFull),
+        }
+    }
+}
+
+impl Drop for Writer<'_> {
+    fn drop(&mut self) {
+        // If we're unwinding from a panic mid-insert, the graph's invariants
+        // may be partially updated: arena cursor advanced past a node that
+        // was never linked into the tree, a root pointer that points at a
+        // freshly-allocated but uninitialized chunk, num_edges incremented
+        // for an insert that aborted, etc. Poison the graph so no further
+        // writer can run; readers keep working at their last consistent
+        // state.
+        let panicking = std::thread::panicking();
+        if panicking {
+            self.graph.poisoned.store(true, Ordering::Release);
+            tracing::warn!("DynamicGraph writer panicked — graph poisoned");
+            self.graph.writer_locked.store(false, Ordering::Release);
+            return;
+        }
+
+        // Clean drop path. The order matters: WAL sync FIRST, then advance
+        // the epoch only if sync succeeded. If sync fails, we've got
+        // in-memory edges that aren't durable — poison instead.
+        #[cfg(feature = "wal")]
+        let mut durable_failure = self.wal_failed;
+        #[cfg(not(feature = "wal"))]
+        let durable_failure = false;
+
+        #[cfg(feature = "wal")]
+        if let Some(wal_mu) = self.graph.wal.as_ref() {
+            let mut w = wal_mu.lock().expect("WAL mutex poisoned");
+            if let Err(e) = w.sync() {
+                tracing::error!(error = %e, "WAL fsync failed; poisoning graph");
+                durable_failure = true;
+            }
+        }
+
+        if durable_failure {
+            self.graph.poisoned.store(true, Ordering::Release);
+        } else {
+            // Publish a new epoch so readers pinning the clock see this
+            // writer's edits. Done before releasing the writer lock so
+            // the next writer can't bump the clock first.
+            let new_epoch = self.graph.epoch.advance().as_u64();
+            tracing::trace!(epoch = new_epoch, "DynamicGraph writer committed");
+        }
+        self.graph.writer_locked.store(false, Ordering::Release);
+    }
+}
+
+/// Reason [`DynamicGraph::writer`] cannot hand out a writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterError {
+    /// Another `Writer` is currently held by some thread.
+    Busy,
+    /// A prior `Writer` was dropped during a panic; the graph's internal
+    /// state may be inconsistent and no further writes are allowed.
+    Poisoned,
+}
+
+impl std::fmt::Display for WriterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("DynamicGraph already has a writer"),
+            Self::Poisoned => f.write_str(
+                "DynamicGraph is poisoned (a previous writer panicked); rebuild from a checkpoint",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriterError {}
 
 /// Error when arena is full.
 #[derive(Debug, Clone, Copy)]
@@ -311,9 +630,11 @@ mod tests {
     #[test]
     fn insert_and_query() {
         let g = DynamicGraph::new(100, 1 << 20);
-        assert!(g.insert_edge(0, 10).unwrap());
-        assert!(g.insert_edge(0, 20).unwrap());
-        assert!(g.insert_edge(0, 5).unwrap());
+        let mut w = g.writer_or_panic();
+        assert!(w.insert_edge(0, 10).unwrap());
+        assert!(w.insert_edge(0, 20).unwrap());
+        assert!(w.insert_edge(0, 5).unwrap());
+        drop(w);
 
         assert_eq!(g.degree(0), 3);
         assert!(g.has_edge(0, 10));
@@ -329,8 +650,10 @@ mod tests {
     #[test]
     fn duplicate_edge() {
         let g = DynamicGraph::new(100, 1 << 20);
-        assert!(g.insert_edge(0, 10).unwrap()); // new
-        assert!(!g.insert_edge(0, 10).unwrap()); // duplicate
+        let mut w = g.writer_or_panic();
+        assert!(w.insert_edge(0, 10).unwrap());
+        assert!(!w.insert_edge(0, 10).unwrap());
+        drop(w);
         assert_eq!(g.degree(0), 1);
         assert_eq!(g.num_edges(), 1);
     }
@@ -338,11 +661,13 @@ mod tests {
     #[test]
     fn multiple_vertices() {
         let g = DynamicGraph::new(100, 1 << 20);
-        g.insert_edge(0, 10).unwrap();
-        g.insert_edge(0, 20).unwrap();
-        g.insert_edge(1, 30).unwrap();
-        g.insert_edge(1, 40).unwrap();
-        g.insert_edge(1, 50).unwrap();
+        let mut w = g.writer_or_panic();
+        w.insert_edge(0, 10).unwrap();
+        w.insert_edge(0, 20).unwrap();
+        w.insert_edge(1, 30).unwrap();
+        w.insert_edge(1, 40).unwrap();
+        w.insert_edge(1, 50).unwrap();
+        drop(w);
 
         assert_eq!(g.degree(0), 2);
         assert_eq!(g.degree(1), 3);
@@ -352,17 +677,18 @@ mod tests {
     #[test]
     fn high_degree_vertex() {
         let g = DynamicGraph::new(1000, 1 << 20);
+        let mut w = g.writer_or_panic();
         for i in 0..500u32 {
-            assert!(g.insert_edge(0, i).unwrap());
+            assert!(w.insert_edge(0, i).unwrap());
         }
+        drop(w);
         assert_eq!(g.degree(0), 500);
 
         let mut buf = Vec::new();
         g.neighbors_into(0, &mut buf);
         assert_eq!(buf.len(), 500);
-        // Sorted
-        for w in buf.windows(2) {
-            assert!(w[0] < w[1]);
+        for win in buf.windows(2) {
+            assert!(win[0] < win[1]);
         }
     }
 
@@ -388,26 +714,25 @@ mod tests {
     #[test]
     fn snapshot_csr_basic() {
         let g = DynamicGraph::new(4, 1 << 20);
-        g.insert_edge(0, 1).unwrap();
-        g.insert_edge(0, 2).unwrap();
-        g.insert_edge(0, 3).unwrap();
-        g.insert_edge(1, 0).unwrap();
-        g.insert_edge(1, 2).unwrap();
-        g.insert_edge(2, 0).unwrap();
+        {
+            let mut w = g.writer_or_panic();
+            w.insert_edge(0, 1).unwrap();
+            w.insert_edge(0, 2).unwrap();
+            w.insert_edge(0, 3).unwrap();
+            w.insert_edge(1, 0).unwrap();
+            w.insert_edge(1, 2).unwrap();
+            w.insert_edge(2, 0).unwrap();
+        }
 
         let (offsets, edges) = g.snapshot_csr();
-        assert_eq!(offsets.len(), 5); // num_vertices + 1
+        assert_eq!(offsets.len(), 5);
         assert_eq!(offsets[0], 0);
-        // vertex 0: neighbors [1, 2, 3]
         assert_eq!(offsets[1] - offsets[0], 3);
         assert_eq!(&edges[offsets[0] as usize..offsets[1] as usize], &[1, 2, 3]);
-        // vertex 1: neighbors [0, 2]
         assert_eq!(offsets[2] - offsets[1], 2);
         assert_eq!(&edges[offsets[1] as usize..offsets[2] as usize], &[0, 2]);
-        // vertex 2: neighbors [0]
         assert_eq!(offsets[3] - offsets[2], 1);
         assert_eq!(&edges[offsets[2] as usize..offsets[3] as usize], &[0]);
-        // vertex 3: no neighbors
         assert_eq!(offsets[4] - offsets[3], 0);
     }
 
@@ -423,7 +748,9 @@ mod tests {
     fn dirty_tracking_basic() {
         let g = DynamicGraph::new(100, 1024);
         assert_eq!(g.dirty_count(), 0);
-        g.insert_edge(0, 1).unwrap();
+        let mut w = g.writer_or_panic();
+        w.insert_edge(0, 1).unwrap();
+        drop(w);
         assert!(g.is_dirty(0));
         assert!(g.is_dirty(1));
         assert!(!g.is_dirty(2));
@@ -433,8 +760,11 @@ mod tests {
     #[test]
     fn dirty_drain() {
         let g = DynamicGraph::new(100, 1024);
-        g.insert_edge(0, 1).unwrap();
-        g.insert_edge(2, 3).unwrap();
+        {
+            let mut w = g.writer_or_panic();
+            w.insert_edge(0, 1).unwrap();
+            w.insert_edge(2, 3).unwrap();
+        }
         let mut dirty = g.drain_dirty();
         dirty.sort();
         assert_eq!(dirty, vec![0, 1, 2, 3]);
@@ -444,20 +774,77 @@ mod tests {
     #[test]
     fn dirty_duplicate_edge() {
         let g = DynamicGraph::new(100, 1024);
-        g.insert_edge(0, 1).unwrap();
+        let mut w = g.writer_or_panic();
+        w.insert_edge(0, 1).unwrap();
+        drop(w);
         g.clear_dirty();
-        // Duplicate edge should NOT mark dirty
-        g.insert_edge(0, 1).unwrap();
+        let mut w = g.writer_or_panic();
+        w.insert_edge(0, 1).unwrap();
+        drop(w);
         assert_eq!(g.dirty_count(), 0);
     }
 
     #[test]
     fn dirty_clear() {
         let g = DynamicGraph::new(100, 1024);
-        g.insert_edge(0, 1).unwrap();
+        let mut w = g.writer_or_panic();
+        w.insert_edge(0, 1).unwrap();
+        drop(w);
         g.clear_dirty();
         assert_eq!(g.dirty_count(), 0);
         assert!(!g.is_dirty(0));
+    }
+
+    #[test]
+    fn writer_is_exclusive() {
+        let g = DynamicGraph::new(10, 1024);
+        let w1 = g.writer().expect("first writer should succeed");
+        assert!(
+            matches!(g.writer(), Err(WriterError::Busy)),
+            "second writer must be rejected with Busy"
+        );
+        drop(w1);
+        assert!(g.writer().is_ok(), "writer slot should be free again");
+    }
+
+    #[test]
+    fn writer_panic_poisons_graph() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::Arc;
+
+        let g = Arc::new(DynamicGraph::new(10, 1024));
+        let g_for_panic = Arc::clone(&g);
+
+        // Run an insert inside a writer that panics — the Writer's Drop
+        // must observe std::thread::panicking() and poison the graph.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut w = g_for_panic.writer().unwrap();
+            let _ = w.insert_edge(0, 1);
+            panic!("simulated mid-insert panic");
+        }));
+        assert!(result.is_err(), "the panic should have propagated");
+
+        assert!(
+            g.is_poisoned(),
+            "graph must be poisoned after panicking writer"
+        );
+        assert!(
+            matches!(g.writer(), Err(WriterError::Poisoned)),
+            "no further writers should be issued after poisoning"
+        );
+
+        // Reads still work — they just observe whatever state existed at
+        // last-consistent snapshot. `degree`/`has_edge` must not panic.
+        let _ = g.degree(0);
+        let _ = g.has_edge(0, 1);
+    }
+
+    #[test]
+    fn dirty_out_of_range_is_safe() {
+        let g = DynamicGraph::new(10, 1024);
+        // Out-of-range queries must not panic.
+        assert!(!g.is_dirty(u32::MAX));
+        assert!(!g.is_dirty(10));
     }
 
     #[test]
@@ -467,23 +854,21 @@ mod tests {
 
         let g = Arc::new(DynamicGraph::new(1000, 1 << 22));
 
-        // Writer inserts edges
         let g_writer = Arc::clone(&g);
         let writer = thread::spawn(move || {
+            let mut w = g_writer.writer_or_panic();
             for i in 0..1000u32 {
-                let _ = g_writer.insert_edge(0, i);
+                let _ = w.insert_edge(0, i);
             }
         });
 
-        // Reader reads concurrently
         let g_reader = Arc::clone(&g);
         let reader = thread::spawn(move || {
             let mut buf = Vec::new();
             for _ in 0..100 {
                 g_reader.neighbors_into(0, &mut buf);
-                // Must always see a consistent sorted list
-                for w in buf.windows(2) {
-                    assert!(w[0] < w[1], "unsorted: {:?}", &buf[..20.min(buf.len())]);
+                for win in buf.windows(2) {
+                    assert!(win[0] < win[1], "unsorted: {:?}", &buf[..20.min(buf.len())]);
                 }
             }
         });

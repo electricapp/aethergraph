@@ -1,0 +1,38 @@
+name: nightly-fuzz
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # daily at 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ctree_insert_sequences, csr_loader_bytes]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-${{ matrix.target }}
+      - run: cargo install cargo-fuzz --locked
+      - name: Regenerate fixed-seed corpus
+        working-directory: fuzz
+        run: cargo run --bin seed_corpus
+      - name: fuzz ${{ matrix.target }} (90 min)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=5400
+      - name: Upload corpus and crashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 14

@@ -20,7 +20,7 @@ try:
 
     import torch
     import torch.nn.functional as F
-    from torch_geometric.nn import SAGEConv  # type: ignore[import-untyped]
+    from torch_geometric.nn import SAGEConv
 
     from aethergraph import Graph
     from aethergraph.pytorch import NeighborLoader
@@ -146,7 +146,7 @@ def main() -> None:
     graph = Graph.load("../test_data/simple_graph.bin")
     num_nodes, feature_dim, num_classes = graph.num_nodes, 16, 3
 
-    graph.features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
+    features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
     labels = torch.from_numpy(rng.integers(0, num_classes, num_nodes)).long()
     logger.info(f"Graph: {num_nodes} nodes, features [{num_nodes}, {feature_dim}]")
 
@@ -155,10 +155,20 @@ def main() -> None:
     logger.info(f"Split: {len(train_idx)} train, {len(val_idx)} val")
 
     train_loader = NeighborLoader(
-        graph, num_neighbors=[3, 2], input_nodes=train_idx, batch_size=4, shuffle=True
+        graph,
+        num_neighbors=[3, 2],
+        input_nodes=train_idx,
+        batch_size=4,
+        shuffle=True,
+        features=features,
     )
     val_loader = NeighborLoader(
-        graph, num_neighbors=[3, 2], input_nodes=val_idx, batch_size=4, shuffle=False
+        graph,
+        num_neighbors=[3, 2],
+        input_nodes=val_idx,
+        batch_size=4,
+        shuffle=False,
+        features=features,
     )
 
     model = GraphSAGE(feature_dim, 32, num_classes).to(device)

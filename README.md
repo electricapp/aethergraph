@@ -7,13 +7,21 @@
 ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝
 ```
 
-**Rust core + Python bindings.** High-performance graph sampling and real-time feature serving for GNN training on billion-scale evolving graphs.
+**Rust core + Python bindings.** High-performance graph sampling and real-time
+feature serving for GNN training on billion-scale evolving graphs.
 
-> *"Because the CSR layout is simply 3 arrays, it scales on a single computer: a CSR matrix can be laid out on a disk instead of in-memory. You simply memory map the 3 arrays and use them on-disk from there.*
+> _"Because the CSR layout is simply 3 arrays, it scales on a single computer: a
+> CSR matrix can be laid out on a disk instead of in-memory. You simply memory
+> map the 3 arrays and use them on-disk from there._
 >
-> *With modern NVMe drives random seeks aren't slow anymore, much faster than distributed network calls like you do when scaling the linked list-based graph. **I haven't seen anyone actually implement this yet**, but it's in the roadmap for my implementation at least."*
+> _With modern NVMe drives random seeks aren't slow anymore, much faster than
+> distributed network calls like you do when scaling the linked list-based
+> graph. **I haven't seen anyone actually implement this yet**, but it's in the
+> roadmap for my implementation at least."_
 >
-> — [VodkaHaze, r/MachineLearning](https://www.reddit.com/r/MachineLearning/comments/kqazpd/d_why_im_lukewarm_on_graph_neural_networks/) (2021)
+> —
+> [VodkaHaze, r/MachineLearning](https://www.reddit.com/r/MachineLearning/comments/kqazpd/d_why_im_lukewarm_on_graph_neural_networks/)
+> (2021)
 
 ## Quick Start
 
@@ -61,43 +69,51 @@ for batch in loader:  # yields PyG HeteroData
 
 ## Why AetherGraph?
 
-Traditional GNN frameworks load entire graphs into GPU memory, hitting the VRAM wall at millions-of-nodes scale. 
-AetherGraph keeps topology on disk and streams neighborhoods via memory-mapping + `io_uring`, enabling 100B+ edge graphs on commodity hardware.
+Traditional GNN frameworks load entire graphs into GPU memory, hitting the VRAM
+wall at millions-of-nodes scale. AetherGraph keeps topology on disk and streams
+neighborhoods via memory-mapping + `io_uring`, enabling 100B+ edge graphs on
+commodity hardware.
 
-|                    | PyTorch Geometric    | AetherGraph                  |
-|--------------------|----------------------|------------------------------|
-| Max graph size     | ~40M nodes (VRAM)    | 2B+ nodes (NVMe)             |
-| Graph updates      | Full rebuild         | O(1) edge insert, no rebuild |
-| Feature loading    | All in RAM           | Streamed on-demand           |
-| Feature serving    | N/A                  | GPUDirect RDMA (<5us)        |
-| Hetero graphs      | Python-level looping | Rust-native typed sampling   |
-| Startup time       | Minutes (load all)   | Instant (mmap)               |
-| Sampling (1M nodes)| 341 us/batch         | 240 us/batch (1.4x faster)   |
+|                     | PyTorch Geometric    | AetherGraph                  |
+| ------------------- | -------------------- | ---------------------------- |
+| Max graph size      | ~40M nodes (VRAM)    | 2B+ nodes (NVMe)             |
+| Graph updates       | Full rebuild         | O(1) edge insert, no rebuild |
+| Feature loading     | All in RAM           | Streamed on-demand           |
+| Feature serving     | N/A                  | GPUDirect RDMA (<5us)        |
+| Hetero graphs       | Python-level looping | Rust-native typed sampling   |
+| Startup time        | Minutes (load all)   | Instant (mmap)               |
+| Sampling (1M nodes) | 341 us/batch         | 240 us/batch (1.4x faster)   |
 
 **How it works:**
-- **Static CSR**: Graph stored as 3 arrays (offsets, destinations, weights) — O(1) neighbor lookup, mmap'd from NVMe
-- **Dynamic C-tree**: Balanced tree of cache-line-sized chunks — O(1) edge insert, lock-free reads via functional persistence and atomic root swap
-- **Rabbit Order reordering**: Hierarchical community-detection vertex permutation (Arai et al., IPDPS 2016) for cache-friendly sampling on power-law graphs
+
+- **Static CSR**: Graph stored as 3 arrays (offsets, destinations, weights) —
+  O(1) neighbor lookup, mmap'd from NVMe
+- **Dynamic C-tree**: Balanced tree of cache-line-sized chunks — O(1) edge
+  insert, lock-free reads via functional persistence and atomic root swap
+- **Rabbit Order reordering**: Hierarchical community-detection vertex
+  permutation (Arai et al., IPDPS 2016) for cache-friendly sampling on power-law
+  graphs
 - **io_uring (Linux)**: Batched async NVMe reads, ~10us per random access
 - **AF_XDP + RDMA**: Kernel-bypass ingestion and GPUDirect feature serving
 - **Rust core**: Zero-copy data pipeline from disk to PyTorch tensors
 
 ## Crates
 
-| Crate              | Purpose                                                                    |
-|--------------------|----------------------------------------------------------------------------|
-| `aethergraph-core` | Static CSR graph, homogeneous + heterogeneous sampling, feature store      |
-| `aethergraph-cli`  | CLI tools (convert, info, stats)                                           |
-| `aethergraph-py`   | PyO3 Python bindings                                                       |
-| `aether-graph`     | Dynamic graph with C-tree neighbor lists, lock-free reader path            |
-| `aether-mem`       | Lock-free slab allocator with HugePages and pluggable memory hooks         |
-| `aether-stream`    | Kernel-bypass streaming: AF_XDP ingestion, seqlock feature table, RDMA     |
+| Crate              | Purpose                                                                |
+| ------------------ | ---------------------------------------------------------------------- |
+| `aethergraph-core` | Static CSR graph, homogeneous + heterogeneous sampling, feature store  |
+| `aethergraph-cli`  | CLI tools (convert, info, stats)                                       |
+| `aethergraph-py`   | PyO3 Python bindings                                                   |
+| `aether-graph`     | Dynamic graph with C-tree neighbor lists, lock-free reader path        |
+| `aether-mem`       | Lock-free slab allocator with HugePages and pluggable memory hooks     |
+| `aether-stream`    | Kernel-bypass streaming: AF_XDP ingestion, seqlock feature table, RDMA |
 
 ## Three Graph Modes
 
 ### 1. Static Graph (CSR) — `Graph`
 
-For graphs that don't change during training. Memory-mapped from NVMe, instant startup.
+For graphs that don't change during training. Memory-mapped from NVMe, instant
+startup.
 
 ```python
 graph = Graph.load("reddit_2B.bin")  # instant, no loading
@@ -106,7 +122,9 @@ loader = NeighborLoader(graph, num_neighbors=[15, 10], batch_size=128)
 
 ### 2. Dynamic Graph (C-tree) — `DynamicGraph`
 
-For graphs that evolve during training. Single-writer ingest publishes new C-tree roots atomically; readers run concurrently without taking locks. Edges arrive from Kafka/Flink while training samples neighborhoods.
+For graphs that evolve during training. Single-writer ingest publishes new
+C-tree roots atomically; readers run concurrently without taking locks. Edges
+arrive from Kafka/Flink while training samples neighborhoods.
 
 ```python
 graph = DynamicGraph(num_vertices=2_000_000_000, arena_mb=8192)
@@ -121,7 +139,9 @@ neighbors = graph.neighbors(node_id)  # lock-free, consistent snapshot
 
 ### 3. Heterogeneous Graph — `HeteroGraph`
 
-For multi-relational graphs (users, posts, comments, subreddits). Typed k-hop sampling with per-edge-type fanout. Drop-in replacement for PyG's HeteroData NeighborLoader.
+For multi-relational graphs (users, posts, comments, subreddits). Typed k-hop
+sampling with per-edge-type fanout. Drop-in replacement for PyG's HeteroData
+NeighborLoader.
 
 ```python
 loader = HeteroNeighborLoader(
@@ -134,7 +154,9 @@ loader = HeteroNeighborLoader(
 
 ## Live Features via RDMA
 
-For real-time models (fraud detection, feed ranking), features change with every user interaction. AetherGraph serves live features directly into GPU memory via GPUDirect RDMA, bypassing CPU entirely.
+For real-time models (fraud detection, feed ranking), features change with every
+user interaction. AetherGraph serves live features directly into GPU memory via
+GPUDirect RDMA, bypassing CPU entirely.
 
 ```
 NIC (AF_XDP)                  GPU Node
@@ -172,7 +194,10 @@ for batch in loader:
 
 ## Cache-Locality Reordering (Rabbit Order)
 
-Sampling a billion-node graph is memory-bound — the working set is the destination array, and random neighbor lookups thrash the cache. Rabbit Order (Arai et al., IPDPS 2016) computes a vertex permutation that places communities contiguously, so neighbor reads stay in L2/L3 far longer.
+Sampling a billion-node graph is memory-bound — the working set is the
+destination array, and random neighbor lookups thrash the cache. Rabbit Order
+(Arai et al., IPDPS 2016) computes a vertex permutation that places communities
+contiguously, so neighbor reads stay in L2/L3 far longer.
 
 ```python
 graph = Graph.load("graph.bin")
@@ -182,13 +207,21 @@ reordered.save("graph.reordered.bin")
 ```
 
 **Implementation:**
+
 - Phase 1 (parallel over V): each node picks its lowest-degree neighbor.
-- Phase 2 (parallel over E): lock-free concurrent union-find merges remaining cross-community edges (`AtomicU32` parent + rank, path-splitting `find`, CAS `union`).
-- Phase 3 (sequential, O(V)): replay the merge log into a dendrogram and emit the permutation.
+- Phase 2 (parallel over E): lock-free concurrent union-find merges remaining
+  cross-community edges (`AtomicU32` parent + rank, path-splitting `find`, CAS
+  `union`).
+- Phase 3 (sequential, O(V)): replay the merge log into a dendrogram and emit
+  the permutation.
 
-The community partitions fall out of the merge log for free — `graph.rabbit_partitions()` returns dense partition IDs without a second pass, and `partition_aligned_batches` uses them to build seed batches that respect locality.
+The community partitions fall out of the merge log for free —
+`graph.rabbit_partitions()` returns dense partition IDs without a second pass,
+and `partition_aligned_batches` uses them to build seed batches that respect
+locality.
 
-See `crates/aethergraph-core/benches/graph_benchmarks.rs` (`rabbit_reorder`, `reorder_sampling_speedup`) for the measurement methodology.
+See `crates/aethergraph-core/benches/graph_benchmarks.rs` (`rabbit_reorder`,
+`reorder_sampling_speedup`) for the measurement methodology.
 
 ## Installation
 
@@ -197,13 +230,15 @@ pip install aethergraph
 ```
 
 For PyTorch Geometric integration:
+
 ```bash
 pip install aethergraph[pytorch-geometric]
 ```
 
 ## Ray Data (Distributed Training)
 
-Replicated Topology: graph on each worker's NVMe, only gradients cross the network.
+Replicated Topology: graph on each worker's NVMe, only gradients cross the
+network.
 
 ```
 Traditional:  Worker 1 ←── graph edges ──→ Worker 2   # Terabytes over network
@@ -302,9 +337,11 @@ for batch in loader:  # yields PyG HeteroData
 
 ### Differences from PyTorch Geometric
 
-AetherGraph is a **high-performance replacement** for PyG's data loading pipeline.
+AetherGraph is a **high-performance replacement** for PyG's data loading
+pipeline.
 
 **Supported (homogeneous + heterogeneous):**
+
 - `num_neighbors` (list or per-edge-type dict)
 - `input_nodes` (Tensor, array, list, or `(node_type, Tensor)` for hetero)
 - `batch_size`, `shuffle`, `replace`, `transform`
@@ -316,7 +353,9 @@ AetherGraph is a **high-performance replacement** for PyG's data loading pipelin
 - Yields standard PyG `Data` / `HeteroData` objects
 
 **Unique to AetherGraph:**
-- Live graph updates via `DynamicGraph` (C-tree, single-writer + lock-free readers)
+
+- Live graph updates via `DynamicGraph` (C-tree, single-writer + lock-free
+  readers)
 - `feature_source="rdma://..."` for GPUDirect RDMA live features
 - mmap'd CSR for instant startup on billion-node graphs
 - io_uring feature loading at NVMe line rate
@@ -365,29 +404,29 @@ Measured on Apple M-series, Python 3.12, PyG 2.6.1 with pyg-lib.
 
 ### Sampling (2-hop, fanout [15, 10], batch_size=128)
 
-| Scale       | AetherGraph | PyG (pyg-lib C++) | Speedup |
-|-------------|-------------|-------------------|---------|
-| 10K nodes   | 170 us      | 210 us            | 1.23x   |
-| 100K nodes  | 185 us      | 218 us            | 1.18x   |
-| 1M nodes    | 240 us      | 341 us            | 1.43x   |
-| 10M nodes   | 302 us      | 358 us            | 1.17x   |
+| Scale      | AetherGraph | PyG (pyg-lib C++) | Speedup |
+| ---------- | ----------- | ----------------- | ------- |
+| 10K nodes  | 170 us      | 210 us            | 1.23x   |
+| 100K nodes | 185 us      | 218 us            | 1.18x   |
+| 1M nodes   | 240 us      | 341 us            | 1.43x   |
+| 10M nodes  | 302 us      | 358 us            | 1.17x   |
 
 ### Dynamic Graph (C-tree, 100K nodes / 1M edges)
 
-| Operation       | Latency | Throughput      |
-|-----------------|---------|-----------------|
-| Edge insert     | 111 ns  | 9M inserts/sec  |
-| Neighbor read   | 26 ns   | 38M reads/sec   |
-| Edge lookup     | 16 ns   | 63M lookups/sec |
-| Degree query    | 3.4 ns  | 294M queries/sec|
+| Operation     | Latency | Throughput       |
+| ------------- | ------- | ---------------- |
+| Edge insert   | 111 ns  | 9M inserts/sec   |
+| Neighbor read | 26 ns   | 38M reads/sec    |
+| Edge lookup   | 16 ns   | 63M lookups/sec  |
+| Degree query  | 3.4 ns  | 294M queries/sec |
 
 ### Heterogeneous Sampling (4 edge types, 2-hop, batch=128)
 
-| Operation                     | Latency |
-|-------------------------------|---------|
-| Typed multi-hop sampling      | 130 us  |
-| Edge index local remapping    | 3 us    |
-| Full Python roundtrip         | 130 us  |
+| Operation                  | Latency |
+| -------------------------- | ------- |
+| Typed multi-hop sampling   | 130 us  |
+| Edge index local remapping | 3 us    |
+| Full Python roundtrip      | 130 us  |
 
 ## License
 

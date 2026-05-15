@@ -34,9 +34,9 @@ try:
     import torch.distributed as dist
     import torch.nn.functional as F
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from torch_geometric.nn import SAGEConv  # type: ignore[import-untyped]
+    from torch_geometric.nn import SAGEConv
 
-    from aethergraph import Graph
+    from aethergraph import Graph, save_features
     from aethergraph.pytorch import NeighborLoader
 except ImportError:
     logger.error("Requires PyTorch and PyG. Install: pip install aethergraph[pytorch-geometric]")
@@ -169,8 +169,9 @@ def create_synthetic_graph(
     src = rng.integers(0, num_nodes, size=num_edges, dtype=np.uint32)
     dst = rng.integers(0, num_nodes, size=num_edges, dtype=np.uint32)
     graph = Graph.from_edges(num_nodes, src, dst)
-    graph.features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
+    features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
     graph.save(graph_path)
+    save_features(graph_path.with_suffix(".feats.bin"), features)
 
 
 def main() -> None:
@@ -216,6 +217,7 @@ def main() -> None:
         batch_size=512,
         shuffle=True,
         pin_memory=True,
+        feature_path=graph_path.with_suffix(".feats.bin"),
     )
 
     model: GraphSAGE | DDP = GraphSAGE(feature_dim, 128, num_classes).to(device)

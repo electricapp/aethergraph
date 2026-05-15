@@ -31,10 +31,16 @@ def main() -> None:
     src = rng.integers(0, num_nodes, size=num_edges, dtype=np.uint32)
     dst = rng.integers(0, num_nodes, size=num_edges, dtype=np.uint32)
     graph = Graph.from_edges(num_nodes, src, dst)
-    graph.features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
+    features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
     logger.info(f"Graph: {num_nodes:,} nodes, {num_edges:,} edges")
 
-    loader = NeighborLoader(graph, num_neighbors=[10, 5], batch_size=128, shuffle=True)
+    loader = NeighborLoader(
+        graph,
+        num_neighbors=[10, 5],
+        batch_size=128,
+        shuffle=True,
+        features=features,
+    )
     logger.info(f"Loader: {len(loader)} batches per epoch")
 
     total_nodes, total_edges = 0, 0

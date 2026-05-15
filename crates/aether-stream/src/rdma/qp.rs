@@ -144,7 +144,12 @@ impl RdmaQp {
         if reads.is_empty() {
             return Ok(());
         }
-        assert!(signal_every_n >= 1, "signal_every_n must be ≥ 1");
+        if signal_every_n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "signal_every_n must be >= 1",
+            ));
+        }
 
         // Build SGE and WR arrays
         let mut sges: Vec<IbvSge> = Vec::with_capacity(reads.len());

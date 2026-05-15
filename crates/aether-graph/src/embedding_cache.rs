@@ -8,6 +8,7 @@
 ///
 /// Stores one embedding vector per node for a single GNN layer.
 /// Embeddings are f32 row-major: `data[node * dim .. (node+1) * dim]`.
+#[derive(Debug)]
 pub struct EmbeddingCache {
     /// Flat storage: num_nodes * embedding_dim f32 values.
     data: Vec<f32>,
@@ -15,7 +16,7 @@ pub struct EmbeddingCache {
     dim: usize,
     /// Number of nodes.
     num_nodes: usize,
-    /// Generation counter -- incremented each epoch.
+    /// Generation counter; nodes with `node_generation < generation` are stale.
     generation: u64,
     /// Per-node generation: `node_generation[i]` = epoch when node i was last computed.
     node_generation: Vec<u64>,
@@ -23,11 +24,17 @@ pub struct EmbeddingCache {
 
 impl EmbeddingCache {
     /// Allocate a zeroed cache for `num_nodes` with `dim`-dimensional embeddings.
+    ///
+    /// # Panics
+    /// Panics if `dim == 0` or if `num_nodes * dim` overflows `usize`.
     pub fn new(num_nodes: usize, dim: usize) -> Self {
-        // Start at generation 1 so all nodes (node_generation == 0) are stale
-        // until explicitly computed.
+        assert!(dim > 0, "embedding dim must be > 0");
+        let total = num_nodes
+            .checked_mul(dim)
+            .expect("num_nodes * dim overflows usize");
+        // Generation starts at 1 so node_generation == 0 is automatically stale.
         Self {
-            data: vec![0.0; num_nodes * dim],
+            data: vec![0.0; total],
             dim,
             num_nodes,
             generation: 1,
@@ -64,15 +71,28 @@ impl EmbeddingCache {
     }
 
     /// True if node's cached embedding is from a previous generation.
+    ///
+    /// Out-of-range nodes are reported as stale so callers iterating over an
+    /// unfiltered candidate list don't panic — this matches `stale_nodes`,
+    /// which skips out-of-range entries rather than indexing them.
     #[inline]
     pub fn is_stale(&self, node: u32) -> bool {
-        self.node_generation[node as usize] < self.generation
+        match self.node_generation.get(node as usize) {
+            Some(&g) => g < self.generation,
+            None => true,
+        }
     }
 
     /// True if node has never had an embedding computed.
+    ///
+    /// Out-of-range nodes are reported as uninitialized for the same reason
+    /// `is_stale` reports them as stale.
     #[inline]
     pub fn is_uninitialized(&self, node: u32) -> bool {
-        self.node_generation[node as usize] == 0
+        match self.node_generation.get(node as usize) {
+            Some(&g) => g == 0,
+            None => true,
+        }
     }
 
     /// Increment generation counter (call at epoch boundary).
@@ -82,17 +102,25 @@ impl EmbeddingCache {
 
     /// Nodes from `candidates` that are dirty OR stale (gen < current).
     ///
-    /// Only checks the provided candidates -- does NOT scan all nodes.
-    /// `dirty` should be sorted for efficient lookup.
+    /// `dirty_sorted` MUST be sorted ascending; this is required for the
+    /// O(n+m) merge-style scan below. The result preserves `candidates`
+    /// order; out-of-range candidates are dropped silently.
     pub fn stale_nodes(&self, candidates: &[u32], dirty_sorted: &[u32]) -> Vec<u32> {
-        candidates
-            .iter()
-            .copied()
-            .filter(|&n| {
-                (n as usize) < self.num_nodes
-                    && (self.is_stale(n) || dirty_sorted.binary_search(&n).is_ok())
-            })
-            .collect()
+        debug_assert!(
+            dirty_sorted.windows(2).all(|w| w[0] <= w[1]),
+            "dirty_sorted must be sorted ascending"
+        );
+        let mut out = Vec::with_capacity(candidates.len());
+        for &n in candidates {
+            if (n as usize) >= self.num_nodes {
+                continue;
+            }
+            // Stale checks are O(1); avoid the binary search if possible.
+            if self.is_stale(n) || dirty_sorted.binary_search(&n).is_ok() {
+                out.push(n);
+            }
+        }
+        out
     }
 
     /// Embedding dimension.

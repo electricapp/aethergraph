@@ -1,0 +1,62 @@
+name: nightly-bench
+
+on:
+  schedule:
+    - cron: "30 6 * * *" # daily at 06:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # for publishing to gh-pages
+
+jobs:
+  bench:
+    name: criterion benches
+    # TODO(infra): pin to a self-hosted quiet runner (label
+    # `aether-bench-runner`) for stable numbers. Until then, use
+    # ubuntu-latest and treat the numbers as directional only — github
+    # runners have noisy neighbors and can swing 30%+ between runs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+
+      - name: Run criterion (full)
+        run: cargo bench --workspace --no-fail-fast -- --noplot
+        env:
+          # Match the CI rust matrix's RUSTFLAGS so numbers compare apples
+          # to apples with PR-time builds.
+          RUSTFLAGS: "-C target-cpu=native"
+
+      - name: Collect criterion JSON
+        run: |
+          mkdir -p bench-output
+          find target/criterion -name 'estimates.json' -print | while read -r p; do
+            rel=${p#target/criterion/}
+            out="bench-output/${rel}"
+            mkdir -p "$(dirname "$out")"
+            cp "$p" "$out"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ github.run_id }}
+          path: bench-output
+          retention-days: 30
+
+      # TODO(infra): wire `benchmark-action/github-action-benchmark` to
+      # publish a tracking dashboard to gh-pages. Skeleton wiring:
+      #
+      #   - uses: benchmark-action/github-action-benchmark@v1
+      #     with:
+      #       tool: 'cargo'
+      #       output-file-path: bench-output/<canonical-output>.txt
+      #       gh-pages-branch: gh-pages
+      #       auto-push: true
+      #
+      # Blocked on: (a) deciding on a canonical bench output format, (b)
+      # quiet runner so day-over-day deltas mean something.

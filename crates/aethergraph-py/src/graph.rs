@@ -23,63 +23,71 @@ pub struct PyCsrGraph {
 
 #[pymethods]
 impl PyCsrGraph {
-    /// Load a graph with mmap-backed storage.
+    /// Load a graph from disk.
+    ///
+    /// Single entry point; pick mmap vs owned via the `storage` argument.
     ///
     /// Args:
-    ///     path: Path to graph file
-    ///     validation: "auto" | "header_only" | "offsets_only" | "full"
+    ///     path: Path to graph file.
+    ///     storage: One of:
+    ///         - `"auto"` (default) — mmap-backed if the file is larger than
+    ///           the system's preferred page-cache threshold, owned otherwise.
+    ///         - `"mmap"` — explicit mmap-backed; topology stays on disk and
+    ///           is paged in on access.
+    ///         - `"owned"` — read the whole file into RAM at load time.
+    ///     validation: One of:
+    ///         - `"auto"` (default) — `"offsets_only"` for files >512 MiB,
+    ///           `"full"` for smaller. Mmap path uses `"offsets_only"`.
+    ///         - `"header_only"` — verify magic + version only.
+    ///         - `"offsets_only"` — also check that CSR offsets are monotonic.
+    ///         - `"full"` — additionally check every neighbor ID is in range.
     ///
     /// Returns:
-    ///     CsrGraph: Loaded graph instance
+    ///     CsrGraph: Loaded graph instance.
+    ///
+    /// Raises:
+    ///     GraphLoadError: If `path` cannot be read, the file is corrupt, or
+    ///         validation fails.
     #[staticmethod]
-    #[pyo3(signature = (path, validation = "auto"))]
-    fn load(path: &str, validation: &str) -> PyResult<Self> {
-        let graph = if validation.eq_ignore_ascii_case("auto") {
-            load_graph(path)
-        } else {
-            let mode = parse_validation_mode(validation)?;
-            load_graph_with_validation(path, mode)
+    #[pyo3(signature = (path, *, storage = "auto", validation = "auto"))]
+    fn load(path: std::path::PathBuf, storage: &str, validation: &str) -> PyResult<Self> {
+        let storage_norm = storage.to_ascii_lowercase();
+        let validation_norm = validation.to_ascii_lowercase();
+
+        // `load_graph*` functions take `impl AsRef<Path>` so `&path` works
+        // directly — no string round-trip needed.
+        let graph = match storage_norm.as_str() {
+            "auto" => {
+                if validation_norm == "auto" {
+                    load_graph(&path)
+                } else {
+                    let mode = parse_validation_mode(&validation_norm)?;
+                    load_graph_with_validation(&path, mode)
+                }
+            }
+            "mmap" => {
+                let mode = if validation_norm == "auto" {
+                    GraphValidationMode::OffsetsOnly
+                } else {
+                    parse_validation_mode(&validation_norm)?
+                };
+                load_graph_mmap(&path, mode)
+            }
+            "owned" => {
+                let mode = if validation_norm == "auto" {
+                    auto_validation_mode(&path)?
+                } else {
+                    parse_validation_mode(&validation_norm)?
+                };
+                load_graph_owned(&path, mode)
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid storage mode '{other}'. Must be one of: auto, mmap, owned"
+                )));
+            }
         }
-        .map_err(|e| graph_load_error(format!("Failed to load graph: {}", e)))?;
-
-        Ok(Self {
-            inner: Arc::new(graph),
-        })
-    }
-
-    /// Explicit mmap-backed load path.
-    ///
-    /// Args:
-    ///     path: Path to graph file
-    ///     validation: "header_only" | "offsets_only" | "full"
-    #[staticmethod]
-    #[pyo3(signature = (path, validation = "offsets_only"))]
-    fn load_mmap(path: &str, validation: &str) -> PyResult<Self> {
-        let mode = parse_validation_mode(validation)?;
-        let graph = load_graph_mmap(path, mode)
-            .map_err(|e| graph_load_error(format!("Failed to mmap-load graph: {}", e)))?;
-
-        Ok(Self {
-            inner: Arc::new(graph),
-        })
-    }
-
-    /// Explicit owned in-memory load path.
-    ///
-    /// Args:
-    ///     path: Path to graph file
-    ///     validation: "auto" | "header_only" | "offsets_only" | "full"
-    #[staticmethod]
-    #[pyo3(signature = (path, validation = "full"))]
-    fn load_owned(path: &str, validation: &str) -> PyResult<Self> {
-        let mode = if validation.eq_ignore_ascii_case("auto") {
-            auto_validation_mode(path)?
-        } else {
-            parse_validation_mode(validation)?
-        };
-
-        let graph = load_graph_owned(path, mode)
-            .map_err(|e| graph_load_error(format!("Failed to owned-load graph: {}", e)))?;
+        .map_err(|e| graph_load_error(format!("Failed to load graph ({storage_norm}): {e}")))?;
 
         Ok(Self {
             inner: Arc::new(graph),
@@ -156,23 +164,19 @@ impl PyCsrGraph {
     ///
     /// Args:
     ///     path: Path to save the binary graph file
-    fn save(&self, path: &str) -> PyResult<()> {
-        save_graph(self.inner.as_ref(), path)
+    fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
+        save_graph(self.inner.as_ref(), &path)
             .map_err(|e| graph_load_error(format!("Failed to save graph: {}", e)))
     }
 
-    /// Returns the number of nodes in the graph.
-    ///
-    /// Returns:
-    ///     int: Number of nodes
+    /// Number of nodes in the graph.
+    #[getter]
     fn num_nodes(&self) -> usize {
         self.inner.num_nodes()
     }
 
-    /// Returns the number of edges in the graph.
-    ///
-    /// Returns:
-    ///     int: Number of edges
+    /// Number of edges in the graph.
+    #[getter]
     fn num_edges(&self) -> usize {
         self.inner.num_edges()
     }
@@ -223,7 +227,8 @@ impl PyCsrGraph {
             .map(|weights| PyArray1::from_slice(py, weights))
     }
 
-    /// Returns whether the graph has edge weights.
+    /// Whether the graph has edge weights.
+    #[getter]
     fn has_weights(&self) -> bool {
         self.inner.weights().is_some()
     }
@@ -237,11 +242,14 @@ impl PyCsrGraph {
     ///     timestamps: numpy array of f64 timestamps (length must equal num_edges)
     fn set_timestamps(&mut self, timestamps: PyReadonlyArray1<f64>) -> PyResult<()> {
         let ts = timestamps.as_slice()?.to_vec();
-        Arc::make_mut(&mut self.inner).set_timestamps(ts);
+        Arc::make_mut(&mut self.inner)
+            .set_timestamps(ts)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
 
-    /// Returns whether the graph has edge timestamps.
+    /// Whether the graph has edge timestamps.
+    #[getter]
     fn has_timestamps(&self) -> bool {
         self.inner.has_timestamps()
     }
@@ -260,7 +268,22 @@ impl PyCsrGraph {
         Ok(dict.into())
     }
 
-    /// Returns a string representation of the graph.
+    /// `len(graph)` returns the number of nodes.
+    fn __len__(&self) -> usize {
+        self.inner.num_nodes()
+    }
+
+    /// `graph[node]` returns the sorted neighbor array (uint32).
+    ///
+    /// The returned numpy array is allocated fresh (a copy of the CSR slice),
+    /// so it remains valid even after the graph is dropped or replaced. This
+    /// matches the behaviour of `neighbors(node)`.
+    fn __getitem__<'py>(&self, py: Python<'py>, node: u32) -> Bound<'py, PyArray1<u32>> {
+        self.neighbors(py, node)
+    }
+
+    /// String representation. `__str__` aliases `__repr__` to keep Python
+    /// `print()` and the REPL consistent.
     fn __repr__(&self) -> String {
         format!(
             "CsrGraph(num_nodes={}, num_edges={}, weighted={})",
@@ -270,13 +293,8 @@ impl PyCsrGraph {
         )
     }
 
-    /// Returns a short string representation of the graph.
     fn __str__(&self) -> String {
-        format!(
-            "Graph with {} nodes and {} edges",
-            self.inner.num_nodes(),
-            self.inner.num_edges()
-        )
+        self.__repr__()
     }
 }
 
@@ -293,22 +311,21 @@ impl PyCsrGraph {
 }
 
 fn parse_validation_mode(value: &str) -> PyResult<GraphValidationMode> {
-    match value.to_ascii_lowercase().as_str() {
+    match value {
         "header_only" => Ok(GraphValidationMode::HeaderOnly),
         "offsets_only" => Ok(GraphValidationMode::OffsetsOnly),
         "full" => Ok(GraphValidationMode::Full),
         "auto" => Err(pyo3::exceptions::PyValueError::new_err(
-            "'auto' is only supported by CsrGraph.load() and CsrGraph.load_owned()",
+            "'auto' validation is only resolved by CsrGraph.load(); call sites here expect a concrete mode",
         )),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Invalid validation mode '{}'. Must be one of: auto, header_only, offsets_only, full",
-            value
+            "Invalid validation mode '{value}'. Must be one of: auto, header_only, offsets_only, full"
         ))),
     }
 }
 
-fn auto_validation_mode(path: &str) -> PyResult<GraphValidationMode> {
-    let metadata = std::fs::metadata(Path::new(path)).map_err(|e| {
+fn auto_validation_mode(path: &Path) -> PyResult<GraphValidationMode> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
         graph_load_error(format!(
             "Failed to stat graph file for auto validation mode selection: {}",
             e

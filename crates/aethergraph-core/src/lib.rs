@@ -16,6 +16,12 @@ pub mod features;
 pub mod graph;
 pub(crate) mod internal;
 pub mod loader;
+pub mod metrics;
+
+/// Re-exported epoch primitives. Lives in `aether-epoch` so both
+/// `aether-graph` (dynamic writer) and this crate (feature store, samplers)
+/// can share the same monotonic version clock without a circular dep.
+pub use aether_epoch::{Epoch, EpochClock};
 
 // Primary public exports
 pub use graph::{
@@ -25,7 +31,7 @@ pub use graph::{
 pub use loader::{
     HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig, NeighborLoader,
     NeighborSampler, ParallelBatchSampler, PrefetchStats, SampledSubgraph, SamplingConfig,
-    SubgraphType, SyncFeatureStore, TemporalStrategy,
+    SubgraphType, SyncFeatureStore, TemporalSamplingError, TemporalStrategy,
 };
 
 // Feature store exports (needed for file-backed features)

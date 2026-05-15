@@ -10,13 +10,37 @@ description = "Lock-free dynamic graph with C-tree neighbor lists. Single-writer
 workspace = true
 
 [dependencies]
+aether-epoch = { path = "../aether-epoch", version = "0.1" }
 crossbeam-utils = "0.8"
+tracing.workspace = true
+# Optional WAL durability — gated behind the `wal` feature so binaries that
+# only want in-memory operation pay no compile / link cost for it.
+crc32fast = { version = "1.4", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
 rand = "0.10"
 proptest = "1"
+tempfile.workspace = true
+# loom is opt-in: a separate `cargo test --features loom` run exercises the
+# lock-free CAS paths under loom's interleaving model.
+loom = "0.7"
+
+[features]
+default = []
+# Enables loom-backed model checking of the writer-guard CAS and dirty bitmap.
+# Build a separate binary in CI:
+#   cargo test -p aether-graph --features loom --test loom_writer_guard
+loom = []
+# Enables the append-only write-ahead log + replay-based recovery. Off by
+# default: callers who want crash durability opt in explicitly.
+wal = ["dep:crc32fast"]
 
 [[bench]]
 name = "ctree_bench"
 harness = false
+
+[[test]]
+name = "loom_writer_guard"
+path = "tests/loom_writer_guard.rs"
+required-features = ["loom"]

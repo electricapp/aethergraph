@@ -253,6 +253,7 @@ impl FeatureStore {
     /// - O(1) load time (just mmaps + validates header)
     /// - Zero-copy access to features
     /// - OS handles paging from NVMe as needed
+    #[tracing::instrument(skip(path), fields(path = %path.as_ref().display()))]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         debug!("Loading feature store from {}", path.display());

@@ -16,7 +16,7 @@
 
 use crate::graph::{Graph, NodeId};
 use anyhow::{Context, Result, bail};
-use arrow_array::{RecordBatch, UInt32Array, cast::AsArray};
+use arrow_array::{RecordBatch, cast::AsArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::Path;
 use tracing::info;
@@ -135,8 +135,21 @@ fn extract_edge_columns(
 }
 
 /// Convert an Arrow array column to Vec<u32>.
+///
+/// Rejects nulls (Aethergraph NodeIds are non-nullable) and out-of-range
+/// values — silent `as u32` truncation would otherwise turn `-1i64` into
+/// `4_294_967_295` and `5_000_000_000i64` into a wrapped small ID, producing
+/// a corrupted graph with no warning.
 fn arrow_col_to_u32(col: &dyn arrow_array::Array, name: &str) -> Result<Vec<NodeId>> {
     use arrow_schema::DataType;
+
+    if col.null_count() > 0 {
+        bail!(
+            "column '{}' has {} null value(s); NodeId columns must be non-nullable",
+            name,
+            col.null_count()
+        );
+    }
 
     match col.data_type() {
         DataType::UInt32 => {
@@ -145,15 +158,44 @@ fn arrow_col_to_u32(col: &dyn arrow_array::Array, name: &str) -> Result<Vec<Node
         }
         DataType::Int32 => {
             let arr = col.as_primitive::<arrow_array::types::Int32Type>();
-            Ok(arr.values().iter().map(|&v| v as u32).collect())
+            arr.values()
+                .iter()
+                .map(|&v| {
+                    u32::try_from(v).map_err(|_| {
+                        anyhow::anyhow!("column '{}' contains negative value {}", name, v)
+                    })
+                })
+                .collect()
         }
         DataType::Int64 => {
             let arr = col.as_primitive::<arrow_array::types::Int64Type>();
-            Ok(arr.values().iter().map(|&v| v as u32).collect())
+            arr.values()
+                .iter()
+                .map(|&v| {
+                    u32::try_from(v).map_err(|_| {
+                        anyhow::anyhow!(
+                            "column '{}' contains value {} outside u32 NodeId range",
+                            name,
+                            v
+                        )
+                    })
+                })
+                .collect()
         }
         DataType::UInt64 => {
             let arr = col.as_primitive::<arrow_array::types::UInt64Type>();
-            Ok(arr.values().iter().map(|&v| v as u32).collect())
+            arr.values()
+                .iter()
+                .map(|&v| {
+                    u32::try_from(v).map_err(|_| {
+                        anyhow::anyhow!(
+                            "column '{}' contains value {} outside u32 NodeId range",
+                            name,
+                            v
+                        )
+                    })
+                })
+                .collect()
         }
         other => bail!(
             "column '{}' has unsupported type {:?} (need int32/int64/uint32/uint64)",

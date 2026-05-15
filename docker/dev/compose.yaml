@@ -1,0 +1,59 @@
+# Dev containers for running the Linux-gated tests from a macOS / Windows
+# laptop. Two services share a volume-mounted workspace so cargo / uv caches
+# survive container restarts.
+#
+# Usage:
+#   docker compose -f docker/dev/compose.yaml run --rm dev
+#       # interactive shell; run any `cargo test`, `uv run pytest`, etc.
+#
+#   docker compose -f docker/dev/compose.yaml run --rm dev-rdma
+#       # same, plus libibverbs userland. Needs the HOST to have
+#       # `rdma_rxe` loaded for the SoftRoCE tests to run successfully.
+#
+# CI mirrors these images on the `rust-ubuntu-stable-rdma` matrix row;
+# parity here means a green local run translates to a green CI run.
+
+services:
+  dev:
+    build:
+      context: ../..
+      dockerfile: docker/dev/Dockerfile
+      target: dev
+    image: aethergraph-dev:latest
+    working_dir: /workspace
+    volumes:
+      - ../..:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-dir:/workspace/target
+      - uv-cache:/root/.cache/uv
+    environment:
+      # Keep build artifacts in a named volume rather than the bind-mounted
+      # workspace — otherwise macOS osxfs makes cargo's incremental builds
+      # 5-10× slower.
+      CARGO_TARGET_DIR: /workspace/target
+    tty: true
+    stdin_open: true
+
+  dev-rdma:
+    extends: dev
+    build:
+      target: dev-rdma
+    image: aethergraph-dev-rdma:latest
+    # SoftRoCE tests need ibverbs to see the host's rdma_rxe device.
+    # `/dev/infiniband` is the userspace ABI; `--cap-add=NET_ADMIN` lets
+    # ibverbs probe device attributes. None of this works on Docker
+    # Desktop (which runs a thin macOS-friendly VM with no IB stack), so
+    # this profile is opt-in via `--profile rdma`.
+    profiles: ["rdma"]
+    devices:
+      - "/dev/infiniband:/dev/infiniband"
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  target-dir:
+  uv-cache:

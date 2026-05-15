@@ -2,6 +2,7 @@ use aethergraph_core::Graph;
 use numpy::{PyArray1, PyReadonlyArray1};
 use parking_lot::Mutex;
 use pyo3::prelude::*;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::graph::PyCsrGraph;
@@ -10,11 +11,54 @@ use crate::graph::PyCsrGraph;
 ///
 /// Supports concurrent edge inserts and neighbor reads for live
 /// GNN training on evolving graphs.
+///
+/// At the Rust level, only one writer may exist at a time; Python callers
+/// are serialized via the internal `write_lock` so multiple threads can
+/// call `insert_edge*` without observing the underlying single-writer
+/// contention error.
 #[pyclass(name = "DynamicGraph")]
 pub struct PyDynamicGraph {
     inner: Arc<aether_graph::DynamicGraph>,
+    /// Serializes Python-side writes when the GIL is released.
+    write_lock: Mutex<()>,
     /// Reusable buffer for neighbor collection (avoids per-call allocation).
     buf: Mutex<Vec<u32>>,
+}
+
+impl PyDynamicGraph {
+    fn map_arena_full() -> PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err("C-tree arena is full")
+    }
+
+    fn map_writer_err(err: aether_graph::WriterError) -> PyErr {
+        match err {
+            aether_graph::WriterError::Busy => pyo3::exceptions::PyRuntimeError::new_err(
+                "DynamicGraph: writer slot already held by another path (likely an \
+                 internal helper that took an Arc<DynamicGraph> clone). Drop the \
+                 other writer before calling insert_edge*.",
+            ),
+            aether_graph::WriterError::Poisoned => pyo3::exceptions::PyRuntimeError::new_err(
+                "DynamicGraph: poisoned by a previous panicking writer. The graph's \
+                 internal state may be inconsistent — rebuild from a checkpoint.",
+            ),
+        }
+    }
+
+    fn map_wal_err(err: aether_graph::WalError) -> PyErr {
+        use aether_graph::WalError;
+        match err {
+            WalError::Io(e) => pyo3::exceptions::PyOSError::new_err(format!("WAL io error: {e}")),
+            WalError::BadMagic { found } => pyo3::exceptions::PyValueError::new_err(format!(
+                "WAL bad magic header: {found:?} — file is not an AetherGraph WAL"
+            )),
+            WalError::UnknownVersion(v) => pyo3::exceptions::PyValueError::new_err(format!(
+                "WAL version {v} not supported by this build"
+            )),
+            WalError::Corrupt { offset } => pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "WAL corrupt at byte offset {offset}; truncate to recover"
+            )),
+        }
+    }
 }
 
 #[pymethods]
@@ -30,6 +74,7 @@ impl PyDynamicGraph {
         let arena_bytes = arena_mb * 1024 * 1024;
         Self {
             inner: Arc::new(aether_graph::DynamicGraph::new(num_vertices, arena_bytes)),
+            write_lock: Mutex::new(()),
             buf: Mutex::new(Vec::new()),
         }
     }
@@ -72,6 +117,38 @@ impl PyDynamicGraph {
 
         Ok(Self {
             inner: Arc::new(graph),
+            write_lock: Mutex::new(()),
+            buf: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Open a DynamicGraph backed by an append-only write-ahead log.
+    ///
+    /// If the WAL at ``path`` already contains records from a previous run,
+    /// they are replayed before this returns; if the file ends in a torn
+    /// record (mid-write crash), the trailing bytes are truncated. Every
+    /// subsequent ``insert_edge*`` call appends to the log and fsyncs at
+    /// writer-guard close.
+    ///
+    /// Args:
+    ///     path: WAL file path. Created if it does not exist.
+    ///     num_vertices: Number of vertices (fixed at construction).
+    ///     arena_mb: Arena capacity in megabytes (default 256).
+    ///
+    /// Raises:
+    ///     OSError: I/O failure opening, reading, or writing the WAL.
+    ///     ValueError: File exists but is not a valid AetherGraph WAL
+    ///         (bad magic or unsupported version).
+    ///     RuntimeError: WAL is corrupt past the recoverable prefix.
+    #[staticmethod]
+    #[pyo3(signature = (path, num_vertices, arena_mb = 256))]
+    fn open_with_wal(path: PathBuf, num_vertices: usize, arena_mb: usize) -> PyResult<Self> {
+        let arena_bytes = arena_mb * 1024 * 1024;
+        let graph = aether_graph::DynamicGraph::open_with_wal(&path, num_vertices, arena_bytes)
+            .map_err(Self::map_wal_err)?;
+        Ok(Self {
+            inner: Arc::new(graph),
+            write_lock: Mutex::new(()),
             buf: Mutex::new(Vec::new()),
         })
     }
@@ -79,13 +156,21 @@ impl PyDynamicGraph {
     /// Insert a directed edge from src to dst.
     ///
     /// Returns True if the edge was new, False if it already existed.
-    /// Raises RuntimeError if the arena is full.
+    /// Raises RuntimeError if the arena is full or the underlying writer slot
+    /// is held by another path.
     fn insert_edge(&self, py: Python<'_>, src: u32, dst: u32) -> PyResult<bool> {
         let inner = Arc::clone(&self.inner);
+        // The closure runs without the GIL but still under `write_lock`,
+        // so concurrent Python callers serialize at the wrapper layer. The
+        // underlying `inner.writer()` can still fail if anyone else holds an
+        // `Arc<DynamicGraph>` clone with an outstanding writer guard — we
+        // surface that as a clean Python error instead of a Rust panic.
         py.detach(move || {
-            inner
+            let _guard = self.write_lock.lock();
+            let mut writer = inner.writer().map_err(Self::map_writer_err)?;
+            writer
                 .insert_edge(src, dst)
-                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("C-tree arena is full"))
+                .map_err(|_| Self::map_arena_full())
         })
     }
 
@@ -116,22 +201,19 @@ impl PyDynamicGraph {
             )));
         }
 
-        // Copy into owned vecs so we can release the GIL
         let src_vec: Vec<u32> = src_slice.to_vec();
         let dst_vec: Vec<u32> = dst_slice.to_vec();
         let inner = Arc::clone(&self.inner);
 
         py.detach(move || {
+            let _guard = self.write_lock.lock();
+            let mut writer = inner.writer().map_err(Self::map_writer_err)?;
             let mut count = 0usize;
             for (&s, &d) in src_vec.iter().zip(dst_vec.iter()) {
-                match inner.insert_edge(s, d) {
+                match writer.insert_edge(s, d) {
                     Ok(true) => count += 1,
-                    Ok(false) => {} // duplicate
-                    Err(_) => {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            "C-tree arena is full",
-                        ));
-                    }
+                    Ok(false) => {}
+                    Err(_) => return Err(Self::map_arena_full()),
                 }
             }
             Ok(count)
@@ -152,9 +234,15 @@ impl PyDynamicGraph {
     fn neighbors<'py>(&self, py: Python<'py>, vertex: u32) -> Bound<'py, PyArray1<i64>> {
         let mut buf = self.buf.lock();
         self.inner.neighbors_into(vertex, &mut buf);
-        // Convert u32 -> i64 for PyTorch compatibility
         let i64_vec: Vec<i64> = buf.iter().map(|&v| v as i64).collect();
         PyArray1::from_vec(py, i64_vec)
+    }
+
+    /// Get sorted neighbor array for a vertex as uint32 (zero-copy convertible).
+    fn neighbors_u32<'py>(&self, py: Python<'py>, vertex: u32) -> Bound<'py, PyArray1<u32>> {
+        let mut buf = self.buf.lock();
+        self.inner.neighbors_into(vertex, &mut buf);
+        PyArray1::from_slice(py, &buf)
     }
 
     /// Number of vertices (fixed at construction).
@@ -181,13 +269,19 @@ impl PyDynamicGraph {
         self.inner.arena_capacity()
     }
 
+    /// Current epoch — the monotonic version counter advanced once per
+    /// successful writer-guard drop (panic-poisoned drops are skipped).
+    /// Pin this before a multi-source read to coordinate consistency with
+    /// other subsystems sharing the same `EpochClock`.
+    #[getter]
+    fn current_epoch(&self) -> u64 {
+        self.inner.current_epoch().as_u64()
+    }
+
     /// Create a frozen CSR snapshot for use with NeighborSampler/NeighborLoader.
     ///
     /// Collects all edges from the C-tree neighbor lists into a static CSR
     /// graph. O(V + E) time — call once per epoch, not per batch.
-    ///
-    /// Returns:
-    ///     CsrGraph: A static graph snapshot usable with the existing sampler.
     fn snapshot(&self) -> PyCsrGraph {
         let (offsets, edges) = self.inner.snapshot_csr();
         let num_vertices = self.inner.num_vertices();
@@ -195,6 +289,10 @@ impl PyDynamicGraph {
         PyCsrGraph {
             inner: Arc::new(graph),
         }
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.num_vertices()
     }
 
     fn __repr__(&self) -> String {
@@ -208,10 +306,6 @@ impl PyDynamicGraph {
     }
 
     fn __str__(&self) -> String {
-        format!(
-            "DynamicGraph with {} vertices and {} edges",
-            self.inner.num_vertices(),
-            self.inner.num_edges()
-        )
+        self.__repr__()
     }
 }

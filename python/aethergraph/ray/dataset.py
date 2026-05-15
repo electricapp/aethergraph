@@ -24,7 +24,7 @@ from aethergraph.ray.datasource import AetherGraphDatasource
 
 if TYPE_CHECKING:
     import torch
-    from torch_geometric.data import Data  # type: ignore[import-untyped]
+    from torch_geometric.data import Data
 
 __all__ = ["collate_to_pyg", "create_sampling_dataset"]
 

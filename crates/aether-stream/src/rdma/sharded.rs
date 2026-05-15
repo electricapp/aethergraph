@@ -91,11 +91,18 @@ impl ShardedQpPool {
     /// Build the pool: N CQs + N QPs + N worker threads, each pinned if
     /// `worker_cores` is provided.
     pub fn new(ctx: &RdmaContext, cfg: ShardedConfig) -> io::Result<Self> {
-        assert!(cfg.num_shards > 0, "num_shards must be > 0");
-        assert!(
-            cfg.worker_cores.is_empty() || cfg.worker_cores.len() == cfg.num_shards,
-            "worker_cores must be empty or have length == num_shards"
-        );
+        if cfg.num_shards == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "num_shards must be > 0",
+            ));
+        }
+        if !cfg.worker_cores.is_empty() && cfg.worker_cores.len() != cfg.num_shards {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker_cores must be empty or have length == num_shards",
+            ));
+        }
 
         let mut qps = Vec::with_capacity(cfg.num_shards);
         let mut cqs = Vec::with_capacity(cfg.num_shards);

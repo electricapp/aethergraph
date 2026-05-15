@@ -39,7 +39,7 @@ use super::sampler::{NeighborSampler, SampledSubgraph, SamplingConfig};
 use crate::features::header::{FeatureDtype, parse_feature_header};
 use crate::graph::{Graph, NodeId};
 use crate::internal::hint;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use half::f16;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -586,6 +586,10 @@ impl NeighborLoader {
     ///
     /// # Errors
     /// Returns an error if the prefetch thread cannot be spawned.
+    #[tracing::instrument(
+        skip(graph, config),
+        fields(num_nodes = graph.num_nodes(), prefetch_depth)
+    )]
     pub fn new(
         graph: Arc<Graph>,
         config: SamplingConfig,
@@ -598,9 +602,17 @@ impl NeighborLoader {
             ));
         }
 
-        // Work channel is unbounded - submit() never blocks
-        // Result channel is bounded - applies backpressure to worker
-        let (work_tx, work_rx) = unbounded::<PrefetchWork>();
+        // Both channels bounded:
+        //   - work channel  : producer blocks when the worker falls behind
+        //                     by more than `prefetch_depth * 8` submitted
+        //                     batches. Prevents unbounded RAM growth when a
+        //                     producer stages many epochs at once but the
+        //                     worker is slow / stuck.
+        //   - result channel: worker blocks when the consumer falls behind
+        //                     by `prefetch_depth` produced subgraphs. This is
+        //                     the canonical pipeline-stall backpressure.
+        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
+        let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
         let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -656,7 +668,10 @@ impl NeighborLoader {
         let feature_store = SyncFeatureStore::load(feature_path.as_ref())?;
         let feature_dim = feature_store.feature_dim();
 
-        let (work_tx, work_rx) = unbounded::<PrefetchWork>();
+        // Same bounding strategy as the in-memory path: producers see
+        // backpressure rather than silently growing the work queue.
+        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
+        let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
         let (sample_tx, sample_rx) = bounded::<SampledWork>(2);
         let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth);
 
@@ -754,7 +769,11 @@ impl NeighborLoader {
             ));
         }
 
-        let (work_tx, work_rx) = unbounded::<PrefetchWork>();
+        // Same bounding strategy as the other constructors: bounded work
+        // channel applies producer-side backpressure so a runaway submit
+        // loop can't grow RAM without limit.
+        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
+        let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
         let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -919,6 +938,7 @@ impl NeighborLoader {
     }
 
     /// Shutdown the prefetch thread(s).
+    #[tracing::instrument(skip(self), fields(num_handles = self.handles.len()))]
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         // Drop sender to unblock workers (take it so channel actually closes)

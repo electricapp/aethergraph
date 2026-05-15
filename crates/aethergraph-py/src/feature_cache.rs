@@ -34,20 +34,27 @@ impl PyFeatureCacheConfig {
         cpu_capacity: usize,
         feature_dim: usize,
         nvme_path: Option<&str>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        if feature_dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "feature_dim must be > 0",
+            ));
+        }
+        if gpu_capacity == 0 && cpu_capacity == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "at least one of gpu_capacity / cpu_capacity must be > 0",
+            ));
+        }
+        Ok(Self {
             inner: FeatureCacheConfig {
                 gpu_capacity,
                 cpu_capacity,
                 feature_dim,
                 nvme_path: nvme_path.map(PathBuf::from),
-                // Advanced warm-start knobs; not exposed through Python yet.
-                // Defaults match FeatureCacheConfig::default() — no frequency
-                // warmup, 0.8 GPU pin ratio if one is provided later.
                 warmup_frequencies: None,
                 pin_ratio: 0.8,
             },
-        }
+        })
     }
 
     #[getter]
@@ -124,6 +131,10 @@ impl PyFeatureCache {
     ///
     /// Returns:
     ///     numpy.ndarray: Feature vector (dtype=float32)
+    ///
+    /// GIL: the returned coroutine releases the GIL while it awaits the
+    /// underlying I/O, so other Python threads run concurrently. The GIL is
+    /// reacquired only to materialize the numpy result.
     fn get<'py>(&self, py: Python<'py>, node: u32) -> PyResult<Bound<'py, PyAny>> {
         let cache = Arc::clone(&self.inner);
 
@@ -147,6 +158,15 @@ impl PyFeatureCache {
     ///
     /// Returns:
     ///     numpy.ndarray: Feature matrix with shape [len(nodes), feature_dim] (dtype=float32)
+    ///
+    /// # Async/GIL contract
+    /// The coroutine returned by `future_into_py` runs the inner `async move`
+    /// block on the `pyo3-async-runtimes` tokio runtime. The GIL is released
+    /// across `cache.get_batch(...).await`. The `Python::attach(|py| ...)`
+    /// block at the end reacquires the GIL on the worker thread purely to
+    /// materialize the numpy result — `pyo3-async-runtimes` guarantees this
+    /// is sound for any task it drives. Do not hand-spawn the inner future
+    /// onto a different runtime, or `Python::attach` may panic.
     fn get_batch<'py>(&self, py: Python<'py>, nodes: Vec<u32>) -> PyResult<Bound<'py, PyAny>> {
         let cache = Arc::clone(&self.inner);
 
@@ -157,7 +177,6 @@ impl PyFeatureCache {
                 .map_err(|e| cache_error(format!("Failed to get batch features: {}", e)))?;
 
             Python::attach(|py| {
-                // Convert Vec<Vec<f32>> to 2D numpy array
                 let num_nodes = features_vec.len();
                 let feature_dim = if num_nodes > 0 {
                     features_vec[0].len()
@@ -165,10 +184,20 @@ impl PyFeatureCache {
                     0
                 };
 
-                // Flatten into 1D array
-                let flat: Vec<f32> = features_vec.into_iter().flatten().collect();
+                // Pre-allocated single buffer + `extend_from_slice` per row:
+                // one allocation total, no per-element iterator state.
+                let mut flat: Vec<f32> = Vec::with_capacity(num_nodes * feature_dim);
+                for row in features_vec {
+                    if row.len() != feature_dim {
+                        return Err(cache_error(format!(
+                            "feature row length mismatch: row has {}, expected {}",
+                            row.len(),
+                            feature_dim
+                        )));
+                    }
+                    flat.extend_from_slice(&row);
+                }
 
-                // Create 2D array
                 let array = PyArray1::from_vec(py, flat);
                 let array_2d = array
                     .reshape([num_nodes, feature_dim])
@@ -247,6 +276,14 @@ impl PyFeatureCache {
     /// Print cache statistics to console.
     fn print_stats(&self) {
         self.inner.print_stats();
+    }
+
+    /// `cache[node]` — awaitable shorthand for `cache.get(node)`.
+    ///
+    /// Returns the coroutine; users still need to `await` it. Matches the
+    /// `__getitem__` shape PyG users expect from feature stores.
+    fn __getitem__<'py>(&self, py: Python<'py>, node: u32) -> PyResult<Bound<'py, PyAny>> {
+        self.get(py, node)
     }
 
     fn __repr__(&self) -> String {

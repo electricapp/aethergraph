@@ -81,7 +81,13 @@ impl SeqlockValidator {
         batch_size: usize,
         epoch_version: u64,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        assert!(batch_size <= self.max_batch_size);
+        if batch_size > self.max_batch_size {
+            return Err(format!(
+                "batch_size {batch_size} exceeds kernel max_batch_size {}",
+                self.max_batch_size
+            )
+            .into());
+        }
 
         // Zero the retry counter from pre-allocated scratch (no cuMemAlloc)
         self.stream
@@ -121,6 +127,9 @@ impl SeqlockValidator {
         // Read retry count back to host
         let mut count = [0i32];
         self.stream.memcpy_dtoh(&self.retry_count, &mut count)?;
+        if count[0] < 0 {
+            return Err(format!("kernel returned negative retry count: {}", count[0]).into());
+        }
         Ok(count[0] as usize)
     }
 

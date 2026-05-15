@@ -9,6 +9,7 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let rdma = std::env::var("CARGO_FEATURE_RDMA").is_ok();
     let efa = std::env::var("CARGO_FEATURE_EFA").is_ok();
+    let xdp_bpf = std::env::var("CARGO_FEATURE_XDP_BPF").is_ok();
 
     if target_os == "linux" && rdma {
         let mut build = cc::Build::new();
@@ -22,6 +23,63 @@ fn main() {
         println!("cargo:rustc-link-lib=ibverbs");
         if efa {
             println!("cargo:rustc-link-lib=efa");
+        }
+    }
+
+    if target_os == "linux" && xdp_bpf {
+        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+        let obj = format!("{out_dir}/xsk_redirect.bpf.o");
+        let src = "bpf/src/xsk_redirect.c";
+
+        // Resolve `bpf/bpf_helpers.h` across distros. Order of preference:
+        //   1. `pkg-config --cflags libbpf`   (Debian/Ubuntu with libbpf-dev,
+        //      Fedora with libbpf-devel, AL2023 with libbpf-devel)
+        //   2. fall back to scanning a few well-known locations directly so
+        //      the build still works when pkg-config isn't installed
+        let mut includes: Vec<String> = Vec::new();
+        if let Ok(out) = std::process::Command::new("pkg-config")
+            .args(["--cflags", "libbpf"])
+            .output()
+            && out.status.success()
+        {
+            let flags = String::from_utf8_lossy(&out.stdout);
+            for tok in flags.split_whitespace() {
+                if let Some(path) = tok.strip_prefix("-I") {
+                    includes.push(format!("-I{path}"));
+                }
+            }
+        }
+        if includes.is_empty() {
+            for candidate in [
+                "/usr/include/bpf",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include/aarch64-linux-gnu",
+                "/usr/include",
+                "/usr/local/include",
+            ] {
+                if std::path::Path::new(candidate).is_dir() {
+                    includes.push(format!("-I{candidate}"));
+                }
+            }
+        }
+
+        let mut cmd = std::process::Command::new("clang");
+        cmd.args(["--target=bpf", "-O2", "-g", "-c", src, "-o", &obj]);
+        cmd.args(&includes);
+        let status = cmd.status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("cargo:rustc-env=XSK_REDIRECT_BPF_OBJ={obj}");
+                println!("cargo:rerun-if-changed={src}");
+            }
+            Ok(s) => panic!(
+                "clang failed to compile {src} (exit {s}); install clang + \
+                 libbpf-dev (or libbpf-devel), or drop the `xdp_bpf` feature"
+            ),
+            Err(e) => panic!(
+                "could not invoke clang to compile {src}: {e}; install clang + \
+                 libbpf-dev (or libbpf-devel), or drop the `xdp_bpf` feature"
+            ),
         }
     }
 }

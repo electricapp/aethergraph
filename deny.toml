@@ -1,0 +1,65 @@
+# cargo-deny configuration.
+#
+# Run locally: `cargo deny check`
+# CI runs the same in `.github/workflows/ci.yml::supply-chain`.
+
+[graph]
+all-features = false
+
+# Crates we depend on must use one of these OSI-approved licenses.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    # `tiny-keccak` ships CC0-1.0 — Creative Commons Zero is effectively
+    # public-domain, FSF-Free, OSI-considered-equivalent-to-MIT.
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace-internal `path = "../foo"` deps appear as wildcards but they are
+# pinned by the workspace `Cargo.lock`; allowing them keeps the deny check
+# focused on external wildcards (which are the real supply-chain hazard).
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    { crate = "openssl-sys", reason = "we use rustls + ring; openssl introduces a heavy C dep" },
+]
+# Crates where multiple versions are acceptable transitive churn.
+skip = []
+skip-tree = []
+
+[advisories]
+version = 2
+yanked = "deny"
+# Track open advisories here with a reason + revisit date. Every entry MUST
+# have a comment explaining why the advisory is accepted. Empty by default so
+# any new RUSTSEC advisory becomes a hard fail in CI.
+ignore = [
+    # `paste` is unmaintained as of 2024-10-07 (RUSTSEC-2024-0436) but is a
+    # proc-macro: it only runs at compile time and never ships in the produced
+    # binary, so "unmaintained" has zero runtime attack surface for us. It is
+    # a transitive dep of `parquet` (latest version still pulls it). Revisit
+    # whenever we bump the `parquet` crate — drop this ignore once a parquet
+    # release no longer depends on paste.
+    { id = "RUSTSEC-2024-0436", reason = "paste: build-time proc-macro only, no runtime impact; pulled in by parquet" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

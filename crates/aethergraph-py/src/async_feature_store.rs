@@ -82,14 +82,14 @@ impl PyAsyncFeatureStore {
             .map(|t| crate::feature_telemetry::PyFeatureLoadTelemetry { inner: t })
     }
 
-    /// Get number of nodes
-    #[pyo3(name = "num_nodes")]
+    /// Get number of nodes (Python attribute, not a method).
+    #[getter]
     fn num_nodes(&self) -> usize {
         self.inner.num_nodes()
     }
 
-    /// Get feature dimension
-    #[pyo3(name = "feature_dim")]
+    /// Get feature dimension (Python attribute, not a method).
+    #[getter]
     fn feature_dim(&self) -> usize {
         self.inner.feature_dim()
     }

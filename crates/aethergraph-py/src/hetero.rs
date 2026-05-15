@@ -78,6 +78,21 @@ impl PyHeteroCsrGraph {
                 ))
             })?;
 
+            // Validate that every endpoint falls within the declared per-type
+            // node count. Without this, an out-of-range edge would silently
+            // become an unreachable phantom node in the CSR and reads of that
+            // node would return empty neighbor lists — confusing failure.
+            if let Some(&bad) = src_slice.iter().find(|&&s| (s as usize) >= num_src) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "src node {bad} >= num_{src_type} ({num_src}) in ({src_type}, {rel}, {dst_type})"
+                )));
+            }
+            if let Some(&bad) = dst_slice.iter().find(|&&d| (d as usize) >= num_dst) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "dst node {bad} >= num_{dst_type} ({num_dst}) in ({src_type}, {rel}, {dst_type})"
+                )));
+            }
+
             let csr_num_nodes = num_src.max(num_dst);
             let edges: Vec<(NodeId, NodeId)> = src_slice
                 .iter()
@@ -174,6 +189,15 @@ pub struct PyHeteroSamplingConfig {
 
 #[pymethods]
 impl PyHeteroSamplingConfig {
+    /// # Arguments
+    /// * `num_neighbors` — dict mapping `(src_type, rel, dst_type)` to a list of
+    ///   neighbor counts (one per hop).
+    /// * `replace` — sample with replacement (default `False`).
+    /// * `seed` — optional RNG seed for reproducible sampling. `None` uses a
+    ///   non-deterministic seed.
+    /// * `max_degree` — hard cap on per-node neighbor count. `None` disables
+    ///   the cap and lets `num_neighbors` decide alone; values > `max_degree`
+    ///   are clamped during sampling.
     #[new]
     #[pyo3(signature = (num_neighbors, replace=false, seed=None, max_degree=None))]
     fn new(
@@ -284,6 +308,8 @@ pub struct PyHeteroSampledSubgraph {
 
 #[pymethods]
 impl PyHeteroSampledSubgraph {
+    /// List of node-type names present in the subgraph.
+    #[getter]
     fn node_types(&self) -> Vec<String> {
         let mut types = Vec::new();
         for nt_id in 0..self.graph.node_type_count() as NodeTypeId {
@@ -294,6 +320,8 @@ impl PyHeteroSampledSubgraph {
         types
     }
 
+    /// List of `(src_type, relation, dst_type)` edge types in the subgraph.
+    #[getter]
     fn edge_types(&self) -> Vec<(String, String, String)> {
         let mut types = Vec::new();
         for et_id in 0..self.graph.edge_type_count() as EdgeTypeId {
@@ -307,15 +335,31 @@ impl PyHeteroSampledSubgraph {
         types
     }
 
-    /// Returns sampled node IDs for a node type as i64 numpy array.
+    /// Returns sampled node IDs for a node type as `int64` numpy array.
+    ///
+    /// PyTorch indexing requires `int64`, so we widen from the u32 storage
+    /// in the core sampler. The widening is a single LLVM-vectorized pass.
     fn nodes<'py>(&self, py: Python<'py>, node_type: &str) -> PyResult<Bound<'py, PyArray1<i64>>> {
         let nt_id = self.graph.node_type_id(node_type).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!("unknown node type '{node_type}'"))
         })?;
         let nodes = &self.inner.nodes[nt_id as usize];
-        // u32→i64 widening: one pass, then from_vec transfers ownership to numpy
         let arr: Vec<i64> = nodes.iter().map(|&n| n as i64).collect();
         Ok(PyArray1::from_vec(py, arr))
+    }
+
+    /// Returns sampled node IDs as `uint32` numpy array (zero-copy slice copy,
+    /// no widening). Use this when feeding back into another aether API that
+    /// expects u32 — saves a `.astype(np.uint32)` on the Python side.
+    fn nodes_u32<'py>(
+        &self,
+        py: Python<'py>,
+        node_type: &str,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let nt_id = self.graph.node_type_id(node_type).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!("unknown node type '{node_type}'"))
+        })?;
+        Ok(PyArray1::from_slice(py, &self.inner.nodes[nt_id as usize]))
     }
 
     /// Returns local edge index as (2, E) i64 numpy array.
@@ -347,10 +391,14 @@ impl PyHeteroSampledSubgraph {
             .map_err(|e| sampling_error(format!("reshape failed: {e}")))
     }
 
+    /// Name of the node type the sample was rooted at.
+    #[getter]
     fn seed_type(&self) -> &str {
         &self.graph.node_type_meta(self.inner.seed_type).name
     }
 
+    /// Seed node IDs as a numpy `int64` array (PyTorch index dtype).
+    #[getter]
     fn seeds<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
         let arr: Vec<i64> = self.inner.seeds.iter().map(|&s| s as i64).collect();
         PyArray1::from_vec(py, arr)
@@ -359,6 +407,8 @@ impl PyHeteroSampledSubgraph {
     fn __repr__(&self) -> String {
         format!(
             "HeteroSampledSubgraph(node_types={}, edge_types={}, seed_type='{}')",
+            // Getters are still methods at the Rust ABI level — the `#[getter]`
+            // attribute only changes Python-side dispatch.
             self.node_types().len(),
             self.edge_types().len(),
             self.seed_type(),
@@ -370,20 +420,98 @@ impl PyHeteroSampledSubgraph {
 // HeteroNeighborSampler
 // ---------------------------------------------------------------------------
 
-/// Cached core sampler. Holds `HeteroNeighborSampler<'static>` by
-/// erasing the lifetime — safe because the `Arc<HeteroGraph>` stored
-/// alongside it guarantees the graph outlives the sampler.
-struct CachedSampler {
-    /// SAFETY: The sampler borrows from `graph` which is kept alive by the
-    /// Arc in PyHeteroNeighborSampler. We erase the lifetime to store it
-    /// in a pyclass. The sampler must never outlive the Arc.
-    inner: HeteroNeighborSampler<'static>,
+/// Self-owning sampler bundle.
+///
+/// `sampler` borrows from the `HeteroGraph` reached through `arc`. The borrow
+/// is erased to `'static` so the struct can be stored in a `#[pyclass]`. The
+/// Arc is kept alongside so the `HeteroGraph` cannot be deallocated while the
+/// sampler is alive.
+///
+/// # Why this is sound
+/// 1. `Arc::as_ptr(&arc)` returns a stable pointer to the heap allocation
+///    that lasts as long as any Arc clone exists. The Arc inside this struct
+///    is one such clone.
+/// 2. Field declaration order is `sampler` then `arc`. Rust drops fields in
+///    declaration order, so `sampler` (which holds the borrow) drops before
+///    `arc` (which holds the allocation). The borrow can never observe a
+///    freed `HeteroGraph`.
+/// 3. The Arc is **private**: no method exposes it or clones it out, so
+///    external code cannot create an additional Arc that would extend the
+///    lifetime of the allocation past `self`'s drop in a way the type system
+///    cannot see.
+/// 4. The sampler is never moved out of this struct after construction —
+///    `sample()` takes `&mut self.sampler` only.
+///
+/// The two `Arc<HeteroGraph>` clones (this one and the one in
+/// [`PyHeteroNeighborSampler::graph`]) are independent: dropping the latter
+/// does not invalidate the former.
+struct OwnedSampler {
+    sampler: HeteroNeighborSampler<'static>,
+    // SAFETY-LOAD-BEARING: must drop AFTER `sampler`. Marker leading underscore
+    // signals "don't reorder me" to readers.
+    _arc: Arc<HeteroGraph>,
+}
+
+// Compile-time field-order guard. Rust drops `#[repr(Rust)]` struct fields in
+// declaration order, so the byte offset of the field that must drop first
+// (`sampler`) MUST be strictly less than the offset of the field that holds
+// its backing storage (`_arc`). If someone reorders these fields, this const
+// fires at compile time.
+const _: () = {
+    let s = std::mem::offset_of!(OwnedSampler, sampler);
+    let a = std::mem::offset_of!(OwnedSampler, _arc);
+    assert!(
+        s < a,
+        "OwnedSampler field order violates the drop-before-arc invariant — \
+         see the SAFETY comment on the struct"
+    );
+};
+
+impl OwnedSampler {
+    fn new(arc: Arc<HeteroGraph>, config: HeteroSamplingConfig) -> Self {
+        // SAFETY: `Arc::as_ptr(&arc)` returns a pointer to the `HeteroGraph`
+        // inside the Arc's allocation. The Arc clone we move into `_arc`
+        // keeps that allocation alive for the lifetime of `Self`. The
+        // sampler is dropped before `_arc` (struct field declaration order),
+        // so the erased `'static` borrow never observes a deallocated graph.
+        let graph_ref: &'static HeteroGraph = unsafe { &*Arc::as_ptr(&arc) };
+        let sampler = HeteroNeighborSampler::new(graph_ref, config);
+        Self { sampler, _arc: arc }
+    }
+
+    fn sampler_mut(&mut self) -> &mut HeteroNeighborSampler<'static> {
+        &mut self.sampler
+    }
+}
+
+#[cfg(test)]
+mod owned_sampler_drop_order {
+    use super::*;
+
+    /// Mirror of the `const _` assertion higher up, run as a normal unit
+    /// test so the failure shows up in the standard `cargo test` output
+    /// (not just in `cargo build`). Catches drop-order drift even if the
+    /// `const _` is accidentally deleted.
+    #[test]
+    fn sampler_offset_is_less_than_arc_offset() {
+        let sampler = std::mem::offset_of!(OwnedSampler, sampler);
+        let arc = std::mem::offset_of!(OwnedSampler, _arc);
+        assert!(
+            sampler < arc,
+            "OwnedSampler field order: sampler offset {sampler}, _arc offset {arc} \
+             — sampler must drop before _arc"
+        );
+    }
 }
 
 #[pyclass(name = "HeteroNeighborSampler")]
 pub struct PyHeteroNeighborSampler {
+    /// Owns its own Arc clone (private, never aliased outwards).
+    inner: OwnedSampler,
+    /// Separate Arc clone for Python-facing methods (type ID lookups etc.).
+    /// Independent from `inner._arc` — both refer to the same allocation,
+    /// so the graph is alive as long as either is.
     graph: Arc<HeteroGraph>,
-    sampler: CachedSampler,
 }
 
 #[pymethods]
@@ -392,17 +520,9 @@ impl PyHeteroNeighborSampler {
     fn new(graph: &PyHeteroCsrGraph, config: PyHeteroSamplingConfig) -> PyResult<Self> {
         let graph_arc = graph.inner_arc();
         let core_config = config.to_core_config(&graph_arc)?;
-
-        // SAFETY: We extend the graph reference lifetime to 'static.
-        // This is safe because `graph_arc` (an Arc) is stored in the same
-        // struct and will keep the HeteroGraph alive for the sampler's
-        // entire lifetime. The sampler is never exposed outside this struct.
-        let graph_ref: &'static HeteroGraph = unsafe { &*Arc::as_ptr(&graph_arc) };
-        let sampler = HeteroNeighborSampler::new(graph_ref, core_config);
-
         Ok(Self {
+            inner: OwnedSampler::new(Arc::clone(&graph_arc), core_config),
             graph: graph_arc,
-            sampler: CachedSampler { inner: sampler },
         })
     }
 
@@ -417,23 +537,10 @@ impl PyHeteroNeighborSampler {
             .node_type_id(seed_type)
             .ok_or_else(|| sampling_error(format!("unknown seed type '{seed_type}'")))?;
 
-        let seeds_vec: Vec<u32> = if let Ok(arr) = seeds.extract::<PyReadonlyArray1<u32>>() {
-            arr.as_slice()?.to_vec()
-        } else if let Ok(arr) = seeds.extract::<PyReadonlyArray1<i64>>() {
-            arr.as_slice()?
-                .iter()
-                .map(|&x| {
-                    u32::try_from(x)
-                        .map_err(|_| sampling_error(format!("seed {x} out of u32 range")))
-                })
-                .collect::<PyResult<Vec<u32>>>()?
-        } else {
-            seeds.extract::<Vec<u32>>()?
-        };
-
+        let seeds_vec: Vec<u32> = crate::error::extract_seeds(seeds)?;
         let sub = self
-            .sampler
             .inner
+            .sampler_mut()
             .sample_neighbors(seed_type_id, &seeds_vec);
 
         Ok(PyHeteroSampledSubgraph {
@@ -444,9 +551,8 @@ impl PyHeteroNeighborSampler {
 
     fn __repr__(&self) -> String {
         format!(
-            "HeteroNeighborSampler(edge_types={}, replace={})",
+            "HeteroNeighborSampler(edge_types={})",
             self.graph.edge_type_count(),
-            false, // config is consumed at construction
         )
     }
 }

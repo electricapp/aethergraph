@@ -46,9 +46,27 @@ class Scale(str, Enum):
 
 
 SCALES = {
-    Scale.quick: {"users": 10_000, "posts": 50_000, "comments": 200_000, "subs": 1_000, "iters": 100},
-    Scale.large: {"users": 100_000, "posts": 500_000, "comments": 2_000_000, "subs": 10_000, "iters": 500},
-    Scale.huge:  {"users": 1_000_000, "posts": 5_000_000, "comments": 20_000_000, "subs": 100_000, "iters": 200},
+    Scale.quick: {
+        "users": 10_000,
+        "posts": 50_000,
+        "comments": 200_000,
+        "subs": 1_000,
+        "iters": 100,
+    },
+    Scale.large: {
+        "users": 100_000,
+        "posts": 500_000,
+        "comments": 2_000_000,
+        "subs": 10_000,
+        "iters": 500,
+    },
+    Scale.huge: {
+        "users": 1_000_000,
+        "posts": 5_000_000,
+        "comments": 20_000_000,
+        "subs": 100_000,
+        "iters": 200,
+    },
 }
 
 
@@ -89,23 +107,41 @@ def build_graph(scale: dict[str, int]) -> HeteroCsrGraph:
     rng = np.random.default_rng(42)
     u, p, c, s = scale["users"], scale["posts"], scale["comments"], scale["subs"]
 
-    with console.status(f"Building graph: {u:,} users, {p:,} posts, {c:,} comments, {s:,} subreddits..."):
+    with console.status(
+        f"Building graph: {u:,} users, {p:,} posts, {c:,} comments, {s:,} subreddits..."
+    ):
         t0 = time.perf_counter()
         graph = HeteroCsrGraph.from_edge_arrays(
             node_types={"user": u, "post": p, "comment": c, "subreddit": s},
             edge_types=[
-                ("user", "votes", "post",
-                 rng.integers(0, u, u * 20).astype(np.uint32),
-                 rng.integers(0, p, u * 20).astype(np.uint32)),
-                ("user", "writes", "comment",
-                 rng.integers(0, u, u * 30).astype(np.uint32),
-                 rng.integers(0, c, u * 30).astype(np.uint32)),
-                ("comment", "reply_to", "comment",
-                 rng.integers(0, c, c // 2).astype(np.uint32),
-                 rng.integers(0, c, c // 2).astype(np.uint32)),
-                ("post", "belongs_to", "subreddit",
-                 rng.integers(0, p, p).astype(np.uint32),
-                 rng.integers(0, s, p).astype(np.uint32)),
+                (
+                    "user",
+                    "votes",
+                    "post",
+                    rng.integers(0, u, u * 20).astype(np.uint32),
+                    rng.integers(0, p, u * 20).astype(np.uint32),
+                ),
+                (
+                    "user",
+                    "writes",
+                    "comment",
+                    rng.integers(0, u, u * 30).astype(np.uint32),
+                    rng.integers(0, c, u * 30).astype(np.uint32),
+                ),
+                (
+                    "comment",
+                    "reply_to",
+                    "comment",
+                    rng.integers(0, c, c // 2).astype(np.uint32),
+                    rng.integers(0, c, c // 2).astype(np.uint32),
+                ),
+                (
+                    "post",
+                    "belongs_to",
+                    "subreddit",
+                    rng.integers(0, p, p).astype(np.uint32),
+                    rng.integers(0, s, p).astype(np.uint32),
+                ),
             ],
         )
         build_ms = (time.perf_counter() - t0) * 1000
@@ -161,7 +197,7 @@ def bench_sample(
     for _ in range(iters):
         seeds = rng.integers(0, users, batch_size).astype(np.uint32)
         sub = sampler.sample("user", seeds)
-        total_nodes += sum(len(sub.nodes(nt)) for nt in sub.node_types())
+        total_nodes += sum(len(sub.nodes(nt)) for nt in sub.node_types)
     elapsed = time.perf_counter() - t0
 
     hops = len(fanout)
@@ -203,12 +239,12 @@ def bench_edge_index_local(graph: HeteroCsrGraph, iters: int) -> BenchResult:
     sub = sampler.sample("user", seeds)
 
     for _ in range(5):
-        for et in sub.edge_types():
+        for et in sub.edge_types:
             sub.edge_index_local(*et)
 
     t0 = time.perf_counter()
     for _ in range(iters):
-        for et in sub.edge_types():
+        for et in sub.edge_types:
             sub.edge_index_local(*et)
     elapsed = time.perf_counter() - t0
 
@@ -217,7 +253,7 @@ def bench_edge_index_local(graph: HeteroCsrGraph, iters: int) -> BenchResult:
         iters=iters,
         total_ms=elapsed * 1000,
         per_iter_us=elapsed / iters * 1e6,
-        throughput=f"{iters * len(sub.edge_types()) / elapsed:,.0f} remap/s",
+        throughput=f"{iters * len(sub.edge_types) / elapsed:,.0f} remap/s",
     )
 
 
@@ -255,7 +291,9 @@ def bench_construction() -> BenchResult:
 
 @app.command()
 def run(
-    scale: Scale = typer.Option(Scale.quick, help="Benchmark scale: quick (~10s), large (~60s), huge (stress)"),
+    scale: Scale = typer.Option(
+        Scale.quick, help="Benchmark scale: quick (~10s), large (~60s), huge (stress)"
+    ),
 ) -> None:
     """Run heterogeneous graph sampling benchmarks.
 

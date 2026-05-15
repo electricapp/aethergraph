@@ -1,6 +1,9 @@
 # AetherGraph Ray Integration
 
-Distributed graph sampling using **Replicated Topology Architecture**. By treating the graph as a static asset on local NVMe (like model weights), we eliminate the Sharding Tax - reducing sampling latency from network RTT (milliseconds) to NVMe I/O (microseconds).
+Distributed graph sampling using **Replicated Topology Architecture**. By
+treating the graph as a static asset on local NVMe (like model weights), we
+eliminate the Sharding Tax - reducing sampling latency from network RTT
+(milliseconds) to NVMe I/O (microseconds).
 
 ## Quick Start
 
@@ -24,18 +27,21 @@ for batch in dataset.iter_batches(batch_format="pyarrow"):
 ## Why This Wins
 
 **Traditional distributed GNN:**
+
 ```
 Worker 1 ←── graph edges ──→ Worker 2    # Terabytes over network
 ```
 
 **AetherGraph approach:**
+
 ```
 Worker 1 ←── gradients ──→ Worker 2      # Megabytes over network
     │                          │
   NVMe                       NVMe         # Graph is local
 ```
 
-Linear scaling: 100 workers = 100x throughput. No diminishing returns from network congestion.
+Linear scaling: 100 workers = 100x throughput. No diminishing returns from
+network congestion.
 
 ## API
 

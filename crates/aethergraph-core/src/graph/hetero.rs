@@ -43,6 +43,26 @@ pub struct HeteroGraph {
     csr_graphs: Vec<Graph>,
 }
 
+/// Errors returned when constructing a [`HeteroGraph`] via [`HeteroGraph::try_from_parts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeteroBuildError {
+    TooManyNodeTypes(usize),
+    TooManyEdgeTypes(usize),
+    UnknownNodeType(String),
+}
+
+impl std::fmt::Display for HeteroBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyNodeTypes(n) => write!(f, "too many node types ({n}, max 255)"),
+            Self::TooManyEdgeTypes(n) => write!(f, "too many edge types ({n}, max 255)"),
+            Self::UnknownNodeType(name) => write!(f, "unknown node type: {name}"),
+        }
+    }
+}
+
+impl std::error::Error for HeteroBuildError {}
+
 impl HeteroGraph {
     /// Build a heterogeneous graph from node types and edge types.
     ///
@@ -50,15 +70,18 @@ impl HeteroGraph {
     /// * `node_types` - Vec of (name, count) pairs for each node type
     /// * `edge_types` - Vec of (src_type_name, relation, dst_type_name, csr_graph) tuples
     ///
-    /// # Panics
-    /// Panics if more than 255 node types or 255 edge types are provided,
-    /// or if an edge type references an unknown node type name.
-    pub fn from_parts(
+    /// Returns `Err` if there are too many types or an edge type references an
+    /// unknown node type name. For tests / one-shot scripts, see [`Self::from_parts`].
+    pub fn try_from_parts(
         node_types: Vec<(String, usize)>,
         edge_types: Vec<(String, String, String, Graph)>,
-    ) -> Self {
-        assert!(node_types.len() <= 255, "too many node types (max 255)");
-        assert!(edge_types.len() <= 255, "too many edge types (max 255)");
+    ) -> Result<Self, HeteroBuildError> {
+        if node_types.len() > 255 {
+            return Err(HeteroBuildError::TooManyNodeTypes(node_types.len()));
+        }
+        if edge_types.len() > 255 {
+            return Err(HeteroBuildError::TooManyEdgeTypes(edge_types.len()));
+        }
 
         let mut node_type_index = HashMap::with_capacity(node_types.len());
         let mut node_metas = Vec::with_capacity(node_types.len());
@@ -75,10 +98,10 @@ impl HeteroGraph {
         for (i, (src, rel, dst, graph)) in edge_types.into_iter().enumerate() {
             let src_id = *node_type_index
                 .get(&src)
-                .unwrap_or_else(|| panic!("unknown source node type: {}", src));
+                .ok_or_else(|| HeteroBuildError::UnknownNodeType(src.clone()))?;
             let dst_id = *node_type_index
                 .get(&dst)
-                .unwrap_or_else(|| panic!("unknown destination node type: {}", dst));
+                .ok_or_else(|| HeteroBuildError::UnknownNodeType(dst.clone()))?;
 
             edge_type_index.insert((src.clone(), rel.clone(), dst.clone()), i as EdgeTypeId);
             edge_metas.push(EdgeTypeMeta {
@@ -89,13 +112,22 @@ impl HeteroGraph {
             csr_graphs.push(graph);
         }
 
-        Self {
+        Ok(Self {
             node_types: node_metas,
             node_type_index,
             edge_types: edge_metas,
             edge_type_index,
             csr_graphs,
-        }
+        })
+    }
+
+    /// Build a heterogeneous graph, panicking on validation errors.
+    /// Convenience wrapper over [`Self::try_from_parts`] for tests and demos.
+    pub fn from_parts(
+        node_types: Vec<(String, usize)>,
+        edge_types: Vec<(String, String, String, Graph)>,
+    ) -> Self {
+        Self::try_from_parts(node_types, edge_types).expect("HeteroGraph::from_parts failed")
     }
 
     /// Look up a node type ID by name.

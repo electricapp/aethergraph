@@ -6,7 +6,6 @@ implementation for multi-relational graph neural network training.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -20,13 +19,20 @@ __all__ = ["HeteroGraph"]
 class HeteroGraph:
     """Heterogeneous graph with multiple node and edge types.
 
-    Wraps a Rust-backed HeteroCsrGraph that holds one CSR matrix per edge type.
-    Node IDs within each CSR are local to their respective node type.
+    Thin Python builder over the Rust :class:`HeteroCsrGraph`. Adds three
+    things the Rust class doesn't provide:
 
-    Attributes:
-        _inner: The underlying Rust HeteroCsrGraph instance.
-        _feature_paths: Per-node-type feature file paths.
-        _features: Per-node-type in-memory feature arrays.
+    1. ``from_pyg`` — converts a ``torch_geometric.data.HeteroData`` object,
+       which can't live on the Rust side (importing torch from a Rust
+       extension is a bad idea).
+    2. Tuple-friendly ``num_edges((src, rel, dst))`` — the Rust API takes
+       three positional args, which is less Pythonic.
+    3. ``@property`` accessors for ``node_types`` / ``edge_types`` /
+       ``total_nodes`` / ``total_edges`` — the Rust calls are methods.
+
+    Features (per-type ``x`` arrays) are NOT held on this class; pass them
+    to :class:`HeteroNeighborLoader` directly via its ``features=`` kwarg,
+    matching the homogeneous-graph pattern.
 
     Example:
         >>> graph = HeteroGraph.from_edge_arrays(
@@ -43,8 +49,6 @@ class HeteroGraph:
     """
 
     _inner: HeteroCsrGraph
-    _feature_paths: dict[str, str]
-    _features: dict[str, npt.NDArray[np.float32]]
 
     def __init__(self, inner: HeteroCsrGraph) -> None:
         """Initialize a HeteroGraph from a HeteroCsrGraph instance.
@@ -53,8 +57,6 @@ class HeteroGraph:
             inner: The underlying Rust HeteroCsrGraph instance.
         """
         self._inner = inner
-        self._feature_paths = {}
-        self._features = {}
 
     @classmethod
     def from_edge_arrays(
@@ -117,7 +119,7 @@ class HeteroGraph:
             >>> graph = HeteroGraph.from_pyg(pyg_data)
         """
         try:
-            from torch_geometric.data import HeteroData  # type: ignore[import-untyped]
+            from torch_geometric.data import HeteroData
         except ImportError as e:
             raise ImportError(
                 "HeteroGraph.from_pyg requires torch-geometric>=2.4. "
@@ -151,55 +153,7 @@ class HeteroGraph:
             dst_arr = ei[1].cpu().numpy().astype(np.uint32)
             edge_list.append((src_type, rel, dst_type, src_arr, dst_arr))
 
-        graph = cls.from_edge_arrays(node_types, edge_list)
-
-        # Copy features if available
-        for nt in data.node_types:
-            store = data[nt]
-            if hasattr(store, "x") and store.x is not None:
-                feat = store.x.cpu().numpy().astype(np.float32)
-                graph._features[nt] = feat
-
-        return graph
-
-    def load_features(self, node_type: str, path: str | Path) -> None:
-        """Load node features for a given type from a binary file.
-
-        Features are loaded lazily by the HeteroNeighborLoader. This method
-        only stores the path; actual loading happens during sampling.
-
-        Args:
-            node_type: Node type name (e.g. "user").
-            path: Path to feature file.
-
-        Raises:
-            FileNotFoundError: If the feature file does not exist.
-            KeyError: If the node type is not present in the graph.
-        """
-        if node_type not in self.node_types:
-            raise KeyError(f"unknown node type '{node_type}', available: {self.node_types}")
-        feature_path = Path(path)
-        if not feature_path.exists():
-            raise FileNotFoundError(f"Feature file not found: {feature_path}")
-        self._feature_paths[node_type] = str(feature_path)
-
-    @property
-    def features(self) -> dict[str, npt.NDArray[np.float32]]:
-        """Per-type in-memory features.
-
-        Returns:
-            Dict mapping node type name to feature array.
-        """
-        return self._features
-
-    @property
-    def feature_paths(self) -> dict[str, str]:
-        """Per-type feature file paths.
-
-        Returns:
-            Dict mapping node type name to feature file path.
-        """
-        return self._feature_paths
+        return cls.from_edge_arrays(node_types, edge_list)
 
     @property
     def node_types(self) -> list[str]:
@@ -251,10 +205,12 @@ class HeteroGraph:
         return self._inner.total_edges()
 
     @property
-    def _rust_graph(self) -> HeteroCsrGraph:
-        """Access the underlying Rust HeteroCsrGraph.
+    def csr(self) -> HeteroCsrGraph:
+        """The underlying Rust :class:`HeteroCsrGraph`.
 
-        For internal use by other AetherGraph modules.
+        Pass this to :class:`HeteroNeighborSampler` or
+        :class:`HeteroNeighborLoader` constructors when they expect the
+        Rust type directly.
         """
         return self._inner
 

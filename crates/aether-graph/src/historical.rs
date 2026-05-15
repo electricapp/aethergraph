@@ -48,10 +48,15 @@ impl HistoricalSampler {
     /// Nodes computed in a prior epoch but NOT dirty use cached embeddings --
     /// this is the GNNAutoScale approximation: their neighbor structure is
     /// unchanged, so the cached embedding is a valid approximation.
-    pub fn prepare_batch(&self, _graph: &DynamicGraph, nodes: &[u32]) -> HistoricalBatch {
-        let mut recompute_nodes = Vec::new();
-        let mut cached_nodes = Vec::new();
-        let mut cached_embeddings = Vec::new();
+    ///
+    /// The dirty set is read from internal state populated by `advance_epoch`;
+    /// the graph itself is not consulted, so callers should ensure
+    /// `advance_epoch` has been invoked at least once for accurate results.
+    pub fn prepare_batch(&self, nodes: &[u32]) -> HistoricalBatch {
+        let dim = self.cache.dim();
+        let mut recompute_nodes = Vec::with_capacity(nodes.len());
+        let mut cached_nodes = Vec::with_capacity(nodes.len());
+        let mut cached_embeddings = Vec::with_capacity(nodes.len() * dim);
 
         for &node in nodes {
             let is_dirty = self.dirty_set.binary_search(&node).is_ok();
@@ -107,17 +112,22 @@ impl HistoricalSampler {
 mod tests {
     use super::*;
 
+    fn fill_graph(g: &DynamicGraph, edges: &[(u32, u32)]) {
+        let mut w = g.writer_or_panic();
+        for &(s, d) in edges {
+            w.insert_edge(s, d).unwrap();
+        }
+    }
+
     #[test]
     fn historical_prepare_batch() {
         let g = DynamicGraph::new(100, 1024);
-        for i in 0..10 {
-            g.insert_edge(i, i + 1).unwrap();
-        }
+        let edges: Vec<_> = (0u32..10).map(|i| (i, i + 1)).collect();
+        fill_graph(&g, &edges);
 
         let sampler = HistoricalSampler::new(100, 4);
-        let batch = sampler.prepare_batch(&g, &[0, 1, 2]);
+        let batch = sampler.prepare_batch(&[0, 1, 2]);
 
-        // All nodes should need recomputation (nothing cached yet)
         assert!(!batch.recompute_nodes.is_empty());
         assert!(batch.cached_nodes.is_empty());
     }
@@ -125,44 +135,38 @@ mod tests {
     #[test]
     fn historical_commit_and_reuse() {
         let g = DynamicGraph::new(100, 1024);
-        g.insert_edge(0, 1).unwrap();
-        g.insert_edge(1, 2).unwrap();
+        fill_graph(&g, &[(0, 1), (1, 2)]);
 
         let mut sampler = HistoricalSampler::new(100, 4);
 
-        // Epoch 1: drain initial dirty set, compute batch
         sampler.advance_epoch(&g);
-        let batch = sampler.prepare_batch(&g, &[0, 1]);
+        let batch = sampler.prepare_batch(&[0, 1]);
         assert_eq!(batch.cached_nodes.len(), 0, "first batch: nothing cached");
         let fake_embeddings: Vec<f32> = (0..batch.recompute_nodes.len() * 4)
             .map(|i| i as f32)
             .collect();
         sampler.commit_batch(&batch, &fake_embeddings);
 
-        // Epoch 2: no new edges -- dirty set is empty
         sampler.advance_epoch(&g);
 
-        // Second batch with same nodes: should reuse cached
-        let batch2 = sampler.prepare_batch(&g, &[0, 1]);
+        let batch2 = sampler.prepare_batch(&[0, 1]);
         assert!(!batch2.cached_nodes.is_empty(), "should have cached nodes");
     }
 
     #[test]
     fn historical_dirty_invalidates() {
         let g = DynamicGraph::new(100, 1024);
-        g.insert_edge(0, 1).unwrap();
+        fill_graph(&g, &[(0, 1)]);
 
         let mut sampler = HistoricalSampler::new(100, 4);
-        let batch = sampler.prepare_batch(&g, &[0]);
+        let batch = sampler.prepare_batch(&[0]);
         let fake_emb = vec![1.0; batch.recompute_nodes.len() * 4];
         sampler.commit_batch(&batch, &fake_emb);
 
-        // New edge touching node 0
-        g.insert_edge(0, 5).unwrap();
+        fill_graph(&g, &[(0, 5)]);
         sampler.advance_epoch(&g);
 
-        // Node 0 should need recomputation (dirty), node 1 should be cached
-        let batch2 = sampler.prepare_batch(&g, &[0, 1]);
+        let batch2 = sampler.prepare_batch(&[0, 1]);
         assert!(
             batch2.recompute_nodes.contains(&0),
             "dirty node should be recomputed"

@@ -30,8 +30,11 @@ crate-type = ["cdylib"]
 doctest = false
 
 [dependencies]
-aethergraph-core = { path = "../aethergraph-core" }
-aether-graph = { path = "../aether-graph" }
+aethergraph-core = { path = "../aethergraph-core", version = "0.1" }
+# `wal` is always on so the Python `DynamicGraph.open_with_wal` constructor is
+# present on every wheel build — durability is a runtime opt-in (pass a path or
+# don't), not a compile-time one.
+aether-graph = { path = "../aether-graph", version = "0.1", features = ["wal"] }
 
 # PyO3 for Python bindings. `extension-module` is conditionally enabled via
 # this crate's `extension-module` feature (above) so `cargo test` links
@@ -62,4 +65,4 @@ serde_json = "1.0"
 parking_lot = "0.12"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-aether-stream = { path = "../aether-stream", optional = true }
+aether-stream = { path = "../aether-stream", version = "0.1", optional = true }

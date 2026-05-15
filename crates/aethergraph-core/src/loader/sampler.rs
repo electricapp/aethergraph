@@ -139,6 +139,20 @@ pub struct SamplingConfig {
     /// mapping each node to its seed index.
     pub disjoint: bool,
 
+    /// Bit-deterministic mode.
+    ///
+    /// When `true`, parallel sampling paths fall back to serial execution
+    /// so that the same `seed` produces byte-identical subgraphs across
+    /// runs, machines, and core counts. When `false` (default), the
+    /// `seed` parameter still controls per-thread RNG streams but Rayon's
+    /// thread-pool scheduling can permute the order in which batches are
+    /// emitted — meaning two runs with the same seed are *statistically*
+    /// equivalent but not bit-identical.
+    ///
+    /// Use `true` for regression tests, audit logs, and any reproducibility
+    /// claim. Pay the throughput cost (typically 2–8×) only when needed.
+    pub deterministic: bool,
+
     /// Optional telemetry collector (opt-in, zero overhead if None)
     pub telemetry: Option<Arc<SamplingTelemetry>>,
 }
@@ -156,20 +170,55 @@ impl Default for SamplingConfig {
             track_edge_ids: true,     // Match PyG: always track e_id by default
             temporal_strategy: None,  // No temporal filtering by default
             disjoint: false,          // Shared node dedup by default
-            telemetry: None,          // Opt-in telemetry
+            // Default to non-deterministic parallel path for throughput;
+            // opt in to `deterministic = true` for tests / audit / regression.
+            deterministic: false,
+            telemetry: None, // Opt-in telemetry
         }
     }
 }
 
+/// Errors returned by [`NeighborSampler::sample_neighbors_temporal`].
+///
+/// Each variant distinguishes a misconfigured graph or sampler from an
+/// honestly-empty neighborhood.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalSamplingError {
+    /// `seeds.len() != input_times.len()`.
+    LengthMismatch { seeds: usize, times: usize },
+    /// The graph has no edge timestamps attached.
+    TimestampsMissing,
+    /// `SamplingConfig::temporal_strategy` is `None`.
+    StrategyMissing,
+}
+
+impl std::fmt::Display for TemporalSamplingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LengthMismatch { seeds, times } => write!(
+                f,
+                "temporal sampling: seeds.len() ({seeds}) != input_times.len() ({times})"
+            ),
+            Self::TimestampsMissing => f.write_str(
+                "temporal sampling: graph has no edge timestamps — call Graph::set_timestamps() first",
+            ),
+            Self::StrategyMissing => f.write_str(
+                "temporal sampling: SamplingConfig::temporal_strategy is None",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TemporalSamplingError {}
+
 /// A neighborhood sampler for GNN training.
 ///
-/// All internal buffers are pre-allocated at construction and reused
-/// across `sample_neighbors` calls. Zero allocations in the hot path.
+/// All internal buffers are pre-allocated at construction and reused across
+/// `sample_neighbors` calls. Zero allocations in the hot path.
 ///
-/// Uses either a generation-tagged direct array (for graphs < 1M nodes) or
-/// FxHashMap (for large graphs) for node dedup. The direct array is O(1) with
-/// no hashing but costs 8 bytes/node. FxHashMap is better when sampled nodes
-/// are a tiny fraction of the graph (e.g., 12K / 10M = 0.1%).
+/// Dedup uses either a generation-tagged direct array (for graphs < 1M nodes,
+/// O(1) lookup, ~8 bytes/node memory) or an FxHashMap-backed index for sparser
+/// sampling patterns (e.g. 12K nodes touched out of 10M).
 pub struct NeighborSampler<'a> {
     graph: &'a Graph,
     config: SamplingConfig,
@@ -327,19 +376,34 @@ impl<'a> NeighborSampler<'a> {
 
     /// Sample k-hop neighborhoods with temporal constraints.
     ///
-    /// Each seed has an associated time; only edges with timestamp < seed time are eligible.
-    /// Requires `temporal_strategy` set in config and `Graph::set_timestamps()`.
+    /// Each seed has an associated time; only edges with timestamp < seed time
+    /// are eligible.
+    ///
+    /// # Errors
+    /// Returns [`TemporalSamplingError::TimestampsMissing`] if the graph has
+    /// no edge timestamps attached (call [`crate::Graph::set_timestamps`]
+    /// first). Returns [`TemporalSamplingError::StrategyMissing`] if no
+    /// `temporal_strategy` is set on the `SamplingConfig`. Returns
+    /// [`TemporalSamplingError::LengthMismatch`] if `seeds.len() !=
+    /// input_times.len()`.
     pub fn sample_neighbors_temporal(
         &mut self,
         seeds: &[NodeId],
         input_times: &[f64],
-    ) -> SampledSubgraph {
-        assert_eq!(
-            seeds.len(),
-            input_times.len(),
-            "seeds and input_times must have same length"
-        );
-        self.sample_neighbors_inner(seeds, Some(input_times))
+    ) -> Result<SampledSubgraph, TemporalSamplingError> {
+        if seeds.len() != input_times.len() {
+            return Err(TemporalSamplingError::LengthMismatch {
+                seeds: seeds.len(),
+                times: input_times.len(),
+            });
+        }
+        if !self.graph.has_timestamps() {
+            return Err(TemporalSamplingError::TimestampsMissing);
+        }
+        if self.config.temporal_strategy.is_none() {
+            return Err(TemporalSamplingError::StrategyMissing);
+        }
+        Ok(self.sample_neighbors_inner(seeds, Some(input_times)))
     }
 
     /// Sample each seed independently (no node dedup across seeds).
@@ -1052,10 +1116,15 @@ impl<'a> NeighborSampler<'a> {
         // Compute keys: key[i] = -ln(u) / w[i], u ~ Uniform(0,1)
         // We use fast_neg_ln: bit-extract log2 approximation (~4x faster than ln())
         // Only relative ordering matters, so approximation is fine.
+        //
+        // Guard against non-finite weights (NaN, ±inf): NaN > 0.0 is false so
+        // it routes to INFINITY, but +inf > 0.0 is true and would produce
+        // INFINITY / INFINITY = NaN, which makes `partial_cmp` return None and
+        // poisons the sort. Require strictly finite, strictly positive weight.
         for (i, &weight) in weights[..n].iter().enumerate() {
             let u_bits = self.rng.next_u64() | 1; // ensure nonzero
             let w = weight as f64;
-            let key = if w > 0.0 {
+            let key = if w.is_finite() && w > 0.0 {
                 fast_neg_ln_u64(u_bits) / w
             } else {
                 f64::INFINITY
@@ -1063,9 +1132,12 @@ impl<'a> NeighborSampler<'a> {
             self.weighted_keys.push((key, i));
         }
 
-        // O(n) partial sort — only partitions around the k-th element
-        self.weighted_keys
-            .select_nth_unstable_by(k - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
+        // O(n) partial sort — only partitions around the k-th element.
+        // Fall back to Equal on any unexpected NaN so the comparator stays a
+        // total order; the finite-weight guard above should already prevent it.
+        self.weighted_keys.select_nth_unstable_by(k - 1, |a, b| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         for &(_, idx) in &self.weighted_keys[..k] {
             self.sample_buf.push((neighbors[idx], idx));
@@ -1231,17 +1303,35 @@ impl<'a> ParallelBatchSampler<'a> {
         Self { graph, config }
     }
 
-    /// Sample neighborhoods for multiple batches in parallel.
+    /// Sample neighborhoods for multiple batches.
     ///
-    /// Each batch is a list of seed nodes to sample from.
+    /// When `config.deterministic == false` (default), batches are sampled
+    /// in parallel via Rayon. The same seed produces statistically
+    /// equivalent results across runs but not bit-identical output —
+    /// rayon's work-stealing scheduler can permute order.
+    ///
+    /// When `config.deterministic == true`, batches are sampled
+    /// **serially** in the order given. Output is byte-identical across
+    /// runs and machines. Expect 2–8× lower throughput; use only for
+    /// regression tests, audit logs, or strict reproducibility.
     pub fn sample_batches(&self, batches: &[Vec<NodeId>]) -> Vec<SampledSubgraph> {
-        batches
-            .par_iter()
-            .map(|seeds| {
-                let mut sampler = NeighborSampler::new(self.graph, self.config.clone());
-                sampler.sample_neighbors(seeds)
-            })
-            .collect()
+        if self.config.deterministic {
+            batches
+                .iter()
+                .map(|seeds| {
+                    let mut sampler = NeighborSampler::new(self.graph, self.config.clone());
+                    sampler.sample_neighbors(seeds)
+                })
+                .collect()
+        } else {
+            batches
+                .par_iter()
+                .map(|seeds| {
+                    let mut sampler = NeighborSampler::new(self.graph, self.config.clone());
+                    sampler.sample_neighbors(seeds)
+                })
+                .collect()
+        }
     }
 }
 
@@ -1283,6 +1373,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1309,6 +1400,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1337,6 +1429,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1362,6 +1455,7 @@ mod tests {
             track_edge_ids: false,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1386,6 +1480,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1411,6 +1506,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1439,6 +1535,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1474,6 +1571,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: Some(telemetry.clone()),
         };
 
@@ -1506,6 +1604,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1547,6 +1646,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1576,6 +1676,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1622,6 +1723,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1654,6 +1756,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1692,6 +1795,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1741,7 +1845,9 @@ mod tests {
         ];
         let mut graph = Graph::from_edges(5, &edges, None).unwrap();
         // Timestamps parallel to edges: 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0
-        graph.set_timestamps(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        graph
+            .set_timestamps(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+            .unwrap();
         graph
     }
 
@@ -1761,11 +1867,12 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: Some(TemporalStrategy::Uniform),
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
         let mut sampler = NeighborSampler::new(&graph, config);
-        let subgraph = sampler.sample_neighbors_temporal(&[0], &[2.5]);
+        let subgraph = sampler.sample_neighbors_temporal(&[0], &[2.5]).unwrap();
 
         // Only edges with t < 2.5 should be sampled: 0->1 and 0->2
         assert_eq!(subgraph.num_edges(), 2);
@@ -1795,11 +1902,12 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: Some(TemporalStrategy::Last),
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
         let mut sampler = NeighborSampler::new(&graph, config);
-        let subgraph = sampler.sample_neighbors_temporal(&[0], &[3.5]);
+        let subgraph = sampler.sample_neighbors_temporal(&[0], &[3.5]).unwrap();
 
         assert_eq!(subgraph.num_edges(), 2);
         let dsts: FxHashSet<_> = subgraph.edge_dst.iter().copied().collect();
@@ -1835,11 +1943,12 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: Some(TemporalStrategy::Uniform),
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
         let mut sampler = NeighborSampler::new(&graph, config);
-        let subgraph = sampler.sample_neighbors_temporal(&[0], &[0.5]);
+        let subgraph = sampler.sample_neighbors_temporal(&[0], &[0.5]).unwrap();
 
         // No edges should be sampled since all timestamps >= 0.5 and the earliest is 1.0
         assert_eq!(subgraph.num_edges(), 0);
@@ -1851,7 +1960,7 @@ mod tests {
         // Build graph: 0->1 (t=10.0), 0->2 (t=20.0), 1->3 (t=5.0), 1->4 (t=15.0)
         let edges = vec![(0, 1), (0, 2), (1, 3), (1, 4)];
         let mut graph = Graph::from_edges(5, &edges, None).unwrap();
-        graph.set_timestamps(vec![10.0, 20.0, 5.0, 15.0]);
+        graph.set_timestamps(vec![10.0, 20.0, 5.0, 15.0]).unwrap();
 
         // 2-hop sampling with seed time 25.0
         // Hop 1: node 0, time=25.0 -> edges with t<25: 0->1 (t=10), 0->2 (t=20) both valid
@@ -1870,11 +1979,12 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: Some(TemporalStrategy::Uniform),
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
         let mut sampler = NeighborSampler::new(&graph, config);
-        let subgraph = sampler.sample_neighbors_temporal(&[0], &[25.0]);
+        let subgraph = sampler.sample_neighbors_temporal(&[0], &[25.0]).unwrap();
 
         // Hop 1 edges: 0->1, 0->2
         // Hop 2 edges from node 1 (time=10.0): only 1->3 (t=5.0 < 10.0)
@@ -1897,7 +2007,7 @@ mod tests {
         // Node 0 has 5 neighbors, all with timestamps well below the seed time.
         let edges = vec![(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)];
         let mut graph = Graph::from_edges(6, &edges, None).unwrap();
-        graph.set_timestamps(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        graph.set_timestamps(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
 
         let config = SamplingConfig {
             fanout: vec![2], // Only sample 2 out of 5 valid neighbors
@@ -1910,11 +2020,12 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: Some(TemporalStrategy::Uniform),
             disjoint: false,
+            deterministic: false,
             telemetry: None,
         };
 
         let mut sampler = NeighborSampler::new(&graph, config);
-        let subgraph = sampler.sample_neighbors_temporal(&[0], &[100.0]);
+        let subgraph = sampler.sample_neighbors_temporal(&[0], &[100.0]).unwrap();
 
         // All 5 edges have t < 100.0, but fanout=2 so exactly 2 should be sampled
         assert_eq!(
@@ -1953,6 +2064,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: true,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -1999,6 +2111,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: true,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -2058,6 +2171,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: None,
             disjoint: true,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -2122,7 +2236,9 @@ mod tests {
             (3, 4),
         ];
         let mut graph = Graph::from_edges(5, &edges, None).unwrap();
-        graph.set_timestamps(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        graph
+            .set_timestamps(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+            .unwrap();
 
         let config = SamplingConfig {
             fanout: vec![10], // large fanout
@@ -2135,6 +2251,7 @@ mod tests {
             track_edge_ids: true,
             temporal_strategy: Some(TemporalStrategy::Uniform),
             disjoint: true,
+            deterministic: false,
             telemetry: None,
         };
 
@@ -2191,5 +2308,33 @@ mod tests {
             !seed1_dsts.contains(&3),
             "seed 1 should NOT sample 1->3 (t=5.0 >= 4.5)"
         );
+    }
+
+    #[test]
+    fn parallel_batch_sampler_deterministic_mode_is_bit_identical() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            fanout: vec![2, 2],
+            seed: Some(0xCAFE_F00D),
+            deterministic: true,
+            ..Default::default()
+        };
+        let batches: Vec<Vec<NodeId>> = vec![vec![0, 1], vec![2, 3], vec![4]];
+        let s = ParallelBatchSampler::new(&graph, config.clone());
+
+        let run1 = s.sample_batches(&batches);
+        let run2 = s.sample_batches(&batches);
+        assert_eq!(run1.len(), run2.len());
+        for (a, b) in run1.iter().zip(run2.iter()) {
+            assert_eq!(a.nodes, b.nodes, "deterministic mode: nodes diverge");
+            assert_eq!(
+                a.edge_src, b.edge_src,
+                "deterministic mode: edge_src diverges"
+            );
+            assert_eq!(
+                a.edge_dst, b.edge_dst,
+                "deterministic mode: edge_dst diverges"
+            );
+        }
     }
 }

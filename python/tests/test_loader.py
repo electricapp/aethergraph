@@ -33,14 +33,16 @@ class TestNeighborLoaderBasic:
 
         assert len(loader) > 0
 
-    def test_iteration(self, small_graph_with_features: Graph) -> None:
+    def test_iteration(self, small_graph_with_features: tuple[Graph, np.ndarray]) -> None:
         """Test iterating over batches."""
         from aethergraph.pytorch import NeighborLoader
 
+        graph, features = small_graph_with_features
         loader = NeighborLoader(
-            small_graph_with_features,
+            graph,
             num_neighbors=[10, 5],
             batch_size=16,
+            features=features,
         )
 
         batches = list(loader)
@@ -65,14 +67,16 @@ class TestNeighborLoaderBasic:
             # batch_size should be at most 10
             assert batch.batch_size <= 10
 
-    def test_features_included(self, small_graph_with_features: Graph) -> None:
+    def test_features_included(self, small_graph_with_features: tuple[Graph, np.ndarray]) -> None:
         """Test that features are included in batches."""
         from aethergraph.pytorch import NeighborLoader
 
+        graph, features = small_graph_with_features
         loader = NeighborLoader(
-            small_graph_with_features,
+            graph,
             num_neighbors=[10],
             batch_size=16,
+            features=features,
         )
 
         for batch in loader:
@@ -93,8 +97,6 @@ class TestNeighborLoaderBasic:
         feature_path = temp_dir / "features.bin"
         save_features(str(feature_path), features)
 
-        small_graph.load_features(feature_path)
-
         loader = NeighborLoader(
             small_graph,
             num_neighbors=[5],
@@ -102,6 +104,7 @@ class TestNeighborLoaderBasic:
             batch_size=3,
             shuffle=False,
             replace=False,
+            feature_path=str(feature_path),
         )
 
         batch = next(iter(loader))

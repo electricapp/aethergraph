@@ -12,14 +12,26 @@ use crate::error::sampling_error;
 use crate::graph::PyCsrGraph;
 use crate::sampler::{PySampledSubgraph, PySamplingConfig};
 
-type NextWithFeaturesResult<'py> = Option<(PySampledSubgraph, Option<Bound<'py, PyArray2<f32>>>)>;
+/// Return type of [`PyNeighborLoader::next_with_features`].
+///
+/// `Some((subgraph, Some(features)))` — both subgraph and features available.
+/// `Some((subgraph, None))` — loader has no feature column attached.
+/// `None` — the prefetcher has finished and there are no more batches.
+pub type NextWithFeaturesResult<'py> =
+    Option<(PySampledSubgraph, Option<Bound<'py, PyArray2<f32>>>)>;
 
 /// Python wrapper for PrefetchStats.
+///
+/// Snapshot of the loader's atomic counters at the moment `.stats()` was
+/// called. The Rust [`PrefetchStats`] keeps the live atomic state; we copy
+/// it out so callers see a stable view.
 #[pyclass(name = "PrefetchStats")]
 pub struct PyPrefetchStats {
-    hits: u64,
-    misses: u64,
-    total: u64,
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) total: u64,
+    pub(crate) sample_time_ns: u64,
+    pub(crate) feature_load_time_ns: u64,
 }
 
 #[pymethods]
@@ -52,6 +64,18 @@ impl PyPrefetchStats {
         }
     }
 
+    /// Cumulative nanoseconds the prefetch worker spent sampling.
+    #[getter]
+    fn sample_time_ns(&self) -> u64 {
+        self.sample_time_ns
+    }
+
+    /// Cumulative nanoseconds the prefetch worker spent loading features.
+    #[getter]
+    fn feature_load_time_ns(&self) -> u64 {
+        self.feature_load_time_ns
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PrefetchStats(hits={}, misses={}, hit_rate={:.1}%)",
@@ -67,6 +91,8 @@ impl PyPrefetchStats {
         dict.set_item("misses", self.misses)?;
         dict.set_item("total", self.total)?;
         dict.set_item("hit_rate", self.hit_rate())?;
+        dict.set_item("sample_time_ns", self.sample_time_ns)?;
+        dict.set_item("feature_load_time_ns", self.feature_load_time_ns)?;
         Ok(dict.into())
     }
 }
@@ -160,16 +186,15 @@ impl PyNeighborLoader {
     fn with_features(
         graph: &PyCsrGraph,
         config: &PySamplingConfig,
-        feature_path: &str,
+        feature_path: PathBuf,
         prefetch_depth: usize,
     ) -> PyResult<Self> {
         let graph_arc = graph.inner_arc();
-        let path = PathBuf::from(feature_path);
 
         let inner = NeighborLoader::with_features(
             graph_arc.clone(),
             config.inner().clone(),
-            &path,
+            &feature_path,
             prefetch_depth,
         )
         .map_err(|e| sampling_error(format!("Failed to create prefetcher with features: {}", e)))?;
@@ -212,16 +237,14 @@ impl PyNeighborLoader {
     #[pyo3(signature = (graph_path, config, prefetch_depth=2))]
     #[cfg(target_os = "linux")]
     fn new_nvme(
-        graph_path: &str,
+        graph_path: PathBuf,
         config: &PySamplingConfig,
         prefetch_depth: usize,
     ) -> PyResult<Self> {
-        let path = PathBuf::from(graph_path);
-
-        let inner = NeighborLoader::new_nvme(&path, config.inner().clone(), prefetch_depth)
+        let inner = NeighborLoader::new_nvme(&graph_path, config.inner().clone(), prefetch_depth)
             .map_err(|e| {
-                pyo3::exceptions::PyOSError::new_err(format!("Failed to open NVMe graph: {}", e))
-            })?;
+            pyo3::exceptions::PyOSError::new_err(format!("Failed to open NVMe graph: {}", e))
+        })?;
 
         Ok(Self {
             inner: Some(inner),
@@ -241,7 +264,7 @@ impl PyNeighborLoader {
     #[cfg(not(target_os = "linux"))]
     #[allow(unused_variables)]
     fn new_nvme(
-        graph_path: &str,
+        graph_path: PathBuf,
         config: &PySamplingConfig,
         prefetch_depth: usize,
     ) -> PyResult<Self> {
@@ -254,29 +277,20 @@ impl PyNeighborLoader {
     /// Submit a batch to be sampled.
     ///
     /// Args:
-    ///     batch_idx: Index of this batch (for ordering)
-    ///     seeds: Seed node IDs as numpy array or list
+    ///     batch_idx: Per-epoch index of this batch, used for ordering.
+    ///         The prefetch thread delivers results in `batch_idx` order, but
+    ///         submissions themselves do NOT need to be in order — duplicates
+    ///         and gaps are caller-visible: a duplicate `batch_idx` collides
+    ///         in the result queue and a missing one leaves a permanent gap
+    ///         that blocks `next()` forever.
+    ///     seeds: Seed node IDs (numpy uint32, numpy int64, or `list[int]`).
     fn submit(&self, batch_idx: usize, seeds: &Bound<'_, PyAny>) -> PyResult<()> {
         let inner = self
             .inner
             .as_ref()
             .ok_or_else(|| sampling_error("Prefetcher has been shut down"))?;
 
-        // Convert seeds to Vec<u32>
-        let seeds_vec: Vec<u32> = if let Ok(arr) = seeds.extract::<numpy::PyReadonlyArray1<i64>>() {
-            arr.as_slice()?
-                .iter()
-                .map(|&x| {
-                    u32::try_from(x).map_err(|_| {
-                        sampling_error(format!("seed node {} out of range [0, {}]", x, u32::MAX))
-                    })
-                })
-                .collect::<PyResult<Vec<u32>>>()?
-        } else if let Ok(arr) = seeds.extract::<numpy::PyReadonlyArray1<u32>>() {
-            arr.as_slice()?.to_vec()
-        } else {
-            seeds.extract::<Vec<u32>>()?
-        };
+        let seeds_vec = crate::error::extract_seeds(seeds)?;
 
         inner
             .submit(batch_idx, seeds_vec)
@@ -458,11 +472,12 @@ impl PyNeighborLoader {
             None => return Ok(None),
         };
 
-        // Gather features via RDMA into VRAM (~20μs)
-        let node_ids: Vec<u32> = subgraph.nodes.iter().map(|&n| n as u32).collect();
+        // Gather features via RDMA into VRAM (~20μs). `subgraph.nodes` is
+        // already `Vec<u32>`; we hand a `&[u32]` straight to RDMA.
+        let node_ids: &[u32] = &subgraph.nodes;
         // epoch_version=0: accept any consistent read (no MVCC pinning from Python yet)
         let gpu_features = rdma
-            .gather(&node_ids, 0)
+            .gather(node_ids, 0)
             .map_err(|e| sampling_error(format!("RDMA gather failed: {e}")))?;
 
         let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;
@@ -506,6 +521,12 @@ impl PyNeighborLoader {
             hits: stats.hits.load(std::sync::atomic::Ordering::Relaxed),
             misses: stats.misses.load(std::sync::atomic::Ordering::Relaxed),
             total: stats.total.load(std::sync::atomic::Ordering::Relaxed),
+            sample_time_ns: stats
+                .sample_time_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            feature_load_time_ns: stats
+                .feature_load_time_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -529,14 +550,16 @@ impl PyNeighborLoader {
     }
 
     fn __repr__(&self) -> String {
-        if let Some(ref inner) = self.inner {
-            format!(
-                "NeighborLoader(prefetch_depth={}, hit_rate={:.1}%)",
+        // `__repr__` is called on every `print()` and inside debuggers, so we
+        // skip live stats here to keep it allocation-cheap. Call `.stats()`
+        // explicitly to inspect hit rates.
+        match &self.inner {
+            Some(inner) => format!(
+                "NeighborLoader(prefetch_depth={}, has_features={})",
                 inner.prefetch_depth(),
-                inner.stats().hit_rate() * 100.0
-            )
-        } else {
-            "NeighborLoader(shutdown)".to_string()
+                self.feature_dim.is_some()
+            ),
+            None => "NeighborLoader(shutdown)".to_string(),
         }
     }
 

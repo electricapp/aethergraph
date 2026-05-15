@@ -76,33 +76,33 @@ loader = NeighborLoader(graph, num_neighbors=[15, 10], batch_size=128)
 
 ### Supported Parameters
 
-| Parameter                  | Description                            |
-|----------------------------|----------------------------------------|
-| `data`                     | Graph object                           |
-| `num_neighbors`            | Neighbors per hop, e.g. `[15, 10]`     |
-| `input_nodes`              | Seed nodes (default: all)              |
-| `batch_size`               | Seeds per batch                        |
-| `shuffle`                  | Shuffle seeds each epoch               |
-| `replace`                  | Sample with replacement                |
+| Parameter       | Description                        |
+| --------------- | ---------------------------------- |
+| `data`          | Graph object                       |
+| `num_neighbors` | Neighbors per hop, e.g. `[15, 10]` |
+| `input_nodes`   | Seed nodes (default: all)          |
+| `batch_size`    | Seeds per batch                    |
+| `shuffle`       | Shuffle seeds each epoch           |
+| `replace`       | Sample with replacement            |
 
 ### Batch Attributes
 
-| Attribute                  | Description                            |
-|----------------------------|----------------------------------------|
-| `x`                        | Node features `[num_nodes, feat_dim]`  |
-| `edge_index`               | COO edges `[2, num_edges]`             |
-| `n_id`                     | Original node IDs                      |
-| `batch_size`               | Number of seed nodes                   |
-| `input_id`                 | Seed indices in batch                  |
-| `num_sampled_nodes`        | Nodes sampled per hop                  |
-| `num_sampled_edges`        | Edges sampled per hop                  |
+| Attribute           | Description                           |
+| ------------------- | ------------------------------------- |
+| `x`                 | Node features `[num_nodes, feat_dim]` |
+| `edge_index`        | COO edges `[2, num_edges]`            |
+| `n_id`              | Original node IDs                     |
+| `batch_size`        | Number of seed nodes                  |
+| `input_id`          | Seed indices in batch                 |
+| `num_sampled_nodes` | Nodes sampled per hop                 |
+| `num_sampled_edges` | Edges sampled per hop                 |
 
 ## Performance Optimizations
 
 ### Rust Sampling Engine
 
 | Optimization               | Description                            |
-|----------------------------|----------------------------------------|
+| -------------------------- | -------------------------------------- |
 | **Floyd's O(k) Algorithm** | Sample k items in O(k) instead of O(n) |
 | **WyRand PRNG**            | ~2x faster than xoshiro                |
 | **CSR Format**             | O(1) neighbor access                   |
@@ -110,12 +110,12 @@ loader = NeighborLoader(graph, num_neighbors=[15, 10], batch_size=128)
 
 ### I/O Pipeline
 
-| Optimization               | Description                            |
-|----------------------------|----------------------------------------|
-| **Memory-Mapped Graph**    | Zero-copy graph loading                |
-| **io_uring (Linux)**       | Async feature loading with SQPOLL      |
-| **Prefetch Thread**        | Overlaps sampling with training        |
-| **Bounded Queue**          | Backpressure prevents memory blow-up   |
+| Optimization            | Description                          |
+| ----------------------- | ------------------------------------ |
+| **Memory-Mapped Graph** | Zero-copy graph loading              |
+| **io_uring (Linux)**    | Async feature loading with SQPOLL    |
+| **Prefetch Thread**     | Overlaps sampling with training      |
+| **Bounded Queue**       | Backpressure prevents memory blow-up |
 
 ### Zero-Copy Data Path
 

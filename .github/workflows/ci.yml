@@ -1,0 +1,384 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  markdown-format:
+    name: prettier markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bunx prettier --check '**/*.md'
+
+  gpudirect-check:
+    name: cargo check (rdma + gpudirect)
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.5.0-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            curl build-essential pkg-config clang \
+            libibverbs-dev libnuma-dev ca-certificates
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpudirect-check
+      - run: cargo check -p aether-stream --tests --features "rdma gpudirect"
+      - run: cargo check -p aethergraph-py --features gpudirect
+
+  # ---------------------------------------------------------------------------
+  # Cross-platform Rust matrix.
+  #
+  # We split runs by (os, features) because the project deliberately gates
+  # whole test files via `#![cfg(target_os = "linux", feature = "rdma")]`,
+  # `#![cfg(target_os = "linux")]`, etc. Each row in the matrix exercises a
+  # distinct subset of the suite; the union is reported at the bottom of the
+  # workflow run via the per-row job summaries.
+  # ---------------------------------------------------------------------------
+  rust:
+    name: rust ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: every linux-gated test (XDP, RDMA, CUDA, SoftRoCE, SRD)
+          # disappears via cfg. Runs the cross-platform core + py + graph + mem
+          # subset. ~243 tests today.
+          - os: macos-latest
+            label: macos-stable-default
+            features: ""
+            run_rdma: false
+
+          # Linux without RDMA features: same cross-platform subset that macOS
+          # runs PLUS any test files gated only on `target_os = "linux"`
+          # (e.g. afxdp_veth, stress_seqlock).
+          - os: ubuntu-latest
+            label: ubuntu-stable-default
+            features: ""
+            run_rdma: false
+
+          # Linux WITH rdma feature: pulls in the SoftRoCE / SRD / device-enum
+          # / control-plane / WR-chain test files (41 tests). Tests still
+          # marked #[ignore] (SoftRoCE micro-bench, SRD loopback) stay
+          # ignored — they need real hardware or a loaded `rxe` kernel module
+          # and run separately via the `rdma-hardware` job below.
+          - os: ubuntu-latest
+            label: ubuntu-stable-rdma
+            features: "rdma"
+            run_rdma: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (no features)
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+
+      - name: clippy (with features)
+        if: matrix.features != ''
+        run: |
+          cargo clippy --workspace --all-targets --no-deps \
+            --features "${{ matrix.features }}" -- -D warnings
+
+      - name: xdp_bpf compile check
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libbpf-dev pkg-config
+          cargo check -p aether-stream --tests --features xdp_bpf
+
+      - name: cargo test --lib
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo test --workspace --lib --features "${{ matrix.features }}"
+          else
+            cargo test --workspace --lib
+          fi
+
+      - name: cargo test --tests
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo test --workspace --tests --features "${{ matrix.features }}"
+          else
+            cargo test --workspace --tests
+          fi
+
+      - name: cargo check --benches
+        run: cargo check --workspace --benches
+
+      # Smoke-run the criterion benches. We only execute the fastest
+      # parameterizations (`--quick`) so PR latency stays acceptable — the
+      # goal is "the benchmarks still compile AND run to completion", not
+      # publishable numbers. The `nightly-bench.yml` workflow runs the full
+      # criterion suite on a self-hosted quiet machine and publishes to
+      # gh-pages.
+      - name: bench smoke
+        if: matrix.label == 'ubuntu-stable-default'
+        run: cargo bench --workspace --no-fail-fast -- --quick --noplot
+
+      # Per-job coverage summary. The number of compiled test binaries is a
+      # proxy for cfg-coverage — macOS reports ~13 file binaries with 0 tests
+      # for the aether-stream crate, ubuntu-default a few more, ubuntu-rdma
+      # all of them with real test functions inside.
+      - name: Coverage summary
+        if: always()
+        run: |
+          features="${{ matrix.features }}"
+          [ -z "$features" ] && features="(none)"
+          ts=$(find target/debug/deps -maxdepth 1 -type f \
+                  -name '*-*' \
+                  ! -name '*.d' \
+                  ! -name '*.rlib' \
+                  ! -name '*.rmeta' \
+                  2>/dev/null | wc -l | tr -d ' ')
+          {
+            echo "## ${{ matrix.label }}"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| os | ${{ matrix.os }} |"
+            echo "| features | $features |"
+            echo "| compiled test binaries | $ts |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Miri — interpreter that catches UB in `unsafe` code.
+  # ---------------------------------------------------------------------------
+  miri:
+    name: miri unsafe-code interpreter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+      - run: cargo +nightly miri test -p aether-graph --test miri_smoke
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## miri"
+            echo ""
+            echo "Ran \`aether-graph::tests::miri_smoke\` under \`cargo miri\` with"
+            echo "\`-Zmiri-strict-provenance\`. Covers Arena, Chunk, CTree, and"
+            echo "\`DynamicGraph::Writer\` paths end-to-end."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # WAL — write-ahead log + recovery tests. Off the default feature set so
+  # the no-WAL build stays minimal; CI explicitly enables the feature.
+  # ---------------------------------------------------------------------------
+  wal:
+    name: wal recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wal
+      - run: cargo test -p aether-graph --features wal
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## wal"
+            echo ""
+            echo "Round-trip + crash-recovery tests for the append-only WAL."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Loom — model checker for the lock-free `DynamicGraph::writer` CAS.
+  # ---------------------------------------------------------------------------
+  loom:
+    name: loom model checker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      - run: cargo test -p aether-graph --features loom --test loom_writer_guard
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## loom"
+            echo ""
+            echo "Exhaustive interleaving check of the writer-guard CAS."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Supply-chain hygiene: cargo-deny enforces licenses, banned crates, source
+  # restrictions, and RUSTSEC advisories. cargo-audit cross-checks the
+  # advisory database. Both run on every PR.
+  # ---------------------------------------------------------------------------
+  supply-chain:
+    name: cargo-deny + audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: supply-chain
+      - name: Install cargo-deny + cargo-audit
+        run: cargo install --locked cargo-deny cargo-audit
+      - name: cargo deny check
+        run: cargo deny check
+      - name: cargo audit
+        # Ignores must mirror `[advisories.ignore]` in deny.toml. cargo-audit
+        # has no local config file, only ~/.cargo/audit.toml, so the list
+        # lives here.
+        run: cargo audit --ignore RUSTSEC-2024-0436
+
+  # ---------------------------------------------------------------------------
+  # Short-budget fuzz on every PR. The long-budget runs live in fuzz.yml.
+  # ---------------------------------------------------------------------------
+  fuzz:
+    name: cargo-fuzz short budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Verify corpus is reproducible
+        working-directory: fuzz
+        run: cargo test --test seed_determinism
+      - name: Regenerate fixed-seed corpus
+        working-directory: fuzz
+        run: cargo run --bin seed_corpus
+      - name: ctree_insert_sequences (60s)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ctree_insert_sequences -- -max_total_time=60
+      - name: csr_loader_bytes (60s)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run csr_loader_bytes -- -max_total_time=60
+
+  # ---------------------------------------------------------------------------
+  # Python integration tests across the same matrix as the Rust core.
+  # macOS and Linux both build a wheel and run pytest with the `test` group
+  # synced from pyproject.toml — fully declarative, no `uv pip install`.
+  # ---------------------------------------------------------------------------
+  python:
+    name: python ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-${{ matrix.os }}
+      - name: Sync test deps
+        working-directory: python
+        run: uv sync --group test
+      - name: Build extension
+        working-directory: python
+        run: uv run maturin develop --release
+      - name: Run pytest
+        working-directory: python
+        run: uv run pytest tests/ -v --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Opt-in: a self-hosted Linux runner with the `rxe` SoftRoCE kernel module
+  # loaded can run the #[ignore]'d RDMA hardware tests. Triggered via
+  # `[rdma]` in the commit message or workflow_dispatch.
+  # ---------------------------------------------------------------------------
+  rdma-hardware:
+    name: rdma hardware (self-hosted)
+    # TODO(infra): wire to a self-hosted Linux runner with rdma_rxe loaded
+    # and `aether-test-rdma` label. Until then this job is opt-in via
+    # workflow_dispatch and skips on PR.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[rdma]')
+    runs-on: [self-hosted, linux, aether-test-rdma]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rdma-hw
+      - name: Verify rxe module
+        run: ip link show rxe0 || (sudo modprobe rdma_rxe && sudo rdma link add rxe0 type rxe netdev lo)
+      - name: Run gated RDMA tests
+        run: |
+          cargo test -p aether-stream --features rdma --tests -- --ignored
+        env:
+          AETHER_SKIP_RDMA: ""
+
+  # ---------------------------------------------------------------------------
+  # Workflow-level summary: aggregates per-job summaries into a single
+  # platform-coverage table at the top of the run.
+  # ---------------------------------------------------------------------------
+  summary:
+    name: coverage summary
+    runs-on: ubuntu-latest
+    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, supply-chain, python]
+    if: always()
+    steps:
+      - name: Render summary
+        run: |
+          {
+            echo "# AetherGraph CI coverage"
+            echo ""
+            echo "| job | platform | features | result |"
+            echo "|---|---|---|---|"
+            echo "| markdown-format | Linux x86_64 | prettier | ${{ needs.markdown-format.result }} |"
+            echo "| gpudirect-check | Linux x86_64 | rdma + gpudirect (cargo check) | ${{ needs.gpudirect-check.result }} |"
+            echo "| rust macos-stable-default | macOS arm64 | (none) | ${{ needs.rust.result }} |"
+            echo "| rust ubuntu-stable-default | Linux x86_64 | (none) | ${{ needs.rust.result }} |"
+            echo "| rust ubuntu-stable-rdma | Linux x86_64 | rdma | ${{ needs.rust.result }} |"
+            echo "| miri | Linux x86_64 | nightly + miri | ${{ needs.miri.result }} |"
+            echo "| loom | Linux x86_64 | loom feature | ${{ needs.loom.result }} |"
+            echo "| wal  | Linux x86_64 | wal feature  | ${{ needs.wal.result }} |"
+            echo "| python ubuntu | Linux x86_64 | test group | ${{ needs.python.result }} |"
+            echo "| python macos | macOS arm64 | test group | ${{ needs.python.result }} |"
+            echo ""
+            echo "Hardware-gated tests (SoftRoCE micro-bench, SRD loopback,"
+            echo "billion-node scale) run only on the self-hosted \`rdma-hardware\`"
+            echo "job (opt-in via \`[rdma]\` in commit message or workflow_dispatch)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # TODO(bench): criterion job that publishes flamegraphs + numbers to
+  # gh-pages for side-by-side comparison vs PyG / DGL. Skeleton lives in
+  # `crates/aethergraph-core/benches/`; the missing piece is a runner pinned
+  # to a quiet machine class so benchmark noise stays comparable across runs.

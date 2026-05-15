@@ -209,12 +209,12 @@ def convert(
     log.info(f"Read {len(edges):,} edges from input file")
 
     log.debug("Building CSR graph structure")
-    src_arr: npt.NDArray[np.int64] = np.array([e[0] for e in edges], dtype=np.int64)
-    dst_arr: npt.NDArray[np.int64] = np.array([e[1] for e in edges], dtype=np.int64)
+    src_arr: npt.NDArray[np.uint32] = np.array([e[0] for e in edges], dtype=np.uint32)
+    dst_arr: npt.NDArray[np.uint32] = np.array([e[1] for e in edges], dtype=np.uint32)
     graph = Graph.from_edges(num_nodes, src_arr, dst_arr)
 
     log.debug("Writing binary file")
-    graph.save(str(resolved_output))
+    graph.save(resolved_output)
 
     log.info("Conversion complete")
     log.info(f"  Nodes: {graph.num_nodes:,}")

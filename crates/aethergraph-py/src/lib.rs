@@ -16,6 +16,7 @@ mod feature_store;
 mod feature_telemetry;
 mod graph;
 mod hetero;
+mod metrics;
 mod prefetch;
 mod sampler;
 
@@ -28,6 +29,7 @@ use graph::PyCsrGraph;
 use hetero::{
     PyHeteroCsrGraph, PyHeteroNeighborSampler, PyHeteroSampledSubgraph, PyHeteroSamplingConfig,
 };
+use metrics::PyMetricsSnapshot;
 use prefetch::{PyNeighborLoader, PyPrefetchStats};
 use sampler::{
     PyNeighborSampler, PyParallelBatchSampler, PySampledSubgraph, PySamplingConfig,
@@ -66,6 +68,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFeatureCache>()?;
     m.add_class::<PyNeighborLoader>()?;
     m.add_class::<PyPrefetchStats>()?;
+    m.add_class::<PyMetricsSnapshot>()?;
 
     // Heterogeneous graph classes
     m.add_class::<PyHeteroCsrGraph>()?;
@@ -86,9 +89,21 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<ArrowConversionError>(),
     )?;
 
-    // Module metadata
+    // Module metadata — baked in at compile time from Cargo.toml. Updating
+    // `version` or `authors` in Cargo.toml requires a rebuild to take effect.
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("__author__", env!("CARGO_PKG_AUTHORS"))?;
+
+    // Compile-time Cargo feature flags exposed as data. Python checks these
+    // directly instead of probing for method existence (`hasattr`), keeping
+    // capability detection out of the structural-typing world.
+    m.add("HAS_GPUDIRECT", cfg!(feature = "gpudirect"))?;
+
+    #[cfg(feature = "gpudirect")]
+    m.add_function(wrap_pyfunction!(
+        dlpack::dlpack_capsule_from_cuda_ptr_py,
+        m
+    )?)?;
 
     Ok(())
 }

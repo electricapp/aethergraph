@@ -147,16 +147,49 @@ fn refill_fill_ring(socket: &mut XdpSocket, umem: &Umem, max_refill: u32) {
     }
 }
 
+/// Errors returned by [`spawn_ingest_threads`].
+#[derive(Debug)]
+pub enum SpawnError {
+    /// `std::thread::Builder::spawn` returned an OS error.
+    Thread(std::io::Error),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::Thread(e) => write!(f, "failed to spawn ingestion thread: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SpawnError::Thread(e) => Some(e),
+        }
+    }
+}
+
 /// Spawn ingestion threads — one per socket, each pinned to a core.
 ///
-/// Returns the crossbeam receiver for inbound frames.
+/// Returns the crossbeam receiver for inbound frames along with the join
+/// handles. On thread spawn failure, already-spawned threads are not cancelled
+/// (they keep polling) but the function returns the error so the caller can
+/// decide.
 pub fn spawn_ingest_threads(
     mut sockets: Vec<XdpSocket>,
     umem: Arc<Umem>,
     core_ids: &[usize],
     config: IngestConfig,
-) -> crossbeam_channel::Receiver<InboundFrame> {
+) -> Result<
+    (
+        crossbeam_channel::Receiver<InboundFrame>,
+        Vec<std::thread::JoinHandle<()>>,
+    ),
+    SpawnError,
+> {
     let (tx, rx) = crossbeam_channel::bounded(sockets.len() * 1024);
+    let mut handles = Vec::with_capacity(sockets.len());
 
     for (i, mut socket) in sockets.drain(..).enumerate() {
         let umem = umem.clone();
@@ -164,10 +197,9 @@ pub fn spawn_ingest_threads(
         let config = config.clone();
         let core_id = core_ids.get(i).copied();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("ingest-q{}", i))
             .spawn(move || {
-                // Pin to core if specified
                 if let Some(id) = core_id {
                     let core = core_affinity::CoreId { id };
                     core_affinity::set_for_current(core);
@@ -177,8 +209,9 @@ pub fn spawn_ingest_threads(
                 ingest_loop(&mut socket, &umem, &tx, &config);
                 tracing::info!(queue = i, "Ingestion thread exiting");
             })
-            .expect("failed to spawn ingestion thread");
+            .map_err(SpawnError::Thread)?;
+        handles.push(handle);
     }
 
-    rx
+    Ok((rx, handles))
 }

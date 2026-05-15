@@ -6,7 +6,7 @@
 //! # Safety
 //! Requires `libibverbs` at link time. Only available behind `rdma` feature.
 
-use crate::MemoryHook;
+use crate::{HookError, MemoryHook};
 use std::sync::Mutex;
 
 // ibverbs FFI — minimal subset for memory registration.
@@ -14,7 +14,7 @@ use std::sync::Mutex;
 // symbols at link time (omitting it works only when no test/binary references
 // the externs — a latent footgun for any consumer that does).
 #[link(name = "ibverbs")]
-extern "C" {
+unsafe extern "C" {
     fn ibv_reg_mr(
         pd: *mut IbvPd,
         addr: *mut libc::c_void,
@@ -51,8 +51,13 @@ unsafe impl Sync for MrPtr {}
 
 struct MrPtr(*mut IbvMr);
 
-/// IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ
-const IBV_ACCESS_FLAGS: i32 = 0x01 | 0x02;
+// ibverbs access bits — defined here because the C header values are stable
+// since libibverbs 1.0 and we link the symbols directly.
+const IBV_ACCESS_LOCAL_WRITE: i32 = 0x01;
+const IBV_ACCESS_REMOTE_READ: i32 = 0x02;
+/// Local writes (so the HCA can DMA *into* this region) plus remote reads
+/// (so peers can RDMA-read it).
+const IBV_ACCESS_FLAGS: i32 = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ;
 
 /// Registers memory with an InfiniBand HCA for RDMA access.
 ///
@@ -89,9 +94,11 @@ impl RdmaRegHook {
 
     /// Get the remote key for this memory region (available after allocation).
     ///
-    /// Returns `None` if registration hasn't happened or failed.
+    /// Returns `None` if registration hasn't happened or failed. A poisoned
+    /// mutex (a prior panic while locked) is recovered transparently — the
+    /// stored `MrPtr` is plain data and remains valid.
     pub fn rkey(&self) -> Option<u32> {
-        let guard = self.mr.lock().ok()?;
+        let guard = self.mr.lock().unwrap_or_else(|e| e.into_inner());
         let mr = guard.as_ref()?;
         // SAFETY: mr.0 is a valid ibv_mr pointer from ibv_reg_mr
         Some(unsafe { (*mr.0).rkey })
@@ -99,9 +106,10 @@ impl RdmaRegHook {
 
     /// Get the local key for this memory region (available after allocation).
     ///
-    /// Returns `None` if registration hasn't happened or failed.
+    /// Returns `None` if registration hasn't happened or failed. Poisoning
+    /// is recovered transparently for the same reason as `rkey`.
     pub fn lkey(&self) -> Option<u32> {
-        let guard = self.mr.lock().ok()?;
+        let guard = self.mr.lock().unwrap_or_else(|e| e.into_inner());
         let mr = guard.as_ref()?;
         // SAFETY: mr.0 is a valid ibv_mr pointer from ibv_reg_mr
         Some(unsafe { (*mr.0).lkey })
@@ -109,32 +117,41 @@ impl RdmaRegHook {
 }
 
 impl MemoryHook for RdmaRegHook {
-    fn on_alloc(&self, ptr: *mut u8, size: usize) -> bool {
-        // SAFETY: pd is valid (caller invariant), ptr/size from ring allocation
+    fn on_alloc(&self, ptr: *mut u8, size: usize) -> Result<(), HookError> {
+        // SAFETY: pd is valid (caller invariant); ptr/size from ring allocation.
         let mr = unsafe { ibv_reg_mr(self.pd, ptr as *mut libc::c_void, size, IBV_ACCESS_FLAGS) };
 
         if mr.is_null() {
             #[cfg(feature = "tracing")]
             tracing::warn!(size, "ibv_reg_mr failed — RDMA reads will not work");
-            return false;
+            return Err(HookError::new("ibv_reg_mr returned null"));
         }
 
         #[cfg(feature = "tracing")]
         tracing::info!(size, "RDMA memory region registered");
 
-        if let Ok(mut guard) = self.mr.lock() {
-            *guard = Some(MrPtr(mr));
+        // Recover from poison: dropping the freshly-registered MR here without
+        // storing it would leak the ibverbs registration. If a previous MR is
+        // still stored (poison left state behind), tear it down before
+        // overwriting so the old registration is not also leaked.
+        let mut guard = self.mr.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = guard.take() {
+            // SAFETY: prev was registered via ibv_reg_mr in a prior on_alloc.
+            unsafe { ibv_dereg_mr(prev.0) };
         }
-        true
+        *guard = Some(MrPtr(mr));
+        Ok(())
     }
 
     fn on_dealloc(&self, _ptr: *mut u8, _size: usize) {
-        if let Ok(mut guard) = self.mr.lock() {
-            if let Some(mr) = guard.take() {
-                // SAFETY: mr was registered via ibv_reg_mr
-                unsafe {
-                    ibv_dereg_mr(mr.0);
-                }
+        // Recover from poison so a previously-registered MR is still
+        // deregistered. Failure to dereg leaks an ibverbs MR and pins the
+        // underlying pages.
+        let mut guard = self.mr.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mr) = guard.take() {
+            // SAFETY: mr was registered via ibv_reg_mr in on_alloc.
+            unsafe {
+                ibv_dereg_mr(mr.0);
             }
         }
     }

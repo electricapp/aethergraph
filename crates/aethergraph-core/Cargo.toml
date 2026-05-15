@@ -15,6 +15,7 @@ gds = []
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 
 [dependencies]
+aether-epoch = { path = "../aether-epoch", version = "0.1" }
 memmap2.workspace = true
 bytemuck.workspace = true
 rayon.workspace = true

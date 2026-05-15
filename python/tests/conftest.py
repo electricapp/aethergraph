@@ -52,19 +52,16 @@ def small_graph() -> Graph:
 
 
 @pytest.fixture
-def small_graph_with_features(small_graph: Graph, rng: np.random.Generator) -> Graph:
-    """Create a small graph with 64-dimensional node features.
+def small_graph_with_features(
+    small_graph: Graph, rng: np.random.Generator
+) -> tuple[Graph, np.ndarray]:
+    """Return `(graph, features)` for loader tests that need both.
 
-    Args:
-        small_graph: Base graph fixture to add features to.
-        rng: Random number generator for feature generation.
-
-    Returns:
-        Graph instance with shape [100, 64] float32 features attached.
+    Features are passed to the loader constructor; the graph itself
+    carries no feature state.
     """
     features = rng.standard_normal((small_graph.num_nodes, 64)).astype(np.float32)
-    small_graph.features = features
-    return small_graph
+    return small_graph, features
 
 
 @pytest.fixture
@@ -151,7 +148,7 @@ def has_pyg() -> bool:
         True if torch_geometric can be imported, False otherwise.
     """
     try:
-        import torch_geometric  # type: ignore[import-untyped]  # noqa: F401
+        import torch_geometric  # noqa: F401
 
         return True
     except ImportError:

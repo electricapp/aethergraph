@@ -5,7 +5,8 @@ use aethergraph_core::{
     create_features as core_create_features, save_feature_data as core_save_feature_data,
     save_features as core_save_features,
 };
-use numpy::{PyArray1, PyArrayMethods};
+use numpy::ndarray::{ArrayView1, ArrayView2};
+use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 
 /// Python wrapper for FeatureStore (memory-mapped feature access).
@@ -59,8 +60,8 @@ impl PyFeatureStore {
     /// ```
     #[staticmethod]
     #[pyo3(signature = (path, telemetry=false))]
-    fn load(path: &str, telemetry: bool) -> PyResult<Self> {
-        let mut inner = CoreFeatureStore::load(path).map_err(|e| {
+    fn load(path: std::path::PathBuf, telemetry: bool) -> PyResult<Self> {
+        let mut inner = CoreFeatureStore::load(&path).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("Failed to load features: {}", e))
         })?;
 
@@ -78,11 +79,6 @@ impl PyFeatureStore {
         self.inner
             .telemetry()
             .map(|t| crate::feature_telemetry::PyFeatureLoadTelemetry { inner: t })
-    }
-
-    /// Print telemetry summary to console.
-    fn print_telemetry(&self) {
-        self.inner.print_telemetry();
     }
 
     /// Get number of nodes
@@ -106,44 +102,64 @@ impl PyFeatureStore {
     /// ```python
     /// features = store.get(node_id)  # shape: [768]
     /// ```
-    fn get(&self, py: Python, node: NodeId) -> PyResult<Py<PyAny>> {
-        let features = self
-            .inner
-            .get(node)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+    fn get<'py>(slf: Bound<'py, Self>, node: NodeId) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        // Lift the (ptr, len) out of the borrow so we can move `slf` into the
+        // numpy container after the borrow ends.
+        let (ptr, len) = {
+            let store = slf.borrow();
+            let features = store
+                .inner
+                .get(node)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+            (features.as_ptr(), features.len())
+        };
 
-        // Copy to numpy array (mmap slice can't be directly exposed to Python)
-        Ok(PyArray1::from_slice(py, features).unbind().into_any())
+        // SAFETY: `ptr`/`len` describe a slice into the mmap owned by `inner`.
+        // The mmap is stable for the FeatureStore's lifetime and is never
+        // reallocated. Passing `slf` as the numpy container increfs the
+        // PyFeatureStore so the mmap outlives the returned array.
+        let view = unsafe { ArrayView1::from_shape_ptr(len, ptr) };
+        Ok(unsafe { PyArray1::borrow_from_array(&view, slf.into_any()) })
     }
 
     /// Get features for multiple nodes in batch (optimized).
     ///
     /// # Arguments
-    /// - nodes: List or numpy array of node IDs
+    /// - nodes: List or numpy array of node IDs. Accepts `int64` (PyTorch
+    ///   default index dtype) — values are bounds-checked and converted to
+    ///   `u32` by the core. Negative values or values exceeding `u32::MAX`
+    ///   raise `ValueError` rather than wrapping silently.
     ///
     /// # Returns
     /// numpy array of shape [len(nodes), feature_dim] (float32)
     ///
+    /// # Why i64 here when get() takes u32?
+    /// PyTorch's `Tensor` index dtype is `int64`. Batched ID arrays come from
+    /// PyG/PyTorch which already produce `int64`. Accepting `int64` here saves
+    /// a Python-side `.astype(np.uint32)`. The single-node `get()` is hand
+    /// indexed and `u32` is the more natural Pythonic choice there.
+    ///
     /// # Performance
     /// - Vectorized batch loading (better than individual gets)
     /// - ~1-10ms for 1000 nodes depending on cache hits
-    /// - Accepts numpy arrays directly (zero-copy)
+    /// - Accepts numpy arrays directly (zero-copy on the input side)
     ///
     /// # Example
     /// ```python
-    /// sampled_nodes = np.array([0, 10, 100, 1000], dtype=np.int32)
+    /// sampled_nodes = np.array([0, 10, 100, 1000], dtype=np.int64)
     /// batch = store.get_batch(sampled_nodes)  # shape: [4, feature_dim]
     /// ```
     fn get_batch(&self, py: Python, nodes: numpy::PyReadonlyArray1<i64>) -> PyResult<Py<PyAny>> {
         let nodes_slice = nodes.as_slice()?;
 
-        // Zero-copy: pass slice directly, casts inline
+        // The core `get_batch<T>` is generic over `T: TryInto<NodeId>` and
+        // returns a clear error per-element. So negatives, out-of-range
+        // values, and out-of-graph IDs all surface as Python ValueError.
         let features = self
             .inner
             .get_batch(nodes_slice)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
 
-        // Reshape to [num_nodes, feature_dim]
         let num_nodes = nodes_slice.len();
         let feature_dim = self.inner.feature_dim();
 
@@ -164,13 +180,22 @@ impl PyFeatureStore {
     /// ```python
     /// all_features = store.features()  # shape: [num_nodes, feature_dim]
     /// ```
-    fn features(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let features = self.inner.features();
+    fn features<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let (ptr, num_nodes, feature_dim) = {
+            let store = slf.borrow();
+            let features = store.inner.features();
+            let num_nodes = store.inner.num_nodes();
+            let feature_dim = store.inner.feature_dim();
+            debug_assert_eq!(features.len(), num_nodes * feature_dim);
+            (features.as_ptr(), num_nodes, feature_dim)
+        };
 
-        // Create numpy array from slice
-        let array = PyArray1::from_slice(py, features);
-        let reshaped = array.reshape([self.inner.num_nodes(), self.inner.feature_dim()])?;
-        Ok(reshaped.unbind().into_any())
+        // SAFETY: `ptr` points to `num_nodes * feature_dim` contiguous f32s in
+        // the mmap inside `inner`. The mmap is stable and never reallocated.
+        // Passing `slf` as the container keeps the PyFeatureStore — and thus
+        // the mmap — alive for as long as Python holds the array.
+        let view = unsafe { ArrayView2::from_shape_ptr((num_nodes, feature_dim), ptr) };
+        Ok(unsafe { PyArray2::borrow_from_array(&view, slf.into_any()) })
     }
 
     fn __repr__(&self) -> String {
@@ -206,22 +231,19 @@ impl PyFeatureStore {
 /// ```
 #[pyfunction]
 #[pyo3(signature = (path, features))]
-fn save_features(path: &str, features: numpy::PyReadonlyArray2<f32>) -> PyResult<()> {
+fn save_features(path: std::path::PathBuf, features: numpy::PyReadonlyArray2<f32>) -> PyResult<()> {
     let features_array = features.as_array();
     let shape = features_array.shape();
     let num_nodes = shape[0];
     let feature_dim = shape[1];
 
-    // Convert to flat Vec (row-major, contiguous)
-    let features_vec: Vec<f32> = if features_array.is_standard_layout() {
-        // Zero-copy if already contiguous
-        features_array.iter().copied().collect()
-    } else {
-        // Copy with correct layout
-        features_array.iter().copied().collect()
-    };
+    // `is_standard_layout()` returns true for some non-contiguous views
+    // (e.g. transposed strides that still match the shape), so we cannot
+    // use it to gate a zero-copy fast path. Materialize unconditionally via
+    // `.iter()`, which yields elements in C order regardless of layout.
+    let features_vec: Vec<f32> = features_array.iter().copied().collect();
 
-    core_save_features(path, features_vec, num_nodes, feature_dim).map_err(|e| {
+    core_save_features(&path, features_vec, num_nodes, feature_dim).map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("Failed to save features: {}", e))
     })?;
 
@@ -311,8 +333,8 @@ impl PyFeatureData {
     }
 
     /// Save to file.
-    fn save(&self, path: &str) -> PyResult<()> {
-        core_save_feature_data(path, &self.inner).map_err(|e| {
+    fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
+        core_save_feature_data(&path, &self.inner).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("Failed to save features: {}", e))
         })?;
         Ok(())

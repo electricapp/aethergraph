@@ -81,7 +81,7 @@ class TestCreateSamplingDataset:
 
     def test_dataset_with_features(
         self,
-        small_graph_with_features: Graph,
+        small_graph_with_features: tuple[Graph, np.ndarray],
         temp_dir: Path,
         rng: np.random.Generator,
     ) -> None:
@@ -94,8 +94,9 @@ class TestCreateSamplingDataset:
             ray.init(num_cpus=2, runtime_env={"working_dir": None})
 
         try:
+            graph, _features = small_graph_with_features
             graph_path = temp_dir / "graph.bin"
-            small_graph_with_features.save(graph_path)
+            graph.save(graph_path)
 
             dataset = create_sampling_dataset(
                 graph_path=graph_path,

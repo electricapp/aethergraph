@@ -45,7 +45,9 @@ impl PyFeatureLoadTelemetry {
         self.inner.total_bytes_loaded
     }
 
-    /// Total time in seconds
+    /// Total wall-clock seconds spent inside `get()` / `get_batch()` calls
+    /// since this telemetry collector was attached. This is *elapsed time*,
+    /// not CPU time — concurrent async waits count once per request.
     fn total_time_secs(&self) -> f64 {
         self.inner.total_time_secs()
     }

@@ -20,6 +20,25 @@ pub type NodeId = u32;
 /// Edge offset type. u64 supports graphs with up to 18 quintillion edges.
 pub type EdgeOffset = u64;
 
+/// Edge timestamp length did not match `Graph::num_edges`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampLengthMismatch {
+    pub got: usize,
+    pub expected: usize,
+}
+
+impl std::fmt::Display for TimestampLengthMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timestamps length {} != num_edges {}",
+            self.got, self.expected
+        )
+    }
+}
+
+impl std::error::Error for TimestampLengthMismatch {}
+
 /// Graph in CSR (Compressed Sparse Row) format.
 ///
 /// Memory layout is optimized for sequential scans and random access patterns
@@ -388,17 +407,18 @@ impl Graph {
 
     /// Sets edge timestamps (parallel to the edges array).
     ///
-    /// # Panics
-    /// Panics if `timestamps.len() != num_edges`.
-    pub fn set_timestamps(&mut self, timestamps: Vec<f64>) {
-        assert_eq!(
-            timestamps.len(),
-            self.num_edges,
-            "timestamps length {} != num_edges {}",
-            timestamps.len(),
-            self.num_edges
-        );
+    /// Returns `Err(TimestampLengthMismatch)` if the slice length does not
+    /// equal `num_edges`. This is the single public way to attach timestamps;
+    /// there is no panicking variant.
+    pub fn set_timestamps(&mut self, timestamps: Vec<f64>) -> Result<(), TimestampLengthMismatch> {
+        if timestamps.len() != self.num_edges {
+            return Err(TimestampLengthMismatch {
+                got: timestamps.len(),
+                expected: self.num_edges,
+            });
+        }
         self.timestamps = Some(Arc::from(timestamps.into_boxed_slice()));
+        Ok(())
     }
 
     /// Returns edge timestamps for a node's neighbors, if timestamps are set.
@@ -805,7 +825,7 @@ mod tests {
         let mut graph = Graph::from_edges(3, &edges, None).unwrap();
 
         let timestamps = vec![100.0, 200.0, 300.0];
-        graph.set_timestamps(timestamps);
+        graph.set_timestamps(timestamps).unwrap();
 
         assert!(graph.has_timestamps());
         assert_eq!(graph.neighbor_timestamps(0), Some(&[100.0, 200.0][..]));
@@ -823,7 +843,7 @@ mod tests {
         let mut graph = Graph::from_edges(3, &edges, None).unwrap();
 
         let timestamps = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        graph.set_timestamps(timestamps);
+        graph.set_timestamps(timestamps).unwrap();
 
         // Node 0 has 2 neighbors -> timestamps at positions 0, 1
         let ts0 = graph.neighbor_timestamps(0).unwrap();
@@ -842,13 +862,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "timestamps length")]
-    fn test_set_timestamps_wrong_length_panics() {
+    fn test_set_timestamps_returns_error_on_mismatch() {
         let edges = vec![(0, 1), (0, 2), (1, 2)];
         let mut graph = Graph::from_edges(3, &edges, None).unwrap();
-
-        // Graph has 3 edges, passing 2 timestamps should panic
-        graph.set_timestamps(vec![1.0, 2.0]);
+        let err = graph.set_timestamps(vec![1.0, 2.0]).unwrap_err();
+        assert_eq!(err.got, 2);
+        assert_eq!(err.expected, 3);
     }
 
     #[test]

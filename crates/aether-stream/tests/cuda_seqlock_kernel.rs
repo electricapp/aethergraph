@@ -1,4 +1,4 @@
-//! TEST_PLAN T2.1 — CUDA seqlock validation kernel.
+//! CUDA seqlock validation kernel — torn-slot detection.
 //!
 //! Stages three slots in VRAM and runs the `validate_and_compact` kernel
 //! directly (no RDMA, no GpuGatherBuffer). Asserts that:
@@ -6,11 +6,7 @@
 //!   - the two torn slots (head odd, head ≠ tail) are flagged for retry,
 //!   - `retry_count` equals 2.
 //!
-//! Requires CUDA + `gpudirect` feature so the kernel module compiles. Run on
-//! a GPU box:
-//!
-//!     cargo test --release -p aether-stream --features gpudirect \
-//!         --test t2_1_cuda_seqlock -- --nocapture
+//! Requires CUDA + `gpudirect` feature so the kernel module compiles.
 
 #![cfg(all(target_os = "linux", feature = "gpudirect"))]
 

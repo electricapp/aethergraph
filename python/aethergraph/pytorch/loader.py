@@ -11,6 +11,7 @@ import time
 import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -25,13 +26,14 @@ except ImportError as e:
     ) from e
 
 try:
-    from torch_geometric.data import Data  # type: ignore[import-untyped]
+    from torch_geometric.data import Data
 except ImportError as e:
     raise ImportError(
         "NeighborLoader requires torch-geometric>=2.4. "
         "Install with: pip install aethergraph[pytorch-geometric]"
     ) from e
 
+from aethergraph._core import HAS_GPUDIRECT
 from aethergraph._core import NeighborLoader as RustNeighborLoader
 from aethergraph._core import SampledSubgraph as RustSampledSubgraph
 from aethergraph._core import SamplingConfig as RustSamplingConfig
@@ -124,13 +126,12 @@ class NeighborLoader(IterableDataset[Data]):
         >>> from aethergraph.pytorch import NeighborLoader
         >>>
         >>> graph = Graph.load("graph.bin")
-        >>> graph.load_features("features.bin")
-        >>>
         >>> loader = NeighborLoader(
         ...     graph,
         ...     num_neighbors=[15, 10],
         ...     batch_size=128,
         ...     shuffle=True,
+        ...     feature_path="features.bin",
         ... )
         >>>
         >>> for batch in loader:
@@ -175,6 +176,8 @@ class NeighborLoader(IterableDataset[Data]):
         temporal_strategy: Literal["uniform", "last"] | None = None,
         disjoint: bool = False,
         neighbor_sampler: Callable[..., Data] | None = None,
+        features: npt.NDArray[np.float32] | None = None,
+        feature_path: str | Path | None = None,
     ) -> None:
         """Initialize the neighbor loader.
 
@@ -218,9 +221,17 @@ class NeighborLoader(IterableDataset[Data]):
             neighbor_sampler: Custom sampling callable. If provided, bypasses
                 the Rust backend entirely. Signature:
                 ``(graph, seeds: np.ndarray) -> Data``.
+            features: In-memory node features as a 2D ``float32`` array of
+                shape ``[num_nodes, feature_dim]``. Mutually exclusive with
+                ``feature_path``.
+            feature_path: Path to an AETHFEAT file for lazy feature loading.
+                The loader uses io_uring on Linux and mmap elsewhere.
+                Mutually exclusive with ``features``.
 
         Raises:
             UserWarning: If num_workers is non-zero.
+            ValueError: If both ``features`` and ``feature_path`` are set, or
+                if ``features.shape[0]`` does not match the graph's node count.
         """
         super().__init__()
 
@@ -251,11 +262,35 @@ class NeighborLoader(IterableDataset[Data]):
         self.transform = transform
         self.feature_source = feature_source
         self.gpu_id = gpu_id
+        if (
+            feature_source is not None
+            and feature_source.startswith("rdma://")
+            and not HAS_GPUDIRECT
+        ):
+            raise RuntimeError(
+                "feature_source='rdma://' requires a wheel built with the "
+                "`gpudirect` Cargo feature (maturin develop --features gpudirect)."
+            )
         self._temporal_strategy = temporal_strategy
         self._disjoint = disjoint
         self._neighbor_sampler = neighbor_sampler
 
+        if features is not None and feature_path is not None:
+            raise ValueError("pass either `features` or `feature_path`, not both")
+        self._features: npt.NDArray[np.float32] | None = (
+            np.asarray(features, dtype=np.float32) if features is not None else None
+        )
+        self._feature_path: Path | None = Path(feature_path) if feature_path is not None else None
+        if self._features is not None and self._features.ndim != 2:
+            raise ValueError(f"features must be 2D, got shape {self._features.shape}")
+
         num_nodes = self.graph.num_nodes
+
+        if self._features is not None and self._features.shape[0] != num_nodes:
+            raise ValueError(
+                f"features.shape[0]={self._features.shape[0]} does not match graph "
+                f"num_nodes={num_nodes}"
+            )
 
         if input_nodes is None:
             self._input_nodes = None
@@ -392,9 +427,9 @@ class NeighborLoader(IterableDataset[Data]):
         )
 
         if self.feature_source and self.feature_source.startswith("rdma://"):
-            server_addr = self.feature_source[len("rdma://"):]
+            server_addr = self.feature_source[len("rdma://") :]
             sampler = RustNeighborLoader.with_rdma_features(
-                self.graph._rust_graph,
+                self.graph,
                 rust_config,
                 server_addr,
                 self.gpu_id,
@@ -405,20 +440,19 @@ class NeighborLoader(IterableDataset[Data]):
             yield from self._iter_rdma(sampler, num_batches, get_batch)
             return
 
-        feature_path = self.graph.feature_path
-        in_memory_features = self.graph.features
+        feature_path = self._feature_path
+        in_memory_features = self._features
 
-        sampler: RustNeighborLoader
         if feature_path is not None:
             sampler = RustNeighborLoader.with_features(
-                self.graph._rust_graph,
+                self.graph,
                 rust_config,
                 feature_path,
                 self.prefetch_factor,
             )
         else:
             sampler = RustNeighborLoader(
-                self.graph._rust_graph,
+                self.graph,
                 rust_config,
                 self.prefetch_factor,
             )
@@ -510,14 +544,14 @@ class NeighborLoader(IterableDataset[Data]):
             PyG Data object with x, edge_index, e_id, n_id, input_id, and
             optionally batch (disjoint mode).
         """
-        nodes_arr: npt.NDArray[np.int64] = np.asarray(subgraph.nodes(), dtype=np.int64)
+        nodes_arr: npt.NDArray[np.int64] = np.asarray(subgraph.nodes, dtype=np.int64)
         n_id = torch.from_numpy(nodes_arr.copy())
         num_nodes = len(n_id)
 
-        local_edge_index: npt.NDArray[np.int64] = subgraph.edge_index_local()
+        local_edge_index: npt.NDArray[np.int64] = subgraph.edge_index_local
         edge_index = torch.from_numpy(local_edge_index.copy())
 
-        e_id = torch.from_numpy(np.asarray(subgraph.edge_ids(), dtype=np.int64))
+        e_id = torch.from_numpy(np.asarray(subgraph.edge_ids, dtype=np.int64))
 
         x: torch.Tensor | None = None
         if file_features is not None:
@@ -525,9 +559,7 @@ class NeighborLoader(IterableDataset[Data]):
         elif in_memory_features is not None:
             x = torch.from_numpy(in_memory_features[nodes_arr].copy())
 
-        seed_indices_arr: npt.NDArray[np.int64] = np.asarray(
-            subgraph.seed_indices(), dtype=np.int64
-        )
+        seed_indices_arr: npt.NDArray[np.int64] = np.asarray(subgraph.seed_indices, dtype=np.int64)
         input_id = torch.from_numpy(seed_indices_arr.copy())
 
         if self.pin_memory and torch.cuda.is_available():
@@ -546,11 +578,11 @@ class NeighborLoader(IterableDataset[Data]):
             batch_size=len(seed_indices_arr),
             input_id=input_id,
             num_nodes=num_nodes,
-            num_sampled_nodes=subgraph.num_sampled_nodes_per_hop(),
-            num_sampled_edges=subgraph.num_sampled_edges_per_hop(),
+            num_sampled_nodes=subgraph.num_sampled_nodes_per_hop,
+            num_sampled_edges=subgraph.num_sampled_edges_per_hop,
         )
 
-        batch_arr = subgraph.batch()
+        batch_arr = subgraph.batch
         if batch_arr is not None:
             batch_tensor = torch.from_numpy(np.asarray(batch_arr, dtype=np.int64))
             if self.pin_memory and torch.cuda.is_available():
@@ -596,8 +628,7 @@ class NeighborLoader(IterableDataset[Data]):
                 result = sampler.next_with_gpu_features()
                 if result is None:
                     raise RuntimeError(
-                        f"RDMA sampler stopped early: received {received} "
-                        f"of {num_batches} batches"
+                        f"RDMA sampler stopped early: received {received} of {num_batches} batches"
                     )
 
                 subgraph, dlpack_capsule = result
@@ -607,7 +638,7 @@ class NeighborLoader(IterableDataset[Data]):
                     sampler.submit(submitted, get_batch(submitted))
                     submitted += 1
 
-                x = torch.from_dlpack(dlpack_capsule)
+                x = torch.from_dlpack(dlpack_capsule)  # type: ignore[attr-defined]
 
                 data = self._to_pyg_data_gpu(subgraph, x)
                 if self.transform is not None:
@@ -652,18 +683,16 @@ class NeighborLoader(IterableDataset[Data]):
         Returns:
             PyG Data object with all tensors on the same CUDA device.
         """
-        nodes_arr: npt.NDArray[np.int64] = np.asarray(subgraph.nodes(), dtype=np.int64)
+        nodes_arr: npt.NDArray[np.int64] = np.asarray(subgraph.nodes, dtype=np.int64)
         n_id = torch.from_numpy(nodes_arr.copy())
         num_nodes = len(n_id)
 
-        local_edge_index: npt.NDArray[np.int64] = subgraph.edge_index_local()
+        local_edge_index: npt.NDArray[np.int64] = subgraph.edge_index_local
         edge_index = torch.from_numpy(local_edge_index.copy())
 
-        e_id = torch.from_numpy(np.asarray(subgraph.edge_ids(), dtype=np.int64))
+        e_id = torch.from_numpy(np.asarray(subgraph.edge_ids, dtype=np.int64))
 
-        seed_indices_arr: npt.NDArray[np.int64] = np.asarray(
-            subgraph.seed_indices(), dtype=np.int64
-        )
+        seed_indices_arr: npt.NDArray[np.int64] = np.asarray(subgraph.seed_indices, dtype=np.int64)
         input_id = torch.from_numpy(seed_indices_arr.copy())
 
         device = x_gpu.device
@@ -680,8 +709,8 @@ class NeighborLoader(IterableDataset[Data]):
             batch_size=len(seed_indices_arr),
             input_id=input_id,
             num_nodes=num_nodes,
-            num_sampled_nodes=subgraph.num_sampled_nodes_per_hop(),
-            num_sampled_edges=subgraph.num_sampled_edges_per_hop(),
+            num_sampled_nodes=subgraph.num_sampled_nodes_per_hop,
+            num_sampled_edges=subgraph.num_sampled_edges_per_hop,
         )
 
     def _random_coprime_stride(self, modulus: int) -> int:

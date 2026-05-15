@@ -291,18 +291,24 @@ unsafe impl Send for RegisteredMr {}
 unsafe impl Sync for RegisteredMr {}
 
 impl RegisteredMr {
-    /// Wrap an existing `ibv_reg_mr`-produced MR handle. Caller must ensure
-    /// the handle is non-null, owned, and has not been deregistered. Used by
-    /// alternate transport paths (SRD) that call `ibv_reg_mr` directly.
+    /// Wrap an existing `ibv_reg_mr`-produced MR handle.
+    ///
+    /// # Safety
+    /// `mr` must be non-null, owned by the caller, and not yet deregistered.
+    /// This wrapper takes ownership and will call `ibv_dereg_mr` on drop.
+    /// Used by alternate transport paths (SRD) that call `ibv_reg_mr` directly.
     #[inline]
-    pub fn __from_raw_mr(mr: *mut IbvMr) -> Self {
+    pub unsafe fn __from_raw_mr(mr: *mut IbvMr) -> Self {
+        debug_assert!(!mr.is_null(), "__from_raw_mr called with null pointer");
         Self { mr }
     }
 
     /// Local key for use as `local_lkey` in send/RDMA work requests.
     #[inline]
     pub fn lkey(&self) -> u32 {
-        // SAFETY: mr is non-null for the lifetime of this wrapper (set in reg_mr).
+        // SAFETY: mr is non-null for the lifetime of this wrapper (asserted in
+        // reg_mr / __from_raw_mr) and the IbvMr layout has been stable since
+        // libibverbs 1.0.
         unsafe { (*self.mr).lkey }
     }
 
@@ -310,6 +316,7 @@ impl RegisteredMr {
     /// to this region.
     #[inline]
     pub fn rkey(&self) -> u32 {
+        // SAFETY: see lkey().
         unsafe { (*self.mr).rkey }
     }
 
@@ -322,7 +329,7 @@ impl RegisteredMr {
 
 impl Drop for RegisteredMr {
     fn drop(&mut self) {
-        // SAFETY: mr was returned by ibv_reg_mr in reg_mr; we own it.
+        // SAFETY: mr was returned by ibv_reg_mr in reg_mr / __from_raw_mr; we own it.
         unsafe {
             ibv_dereg_mr(self.mr);
         }

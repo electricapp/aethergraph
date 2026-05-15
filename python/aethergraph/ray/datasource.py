@@ -35,7 +35,7 @@ except ImportError as e:
     ) from e
 
 if TYPE_CHECKING:
-    from torch_geometric.data import Data  # type: ignore[import-untyped]
+    from torch_geometric.data import Data
 
 __all__ = ["AetherGraphDatasource"]
 
@@ -126,7 +126,10 @@ class AetherGraphDatasource(Datasource):
             self._num_input_nodes = len(self._input_nodes)
 
     def get_read_tasks(
-        self, parallelism: int, per_task_row_limit: int | None = None
+        self,
+        parallelism: int,
+        per_task_row_limit: int | None = None,
+        data_context: Any | None = None,
     ) -> list[ReadTask]:
         """Generate read tasks that Ray will execute in parallel.
 
@@ -137,11 +140,12 @@ class AetherGraphDatasource(Datasource):
         Args:
             parallelism: Number of parallel tasks requested by Ray.
             per_task_row_limit: Optional row limit per task (ignored).
-
-        Returns:
-            List of ReadTask objects, one per partition of input nodes.
+            data_context: Ray's DataContext (Ray >= 2.46). Typed as ``Any`` so
+                we don't take a hard import on ``ray.data.context.DataContext``
+                whose location has shifted between Ray versions. We don't read
+                it; accepting it satisfies the Liskov override.
         """
-        del per_task_row_limit
+        del per_task_row_limit, data_context
         total_nodes = self._num_input_nodes
         num_tasks = min(parallelism, total_nodes)
         if num_tasks == 0:
@@ -309,9 +313,6 @@ def _run_neighbor_loader(
     batches_yielded = 0
     try:
         graph = Graph.load(graph_path)
-        if features_path:
-            graph.load_features(features_path)
-
         loader = NeighborLoader(
             graph,
             num_neighbors=num_neighbors,
@@ -319,6 +320,7 @@ def _run_neighbor_loader(
             batch_size=batch_size,
             shuffle=False,
             replace=replace,
+            feature_path=features_path,
         )
 
         for data in loader:

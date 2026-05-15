@@ -7,16 +7,25 @@
 //! The arena is NOT thread-safe for allocation (single writer). It IS
 //! safe for concurrent reads from previously-allocated nodes.
 
+use std::alloc::Layout;
 use std::cell::UnsafeCell;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fixed-capacity bump arena. Pre-allocates all memory upfront.
 ///
 /// Nodes are allocated by bumping `offset`. Freed only when the entire
 /// arena is dropped (epoch-based reclamation at the graph level).
+///
+/// The backing buffer is a raw `NonNull<u8>` paired with the `Layout` it was
+/// allocated with. `Vec<u8>` is not used because `Vec` would deallocate with
+/// `align_of::<u8>() = 1`, mismatching the 64-byte alignment we need for
+/// cache-line chunks and producing UB at drop.
 pub struct Arena {
-    /// Backing storage. 64-byte aligned for chunk cache-line access.
-    data: UnsafeCell<Vec<u8>>,
+    /// 64-byte aligned backing storage.
+    ptr: UnsafeCell<NonNull<u8>>,
+    /// Layout the buffer was allocated with — needed for matched dealloc.
+    layout: Layout,
     /// Next free byte offset. Only the writer advances this.
     offset: AtomicUsize,
     /// Total capacity in bytes.
@@ -33,19 +42,29 @@ unsafe impl Sync for Arena {}
 
 impl Arena {
     /// Create an arena with `capacity` bytes, 64-byte aligned.
+    ///
+    /// # Panics
+    /// Panics if `capacity == 0` or `capacity > u32::MAX` (offsets are u32).
     pub fn new(capacity: usize) -> Self {
-        // Allocate aligned to 64 bytes for cache-line chunks
-        let layout = std::alloc::Layout::from_size_align(capacity, 64).unwrap();
-        // SAFETY: layout has non-zero size (capacity > 0 enforced by caller-acceptable use; alloc_zeroed handles zero-init).
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
+        assert!(capacity > 0, "Arena capacity must be > 0");
+        // Offsets returned by alloc are u32; arenas larger than u32::MAX would
+        // truncate silently and corrupt readers. Cap at u32::MAX up front.
+        assert!(
+            capacity <= u32::MAX as usize,
+            "Arena capacity {capacity} exceeds u32::MAX (offsets are u32)"
+        );
+        let layout = Layout::from_size_align(capacity, 64)
+            .expect("Layout: capacity > 0, alignment is power of two");
+        // SAFETY: layout has non-zero size (capacity > 0); alloc_zeroed
+        // initializes the buffer so reads of un-allocated bytes are
+        // well-defined zero.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let Some(ptr) = NonNull::new(raw) else {
             std::alloc::handle_alloc_error(layout);
-        }
-        // SAFETY: ptr came from the global allocator with the same capacity/alignment;
-        // the Vec takes ownership and will free via Layout-compatible dealloc on drop.
-        let data = unsafe { Vec::from_raw_parts(ptr, capacity, capacity) };
+        };
         Self {
-            data: UnsafeCell::new(data),
+            ptr: UnsafeCell::new(ptr),
+            layout,
             offset: AtomicUsize::new(0),
             capacity,
         }
@@ -55,26 +74,37 @@ impl Arena {
     /// into the arena. Returns None if arena is full.
     ///
     /// # Safety
-    /// Only the single writer thread should call this.
+    /// Single-writer invariant. The bump cursor is updated via a non-atomic
+    /// read-modify-write; concurrent callers produce overlapping allocations
+    /// and silent corruption. Callers in `aether-graph` go through
+    /// `DynamicGraph::writer()`, which holds a runtime-enforced single-writer
+    /// guard for the lifetime of allocation.
     #[inline]
-    pub fn alloc(&self, size: usize, align: usize) -> Option<u32> {
+    pub unsafe fn alloc(&self, size: usize, align: usize) -> Option<u32> {
+        debug_assert!(align.is_power_of_two(), "alignment must be power of two");
         let current = self.offset.load(Ordering::Relaxed);
-        // Align up
-        let aligned = (current + align - 1) & !(align - 1);
-        let new_offset = aligned + size;
+        // Align up — checked to catch malformed (size, align) inputs.
+        let aligned = current.checked_add(align - 1)? & !(align - 1);
+        let new_offset = aligned.checked_add(size)?;
         if new_offset > self.capacity {
             return None; // arena full
         }
         self.offset.store(new_offset, Ordering::Relaxed);
+        // Capacity ≤ u32::MAX (enforced in `new`), so this cast cannot truncate.
         Some(aligned as u32)
     }
 
     /// Allocate and write a value. Returns the offset.
+    ///
+    /// # Safety
+    /// Single-writer invariant: only one thread may call this concurrently.
+    /// See [`Arena::alloc`].
     #[inline]
-    pub fn alloc_write<T: Copy>(&self, val: T) -> Option<u32> {
+    pub unsafe fn alloc_write<T: Copy>(&self, val: T) -> Option<u32> {
         let size = std::mem::size_of::<T>();
         let align = std::mem::align_of::<T>();
-        let offset = self.alloc(size, align)?;
+        // SAFETY: caller upholds the single-writer invariant.
+        let offset = unsafe { self.alloc(size, align)? };
         // SAFETY: alloc returned a fresh, in-bounds offset of `size` bytes aligned for T.
         let ptr = unsafe { self.ptr_at(offset) };
         // SAFETY: ptr points to `size_of::<T>()` bytes of uninitialized arena storage
@@ -91,11 +121,13 @@ impl Arena {
     /// Offset must be within bounds and point to a valid, initialized value.
     #[inline(always)]
     pub unsafe fn ptr_at(&self, offset: u32) -> *const u8 {
-        // SAFETY: single-writer invariant means no &mut alias exists while readers hold &Arena;
-        // UnsafeCell deref produces a shared view of the immutable backing buffer.
-        let data = unsafe { &*self.data.get() };
-        // SAFETY: caller asserts offset is within the allocated capacity.
-        unsafe { data.as_ptr().add(offset as usize) }
+        // SAFETY: UnsafeCell deref reads the stable base pointer set in `new`;
+        // single-writer invariant means no &mut alias exists while readers
+        // hold &Arena.
+        let base = unsafe { (*self.ptr.get()).as_ptr() };
+        // SAFETY: caller asserts offset is within the allocated capacity, so
+        // the resulting pointer stays inside the buffer.
+        unsafe { base.add(offset as usize) as *const u8 }
     }
 
     /// Get a typed reference at `offset`.
@@ -130,6 +162,19 @@ impl Arena {
     }
 }
 
+impl Drop for Arena {
+    fn drop(&mut self) {
+        // SAFETY: read of the NonNull<u8> through UnsafeCell — Drop has &mut self
+        // so no other reference exists.
+        let ptr = unsafe { (*self.ptr.get()).as_ptr() };
+        // SAFETY: `ptr` was returned by `alloc_zeroed(self.layout)` in `new`,
+        // we own it exclusively here, and the layout matches.
+        unsafe {
+            std::alloc::dealloc(ptr, self.layout);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,11 +185,13 @@ mod tests {
         let arena = Arena::new(4096);
         assert_eq!(arena.used(), 0);
 
-        let off = arena.alloc(64, 64).unwrap();
+        // SAFETY: test is single-threaded.
+        let off = unsafe { arena.alloc(64, 64) }.unwrap();
         assert_eq!(off, 0);
         assert_eq!(arena.used(), 64);
 
-        let off2 = arena.alloc(64, 64).unwrap();
+        // SAFETY: test is single-threaded.
+        let off2 = unsafe { arena.alloc(64, 64) }.unwrap();
         assert_eq!(off2, 64);
         assert_eq!(arena.used(), 128);
     }
@@ -154,7 +201,8 @@ mod tests {
         let arena = Arena::new(4096);
         let chunk = Chunk::from_sorted(&[10, 20, 30]);
 
-        let off = arena.alloc_write(chunk).unwrap();
+        // SAFETY: test is single-threaded.
+        let off = unsafe { arena.alloc_write(chunk) }.unwrap();
         // SAFETY: off was just returned by alloc_write::<Chunk>, so it points to a valid Chunk.
         let read: &Chunk = unsafe { arena.get(off) };
         assert_eq!(read.as_slice(), &[10, 20, 30]);
@@ -163,27 +211,40 @@ mod tests {
     #[test]
     fn arena_full_returns_none() {
         let arena = Arena::new(128);
-        let _ = arena.alloc(64, 64).unwrap();
-        let _ = arena.alloc(64, 64).unwrap();
-        assert!(arena.alloc(64, 64).is_none());
+        // SAFETY: test is single-threaded.
+        unsafe {
+            let _ = arena.alloc(64, 64).unwrap();
+            let _ = arena.alloc(64, 64).unwrap();
+            assert!(arena.alloc(64, 64).is_none());
+        }
     }
 
     #[test]
     fn alignment() {
         let arena = Arena::new(4096);
-        // Alloc 1 byte, then 64-byte aligned
-        let _ = arena.alloc(1, 1).unwrap();
-        let off = arena.alloc(64, 64).unwrap();
-        assert_eq!(off % 64, 0);
+        // SAFETY: test is single-threaded.
+        unsafe {
+            let _ = arena.alloc(1, 1).unwrap();
+            let off = arena.alloc(64, 64).unwrap();
+            assert_eq!(off % 64, 0);
+        }
     }
 
     #[test]
     fn reset() {
         let arena = Arena::new(4096);
-        let _ = arena.alloc(64, 64).unwrap();
-        assert_eq!(arena.used(), 64);
-        // SAFETY: test holds no live references into the arena across this call.
-        unsafe { arena.reset() };
+        // SAFETY: test is single-threaded.
+        unsafe {
+            let _ = arena.alloc(64, 64).unwrap();
+            assert_eq!(arena.used(), 64);
+            arena.reset();
+        }
         assert_eq!(arena.used(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Arena capacity must be > 0")]
+    fn zero_capacity_panics() {
+        let _ = Arena::new(0);
     }
 }

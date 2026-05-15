@@ -26,7 +26,7 @@ except ImportError as e:
     ) from e
 
 try:
-    from torch_geometric.data import HeteroData  # type: ignore[import-untyped]
+    from torch_geometric.data import HeteroData
 except ImportError as e:
     raise ImportError(
         "HeteroNeighborLoader requires torch-geometric>=2.4. "
@@ -117,8 +117,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         self,
         data: HeteroGraph,
         num_neighbors: dict[tuple[str, str, str], list[int]],
-        input_nodes: tuple[str, torch.Tensor | npt.NDArray[Any] | list[int] | None]
-        | None = None,
+        input_nodes: tuple[str, torch.Tensor | npt.NDArray[Any] | list[int] | None] | None = None,
         batch_size: int = 128,
         shuffle: bool = True,
         replace: bool = False,
@@ -127,6 +126,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         seed: int | None = None,
         max_degree: int | None = None,
         transform: Callable[[HeteroData], HeteroData] | None = None,
+        features: dict[str, npt.NDArray[np.float32]] | None = None,
     ) -> None:
         """Initialize the heterogeneous neighbor loader.
 
@@ -182,6 +182,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         self.transform = transform
         self._seed = seed
         self._max_degree = max_degree
+        self._features: dict[str, npt.NDArray[np.float32]] | None = features
 
         seed_type, node_ids = input_nodes
         self._seed_type = seed_type
@@ -277,9 +278,9 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
             seed=self._seed,
             max_degree=self._max_degree,
         )
-        sampler = RustHeteroSampler(self.graph._rust_graph, rust_config)
+        sampler = RustHeteroSampler(self.graph.csr, rust_config)
 
-        in_memory_features = self.graph.features
+        in_memory_features = self._features
         epoch_start = time.perf_counter()
         received = 0
 
@@ -333,7 +334,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         """
         data = HeteroData()
 
-        for nt in subgraph.node_types():
+        for nt in subgraph.node_types:
             nodes = np.asarray(subgraph.nodes(nt), dtype=np.int64)
             n_id = torch.from_numpy(nodes.copy())
             data[nt].n_id = n_id
@@ -348,7 +349,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                     x = x.pin_memory()
                 data[nt].x = x
 
-        for src, rel, dst in subgraph.edge_types():
+        for src, rel, dst in subgraph.edge_types:
             ei = np.asarray(subgraph.edge_index_local(src, rel, dst), dtype=np.int64)
             edge_index = torch.from_numpy(ei.copy())
             if self.pin_memory and torch.cuda.is_available():
@@ -356,8 +357,8 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
             data[src, rel, dst].edge_index = edge_index
 
         # Set batch_size and input_id for the seed node type
-        seed_type = subgraph.seed_type()
-        seeds = np.asarray(subgraph.seeds(), dtype=np.int64)
+        seed_type = subgraph.seed_type
+        seeds = np.asarray(subgraph.seeds, dtype=np.int64)
         data[seed_type].batch_size = len(seeds)
 
         # Compute input_id: the global IDs of the seed nodes

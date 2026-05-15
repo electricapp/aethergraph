@@ -19,7 +19,7 @@ except ImportError as e:
     ) from e
 
 try:
-    from torch_geometric.data import Data  # type: ignore[import-untyped]
+    from torch_geometric.data import Data
 except ImportError as e:
     raise ImportError(
         "PyTorch Geometric integration requires torch-geometric>=2.4. "

@@ -1,6 +1,7 @@
 # AetherGraph Python
 
-Python bindings for AetherGraph. See the [main README](../README.md) for full documentation.
+Python bindings for AetherGraph. See the [main README](../README.md) for full
+documentation.
 
 ## Features
 
@@ -42,7 +43,9 @@ for data in loader:
 
 ## Ray Distributed Training
 
-AetherGraph uses **Replicated Topology Architecture**: the graph is replicated on each worker's local NVMe, not partitioned across the network. This eliminates the Sharding Tax.
+AetherGraph uses **Replicated Topology Architecture**: the graph is replicated
+on each worker's local NVMe, not partitioned across the network. This eliminates
+the Sharding Tax.
 
 ```
 Traditional:  Worker 1 ←── graph edges ──→ Worker 2   # Terabytes over network
@@ -106,6 +109,7 @@ aethergraph convert -i edges.csv -o graph.bin -n 1000000
 ```
 
 Options:
+
 - `-i, --input`: Input edge list file (TSV/CSV, auto-detected)
 - `-o, --output`: Output binary graph file
 - `-n, --num-nodes`: Number of nodes in the graph
@@ -123,6 +127,7 @@ aethergraph info graph.bin
 ```
 
 Output:
+
 ```
 Graph Information:
   Nodes: 1,000,000
@@ -140,6 +145,7 @@ aethergraph stats graph.bin
 ```
 
 Output:
+
 ```
 Graph Statistics:
   Nodes: 1,000,000

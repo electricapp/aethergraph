@@ -1,0 +1,9 @@
+# actionlint configuration.
+#
+# `self-hosted-runner.labels` lists runner labels actionlint should treat as
+# valid even though they aren't built into GitHub. Used by the
+# `rdma-hardware` job in ci.yml, which targets a self-hosted Linux box with
+# the `rdma_rxe` kernel module loaded.
+self-hosted-runner:
+  labels:
+    - aether-test-rdma

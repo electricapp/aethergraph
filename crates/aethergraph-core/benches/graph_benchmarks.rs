@@ -71,7 +71,7 @@ fn generate_timestamped_graph(num_nodes: usize, avg_degree: usize) -> Graph {
     let timestamps: Vec<f64> = (0..graph.num_edges())
         .map(|i| (i as f64) * 0.001) // monotonically increasing timestamps
         .collect();
-    graph.set_timestamps(timestamps);
+    graph.set_timestamps(timestamps).unwrap();
     graph
 }
 
@@ -309,7 +309,11 @@ fn bench_temporal_sampling(c: &mut Criterion) {
     group.bench_function("temporal_uniform", |b| {
         let mut sampler = NeighborSampler::new(&graph, config_uniform.clone());
         b.iter(|| {
-            black_box(sampler.sample_neighbors_temporal(black_box(&seeds), black_box(&input_times)))
+            black_box(
+                sampler
+                    .sample_neighbors_temporal(black_box(&seeds), black_box(&input_times))
+                    .unwrap(),
+            )
         });
     });
 
@@ -324,7 +328,11 @@ fn bench_temporal_sampling(c: &mut Criterion) {
     group.bench_function("temporal_last", |b| {
         let mut sampler = NeighborSampler::new(&graph, config_last.clone());
         b.iter(|| {
-            black_box(sampler.sample_neighbors_temporal(black_box(&seeds), black_box(&input_times)))
+            black_box(
+                sampler
+                    .sample_neighbors_temporal(black_box(&seeds), black_box(&input_times))
+                    .unwrap(),
+            )
         });
     });
 

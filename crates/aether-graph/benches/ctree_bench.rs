@@ -10,10 +10,13 @@ fn build_graph(num_vertices: usize, num_edges: usize) -> DynamicGraph {
     let mut rng = SmallRng::seed_from_u64(42);
     let arena_bytes = num_edges * 128;
     let g = DynamicGraph::new(num_vertices, arena_bytes);
-    for _ in 0..num_edges {
-        let src = rng.random_range(0..num_vertices as u32);
-        let dst = rng.random_range(0..num_vertices as u32);
-        let _ = g.insert_edge(src, dst);
+    {
+        let mut w = g.writer_or_panic();
+        for _ in 0..num_edges {
+            let src = rng.random_range(0..num_vertices as u32);
+            let dst = rng.random_range(0..num_vertices as u32);
+            let _ = w.insert_edge(src, dst);
+        }
     }
     g
 }
@@ -26,6 +29,7 @@ fn bench_insert(c: &mut Criterion) {
     for n in [10_000, 100_000] {
         let arena_bytes = 1 << 28;
         let g = DynamicGraph::new(n, arena_bytes);
+        let mut writer = g.writer_or_panic();
         let mut rng = SmallRng::seed_from_u64(99);
 
         group.throughput(Throughput::Elements(1));
@@ -33,7 +37,7 @@ fn bench_insert(c: &mut Criterion) {
             b.iter(|| {
                 let src = rng.random_range(0..n as u32);
                 let dst = rng.random_range(0..n as u32);
-                let _ = black_box(g.insert_edge(src, dst));
+                let _ = black_box(writer.insert_edge(src, dst));
             });
         });
     }

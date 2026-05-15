@@ -77,6 +77,12 @@ unsafe extern "C" fn dlpack_deleter(managed: *mut DLManagedTensor) {
 /// view backed by `ptr`. Pure-Rust so we can assert on the struct fields
 /// without going through the Python GIL — see `tests` module below.
 ///
+/// Layout: row-major `f32` in CUDA memory. Strides are
+/// `[feature_dim, 1]` — i.e. row stride = `feature_dim` elements, column stride
+/// = 1 element. The DLPack spec defines strides in **elements** (not bytes),
+/// matching numpy's `arr.strides // dtype.itemsize`. Consumers that interpret
+/// them in bytes (or that flip row/column major) will silently corrupt reads.
+///
 /// Ownership: caller takes the returned `*mut DLManagedTensor` and is
 /// responsible for either (a) handing it to `PyCapsule_New` whose consumer
 /// will eventually call `dlpack_deleter`, or (b) calling `dlpack_deleter`
@@ -93,6 +99,8 @@ fn build_managed_tensor(
 ) -> *mut DLManagedTensor {
     let mut ctx = Box::new(DlpackContext {
         shape: vec![num_nodes as i64, feature_dim as i64],
+        // Row-major: stride[0]=feature_dim elements, stride[1]=1 element.
+        // DLPack measures strides in elements, not bytes — see comment above.
         strides: vec![feature_dim as i64, 1],
     });
 
@@ -116,10 +124,35 @@ fn build_managed_tensor(
     let managed = Box::new(DLManagedTensor {
         dl_tensor: tensor,
         manager_ctx: Box::into_raw(ctx) as *mut c_void,
+        // PyTorch rejects DLPack capsules whose `deleter` is None — even when
+        // the capsule itself has its own destructor. We always set this Some
+        // so `torch.from_dlpack()` accepts the capsule.
         deleter: Some(dlpack_deleter),
     });
 
     Box::into_raw(managed)
+}
+
+/// Test-only Python entry point. Lets pytest hand in an existing CUDA buffer
+/// (e.g. `torch.empty(..., device='cuda').data_ptr()`) and round-trip it
+/// through `create_dlpack_capsule` + `torch.from_dlpack`. The capsule's
+/// deleter does not free VRAM, so the original tensor stays the owner.
+///
+/// # Safety
+/// Caller is responsible for `ptr` being a valid CUDA allocation with at least
+/// `num_nodes * feature_dim * sizeof(f32)` bytes that outlives the resulting
+/// numpy/torch view. Exposed only so T2.2 can exercise the capsule path
+/// without spinning up a full RDMA server.
+#[pyfunction]
+#[pyo3(name = "_dlpack_capsule_from_cuda_ptr")]
+pub fn dlpack_capsule_from_cuda_ptr_py(
+    py: Python<'_>,
+    ptr: u64,
+    num_nodes: usize,
+    feature_dim: usize,
+    gpu_id: i32,
+) -> PyResult<PyObject> {
+    create_dlpack_capsule(py, ptr, num_nodes, feature_dim, gpu_id)
 }
 
 /// Create a PyCapsule wrapping a DLPack managed tensor for a CUDA f32 buffer.
@@ -141,19 +174,17 @@ pub fn create_dlpack_capsule(
 
     // Create PyCapsule with name "dltensor" (required by DLPack spec)
     let name = CString::new("dltensor").unwrap();
+    // SAFETY: PyCapsule_New requires the GIL. `Python<'_>` proves the GIL is held.
+    // `name` lives for the duration of this call (the CString stays in scope).
+    // Destructor is `None`: cleanup is driven by the DLPack `deleter` field on
+    // the managed tensor, which the consumer invokes when releasing.
     let capsule = unsafe {
-        let raw = pyffi::PyCapsule_New(
-            managed_ptr as *mut c_void,
-            name.as_ptr(),
-            None, // no capsule destructor — DLPack deleter handles cleanup
-        );
+        let raw = pyffi::PyCapsule_New(managed_ptr as *mut c_void, name.as_ptr(), None);
         if raw.is_null() {
-            // PyCapsule creation failed — clean up manually
-            let managed = Box::from_raw(managed_ptr);
-            let ctx = managed.manager_ctx as *mut DlpackContext;
-            if !ctx.is_null() {
-                drop(Box::from_raw(ctx));
-            }
+            // On capsule-creation failure, drive cleanup through the same
+            // deleter the consumer would call — single source of truth for
+            // freeing the DLManagedTensor + context.
+            dlpack_deleter(managed_ptr);
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "Failed to create DLPack PyCapsule",
             ));

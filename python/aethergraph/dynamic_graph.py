@@ -7,6 +7,7 @@ reads and lock-free concurrent access.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -54,6 +55,45 @@ class DynamicGraph:
         self._inner = _DynamicGraph(num_vertices=num_vertices, arena_mb=arena_mb)
 
     @classmethod
+    def open_with_wal(
+        cls,
+        path: str | os.PathLike[str],
+        num_vertices: int,
+        arena_mb: int = 256,
+    ) -> DynamicGraph:
+        """Open a DynamicGraph backed by an append-only write-ahead log.
+
+        Existing records at ``path`` are replayed before this returns; if the
+        file ends in a torn record (mid-write crash), the trailing bytes are
+        truncated. Every subsequent ``insert_edge*`` call appends to the log
+        and fsyncs at writer-guard close.
+
+        Args:
+            path: WAL file path. Created if it does not exist.
+            num_vertices: Number of vertices (fixed at construction).
+            arena_mb: Arena capacity in megabytes.
+
+        Returns:
+            DynamicGraph at the same epoch the previous run reached, ready
+            to accept new writers.
+
+        Raises:
+            OSError: I/O failure opening, reading, or writing the WAL.
+            ValueError: File exists but is not a valid AetherGraph WAL.
+            RuntimeError: WAL is corrupt past the recoverable prefix.
+        """
+        obj = cls.__new__(cls)
+        obj._inner = _DynamicGraph.open_with_wal(path, num_vertices, arena_mb)
+        return obj
+
+    @property
+    def current_epoch(self) -> int:
+        """Monotonic version counter — advances on every successful writer
+        commit. Pin before a multi-source read to coordinate consistency
+        with other subsystems sharing the same ``EpochClock``."""
+        return self._inner.current_epoch
+
+    @classmethod
     def from_edges(
         cls,
         num_vertices: int,
@@ -97,9 +137,7 @@ class DynamicGraph:
         """
         return self._inner.insert_edge(src, dst)
 
-    def insert_edges(
-        self, src: npt.NDArray[Any], dst: npt.NDArray[Any]
-    ) -> int:
+    def insert_edges(self, src: npt.NDArray[Any], dst: npt.NDArray[Any]) -> int:
         """Batch-insert edges from arrays.
 
         Args:
@@ -197,10 +235,9 @@ class DynamicGraph:
             >>> graph.degree(0)
             1
         """
-        from aethergraph.graph import Graph
-
-        csr_graph = self._inner.snapshot()
-        return Graph(csr_graph)
+        # `Graph` is `aethergraph._core.CsrGraph` directly; `snapshot()`
+        # already returns one, so this is just a passthrough.
+        return self._inner.snapshot()
 
     def __repr__(self) -> str:
         """Return detailed string representation."""

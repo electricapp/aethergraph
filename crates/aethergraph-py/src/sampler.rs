@@ -8,7 +8,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 
-use crate::arrow_utils::subgraph_to_arrow;
 use crate::error::sampling_error;
 use crate::graph::PyCsrGraph;
 
@@ -19,7 +18,7 @@ use crate::graph::PyCsrGraph;
 #[pyclass(name = "SamplingTelemetry", from_py_object)]
 #[derive(Clone)]
 pub struct PySamplingTelemetry {
-    inner: Arc<SamplingTelemetry>,
+    pub(crate) inner: Arc<SamplingTelemetry>,
 }
 
 #[pymethods]
@@ -107,7 +106,7 @@ impl PySamplingConfig {
     /// Returns:
     ///     SamplingConfig: Configuration object
     #[new]
-    #[pyo3(signature = (num_neighbors, replace=false, seed=None, max_degree=None, cumulative=true, weighted=false, subgraph_type="directional", track_edge_ids=true, temporal_strategy=None, disjoint=false, telemetry=None))]
+    #[pyo3(signature = (num_neighbors, replace=false, seed=None, max_degree=None, cumulative=true, weighted=false, subgraph_type="directional", track_edge_ids=true, temporal_strategy=None, disjoint=false, deterministic=false, telemetry=None))]
     #[allow(clippy::too_many_arguments)] // Python API is explicit and mirrors documented kwargs.
     fn new(
         num_neighbors: Vec<usize>,
@@ -120,6 +119,7 @@ impl PySamplingConfig {
         track_edge_ids: bool,
         temporal_strategy: Option<&str>,
         disjoint: bool,
+        deterministic: bool,
         telemetry: Option<PySamplingTelemetry>,
     ) -> PyResult<Self> {
         let subgraph_type = match subgraph_type {
@@ -158,9 +158,18 @@ impl PySamplingConfig {
                 track_edge_ids,
                 temporal_strategy: temporal,
                 disjoint,
+                deterministic,
                 telemetry: telemetry.map(|t| t.inner.clone()),
             },
         })
+    }
+
+    /// Bit-deterministic mode. When True, parallel sampling paths
+    /// serialize so the same seed produces byte-identical output across
+    /// runs / machines / core counts. Default False.
+    #[getter]
+    fn deterministic(&self) -> bool {
+        self.inner.deterministic
     }
 
     /// Get the num_neighbors configuration.
@@ -256,7 +265,14 @@ impl PySamplingConfig {
 
 /// Python wrapper for SampledSubgraph.
 ///
-/// ZERO-COPY: Arrays are int64 so PyTorch can use them directly without conversion.
+/// Two storage layers:
+/// - `*_i64` numpy arrays — what Python sees on `.nodes()`, `.edges()` etc.
+///   PyTorch's `Tensor` indexing uses `int64`, so we widen once at conversion
+///   time and never narrow again on the Python-facing path.
+/// - `original_*` `Arc<[u32]>` — the canonical Rust-side data, kept so that
+///   `to_arrow()` and other consumers don't have to round-trip i64→u32 (which
+///   in addition to being wasteful would lose the bounds check that node IDs
+///   actually fit in u32).
 #[pyclass(name = "SampledSubgraph")]
 pub struct PySampledSubgraph {
     // Pre-computed numpy arrays as int64 (PyTorch's native index type)
@@ -277,6 +293,13 @@ pub struct PySampledSubgraph {
     // Per-hop sampling stats (for PyG compatibility)
     num_sampled_nodes: Vec<usize>,
     num_sampled_edges: Vec<usize>,
+    // Canonical u32 buffers — Arc so to_arrow() etc. can hand them to Arrow
+    // (which takes ownership of a Vec) without an additional clone.
+    original_nodes: Arc<[u32]>,
+    original_seeds: Arc<[u32]>,
+    original_edge_src: Arc<[u32]>,
+    original_edge_dst: Arc<[u32]>,
+    original_edge_ids: Arc<[u64]>,
 }
 
 impl PySampledSubgraph {
@@ -296,11 +319,26 @@ impl PySampledSubgraph {
             .edge_index_local()
             .map_err(|e| sampling_error(format!("Failed to compute local edge indices: {}", e)))?;
 
-        // In disjoint mode, local_index is empty so seed_indices_local won't work.
-        // Each seed is the first node of its per-seed subgraph — find their offsets.
+        // In disjoint mode `local_index` is intentionally empty (each seed has
+        // its own remap) so `seed_indices_local()` cannot be used. The seeds
+        // appear in the global `nodes` array in the same order they were
+        // submitted, with each seed at the start of its per-seed block. We
+        // reconstruct the seed positions by walking `batch_vec` and recording
+        // the index of the first occurrence of seed 0, 1, 2, ...
+        //
+        // Invariant assumed: `batch_vec` is monotonic non-decreasing — once we
+        // see seed `k`, we never see seed `k-1` again. The core sampler
+        // guarantees this. We `debug_assert!` it here for catch-on-test if it
+        // ever drifts; in release we trust the producer.
         let seed_indices_local = if is_disjoint {
-            // Seeds are at the start of each seed's block. batch vector tells us where.
-            let batch_ref = subgraph.batch.as_ref().unwrap();
+            let batch_ref = subgraph
+                .batch
+                .as_ref()
+                .expect("disjoint mode without batch vector — core sampler bug");
+            debug_assert!(
+                batch_ref.windows(2).all(|w| w[0] <= w[1]),
+                "batch vector must be monotonic non-decreasing"
+            );
             let mut indices = Vec::with_capacity(subgraph.seeds.len());
             let mut current_seed = 0u32;
             for (i, &b) in batch_ref.iter().enumerate() {
@@ -312,6 +350,13 @@ impl PySampledSubgraph {
                     }
                 }
             }
+            if indices.len() != subgraph.seeds.len() {
+                return Err(sampling_error(format!(
+                    "disjoint mode: found {} seed offsets in batch vector, expected {}",
+                    indices.len(),
+                    subgraph.seeds.len()
+                )));
+            }
             indices
         } else {
             subgraph
@@ -319,7 +364,22 @@ impl PySampledSubgraph {
                 .map_err(|e| sampling_error(format!("Failed to compute seed indices: {}", e)))?
         };
 
-        // Convert u32 to i64 - let LLVM auto-vectorize (it's very good at this)
+        // Cache canonical u32 buffers before widening into the Python-facing
+        // i64 arrays so `to_arrow()` and similar consumers can hand them
+        // straight to Arrow without an i64→u32 narrowing pass.
+        let original_nodes: Arc<[u32]> = subgraph.nodes.clone().into();
+        let original_seeds: Arc<[u32]> = subgraph.seeds.clone().into();
+        let original_edge_src: Arc<[u32]> = subgraph.edge_src.clone().into();
+        let original_edge_dst: Arc<[u32]> = subgraph.edge_dst.clone().into();
+        let original_edge_ids: Arc<[u64]> = subgraph.edge_ids.clone().into();
+
+        // u32 → i64 widening, one pass per buffer. The cast is monotonic and
+        // free of branches; whether LLVM emits a vectorized form
+        // (vpmovzxdq on x86_64 AVX2 / uxtl on aarch64 NEON) is target- and
+        // codegen-flag-dependent and has NOT been audited here.
+        // TODO(perf): pin this in CI with a `cargo asm` snapshot job that
+        // fails the build if the widening lowers to a scalar loop on
+        // either target.
         let nodes_i64: Vec<i64> = subgraph.nodes.into_iter().map(|n| n as i64).collect();
         let seeds_i64: Vec<i64> = subgraph.seeds.into_iter().map(|s| s as i64).collect();
         let seed_indices_i64: Vec<i64> = seed_indices_local.into_iter().map(|i| i as i64).collect();
@@ -340,7 +400,7 @@ impl PySampledSubgraph {
         let seed_indices = PyArray1::from_vec(py, seed_indices_i64).unbind();
         let edge_ids = PyArray1::from_vec(py, edge_ids_i64).unbind();
 
-        // Reshape to 2xN - this is just a view, no copy
+        // Reshape to 2xN — `numpy` ndarray reshape is a view, not a copy.
         let edge_array = PyArray1::from_vec(py, edge_data);
         let edge_index = edge_array
             .reshape([2, num_edges])
@@ -353,7 +413,6 @@ impl PySampledSubgraph {
             .map_err(|e| sampling_error(format!("Failed to reshape local edge index: {}", e)))?
             .unbind();
 
-        // Build batch vector if present (disjoint mode)
         let batch_vec = subgraph.batch.map(|b| {
             let batch_i64: Vec<i64> = b.into_iter().map(|x| x as i64).collect();
             PyArray1::from_vec(py, batch_i64).unbind()
@@ -372,98 +431,91 @@ impl PySampledSubgraph {
             num_seeds,
             num_sampled_nodes,
             num_sampled_edges,
+            original_nodes,
+            original_seeds,
+            original_edge_src,
+            original_edge_dst,
+            original_edge_ids,
         })
     }
 }
 
 #[pymethods]
 impl PySampledSubgraph {
-    /// Returns the number of nodes in the subgraph.
+    /// Number of unique nodes in the subgraph.
+    #[getter]
     fn num_nodes(&self) -> usize {
         self.num_nodes
     }
 
-    /// Returns the number of edges in the subgraph.
+    /// Number of edges in the subgraph.
+    #[getter]
     fn num_edges(&self) -> usize {
         self.num_edges
     }
 
-    /// Returns the number of seed nodes.
+    /// Number of seed nodes used to produce this subgraph.
+    #[getter]
     fn num_seeds(&self) -> usize {
         self.num_seeds
     }
 
-    /// Returns all node IDs in the subgraph as a numpy array (zero-copy).
-    ///
-    /// Returns:
-    ///     numpy.ndarray: Array of node IDs (dtype=uint32)
+    /// All node IDs in the subgraph as a numpy `int64` array (zero-copy view).
+    /// `int64` matches PyTorch's `Tensor` index dtype.
+    #[getter]
     fn nodes(&self, py: Python<'_>) -> Py<PyAny> {
         self.nodes.clone_ref(py).into_any()
     }
 
-    /// Returns all seed node IDs as a numpy array (zero-copy).
-    ///
-    /// Returns:
-    ///     numpy.ndarray: Array of seed node IDs (dtype=uint32)
+    /// Seed node IDs as a numpy `int64` array (zero-copy view).
+    #[getter]
     fn seeds(&self, py: Python<'_>) -> Py<PyAny> {
         self.seeds.clone_ref(py).into_any()
     }
 
-    /// Returns edge index in PyTorch Geometric COO format as a 2xN numpy array (zero-copy).
-    /// Uses global node IDs.
-    ///
-    /// Returns:
-    ///     numpy.ndarray: Edge index array with shape [2, num_edges] (dtype=int64)
+    /// Edge index in PyTorch Geometric COO format — shape `[2, num_edges]`,
+    /// dtype `int64`. Global node IDs.
+    #[getter]
     fn edge_index(&self, py: Python<'_>) -> Py<PyAny> {
         self.edge_index.clone_ref(py).into_any()
     }
 
-    /// Returns edge index with local node IDs remapped to [0, num_nodes).
-    /// Use this for PyG models to avoid OOM on large graphs.
-    ///
-    /// Returns:
-    ///     numpy.ndarray: Edge index array with shape [2, num_edges] (dtype=int64)
+    /// Edge index with local IDs remapped to `[0, num_nodes)` — shape
+    /// `[2, num_edges]`, dtype `int64`. Use this for PyG models to avoid OOM
+    /// on large graphs.
+    #[getter]
     fn edge_index_local(&self, py: Python<'_>) -> Py<PyAny> {
         self.edge_index_local.clone_ref(py).into_any()
     }
 
-    /// Returns global edge IDs (positions in the CSR edges array).
-    /// Useful for looking up edge features or weights.
-    ///
-    /// Returns:
-    ///     numpy.ndarray: Array of edge IDs (dtype=int64)
+    /// Global edge IDs (positions in the CSR edges array) — dtype `int64`.
+    /// Use for looking up edge features or weights.
+    #[getter]
     fn edge_ids(&self, py: Python<'_>) -> Py<PyAny> {
         self.edge_ids.clone_ref(py).into_any()
     }
 
-    /// Returns local indices of seed nodes in the sorted nodes array.
-    ///
-    /// Returns:
-    ///     numpy.ndarray: Array of seed indices (dtype=int64)
+    /// Local indices of seed nodes in the sorted `nodes` array — dtype `int64`.
+    #[getter]
     fn seed_indices(&self, py: Python<'_>) -> Py<PyAny> {
         self.seed_indices.clone_ref(py).into_any()
     }
 
-    /// Returns the batch vector mapping each node to its seed index (disjoint mode only).
-    ///
-    /// Returns:
-    ///     numpy.ndarray or None: Batch assignments (dtype=int64), or None if not disjoint.
+    /// Batch vector mapping each node to its seed index (disjoint mode only),
+    /// or `None` when sampling was non-disjoint. dtype `int64`.
+    #[getter]
     fn batch(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         self.batch_vec.as_ref().map(|b| b.clone_ref(py).into_any())
     }
 
-    /// Returns the number of nodes sampled at each hop (for PyG compatibility).
-    ///
-    /// Returns:
-    ///     List[int]: Number of new nodes sampled at each hop
+    /// Number of new nodes sampled at each hop (PyG-compatible).
+    #[getter]
     fn num_sampled_nodes_per_hop(&self) -> Vec<usize> {
         self.num_sampled_nodes.clone()
     }
 
-    /// Returns the number of edges sampled at each hop (for PyG compatibility).
-    ///
-    /// Returns:
-    ///     List[int]: Number of edges sampled at each hop
+    /// Number of edges sampled at each hop (PyG-compatible).
+    #[getter]
     fn num_sampled_edges_per_hop(&self) -> Vec<usize> {
         self.num_sampled_edges.clone()
     }
@@ -477,78 +529,67 @@ impl PySampledSubgraph {
     ///         - edge_src: Source node IDs
     ///         - edge_dst: Destination node IDs
     ///         - nodes: All node IDs in subgraph
+    /// Convert this subgraph to a dict of PyArrow `RecordBatch`es:
+    /// ```python
+    /// {"edges": RecordBatch(edge_src, edge_dst, edge_id),
+    ///  "nodes": RecordBatch(nodes),
+    ///  "seeds": RecordBatch(seeds)}
+    /// ```
+    ///
+    /// Three batches rather than one because Arrow `RecordBatch` requires
+    /// equal-length columns, and the edge / node / seed arrays have different
+    /// lengths.
     fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        // Extract SOA edge arrays from edge_index (stored as i64, convert back to u32)
-        let edge_index_bound = self.edge_index.bind(py);
-        let edge_index_readonly = edge_index_bound.readonly();
-        let flat_data = edge_index_readonly.as_slice()?;
-        let num_edges = flat_data.len() / 2;
-
-        let edge_src: Vec<u32> = flat_data[..num_edges].iter().map(|&x| x as u32).collect();
-        let edge_dst: Vec<u32> = flat_data[num_edges..].iter().map(|&x| x as u32).collect();
-
-        let nodes_bound = self.nodes.bind(py);
-        let nodes_readonly = nodes_bound.readonly();
-        let nodes_slice: Vec<u32> = nodes_readonly
-            .as_slice()?
-            .iter()
-            .map(|&x| x as u32)
-            .collect();
-
-        let seeds_bound = self.seeds.bind(py);
-        let seeds_readonly = seeds_bound.readonly();
-        let seeds_slice: Vec<u32> = seeds_readonly
-            .as_slice()?
-            .iter()
-            .map(|&x| x as u32)
-            .collect();
-
-        // Get edge_ids for temp subgraph
-        let edge_ids_bound = self.edge_ids.bind(py);
-        let edge_ids_readonly = edge_ids_bound.readonly();
-        let edge_ids_slice: Vec<u64> = edge_ids_readonly
-            .as_slice()?
-            .iter()
-            .map(|&x| x as u64)
-            .collect();
-
         let temp_subgraph = SampledSubgraph::from_parts(
-            nodes_slice,
-            edge_src,
-            edge_dst,
-            edge_ids_slice,
-            seeds_slice,
+            self.original_nodes.to_vec(),
+            self.original_edge_src.to_vec(),
+            self.original_edge_dst.to_vec(),
+            self.original_edge_ids.to_vec(),
+            self.original_seeds.to_vec(),
             self.num_sampled_nodes.clone(),
             self.num_sampled_edges.clone(),
         );
 
-        let record_batch = subgraph_to_arrow(&temp_subgraph)?;
+        let batches = crate::arrow_utils::subgraph_into_arrow(temp_subgraph)?;
 
-        // Convert to PyArrow object via Python
-        // We need to use PyArrow's Python API since arrow-rs doesn't have direct PyO3 integration yet
         let pyarrow = py.import("pyarrow")?;
-
-        // Create schema
-        let schema = pyarrow.getattr("schema")?;
-        let fields = vec![
-            schema.call_method1("field", ("edge_src", pyarrow.getattr("uint32")?))?,
-            schema.call_method1("field", ("edge_dst", pyarrow.getattr("uint32")?))?,
-            schema.call_method1("field", ("nodes", pyarrow.getattr("uint32")?))?,
-        ];
-        let py_schema = schema.call1((fields,))?;
-
-        // Create arrays
-        let arrays = vec![
-            self.arrow_array_to_pyarrow(py, &record_batch, 0)?,
-            self.arrow_array_to_pyarrow(py, &record_batch, 1)?,
-            self.arrow_array_to_pyarrow(py, &record_batch, 2)?,
-        ];
-
-        // Create RecordBatch
         let rb_class = pyarrow.getattr("RecordBatch")?;
-        let py_record_batch = rb_class.call_method1("from_arrays", (arrays, py_schema))?;
+        let schema_fn = pyarrow.getattr("schema")?;
+        let uint32_dt = pyarrow.getattr("uint32")?;
 
-        Ok(py_record_batch.unbind())
+        let edges_py = build_py_record_batch(
+            py,
+            &pyarrow,
+            &rb_class,
+            &schema_fn,
+            &uint32_dt,
+            &batches.edges,
+            &["edge_src", "edge_dst", "edge_id"],
+        )?;
+        let nodes_py = build_py_record_batch(
+            py,
+            &pyarrow,
+            &rb_class,
+            &schema_fn,
+            &uint32_dt,
+            &batches.nodes,
+            &["nodes"],
+        )?;
+        let seeds_py = build_py_record_batch(
+            py,
+            &pyarrow,
+            &rb_class,
+            &schema_fn,
+            &uint32_dt,
+            &batches.seeds,
+            &["seeds"],
+        )?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("edges", edges_py)?;
+        dict.set_item("nodes", nodes_py)?;
+        dict.set_item("seeds", seeds_py)?;
+        Ok(dict.into())
     }
 
     /// Returns a dictionary representation of the subgraph.
@@ -570,39 +611,56 @@ impl PySampledSubgraph {
     }
 
     fn __str__(&self) -> String {
-        format!(
-            "Subgraph with {} nodes, {} edges (from {} seeds)",
-            self.num_nodes, self.num_edges, self.num_seeds
-        )
+        self.__repr__()
+    }
+
+    /// `len(subgraph)` returns the number of nodes (matches PyG convention).
+    fn __len__(&self) -> usize {
+        self.num_nodes
     }
 }
 
-impl PySampledSubgraph {
-    /// Helper to convert Arrow array to PyArrow array
-    fn arrow_array_to_pyarrow(
-        &self,
-        py: Python<'_>,
-        batch: &RecordBatch,
-        col_idx: usize,
-    ) -> PyResult<Py<PyAny>> {
-        let pyarrow = py.import("pyarrow")?;
-        let array_class = pyarrow.getattr("array")?;
+/// Convert a Rust Arrow `RecordBatch` into a `pyarrow.RecordBatch`.
+///
+/// arrow-rs and pyarrow share a binary buffer layout but no stable PyO3
+/// bridge, so we round-trip column buffers through Python lists. Acceptable
+/// because Python-side Arrow consumers (Ray Data, etc.) are not on a tight
+/// per-batch hot path — this conversion runs once per epoch / batch boundary.
+fn build_py_record_batch(
+    py: Python<'_>,
+    pyarrow: &Bound<'_, pyo3::types::PyModule>,
+    rb_class: &Bound<'_, PyAny>,
+    schema_fn: &Bound<'_, PyAny>,
+    uint32_dt: &Bound<'_, PyAny>,
+    batch: &RecordBatch,
+    field_names: &[&str],
+) -> PyResult<Py<PyAny>> {
+    debug_assert_eq!(field_names.len(), batch.num_columns());
+    let array_class = pyarrow.getattr("array")?;
 
-        let column = batch.column(col_idx);
+    let mut arrays = Vec::with_capacity(batch.num_columns());
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    for (i, name) in field_names.iter().enumerate() {
+        let column = batch.column(i);
         let uint32_array = column
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| sampling_error("Expected UInt32Array"))?;
-
-        // Convert to Python list
+            .ok_or_else(|| {
+                sampling_error(format!(
+                    "expected UInt32Array at column {i} ({name}), got {:?}",
+                    column.data_type()
+                ))
+            })?;
         let values: Vec<u32> = uint32_array.values().to_vec();
         let py_list = PyList::new(py, &values)?;
-
-        // Create PyArrow array from Python list
-        let py_array = array_class.call1((py_list, pyarrow.getattr("uint32")?))?;
-
-        Ok(py_array.unbind())
+        let py_array = array_class.call1((py_list, uint32_dt.clone()))?;
+        arrays.push(py_array);
+        fields.push(schema_fn.call_method1("field", (*name, uint32_dt.clone()))?);
     }
+
+    let py_schema = schema_fn.call1((fields,))?;
+    let py_record_batch = rb_class.call_method1("from_arrays", (arrays, py_schema))?;
+    Ok(py_record_batch.unbind())
 }
 
 /// Python wrapper for NeighborSampler.
@@ -647,20 +705,7 @@ impl PyNeighborSampler {
         let graph = self.graph.borrow(py);
         let mut sampler = NeighborSampler::new(graph.inner(), self.config.inner.clone());
 
-        let seeds_vec: Vec<u32> = if let Ok(arr) = seeds.extract::<numpy::PyReadonlyArray1<i64>>() {
-            arr.as_slice()?
-                .iter()
-                .map(|&x| {
-                    u32::try_from(x).map_err(|_| {
-                        sampling_error(format!("seed node {} out of range [0, {}]", x, u32::MAX))
-                    })
-                })
-                .collect::<PyResult<Vec<u32>>>()?
-        } else if let Ok(arr) = seeds.extract::<numpy::PyReadonlyArray1<u32>>() {
-            arr.as_slice()?.to_vec()
-        } else {
-            seeds.extract::<Vec<u32>>()?
-        };
+        let seeds_vec: Vec<u32> = crate::error::extract_seeds(seeds)?;
 
         let subgraph = if self.config.inner.disjoint {
             let times = input_times.as_ref().map(|t| t.as_slice()).transpose()?;
@@ -669,7 +714,9 @@ impl PyNeighborSampler {
             let times = input_times
                 .as_ref()
                 .ok_or_else(|| sampling_error("temporal_strategy requires input_times"))?;
-            sampler.sample_neighbors_temporal(&seeds_vec, times.as_slice()?)
+            sampler
+                .sample_neighbors_temporal(&seeds_vec, times.as_slice()?)
+                .map_err(|e| sampling_error(e.to_string()))?
         } else {
             sampler.sample_neighbors(&seeds_vec)
         };

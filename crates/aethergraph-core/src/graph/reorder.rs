@@ -493,7 +493,12 @@ impl Graph {
             weights_arc,
         );
         if has_timestamps {
-            graph.set_timestamps(new_timestamps);
+            // `new_timestamps` is built parallel to `new_edges` above, so the
+            // length contract holds; surface a clear error if a future refactor
+            // violates it rather than silently dropping the result.
+            graph.set_timestamps(new_timestamps).map_err(|e| {
+                anyhow::anyhow!("internal: reorder produced mismatched timestamps ({e})")
+            })?;
         }
         Ok(graph)
     }
@@ -671,7 +676,7 @@ mod tests {
     #[test]
     fn test_permute_preserves_timestamps() {
         let mut graph = Graph::from_edges(3, &[(0, 1), (1, 2)], None).unwrap();
-        graph.set_timestamps(vec![100.0, 200.0]);
+        graph.set_timestamps(vec![100.0, 200.0]).unwrap();
         let permuted = graph.permute(&[1, 0, 2]).unwrap();
         assert!((permuted.neighbor_timestamps(1).unwrap()[0] - 100.0).abs() < f64::EPSILON);
     }

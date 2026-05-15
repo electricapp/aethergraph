@@ -85,6 +85,17 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 namespace_packages = true
 
+# Third-party libraries that don't ship `py.typed` markers / stubs. We treat
+# their public surface as `Any` rather than fail the strict run.
+[[tool.mypy.overrides]]
+module = [
+    "torch_geometric",
+    "torch_geometric.*",
+    "wandb",
+    "pydantic",
+]
+ignore_missing_imports = true
+
 [dependency-groups]
 dev = [
     "hypothesis>=6.152.4",

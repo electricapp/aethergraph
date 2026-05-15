@@ -1,0 +1,60 @@
+[package]
+name = "aethergraph-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# This crate hosts cargo-fuzz targets for AetherGraph's parsers and lock-free
+# data structures. It is excluded from the workspace so a regular `cargo
+# build --workspace` does not need a nightly toolchain.
+#
+# Run a target with:
+#     cargo +nightly fuzz run ctree_insert_sequences
+#
+# CI wiring lives in `.github/workflows/fuzz.yml` (short-budget runs nightly).
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+aether-graph = { path = "../crates/aether-graph" }
+aethergraph-core = { path = "../crates/aethergraph-core" }
+# `seed_corpus` binary deps: fixed-seed RNG + deterministic hash.
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+
+[dev-dependencies]
+tempfile = "3"
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+
+[[bin]]
+name = "ctree_insert_sequences"
+path = "fuzz_targets/ctree_insert_sequences.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "csr_loader_bytes"
+path = "fuzz_targets/csr_loader_bytes.rs"
+test = false
+doc = false
+bench = false
+
+# Reproducible corpus seeder: source-controlled, audit-friendly. Run with
+#   cargo run -p aethergraph-fuzz --bin seed_corpus
+# to (re)populate ./corpus/<target>/ with the canonical inputs declared in
+# `bin/seed_corpus.rs`. CI regenerates the corpus this way so a fuzz run on
+# a fresh machine starts from a known floor instead of empty.
+[[bin]]
+name = "seed_corpus"
+path = "bin/seed_corpus.rs"
+test = false
+doc = false
+bench = false
+
+# TODO(fuzz): add targets for:
+# - parquet_import (when the `parquet` feature lands in CI)
+# - hetero_loader (HeteroGraph::try_from_parts with adversarial type metadata)
+# - feature_table seqlock writer/reader interleaving

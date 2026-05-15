@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import gc
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
+import numpy.typing as npt
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -38,9 +40,9 @@ class Scale(str, Enum):
 
 
 SCALES = {
-    Scale.small:  {"nodes": 10_000,    "edges": 100_000,    "iters": 500},
-    Scale.medium: {"nodes": 100_000,   "edges": 1_000_000,  "iters": 200},
-    Scale.large:  {"nodes": 1_000_000, "edges": 10_000_000, "iters": 50},
+    Scale.small: {"nodes": 10_000, "edges": 100_000, "iters": 500},
+    Scale.medium: {"nodes": 100_000, "edges": 1_000_000, "iters": 200},
+    Scale.large: {"nodes": 1_000_000, "edges": 10_000_000, "iters": 50},
 }
 
 
@@ -53,7 +55,7 @@ class BenchResult:
     us_per_iter: float
 
 
-def _timed_iters(fn, iters: int, warmup: int = 10):
+def _timed_iters(fn: Callable[[], None], iters: int, warmup: int = 10) -> float:
     """Run warmup + timed iterations, return total seconds."""
     for _ in range(warmup):
         fn()
@@ -66,7 +68,9 @@ def _timed_iters(fn, iters: int, warmup: int = 10):
     return elapsed
 
 
-def _make_graph(scale: dict[str, int]):
+def _make_graph(
+    scale: dict[str, int],
+) -> tuple[int, npt.NDArray[np.int64], npt.NDArray[np.int64]]:
     """Build identical random edges for both frameworks."""
     rng = np.random.default_rng(42)
     n, e = scale["nodes"], scale["edges"]
@@ -94,7 +98,7 @@ def bench_homo_ag(scale: dict[str, int], fanout: list[int], batch_size: int) -> 
     seeds = [rng.integers(0, n, batch_size).astype(np.int64) for _ in range(iters + 15)]
     idx = [0]
 
-    def run():
+    def run() -> None:
         sampler.sample(seeds[idx[0]])
         idx[0] += 1
 
@@ -115,10 +119,12 @@ def bench_homo_pyg(scale: dict[str, int], fanout: list[int], batch_size: int) ->
 
     rng = np.random.default_rng(99)
     iters = scale["iters"]
-    seeds = [torch.from_numpy(rng.integers(0, n, batch_size).astype(np.int64)) for _ in range(iters + 15)]
+    seeds = [
+        torch.from_numpy(rng.integers(0, n, batch_size).astype(np.int64)) for _ in range(iters + 15)
+    ]
     idx = [0]
 
-    def run():
+    def run() -> None:
         inp = NodeSamplerInput(input_id=torch.arange(batch_size), node=seeds[idx[0]])
         sampler.sample_from_nodes(inp)
         idx[0] += 1
@@ -132,7 +138,14 @@ def bench_homo_pyg(scale: dict[str, int], fanout: list[int], batch_size: int) ->
 # ---------------------------------------------------------------------------
 
 
-def _make_weighted_graph(scale: dict[str, int]):
+def _make_weighted_graph(
+    scale: dict[str, int],
+) -> tuple[
+    int,
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float32],
+]:
     """Build identical random edges + weights for both frameworks."""
     rng = np.random.default_rng(42)
     n, e = scale["nodes"], scale["edges"]
@@ -156,7 +169,7 @@ def bench_weighted_ag(scale: dict[str, int], fanout: list[int], batch_size: int)
     seeds = [rng.integers(0, n, batch_size).astype(np.int64) for _ in range(iters + 15)]
     idx = [0]
 
-    def run():
+    def run() -> None:
         sampler.sample(seeds[idx[0]])
         idx[0] += 1
 
@@ -178,10 +191,12 @@ def bench_weighted_pyg(scale: dict[str, int], fanout: list[int], batch_size: int
 
     rng = np.random.default_rng(99)
     iters = scale["iters"]
-    seeds = [torch.from_numpy(rng.integers(0, n, batch_size).astype(np.int64)) for _ in range(iters + 15)]
+    seeds = [
+        torch.from_numpy(rng.integers(0, n, batch_size).astype(np.int64)) for _ in range(iters + 15)
+    ]
     idx = [0]
 
-    def run():
+    def run() -> None:
         inp = NodeSamplerInput(input_id=torch.arange(batch_size), node=seeds[idx[0]])
         sampler.sample_from_nodes(inp)
         idx[0] += 1
@@ -195,7 +210,14 @@ def bench_weighted_pyg(scale: dict[str, int], fanout: list[int], batch_size: int
 # ---------------------------------------------------------------------------
 
 
-def _make_temporal_graph(scale: dict[str, int]):
+def _make_temporal_graph(
+    scale: dict[str, int],
+) -> tuple[
+    int,
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+]:
     """Build identical random edges + timestamps for both frameworks."""
     rng = np.random.default_rng(42)
     n, e = scale["nodes"], scale["edges"]
@@ -207,7 +229,10 @@ def _make_temporal_graph(scale: dict[str, int]):
 
 
 def bench_temporal_ag(
-    scale: dict[str, int], fanout: list[int], batch_size: int, strategy: str,
+    scale: dict[str, int],
+    fanout: list[int],
+    batch_size: int,
+    strategy: str,
 ) -> BenchResult:
     """AetherGraph temporal sampling."""
     from aethergraph._core import CsrGraph, NeighborSampler, SamplingConfig
@@ -216,7 +241,9 @@ def bench_temporal_ag(
     graph = CsrGraph.from_edges(n, src.astype(np.uint32), dst.astype(np.uint32))
     graph.set_timestamps(timestamps)
     config = SamplingConfig(
-        num_neighbors=fanout, replace=False, temporal_strategy=strategy,
+        num_neighbors=fanout,
+        replace=False,
+        temporal_strategy=strategy,
     )
     sampler = NeighborSampler(graph, config)
 
@@ -227,16 +254,21 @@ def bench_temporal_ag(
     input_times = np.full(batch_size, mid_time, dtype=np.float64)
     idx = [0]
 
-    def run():
+    def run() -> None:
         sampler.sample(seeds[idx[0]], input_times=input_times)
         idx[0] += 1
 
     elapsed = _timed_iters(run, iters)
-    return BenchResult(f"temporal_{strategy}_{len(fanout)}hop_b{batch_size}", "ag", elapsed / iters * 1e6)
+    return BenchResult(
+        f"temporal_{strategy}_{len(fanout)}hop_b{batch_size}", "ag", elapsed / iters * 1e6
+    )
 
 
 def bench_temporal_pyg(
-    scale: dict[str, int], fanout: list[int], batch_size: int, strategy: str,
+    scale: dict[str, int],
+    fanout: list[int],
+    batch_size: int,
+    strategy: str,
 ) -> BenchResult:
     """PyG temporal sampling."""
     import torch
@@ -251,26 +283,34 @@ def bench_temporal_pyg(
     data.edge_time = edge_time
 
     sampler = NeighborSampler(
-        data, num_neighbors=NumNeighbors(fanout),
-        time_attr="edge_time", temporal_strategy=strategy,
+        data,
+        num_neighbors=NumNeighbors(fanout),
+        time_attr="edge_time",
+        temporal_strategy=strategy,
     )
 
     mid_time = int(np.median(timestamps) * 1000)
     rng = np.random.default_rng(99)
     iters = scale["iters"]
-    seeds = [torch.from_numpy(rng.integers(0, n, batch_size).astype(np.int64)) for _ in range(iters + 15)]
+    seeds = [
+        torch.from_numpy(rng.integers(0, n, batch_size).astype(np.int64)) for _ in range(iters + 15)
+    ]
     seed_times = torch.full((batch_size,), mid_time, dtype=torch.long)
     idx = [0]
 
-    def run():
+    def run() -> None:
         inp = NodeSamplerInput(
-            input_id=torch.arange(batch_size), node=seeds[idx[0]], time=seed_times,
+            input_id=torch.arange(batch_size),
+            node=seeds[idx[0]],
+            time=seed_times,
         )
         sampler.sample_from_nodes(inp)
         idx[0] += 1
 
     elapsed = _timed_iters(run, iters)
-    return BenchResult(f"temporal_{strategy}_{len(fanout)}hop_b{batch_size}", "pyg", elapsed / iters * 1e6)
+    return BenchResult(
+        f"temporal_{strategy}_{len(fanout)}hop_b{batch_size}", "pyg", elapsed / iters * 1e6
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +332,7 @@ def bench_disjoint_ag(scale: dict[str, int], fanout: list[int], batch_size: int)
     seeds = [rng.integers(0, n, batch_size).astype(np.int64) for _ in range(iters + 15)]
     idx = [0]
 
-    def run():
+    def run() -> None:
         sampler.sample(seeds[idx[0]])
         idx[0] += 1
 
@@ -313,10 +353,12 @@ def bench_disjoint_pyg(scale: dict[str, int], fanout: list[int], batch_size: int
 
     rng = np.random.default_rng(99)
     iters = scale["iters"]
-    seeds = [torch.from_numpy(rng.integers(0, n, batch_size).astype(np.int64)) for _ in range(iters + 15)]
+    seeds = [
+        torch.from_numpy(rng.integers(0, n, batch_size).astype(np.int64)) for _ in range(iters + 15)
+    ]
     idx = [0]
 
-    def run():
+    def run() -> None:
         inp = NodeSamplerInput(input_id=torch.arange(batch_size), node=seeds[idx[0]])
         sampler.sample_from_nodes(inp)
         idx[0] += 1
@@ -330,7 +372,18 @@ def bench_disjoint_pyg(scale: dict[str, int], fanout: list[int], batch_size: int
 # ---------------------------------------------------------------------------
 
 
-def _make_hetero_edges(scale: dict[str, int]):
+def _make_hetero_edges(
+    scale: dict[str, int],
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+    dict[
+        tuple[str, str, str],
+        tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]],
+    ],
+]:
     """Build identical hetero edges for both frameworks."""
     rng = np.random.default_rng(42)
     n = scale["nodes"]
@@ -338,24 +391,30 @@ def _make_hetero_edges(scale: dict[str, int]):
     p = n // 5
     c = n // 2
     s = n // 100
-    return u, p, c, s, {
-        ("user", "votes", "post"): (
-            rng.integers(0, u, u * 10).astype(np.int64),
-            rng.integers(0, p, u * 10).astype(np.int64),
-        ),
-        ("user", "writes", "comment"): (
-            rng.integers(0, u, u * 15).astype(np.int64),
-            rng.integers(0, c, u * 15).astype(np.int64),
-        ),
-        ("comment", "reply_to", "comment"): (
-            rng.integers(0, c, c // 2).astype(np.int64),
-            rng.integers(0, c, c // 2).astype(np.int64),
-        ),
-        ("post", "belongs_to", "subreddit"): (
-            rng.integers(0, p, p).astype(np.int64),
-            rng.integers(0, s, p).astype(np.int64),
-        ),
-    }
+    return (
+        u,
+        p,
+        c,
+        s,
+        {
+            ("user", "votes", "post"): (
+                rng.integers(0, u, u * 10).astype(np.int64),
+                rng.integers(0, p, u * 10).astype(np.int64),
+            ),
+            ("user", "writes", "comment"): (
+                rng.integers(0, u, u * 15).astype(np.int64),
+                rng.integers(0, c, u * 15).astype(np.int64),
+            ),
+            ("comment", "reply_to", "comment"): (
+                rng.integers(0, c, c // 2).astype(np.int64),
+                rng.integers(0, c, c // 2).astype(np.int64),
+            ),
+            ("post", "belongs_to", "subreddit"): (
+                rng.integers(0, p, p).astype(np.int64),
+                rng.integers(0, s, p).astype(np.int64),
+            ),
+        },
+    )
 
 
 HETERO_FANOUT = {
@@ -386,7 +445,7 @@ def bench_hetero_ag(scale: dict[str, int], batch_size: int) -> BenchResult:
     seeds = [rng.integers(0, u, batch_size).astype(np.uint32) for _ in range(iters + 15)]
     idx = [0]
 
-    def run():
+    def run() -> None:
         sampler.sample("user", seeds[idx[0]])
         idx[0] += 1
 
@@ -409,30 +468,32 @@ def bench_hetero_pyg(scale: dict[str, int], batch_size: int) -> BenchResult:
     data["subreddit"].num_nodes = s
 
     for (st, r, dt), (es, ed) in edges.items():
-        data[st, r, dt].edge_index = torch.stack([
-            torch.from_numpy(es), torch.from_numpy(ed)
-        ])
+        data[st, r, dt].edge_index = torch.stack([torch.from_numpy(es), torch.from_numpy(ed)])
 
     sampler = NeighborSampler(data, num_neighbors=NumNeighbors(HETERO_FANOUT))
 
     rng = np.random.default_rng(99)
     iters = scale["iters"]
-    seeds = [torch.from_numpy(rng.integers(0, u, batch_size).astype(np.int64)) for _ in range(iters + 15)]
+    seeds = [
+        torch.from_numpy(rng.integers(0, u, batch_size).astype(np.int64)) for _ in range(iters + 15)
+    ]
     idx = [0]
 
     # Verify PyG is actually sampling (not returning empty)
-    test_inp = NodeSamplerInput(
-        input_id=torch.arange(batch_size), node=seeds[0], input_type="user"
-    )
+    test_inp = NodeSamplerInput(input_id=torch.arange(batch_size), node=seeds[0], input_type="user")
     test_out = sampler.sample_from_nodes(test_inp)
-    total_nodes = sum(v.numel() for v in test_out.node.values()) if isinstance(test_out.node, dict) else test_out.node.numel()
+    total_nodes = (
+        sum(v.numel() for v in test_out.node.values())
+        if isinstance(test_out.node, dict)
+        else test_out.node.numel()
+    )
     if total_nodes <= batch_size:
         raise RuntimeError(
             f"PyG hetero sampler returned only {total_nodes} nodes for {batch_size} seeds — "
             "sampling backend may not be working. Check pyg-lib installation."
         )
 
-    def run():
+    def run() -> None:
         inp = NodeSamplerInput(
             input_id=torch.arange(batch_size), node=seeds[idx[0]], input_type="user"
         )

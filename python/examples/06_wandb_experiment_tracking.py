@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Annotated, cast
 
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn.functional as F
 import typer
@@ -37,7 +38,7 @@ import wandb
 from pydantic import BaseModel
 from rich.console import Console
 from rich.table import Table
-from torch_geometric.nn import SAGEConv  # type: ignore[import-untyped]
+from torch_geometric.nn import SAGEConv
 
 from aethergraph import Graph
 from aethergraph.pytorch import NeighborLoader
@@ -51,7 +52,7 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 
-class TrainConfig(BaseModel):
+class TrainConfig(BaseModel):  # type: ignore[misc]
     """Training hyperparameters — logged to W&B as run config."""
 
     num_nodes: int = 10_000
@@ -66,7 +67,7 @@ class TrainConfig(BaseModel):
     sampler: str = "aethergraph"
 
 
-class EpochMetrics(BaseModel):
+class EpochMetrics(BaseModel):  # type: ignore[misc]
     """Per-epoch metrics — logged to W&B after each epoch."""
 
     epoch: int
@@ -79,7 +80,7 @@ class EpochMetrics(BaseModel):
     sampling_prefetch_hit_rate: float
 
 
-class CheckpointPayload(BaseModel):
+class CheckpointPayload(BaseModel):  # type: ignore[misc]
     """Model checkpoint metadata — saved alongside state dict."""
 
     config: TrainConfig
@@ -111,8 +112,11 @@ class GraphSAGE(torch.nn.Module):
 
 
 def build_synthetic_graph(
-    num_nodes: int, avg_degree: int, feature_dim: int, num_classes: int,
-) -> tuple[Graph, torch.Tensor]:
+    num_nodes: int,
+    avg_degree: int,
+    feature_dim: int,
+    num_classes: int,
+) -> tuple[Graph, npt.NDArray[np.float32], torch.Tensor]:
     """Build a synthetic power-law graph with random features and labels."""
     rng = np.random.default_rng(42)
     edges = []
@@ -135,10 +139,10 @@ def build_synthetic_graph(
     graph = Graph.load(path)
     Path(path).unlink()
 
-    graph.features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
+    features = rng.standard_normal((num_nodes, feature_dim)).astype(np.float32)
     labels = torch.from_numpy(rng.integers(0, num_classes, num_nodes)).long()
 
-    return graph, labels
+    return graph, features, labels
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +182,11 @@ def train(
     console.print(f"Device: {device} | W&B run: {run.name}")
 
     # Build graph
-    graph, labels = build_synthetic_graph(
-        config.num_nodes, avg_degree=20,
-        feature_dim=config.feature_dim, num_classes=config.num_classes,
+    graph, features, labels = build_synthetic_graph(
+        config.num_nodes,
+        avg_degree=20,
+        feature_dim=config.feature_dim,
+        num_classes=config.num_classes,
     )
     wandb.log({"graph/num_nodes": graph.num_nodes, "graph/num_edges": graph.num_edges})
     console.print(f"Graph: {graph.num_nodes:,} nodes, {graph.num_edges:,} edges")
@@ -193,12 +199,20 @@ def train(
     val_idx = np.sort(perm[split:]).astype(np.int64)
 
     train_loader = NeighborLoader(
-        graph, num_neighbors=config.num_neighbors, input_nodes=train_idx,
-        batch_size=config.batch_size, shuffle=True,
+        graph,
+        num_neighbors=config.num_neighbors,
+        input_nodes=train_idx,
+        batch_size=config.batch_size,
+        shuffle=True,
+        features=features,
     )
     val_loader = NeighborLoader(
-        graph, num_neighbors=config.num_neighbors, input_nodes=val_idx,
-        batch_size=config.batch_size, shuffle=False,
+        graph,
+        num_neighbors=config.num_neighbors,
+        input_nodes=val_idx,
+        batch_size=config.batch_size,
+        shuffle=False,
+        features=features,
     )
 
     model = GraphSAGE(config.feature_dim, config.hidden_dim, config.num_classes).to(device)
@@ -271,16 +285,18 @@ def train(
         )
         last_metrics = m
 
-        wandb.log({
-            "epoch": m.epoch,
-            "train/loss": m.train_loss,
-            "train/epoch_time_s": m.epoch_time_s,
-            "train/batches": m.num_batches,
-            "val/accuracy": m.val_accuracy,
-            "sampling/throughput_batches_per_sec": m.sampling_throughput_batches_per_sec,
-            "sampling/avg_batch_ms": m.sampling_avg_batch_ms,
-            "sampling/prefetch_hit_rate": m.sampling_prefetch_hit_rate,
-        })
+        wandb.log(
+            {
+                "epoch": m.epoch,
+                "train/loss": m.train_loss,
+                "train/epoch_time_s": m.epoch_time_s,
+                "train/batches": m.num_batches,
+                "val/accuracy": m.val_accuracy,
+                "sampling/throughput_batches_per_sec": m.sampling_throughput_batches_per_sec,
+                "sampling/avg_batch_ms": m.sampling_avg_batch_ms,
+                "sampling/prefetch_hit_rate": m.sampling_prefetch_hit_rate,
+            }
+        )
 
         table.add_row(
             str(m.epoch),
@@ -301,11 +317,14 @@ def train(
         final_val_accuracy=last_metrics.val_accuracy if last_metrics else 0.0,
         total_epochs=config.epochs,
     )
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "metadata": meta.model_dump(),
-    }, checkpoint_path)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "metadata": meta.model_dump(),
+        },
+        checkpoint_path,
+    )
 
     artifact = wandb.Artifact("graphsage-model", type="model")
     artifact.add_file(str(checkpoint_path))

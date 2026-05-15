@@ -97,7 +97,37 @@ impl RdmaFeatureClient {
         node_ids: &[u32],
         epoch_version: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        assert!(node_ids.len() <= self.buffer.max_batch_size());
+        if node_ids.len() > self.buffer.max_batch_size() {
+            return Err(format!(
+                "node_ids.len() {} exceeds buffer.max_batch_size() {}",
+                node_ids.len(),
+                self.buffer.max_batch_size()
+            )
+            .into());
+        }
+        // QP send-queue rate limit: a single `post_reads` chain posts one
+        // WR per node and signals only the last one. The QP's
+        // `max_send_wr` is `DEFAULT_QP_CAP.max_send_wr` (4096); posting
+        // more would overflow with `ENOMEM`. Reject upfront so the
+        // failure mode is observable, not silent. For batches larger
+        // than this cap, the caller should chunk OR construct the
+        // client with a deeper QP cap via `RdmaQp::create_with_cqs` and
+        // a custom `IbvQpCap`.
+        //
+        // TODO(perf): support streaming posts — post N, drain N
+        // completions via `signal_every_n`, post next N. Requires
+        // bookkeeping that splits `post_and_wait` into post + drain
+        // primitives and tracks the inflight wr_id window.
+        const MAX_INFLIGHT_WR: usize = crate::rdma::qp::DEFAULT_QP_CAP.max_send_wr as usize;
+        if node_ids.len() > MAX_INFLIGHT_WR {
+            return Err(format!(
+                "node_ids.len() {} exceeds QP max_send_wr {}; chunk the batch or \
+                 build the QP with a deeper send queue",
+                node_ids.len(),
+                MAX_INFLIGHT_WR,
+            )
+            .into());
+        }
 
         let batch_size = node_ids.len();
         let lkey = self.buffer.lkey();

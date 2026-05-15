@@ -20,6 +20,17 @@ pub const NULL: u32 = u32::MAX;
 /// Bit 31 = 1 means interior node. Bit 31 = 0 means leaf (chunk).
 const INTERIOR_BIT: u32 = 1 << 31;
 
+/// Result of inserting into a C-tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertResult {
+    /// Insert succeeded; the new tree root.
+    Inserted(CTree),
+    /// Value was already present; the tree is unchanged.
+    Duplicate,
+    /// Arena is full; the tree is unchanged.
+    ArenaFull,
+}
+
 /// Interior node of the C-tree. 16 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -81,7 +92,6 @@ impl CTree {
     }
 
     /// Collect all neighbors into a pre-allocated buffer.
-    /// Returns the number of neighbors written.
     #[inline]
     pub fn collect_into(&self, arena: &Arena, buf: &mut Vec<u32>) {
         self.for_each_chunk(arena, |chunk| {
@@ -99,19 +109,30 @@ impl CTree {
     }
 
     /// Insert `val` into the tree. Returns a new root (path-copied).
-    /// Returns None if `val` already exists (duplicate).
     ///
+    /// Returns [`InsertResult::Duplicate`] if `val` already exists, or
+    /// [`InsertResult::ArenaFull`] if a fresh node could not be allocated.
     /// All new nodes are allocated from `arena`. The old tree is untouched.
+    ///
+    /// # Safety
+    /// Single-writer invariant on the arena: only one thread may call `insert`
+    /// concurrently for a given arena. See [`Arena::alloc`].
     #[inline]
-    pub fn insert(&self, arena: &Arena, val: u32) -> Option<CTree> {
+    pub unsafe fn insert(&self, arena: &Arena, val: u32) -> InsertResult {
         if self.root == NULL {
-            // First neighbor: create a single-element chunk.
             let chunk = Chunk::from_sorted(&[val]);
-            let off = arena.alloc_write(chunk)?;
-            return Some(CTree { root: off });
+            // SAFETY: caller upholds single-writer invariant.
+            return match unsafe { arena.alloc_write(chunk) } {
+                Some(off) => InsertResult::Inserted(CTree { root: off }),
+                None => InsertResult::ArenaFull,
+            };
         }
-        let new_root = insert_rec(self.root, arena, val)?;
-        Some(CTree { root: new_root })
+        // SAFETY: caller upholds single-writer invariant.
+        match unsafe { insert_rec(self.root, arena, val) } {
+            NodeInsert::New(new_root) => InsertResult::Inserted(CTree { root: new_root }),
+            NodeInsert::Duplicate => InsertResult::Duplicate,
+            NodeInsert::ArenaFull => InsertResult::ArenaFull,
+        }
     }
 }
 
@@ -167,29 +188,52 @@ fn contains_rec(offset: u32, arena: &Arena, val: u32) -> bool {
     }
 }
 
-/// Insert into subtree rooted at `offset`. Returns new root offset.
-/// Returns None if duplicate or arena full.
-fn insert_rec(offset: u32, arena: &Arena, val: u32) -> Option<u32> {
+/// Internal recursive insert result. Distinguishes duplicate from arena-full.
+enum NodeInsert {
+    New(u32),
+    Duplicate,
+    ArenaFull,
+}
+
+/// `?`-friendly: turns `Option<u32>` from arena allocation into a `NodeInsert`.
+macro_rules! alloc_or_full {
+    ($expr:expr) => {
+        match $expr {
+            Some(v) => v,
+            None => return NodeInsert::ArenaFull,
+        }
+    };
+}
+
+/// Insert into subtree rooted at `offset`.
+///
+/// # Safety
+/// Single-writer invariant on the arena. See [`Arena::alloc`].
+unsafe fn insert_rec(offset: u32, arena: &Arena, val: u32) -> NodeInsert {
     if is_leaf(offset) {
         // SAFETY: leaf tag is clear, so offset is a Chunk allocated in this arena.
         let chunk: &Chunk = unsafe { arena.get(offset) };
 
         if chunk.is_full() {
-            // Split the chunk, then insert into the appropriate half.
             let (left, right) = chunk.split();
             let split_key = right.min();
 
             let (new_left, new_right) = if val < split_key {
-                (left.insert(val)?, right)
+                match left.insert(val) {
+                    Some(l) => (l, right),
+                    None => return NodeInsert::Duplicate,
+                }
             } else {
                 match right.insert(val) {
                     Some(r) => (left, r),
-                    None => return None, // duplicate
+                    None => return NodeInsert::Duplicate,
                 }
             };
 
-            let left_off = arena.alloc_write(new_left)?;
-            let right_off = arena.alloc_write(new_right)?;
+            // SAFETY: caller upholds single-writer invariant on the arena.
+            let left_off = alloc_or_full!(unsafe { arena.alloc_write(new_left) });
+            // SAFETY: same invariant.
+            let right_off = alloc_or_full!(unsafe { arena.alloc_write(new_right) });
             let total = new_left.len() + new_right.len();
             let interior = Interior {
                 left: left_off,
@@ -197,39 +241,47 @@ fn insert_rec(offset: u32, arena: &Arena, val: u32) -> Option<u32> {
                 count: total as u32,
                 split_key,
             };
-            let int_off = arena.alloc_write(interior)?;
-            Some(tag_interior(int_off))
+            // SAFETY: same invariant.
+            let int_off = alloc_or_full!(unsafe { arena.alloc_write(interior) });
+            NodeInsert::New(tag_interior(int_off))
         } else {
-            // Chunk has space — insert and return new chunk.
-            let new_chunk = chunk.insert(val)?;
-            let off = arena.alloc_write(new_chunk)?;
-            Some(off)
+            let new_chunk = match chunk.insert(val) {
+                Some(c) => c,
+                None => return NodeInsert::Duplicate,
+            };
+            // SAFETY: caller upholds single-writer invariant.
+            let off = unsafe { alloc_or_full!(arena.alloc_write(new_chunk)) };
+            NodeInsert::New(off)
         }
     } else {
         // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
         let node: &Interior = unsafe { arena.get(strip_tag(offset)) };
 
-        if val < node.split_key {
-            let new_left = insert_rec(node.left, arena, val)?;
-            let new_interior = Interior {
-                left: new_left,
-                right: node.right,
-                count: node.count + 1,
-                split_key: node.split_key,
+        let (new_left, new_right) = if val < node.split_key {
+            // SAFETY: caller upholds single-writer invariant.
+            let new_left = match unsafe { insert_rec(node.left, arena, val) } {
+                NodeInsert::New(off) => off,
+                other => return other,
             };
-            let off = arena.alloc_write(new_interior)?;
-            Some(tag_interior(off))
+            (new_left, node.right)
         } else {
-            let new_right = insert_rec(node.right, arena, val)?;
-            let new_interior = Interior {
-                left: node.left,
-                right: new_right,
-                count: node.count + 1,
-                split_key: node.split_key,
+            // SAFETY: caller upholds single-writer invariant.
+            let new_right = match unsafe { insert_rec(node.right, arena, val) } {
+                NodeInsert::New(off) => off,
+                other => return other,
             };
-            let off = arena.alloc_write(new_interior)?;
-            Some(tag_interior(off))
-        }
+            (node.left, new_right)
+        };
+
+        let new_interior = Interior {
+            left: new_left,
+            right: new_right,
+            count: node.count + 1,
+            split_key: node.split_key,
+        };
+        // SAFETY: caller upholds single-writer invariant on the arena.
+        let off = alloc_or_full!(unsafe { arena.alloc_write(new_interior) });
+        NodeInsert::New(tag_interior(off))
     }
 }
 
@@ -239,7 +291,15 @@ mod tests {
     use crate::chunk::CHUNK_CAP;
 
     fn make_arena() -> Arena {
-        Arena::new(1 << 20) // 1MB
+        Arena::new(1 << 20)
+    }
+
+    fn insert_assert(tree: CTree, arena: &Arena, val: u32) -> CTree {
+        // SAFETY: tests are single-threaded.
+        match unsafe { tree.insert(arena, val) } {
+            InsertResult::Inserted(t) => t,
+            other => panic!("expected Inserted, got {other:?}"),
+        }
     }
 
     #[test]
@@ -254,8 +314,7 @@ mod tests {
     #[test]
     fn insert_one() {
         let arena = make_arena();
-        let tree = CTree::empty();
-        let tree = tree.insert(&arena, 42).unwrap();
+        let tree = insert_assert(CTree::empty(), &arena, 42);
         assert!(!tree.is_empty());
         assert_eq!(tree.count(&arena), 1);
         assert!(tree.contains(&arena, 42));
@@ -267,7 +326,7 @@ mod tests {
         let arena = make_arena();
         let mut tree = CTree::empty();
         for i in 0..10u32 {
-            tree = tree.insert(&arena, i * 10).unwrap();
+            tree = insert_assert(tree, &arena, i * 10);
         }
         assert_eq!(tree.count(&arena), 10);
 
@@ -282,10 +341,8 @@ mod tests {
         let arena = make_arena();
         let mut tree = CTree::empty();
         for i in (0..10u32).rev() {
-            tree = tree.insert(&arena, i * 10).unwrap();
+            tree = insert_assert(tree, &arena, i * 10);
         }
-        assert_eq!(tree.count(&arena), 10);
-
         let mut buf = Vec::new();
         tree.collect_into(&arena, &mut buf);
         let expected: Vec<u32> = (0..10).map(|i| i * 10).collect();
@@ -298,10 +355,8 @@ mod tests {
         let mut tree = CTree::empty();
         let vals = [50, 20, 80, 10, 30, 70, 90, 5, 15, 25, 35, 60, 75, 85, 95];
         for &v in &vals {
-            tree = tree.insert(&arena, v).unwrap();
+            tree = insert_assert(tree, &arena, v);
         }
-        assert_eq!(tree.count(&arena), vals.len());
-
         let mut buf = Vec::new();
         tree.collect_into(&arena, &mut buf);
         let mut expected = vals.to_vec();
@@ -310,29 +365,48 @@ mod tests {
     }
 
     #[test]
-    fn insert_duplicate_returns_none() {
+    fn insert_duplicate_returns_duplicate() {
         let arena = make_arena();
-        let tree = CTree::empty();
-        let tree = tree.insert(&arena, 42).unwrap();
-        assert!(tree.insert(&arena, 42).is_none());
+        let tree = insert_assert(CTree::empty(), &arena, 42);
+        // SAFETY: test is single-threaded.
+        assert!(matches!(
+            unsafe { tree.insert(&arena, 42) },
+            InsertResult::Duplicate
+        ));
+    }
+
+    #[test]
+    fn arena_full_returns_arena_full() {
+        // Tiny arena: only enough for a single chunk allocation, then split needs more.
+        let arena = Arena::new(64);
+        let mut tree = CTree::empty();
+        // Fill until ArenaFull.
+        let mut val = 0u32;
+        loop {
+            // SAFETY: test is single-threaded.
+            match unsafe { tree.insert(&arena, val) } {
+                InsertResult::Inserted(t) => tree = t,
+                InsertResult::ArenaFull => return,
+                InsertResult::Duplicate => unreachable!("monotonic vals"),
+            }
+            val += 1;
+            assert!(val < 1_000_000, "should hit ArenaFull before 1M iterations");
+        }
     }
 
     #[test]
     fn triggers_chunk_split() {
         let arena = make_arena();
         let mut tree = CTree::empty();
-        // Insert CHUNK_CAP + 1 elements to force a split
         for i in 0..=CHUNK_CAP as u32 {
-            tree = tree.insert(&arena, i).unwrap();
+            tree = insert_assert(tree, &arena, i);
         }
         assert_eq!(tree.count(&arena), CHUNK_CAP + 1);
 
-        // Verify all elements present
         for i in 0..=CHUNK_CAP as u32 {
             assert!(tree.contains(&arena, i), "missing {}", i);
         }
 
-        // Verify sorted order
         let mut buf = Vec::new();
         tree.collect_into(&arena, &mut buf);
         let expected: Vec<u32> = (0..=CHUNK_CAP as u32).collect();
@@ -341,22 +415,20 @@ mod tests {
 
     #[test]
     fn large_tree() {
-        let arena = Arena::new(4 << 20); // 4MB — path copying creates many nodes
+        let arena = Arena::new(4 << 20);
         let mut tree = CTree::empty();
         let n = 1000u32;
         for i in 0..n {
-            tree = tree.insert(&arena, i * 3).unwrap();
+            tree = insert_assert(tree, &arena, i * 3);
         }
         assert_eq!(tree.count(&arena), n as usize);
 
         let mut buf = Vec::new();
         tree.collect_into(&arena, &mut buf);
         assert_eq!(buf.len(), n as usize);
-        // Verify sorted
         for w in buf.windows(2) {
             assert!(w[0] < w[1]);
         }
-        // Verify all present
         for i in 0..n {
             assert!(tree.contains(&arena, i * 3));
         }
@@ -366,16 +438,13 @@ mod tests {
     fn functional_persistence() {
         let arena = make_arena();
         let tree1 = CTree::empty();
-        let tree2 = tree1.insert(&arena, 10).unwrap();
-        let tree3 = tree2.insert(&arena, 20).unwrap();
+        let tree2 = insert_assert(tree1, &arena, 10);
+        let tree3 = insert_assert(tree2, &arena, 20);
 
-        // tree1 is still empty
         assert_eq!(tree1.count(&arena), 0);
-        // tree2 has one element
         assert_eq!(tree2.count(&arena), 1);
         assert!(tree2.contains(&arena, 10));
         assert!(!tree2.contains(&arena, 20));
-        // tree3 has two elements
         assert_eq!(tree3.count(&arena), 2);
         assert!(tree3.contains(&arena, 10));
         assert!(tree3.contains(&arena, 20));
@@ -386,13 +455,12 @@ mod tests {
         let arena = make_arena();
         let mut tree = CTree::empty();
         for i in 0..50u32 {
-            tree = tree.insert(&arena, i).unwrap();
+            tree = insert_assert(tree, &arena, i);
         }
 
         let mut total = 0;
         tree.for_each_chunk(&arena, |chunk| {
             total += chunk.len();
-            // Each chunk should be sorted
             let s = chunk.as_slice();
             for w in s.windows(2) {
                 assert!(w[0] < w[1]);

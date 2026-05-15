@@ -9,9 +9,12 @@ Example:
     >>> from aethergraph.pytorch import NeighborLoader
     >>>
     >>> graph = Graph.load("graph.bin")
-    >>> graph.load_features("features.bin")
-    >>>
-    >>> loader = NeighborLoader(graph, num_neighbors=[15, 10], batch_size=128)
+    >>> loader = NeighborLoader(
+    ...     graph,
+    ...     num_neighbors=[15, 10],
+    ...     batch_size=128,
+    ...     feature_path="features.bin",
+    ... )
     >>> for data in loader:
     ...     out = model(data.x, data.edge_index)
 """
@@ -20,7 +23,9 @@ from aethergraph._core import (
     ArrowConversionError,
     CacheError,
     GraphLoadError,
+    MetricsSnapshot,
     SamplingError,
+    save_features,
     __version__,
 )
 from aethergraph.dynamic_graph import DynamicGraph
@@ -38,11 +43,13 @@ __all__ = [
     "DynamicGraph",
     "Graph",
     "HeteroGraph",
+    "MetricsSnapshot",
     "Sampler",
     "NeighborSampler",  # PyG-compatible alias
     "SamplingConfig",
     "SampledSubgraph",
     "ParallelBatchSampler",
+    "save_features",
     "__version__",
     "GraphLoadError",
     "SamplingError",

@@ -29,7 +29,7 @@ __all__ = [
     "SamplingError",
 ]
 
-SeedInput = Sequence[int] | npt.NDArray[np.integer[Any]]
+SeedInput = Sequence[int] | npt.NDArray[np.int64] | npt.NDArray[np.uint32]
 
 
 @dataclass
@@ -49,12 +49,18 @@ class SamplingConfig:
         subgraph_type: Type of subgraph to extract.
             Must be one of {"directional", "induced", "bidirectional"}.
         track_edge_ids: Whether to track original edge IDs in sampled subgraph.
+        temporal_strategy: ``"uniform"`` or ``"last"`` to enable temporal
+            sampling; ``None`` disables it. Requires `Graph.set_timestamps`.
+        disjoint: When ``True``, each seed produces its own isolated subgraph
+            (no node dedup across seeds). The returned subgraph carries a
+            ``batch`` vector mapping each node to its seed index.
 
     Example:
         >>> config = SamplingConfig(num_neighbors=[25, 10], replace=False)
         >>> config = SamplingConfig(num_neighbors=[15, 10, 5], replace=True, seed=42)
         >>> config = SamplingConfig(num_neighbors=[25, 10], max_degree=10000)
         >>> config = SamplingConfig(num_neighbors=[25, 10], cumulative=False)
+        >>> config = SamplingConfig(num_neighbors=[25, 10], disjoint=True)
     """
 
     num_neighbors: list[int]
@@ -65,6 +71,8 @@ class SamplingConfig:
     weighted: bool = False
     subgraph_type: str = "directional"
     track_edge_ids: bool = True
+    temporal_strategy: str | None = None
+    disjoint: bool = False
 
     def __post_init__(self) -> None:
         """Validate configuration parameters.
@@ -84,6 +92,14 @@ class SamplingConfig:
                 "subgraph_type must be one of {'directional', 'induced', 'bidirectional'}, "
                 f"got '{self.subgraph_type}'"
             )
+        if self.temporal_strategy is not None and self.temporal_strategy not in {
+            "uniform",
+            "last",
+        }:
+            raise ValueError(
+                "temporal_strategy must be 'uniform', 'last', or None, "
+                f"got '{self.temporal_strategy}'"
+            )
 
     def _to_rust(self) -> _SamplingConfig:
         """Convert to Rust SamplingConfig.
@@ -100,17 +116,18 @@ class SamplingConfig:
             weighted=self.weighted,
             subgraph_type=self.subgraph_type,
             track_edge_ids=self.track_edge_ids,
+            temporal_strategy=self.temporal_strategy,
+            disjoint=self.disjoint,
         )
 
 
 class SampledSubgraph:
     """A sampled subgraph containing nodes and edges.
 
-    This is a lightweight wrapper around the Rust SampledSubgraph that provides
-    convenient access to the sampled data.
-
-    Attributes:
-        _inner: The underlying Rust SampledSubgraph instance.
+    Thin typed wrapper around the Rust SampledSubgraph; every data accessor is
+    a property that forwards to the underlying Rust getter. The Rust class is
+    also accessible directly via `aethergraph._core.SampledSubgraph` for code
+    that prefers to avoid the wrapper.
 
     Example:
         >>> sampler = Sampler(graph, SamplingConfig(num_neighbors=[10, 5]))
@@ -122,100 +139,86 @@ class SampledSubgraph:
     _inner: _SampledSubgraph
 
     def __init__(self, inner: _SampledSubgraph) -> None:
-        """Initialize a SampledSubgraph from a Rust SampledSubgraph.
-
-        Args:
-            inner: The underlying Rust SampledSubgraph instance.
-        """
         self._inner = inner
 
     @property
     def num_nodes(self) -> int:
-        """Number of nodes in the subgraph."""
-        return self._inner.num_nodes()
+        """Number of unique nodes in the subgraph."""
+        return self._inner.num_nodes
 
     @property
     def num_edges(self) -> int:
         """Number of edges in the subgraph."""
-        return self._inner.num_edges()
+        return self._inner.num_edges
 
     @property
     def num_seeds(self) -> int:
-        """Number of seed nodes."""
-        return self._inner.num_seeds()
+        """Number of seed nodes used to produce this subgraph."""
+        return self._inner.num_seeds
 
     @property
-    def nodes(self) -> npt.NDArray[np.uint32]:
-        """All node IDs in the subgraph (sorted).
-
-        Returns:
-            Numpy array of node IDs with dtype=uint32.
-        """
-        return self._inner.nodes()
+    def nodes(self) -> npt.NDArray[np.int64]:
+        """All node IDs (dtype=int64 to match PyTorch's index dtype)."""
+        return self._inner.nodes
 
     @property
-    def seeds(self) -> npt.NDArray[np.uint32]:
-        """Original seed node IDs.
-
-        Returns:
-            Numpy array of seed node IDs with dtype=uint32.
-        """
-        return self._inner.seeds()
+    def seeds(self) -> npt.NDArray[np.int64]:
+        """Seed node IDs (dtype=int64)."""
+        return self._inner.seeds
 
     @property
     def edge_index(self) -> npt.NDArray[np.int64]:
-        """Edge index in PyTorch Geometric COO format with global node IDs.
-
-        Returns:
-            Numpy array with shape [2, num_edges] and dtype=int64.
-            Row 0 contains source node IDs (global).
-            Row 1 contains destination node IDs (global).
-        """
-        return self._inner.edge_index()
+        """Edge index `[2, num_edges]` with global node IDs (dtype=int64)."""
+        return self._inner.edge_index
 
     @property
     def edge_index_local(self) -> npt.NDArray[np.int64]:
-        """Edge index with local (remapped) node IDs in [0, num_nodes).
+        """Edge index `[2, num_edges]` with local IDs in `[0, num_nodes)` (dtype=int64)."""
+        return self._inner.edge_index_local
 
-        Local IDs are pre-computed in Rust using O(E log N) binary search,
-        avoiding Python dict/list overhead.
+    @property
+    def edge_ids(self) -> npt.NDArray[np.int64]:
+        """Global edge IDs (positions in the CSR edges array, dtype=int64)."""
+        return self._inner.edge_ids
 
-        Returns:
-            Numpy array with shape [2, num_edges] and dtype=int64.
-            Row 0 contains source node IDs (local, 0-indexed).
-            Row 1 contains destination node IDs (local, 0-indexed).
-        """
-        return self._inner.edge_index_local()
+    @property
+    def seed_indices(self) -> npt.NDArray[np.int64]:
+        """Indices of seeds inside `nodes` (dtype=int64)."""
+        return self._inner.seed_indices
+
+    @property
+    def batch(self) -> npt.NDArray[np.int64] | None:
+        """Per-node seed index (disjoint mode only), else `None`."""
+        return self._inner.batch
+
+    @property
+    def num_sampled_nodes_per_hop(self) -> list[int]:
+        """PyG-compatible: new nodes added at each hop."""
+        return self._inner.num_sampled_nodes_per_hop
+
+    @property
+    def num_sampled_edges_per_hop(self) -> list[int]:
+        """PyG-compatible: edges added at each hop."""
+        return self._inner.num_sampled_edges_per_hop
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary representation.
-
-        Returns:
-            Dictionary containing num_nodes, num_edges, nodes, seeds, and
-            edge_index keys.
-        """
+        """Dictionary view: `{num_nodes, num_edges, nodes, seeds, edge_index}`."""
         return self._inner.to_dict()
 
     def to_arrow(self) -> Any:
-        """Convert to Apache Arrow RecordBatch for zero-copy data transfer.
+        """Convert to PyArrow `RecordBatch`es.
 
-        Requires pyarrow to be installed.
+        Returns a `dict[str, pyarrow.RecordBatch]` with keys `"edges"`
+        (length E, columns `edge_src` / `edge_dst` / `edge_id`), `"nodes"`
+        (length N, column `nodes`), and `"seeds"` (length S, column `seeds`).
+        Three batches rather than one because Arrow `RecordBatch` requires
+        equal-length columns.
 
-        Returns:
-            pyarrow.RecordBatch with columns edge_src (source node IDs),
-            edge_dst (destination node IDs), and nodes (all node IDs in
-            subgraph).
-
-        Example:
-            >>> import pyarrow as pa
-            >>> subgraph = sampler.sample([0, 1, 2])
-            >>> batch = subgraph.to_arrow()
-            >>> print(batch.schema)
+        Requires pyarrow.
         """
         return self._inner.to_arrow()
 
     def __repr__(self) -> str:
-        """Return string representation of the subgraph."""
         return (
             f"SampledSubgraph(num_nodes={self.num_nodes}, "
             f"num_edges={self.num_edges}, "
@@ -223,11 +226,11 @@ class SampledSubgraph:
         )
 
     def __str__(self) -> str:
-        """Return short string description of the subgraph."""
-        return (
-            f"Subgraph with {self.num_nodes:,} nodes, "
-            f"{self.num_edges:,} edges (from {self.num_seeds} seeds)"
-        )
+        return self.__repr__()
+
+    def __len__(self) -> int:
+        """`len(subgraph)` returns the node count (matches PyG convention)."""
+        return self.num_nodes
 
 
 class Sampler:
@@ -271,15 +274,24 @@ class Sampler:
         self.graph = graph
         self.config = config
         self._inner = _NeighborSampler(
-            graph._rust_graph,
+            graph,
             config._to_rust(),
         )
 
-    def sample(self, seeds: SeedInput) -> SampledSubgraph:
+    def sample(
+        self,
+        seeds: SeedInput,
+        input_times: npt.NDArray[np.float64] | None = None,
+    ) -> SampledSubgraph:
         """Sample k-hop neighborhoods for a batch of seed nodes.
 
         Args:
-            seeds: List of seed node IDs to sample from.
+            seeds: Seed node IDs. Accepts numpy `uint32` arrays (zero-copy),
+                numpy `int64` arrays (range-checked widening), or any Python
+                sequence of ints. Dispatch happens at the FFI boundary, not
+                here.
+            input_times: Per-seed timestamps (`float64`), required when
+                `config.temporal_strategy` is set.
 
         Returns:
             SampledSubgraph containing the sampled nodes and edges.
@@ -289,8 +301,7 @@ class Sampler:
             >>> subgraph = sampler.sample([0, 1, 2, 3])
             >>> print(f"Sampled {subgraph.num_nodes} nodes from 4 seeds")
         """
-        seed_list = seeds.tolist() if isinstance(seeds, np.ndarray) else list(seeds)
-        rust_subgraph = self._inner.sample(seed_list)
+        rust_subgraph = self._inner.sample(seeds, input_times=input_times)
         return SampledSubgraph(rust_subgraph)
 
     def __repr__(self) -> str:
@@ -338,7 +349,7 @@ class ParallelBatchSampler:
         self.graph = graph
         self.config = config
         self._inner = _ParallelBatchSampler(
-            graph._rust_graph,
+            graph,
             config._to_rust(),
         )
 

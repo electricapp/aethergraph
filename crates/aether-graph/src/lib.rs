@@ -14,10 +14,14 @@ mod embedding_cache;
 mod graph;
 mod historical;
 pub mod ingest;
+#[cfg(feature = "wal")]
+pub mod wal;
 
 pub use arena::Arena;
 pub use chunk::Chunk;
-pub use ctree::CTree;
+pub use ctree::{CTree, InsertResult};
 pub use embedding_cache::EmbeddingCache;
-pub use graph::{ArenaFull, DynamicGraph};
+pub use graph::{ArenaFull, DynamicGraph, Writer, WriterError};
 pub use historical::{HistoricalBatch, HistoricalSampler};
+#[cfg(feature = "wal")]
+pub use wal::{EdgeRecord, ReplayOutcome, WalError, WalWriter, replay as replay_wal};

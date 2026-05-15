@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -433,3 +434,49 @@ class TestNeighborLoaderWithDynamicGraph:
         # (since node 0 now has degree 29 instead of 9)
         # We verify that iteration works and the loader didn't error out.
         assert batches_2[0].num_nodes > 0
+
+
+class TestWalDurability:
+    """WAL-backed DynamicGraph: open, append, replay round-trip."""
+
+    def test_open_creates_fresh_wal(self, tmp_path: Path) -> None:
+        """A fresh WAL path produces an empty graph at epoch 0."""
+        wal = tmp_path / "graph.wal"
+        g = DynamicGraph.open_with_wal(wal, num_vertices=100)
+        assert g.num_vertices == 100
+        assert g.num_edges == 0
+        assert g.current_epoch == 0
+        assert wal.exists(), "WAL header is written on open"
+
+    def test_inserts_replay_after_reopen(self, tmp_path: Path) -> None:
+        """Edges inserted before close are recovered on the next open."""
+        wal = tmp_path / "graph.wal"
+        g = DynamicGraph.open_with_wal(wal, num_vertices=100)
+        for src, dst in [(0, 1), (0, 2), (3, 7)]:
+            g.insert_edge(src, dst)
+        del g
+
+        g2 = DynamicGraph.open_with_wal(wal, num_vertices=100)
+        assert g2.num_edges == 3
+        assert g2.has_edge(0, 1)
+        assert g2.has_edge(0, 2)
+        assert g2.has_edge(3, 7)
+        assert not g2.has_edge(1, 0)
+        # Three writer-guard commits during replay → epoch advances three times.
+        assert g2.current_epoch == 3
+
+    def test_current_epoch_advances_on_commit(self, tmp_path: Path) -> None:
+        """Each writer-guard close (one per `insert_edge`) bumps the epoch."""
+        wal = tmp_path / "graph.wal"
+        g = DynamicGraph.open_with_wal(wal, num_vertices=10)
+        start = g.current_epoch
+        g.insert_edge(0, 1)
+        g.insert_edge(0, 2)
+        assert g.current_epoch == start + 2
+
+    def test_bad_magic_raises_value_error(self, tmp_path: Path) -> None:
+        """Existing file without WAL magic surfaces as ValueError."""
+        wal = tmp_path / "graph.wal"
+        wal.write_bytes(b"NOT_A_WAL_FILE\0\0\0\0\0\0\0\0\0\0\0\0")
+        with pytest.raises(ValueError, match="bad magic"):
+            DynamicGraph.open_with_wal(wal, num_vertices=10)

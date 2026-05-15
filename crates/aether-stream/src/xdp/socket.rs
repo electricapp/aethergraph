@@ -90,7 +90,12 @@ impl XdpSocket {
         queue_id: u32,
         bind_flags: u16,
     ) -> std::io::Result<Self> {
-        assert!(ring_size.is_power_of_two());
+        if !ring_size.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("ring_size {ring_size} must be a power of two"),
+            ));
+        }
 
         // 1. Create socket
         let fd = libc::socket(AF_XDP, libc::SOCK_RAW, 0);

@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use aether_graph::{Arena, CTree, Chunk, DynamicGraph};
+use aether_graph::{Arena, CTree, Chunk, DynamicGraph, InsertResult};
 use proptest::prelude::*;
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
@@ -19,6 +19,18 @@ fn is_sorted_strict(s: &[u32]) -> bool {
 
 fn is_sorted_nonstrict(s: &[u32]) -> bool {
     s.windows(2).all(|w| w[0] <= w[1])
+}
+
+/// Insert into the arena via the new unsafe API. Returns the updated tree
+/// (unchanged on Duplicate or ArenaFull).
+fn ctree_insert(tree: CTree, arena: &Arena, val: u32) -> (CTree, InsertResult) {
+    // SAFETY: tests are single-threaded.
+    let result = unsafe { tree.insert(arena, val) };
+    let new_tree = match result {
+        InsertResult::Inserted(t) => t,
+        _ => tree,
+    };
+    (new_tree, result)
 }
 
 /// Proptest strategy: a sorted, deduplicated Vec<u32> with length in [0, max_len].
@@ -37,7 +49,6 @@ fn sorted_dedup_vec(max_len: usize) -> impl Strategy<Value = Vec<u32>> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
 
-    // 1. insert into a non-full chunk always produces a sorted result
     #[test]
     fn insert_maintains_sorted(
         vals in sorted_dedup_vec(CHUNK_CAP - 1),
@@ -51,7 +62,6 @@ proptest! {
         }
     }
 
-    // 2. after inserting val, chunk.contains(val) is true
     #[test]
     fn insert_then_contains(
         vals in sorted_dedup_vec(CHUNK_CAP - 1),
@@ -62,14 +72,12 @@ proptest! {
             prop_assert!(new.contains(val),
                 "contains({}) false after insert", val);
         }
-        // If insert returned None, val was already present
         if chunk.insert(val).is_none() {
             prop_assert!(chunk.contains(val),
                 "insert returned None but contains({}) is false", val);
         }
     }
 
-    // 3. split into left+right, merge back, get original elements
     #[test]
     fn split_preserves_elements(vals in sorted_dedup_vec(CHUNK_CAP)) {
         let chunk = Chunk::from_sorted(&vals);
@@ -82,23 +90,23 @@ proptest! {
             "split then merge changed elements");
     }
 
-    // 4. merging two sorted chunks produces a sorted chunk
     #[test]
-    fn merge_is_sorted(
-        a_vals in sorted_dedup_vec(7),
-        b_vals in sorted_dedup_vec(7),
-    ) {
-        let a = Chunk::from_sorted(&a_vals);
-        let b = Chunk::from_sorted(&b_vals);
-        if a.len() + b.len() > CHUNK_CAP {
-            return Ok(());
-        }
+    fn merge_is_sorted(vals in sorted_dedup_vec(CHUNK_CAP)) {
+        // `Chunk::merge` requires its two inputs to have disjoint key ranges
+        // — it's only used in production to recombine the two halves of a
+        // `split()`, which is disjoint by construction. Generate disjoint
+        // halves the same way: take a sorted/deduped vec and split at the
+        // midpoint.
+        let mid = vals.len() / 2;
+        let a = Chunk::from_sorted(&vals[..mid]);
+        let b = Chunk::from_sorted(&vals[mid..]);
         let merged = Chunk::merge(&a, &b);
         prop_assert!(is_sorted_nonstrict(merged.as_slice()),
             "merged chunk not sorted: {:?}", merged.as_slice());
+        prop_assert_eq!(merged.as_slice(), vals.as_slice(),
+            "merge of two halves did not reconstruct the original");
     }
 
-    // 5. inserting a value that exists returns None
     #[test]
     fn no_duplicates_after_insert(vals in sorted_dedup_vec(CHUNK_CAP - 1)) {
         if vals.is_empty() {
@@ -118,7 +126,6 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    // 1. inserting values in any order produces the same set of neighbors
     #[test]
     fn insert_any_order_same_result(vals in prop::collection::hash_set(0..10_000u32, 1..50)) {
         let arena1 = Arena::new(1 << 20);
@@ -130,16 +137,14 @@ proptest! {
 
         let mut tree1 = CTree::empty();
         for &v in &order1 {
-            if let Some(t) = tree1.insert(&arena1, v) {
-                tree1 = t;
-            }
+            let (t, _) = ctree_insert(tree1, &arena1, v);
+            tree1 = t;
         }
 
         let mut tree2 = CTree::empty();
         for &v in &order2 {
-            if let Some(t) = tree2.insert(&arena2, v) {
-                tree2 = t;
-            }
+            let (t, _) = ctree_insert(tree2, &arena2, v);
+            tree2 = t;
         }
 
         let mut buf1 = Vec::new();
@@ -151,7 +156,6 @@ proptest! {
             "different insertion orders produced different neighbor sets");
     }
 
-    // 2. after inserting N values, all N are found via contains()
     #[test]
     fn insert_then_contains_all(vals in prop::collection::hash_set(0..10_000u32, 0..100)) {
         let arena = Arena::new(2 << 20);
@@ -159,9 +163,8 @@ proptest! {
         let vals_vec: Vec<u32> = vals.into_iter().collect();
 
         for &v in &vals_vec {
-            if let Some(t) = tree.insert(&arena, v) {
-                tree = t;
-            }
+            let (t, _) = ctree_insert(tree, &arena, v);
+            tree = t;
         }
 
         for &v in &vals_vec {
@@ -170,7 +173,6 @@ proptest! {
         }
     }
 
-    // 3. count always equals number of unique inserts
     #[test]
     fn insert_never_loses_elements(vals in prop::collection::vec(0..5_000u32, 0..200)) {
         let arena = Arena::new(4 << 20);
@@ -178,14 +180,14 @@ proptest! {
         let mut unique = BTreeSet::new();
 
         for &v in &vals {
+            let (t, result) = ctree_insert(tree, &arena, v);
+            tree = t;
             if unique.insert(v) {
-                let t = tree.insert(&arena, v);
-                prop_assert!(t.is_some(),
-                    "insert of new value {} returned None (arena full?)", v);
-                tree = t.unwrap();
+                prop_assert!(matches!(result, InsertResult::Inserted(_)),
+                    "insert of new value {} returned {:?}", v, result);
             } else {
-                prop_assert!(tree.insert(&arena, v).is_none(),
-                    "insert of duplicate {} should return None", v);
+                prop_assert!(matches!(result, InsertResult::Duplicate),
+                    "insert of duplicate {} returned {:?}", v, result);
             }
         }
 
@@ -195,16 +197,14 @@ proptest! {
             "count mismatch: tree={}, expected={}", got, want);
     }
 
-    // 4. collecting all elements always produces a sorted list
     #[test]
     fn collect_is_sorted(vals in prop::collection::vec(0..10_000u32, 0..200)) {
         let arena = Arena::new(4 << 20);
         let mut tree = CTree::empty();
 
         for &v in &vals {
-            if let Some(t) = tree.insert(&arena, v) {
-                tree = t;
-            }
+            let (t, _) = ctree_insert(tree, &arena, v);
+            tree = t;
         }
 
         let mut buf = Vec::new();
@@ -214,8 +214,6 @@ proptest! {
             buf.windows(2).find(|w| w[0] >= w[1]));
     }
 
-    // 5. functional persistence: after inserting into tree1 to get tree2,
-    //    tree1 still has its original elements
     #[test]
     fn functional_persistence(
         phase1 in prop::collection::hash_set(0..10_000u32, 1..30),
@@ -223,32 +221,26 @@ proptest! {
     ) {
         let arena = Arena::new(2 << 20);
 
-        // Build tree1
         let mut tree1 = CTree::empty();
         for &v in &phase1 {
-            if let Some(t) = tree1.insert(&arena, v) {
-                tree1 = t;
-            }
+            let (t, _) = ctree_insert(tree1, &arena, v);
+            tree1 = t;
         }
 
         let mut snap1 = Vec::new();
         tree1.collect_into(&arena, &mut snap1);
 
-        // Build tree2 by inserting more into tree1
         let mut tree2 = tree1;
         for &v in &phase2 {
-            if let Some(t) = tree2.insert(&arena, v) {
-                tree2 = t;
-            }
+            let (t, _) = ctree_insert(tree2, &arena, v);
+            tree2 = t;
         }
 
-        // tree1 must still have its original elements (functional persistence)
         let mut snap1_after = Vec::new();
         tree1.collect_into(&arena, &mut snap1_after);
         prop_assert_eq!(&snap1, &snap1_after,
             "tree1 was mutated after inserting into tree2");
 
-        // tree2 must contain everything from both phases
         let mut snap2 = Vec::new();
         tree2.collect_into(&arena, &mut snap2);
         let snap2_set: BTreeSet<u32> = snap2.into_iter().collect();
@@ -262,7 +254,6 @@ proptest! {
         }
     }
 
-    // 6. insert 1000 random u32 values, verify all present and count correct
     #[test]
     fn stress_insert_1000(vals in prop::collection::vec(0..100_000u32, 1000..=1000)) {
         let arena = Arena::new(8 << 20);
@@ -271,9 +262,8 @@ proptest! {
 
         for &v in &vals {
             unique.insert(v);
-            if let Some(t) = tree.insert(&arena, v) {
-                tree = t;
-            }
+            let (t, _) = ctree_insert(tree, &arena, v);
+            tree = t;
         }
 
         prop_assert_eq!(tree.count(&arena), unique.len());
@@ -297,23 +287,27 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    // 1. for any (src, dst), insert then has_edge returns true
     #[test]
     fn insert_edge_then_has_edge(src in 0..1000u32, dst in 0..1000u32) {
         let g = DynamicGraph::new(1000, 1 << 20);
-        let _ = g.insert_edge(src, dst);
+        {
+            let mut w = g.writer_or_panic();
+            let _ = w.insert_edge(src, dst);
+        }
         prop_assert!(g.has_edge(src, dst),
             "has_edge({}, {}) false after insert", src, dst);
     }
 
-    // 2. for any sequence of inserts, neighbors() is always sorted
     #[test]
     fn neighbors_always_sorted(
         edges in prop::collection::vec((0..100u32, 0..10_000u32), 0..200)
     ) {
         let g = DynamicGraph::new(10_000, 4 << 20);
-        for &(src, dst) in &edges {
-            let _ = g.insert_edge(src, dst);
+        {
+            let mut w = g.writer_or_panic();
+            for &(src, dst) in &edges {
+                let _ = w.insert_edge(src, dst);
+            }
         }
 
         let mut buf = Vec::new();
@@ -325,7 +319,6 @@ proptest! {
         }
     }
 
-    // 3. degree equals length of deduplicated neighbor list
     #[test]
     fn degree_equals_unique_neighbors(
         edges in prop::collection::vec((0..50u32, 0..1000u32), 0..200)
@@ -333,9 +326,12 @@ proptest! {
         let g = DynamicGraph::new(1000, 4 << 20);
         let mut expected: HashMap<u32, BTreeSet<u32>> = HashMap::new();
 
-        for &(src, dst) in &edges {
-            let _ = g.insert_edge(src, dst);
-            expected.entry(src).or_default().insert(dst);
+        {
+            let mut w = g.writer_or_panic();
+            for &(src, dst) in &edges {
+                let _ = w.insert_edge(src, dst);
+                expected.entry(src).or_default().insert(dst);
+            }
         }
 
         for (src, dsts) in &expected {
@@ -347,13 +343,13 @@ proptest! {
         }
     }
 
-    // 4. inserting same edge twice doesn't change degree
     #[test]
     fn duplicate_edges_idempotent(src in 0..1000u32, dst in 0..1000u32) {
         let g = DynamicGraph::new(1000, 1 << 20);
-        let _ = g.insert_edge(src, dst);
+        let mut w = g.writer_or_panic();
+        let _ = w.insert_edge(src, dst);
         let deg1 = g.degree(src);
-        let was_new = g.insert_edge(src, dst).unwrap();
+        let was_new = w.insert_edge(src, dst).unwrap();
         let deg2 = g.degree(src);
         prop_assert!(!was_new,
             "second insert of ({},{}) claimed it was new", src, dst);
@@ -369,7 +365,6 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
-    // 5. spawn reader + writer threads, reader always sees sorted neighbors
     #[test]
     fn concurrent_invariant(
         vals in prop::collection::vec(0..10_000u32, 100..=500)
@@ -378,8 +373,9 @@ proptest! {
 
         let g_writer = Arc::clone(&g);
         let writer = std::thread::spawn(move || {
+            let mut w = g_writer.writer_or_panic();
             for &dst in &vals {
-                let _ = g_writer.insert_edge(0, dst);
+                let _ = w.insert_edge(0, dst);
             }
         });
 
@@ -388,7 +384,6 @@ proptest! {
             let mut buf = Vec::new();
             for _ in 0..200 {
                 g_reader.neighbors_into(0, &mut buf);
-                // Must always see a consistent, sorted snapshot
                 assert!(is_sorted_strict(&buf),
                     "reader saw unsorted neighbors: first bad pair at {:?}",
                     buf.windows(2).find(|w| w[0] >= w[1]));
@@ -401,23 +396,25 @@ proptest! {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Deterministic stress test: 10K inserts
+// Deterministic stress test
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn stress_10k_inserts() {
-    let g = DynamicGraph::new(10_000, 8 << 20); // 8MB arena
+    let g = DynamicGraph::new(10_000, 8 << 20);
     let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF);
     let mut expected: HashMap<u32, BTreeSet<u32>> = HashMap::new();
 
-    for _ in 0..10_000 {
-        let src = rng.random_range(0..1000u32);
-        let dst = rng.random_range(0..10_000u32);
-        let _ = g.insert_edge(src, dst);
-        expected.entry(src).or_default().insert(dst);
+    {
+        let mut w = g.writer_or_panic();
+        for _ in 0..10_000 {
+            let src = rng.random_range(0..1000u32);
+            let dst = rng.random_range(0..10_000u32);
+            let _ = w.insert_edge(src, dst);
+            expected.entry(src).or_default().insert(dst);
+        }
     }
 
-    // Verify every vertex that received edges
     for (src, dsts) in &expected {
         let mut buf = Vec::new();
         g.neighbors_into(*src, &mut buf);
@@ -430,7 +427,6 @@ fn stress_10k_inserts() {
             actual.len(),
             dsts.len()
         );
-        // Also verify sorted
         assert!(
             is_sorted_strict(&buf),
             "neighbors of vertex {} not sorted",
@@ -438,7 +434,6 @@ fn stress_10k_inserts() {
         );
     }
 
-    // Verify degree matches
     for (src, dsts) in &expected {
         assert_eq!(
             g.degree(*src),
@@ -448,7 +443,6 @@ fn stress_10k_inserts() {
         );
     }
 
-    // Verify has_edge for every expected edge
     for (src, dsts) in &expected {
         for dst in dsts {
             assert!(

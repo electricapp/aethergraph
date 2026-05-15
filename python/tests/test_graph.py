@@ -33,13 +33,15 @@ class TestGraphCreation:
         assert graph.num_nodes == 10
         assert graph.num_edges == 0
 
-    def test_from_edges_dtype_conversion(self) -> None:
-        """Edge arrays should be converted to uint32."""
+    def test_from_edges_strict_dtype(self) -> None:
+        """The Rust binding requires `uint32` arrays. Non-uint32 input must
+        raise TypeError — callers convert at the call site."""
         src = np.array([0, 1, 2], dtype=np.int64)
         dst = np.array([1, 2, 0], dtype=np.int64)
-        graph = Graph.from_edges(3, src, dst)
-
-        assert graph.num_edges == 3
+        with pytest.raises(TypeError):
+            # The intentional wrong dtype is the whole point of this test —
+            # silence mypy so the strict check survives.
+            Graph.from_edges(3, src, dst)  # type: ignore[arg-type]
 
     def test_from_edges_list_input(self) -> None:
         """Python lists should work as edge input."""
@@ -71,13 +73,13 @@ class TestGraphPersistence:
         assert loaded.num_nodes == small_graph.num_nodes
         assert loaded.num_edges == small_graph.num_edges
 
-    def test_load_mmap_and_load_owned(self, small_graph: Graph, temp_dir: Path) -> None:
-        """Load using explicit storage modes."""
+    def test_load_explicit_storage_modes(self, small_graph: Graph, temp_dir: Path) -> None:
+        """Load using explicit storage modes via the unified `load(storage=...)` API."""
         path = temp_dir / "test_graph_modes.bin"
         small_graph.save(path)
 
-        mmap_graph = Graph.load_mmap(path, validation="offsets_only")
-        owned_graph = Graph.load_owned(path, validation="full")
+        mmap_graph = Graph.load(path, storage="mmap", validation="offsets_only")
+        owned_graph = Graph.load(path, storage="owned", validation="full")
 
         assert mmap_graph.num_nodes == small_graph.num_nodes
         assert mmap_graph.num_edges == small_graph.num_edges
@@ -138,58 +140,8 @@ class TestGraphStructure:
         assert stats["num_edges"] == small_graph.num_edges
 
 
-class TestGraphFeatures:
-    """Test feature handling."""
-
-    def test_set_features_numpy(self, small_graph: Graph, rng: np.random.Generator) -> None:
-        """Set features from numpy array."""
-        features = rng.standard_normal((small_graph.num_nodes, 128)).astype(np.float32)
-        small_graph.features = features
-
-        assert small_graph.features is not None
-        assert small_graph.features.shape == (small_graph.num_nodes, 128)
-        np.testing.assert_array_almost_equal(small_graph.features, features)
-
-    @pytest.mark.requires_torch
-    def test_set_features_torch(self, small_graph: Graph) -> None:
-        """Set features from torch tensor."""
-        import torch
-
-        features = torch.randn(small_graph.num_nodes, 64)
-        small_graph.features = features
-
-        assert small_graph.features is not None
-        assert small_graph.features.shape == (small_graph.num_nodes, 64)
-        assert small_graph.features.dtype == np.float32
-        # Verify actual values match (accounting for float32 conversion)
-        np.testing.assert_array_almost_equal(
-            small_graph.features, features.numpy().astype(np.float32), decimal=5
-        )
-
-    def test_features_dtype_conversion(self, small_graph: Graph, rng: np.random.Generator) -> None:
-        """Features should be converted to float32."""
-        features = rng.standard_normal((small_graph.num_nodes, 32)).astype(np.float64)
-        small_graph.features = features
-
-        assert small_graph.features is not None
-        assert small_graph.features.dtype == np.float32
-
-    def test_features_shape_validation(self, small_graph: Graph, rng: np.random.Generator) -> None:
-        """Features with wrong shape should raise ValueError."""
-        # Wrong number of nodes
-        wrong_features = rng.standard_normal((small_graph.num_nodes + 10, 32)).astype(np.float32)
-        with pytest.raises(ValueError, match="num_nodes"):
-            small_graph.features = wrong_features
-
-        # 1D array (must be 2D)
-        one_dim_features = rng.standard_normal(small_graph.num_nodes).astype(np.float32)
-        with pytest.raises(ValueError, match="2D"):
-            small_graph.features = one_dim_features
-
-        # Empty features (0D)
-        empty_features = np.array([], dtype=np.float32)
-        with pytest.raises(ValueError, match="2D"):
-            small_graph.features = empty_features
+# Feature handling lives on the loader, not the graph — see
+# `tests/test_loader.py` for the constructor-arg shape.
 
 
 class TestGraphRepr:

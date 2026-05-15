@@ -86,7 +86,7 @@ mod ffi {
     pub type CUfileBatchHandle = *mut c_void;
 
     #[link(name = "cufile")]
-    extern "C" {
+    unsafe extern "C" {
         pub fn cuFileDriverOpen() -> CUfileError;
         pub fn cuFileDriverClose() -> CUfileError;
 
@@ -140,6 +140,8 @@ mod ffi {
 /// `GdsFeatureStore` instances.
 #[allow(unsafe_code)]
 pub fn gds_driver_open() -> Result<()> {
+    // SAFETY: cuFileDriverOpen is a no-arg FFI call provided by libcufile;
+    // it is idempotent and safe to invoke from any thread.
     let err = unsafe { ffi::cuFileDriverOpen() };
     ensure!(
         err.err == ffi::CU_FILE_SUCCESS,
@@ -154,6 +156,8 @@ pub fn gds_driver_open() -> Result<()> {
 /// Shut down the cuFile driver. Call once at process exit.
 #[allow(unsafe_code)]
 pub fn gds_driver_close() {
+    // SAFETY: cuFileDriverClose is a no-arg FFI call; calling it on a
+    // not-yet-opened driver is documented to return an error, not crash.
     let err = unsafe { ffi::cuFileDriverClose() };
     if err.err != ffi::CU_FILE_SUCCESS {
         warn!(
@@ -274,6 +278,9 @@ impl GdsFeatureStore {
             fs_ops: std::ptr::null(),
         };
 
+        // SAFETY: `file_handle` and `descr` are stack-allocated locals we
+        // pass exclusive mutable pointers to; `descr.handle.fd` came from a
+        // `File` we still own, so the fd remains valid for the call.
         let err = unsafe { ffi::cuFileHandleRegister(&raw mut file_handle, &raw mut descr) };
         ensure!(
             err.err == ffi::CU_FILE_SUCCESS,
@@ -284,8 +291,13 @@ impl GdsFeatureStore {
 
         // Register the GPU buffer for DMA.
         let gpu_ptr = gpu_device_ptr as *mut c_void;
+        // SAFETY: the caller has documented (in this function's `Safety
+        // contract`) that `gpu_ptr` points at an allocation of at least
+        // `gpu_buffer_size` bytes and outlives this store.
         let err = unsafe { ffi::cuFileBufRegister(gpu_ptr, gpu_buffer_size, 0) };
         if err.err != ffi::CU_FILE_SUCCESS {
+            // SAFETY: `file_handle` was just successfully registered above;
+            // deregistering it on the error path is the documented cleanup.
             unsafe { ffi::cuFileHandleDeregister(file_handle) };
             anyhow::bail!(
                 "cuFileBufRegister failed: err={}, cu_err={}",
@@ -425,6 +437,8 @@ impl GdsFeatureStore {
         // Set up batch handle.
         let num_entries = sorted.len() as u32;
         let mut batch_handle: ffi::CUfileBatchHandle = std::ptr::null_mut();
+        // SAFETY: `batch_handle` is a stack local with exclusive mutable
+        // access; cuFile writes a fresh opaque pointer into it.
         let err = unsafe { ffi::cuFileBatchIOSetUp(&raw mut batch_handle, num_entries) };
         ensure!(
             err.err == ffi::CU_FILE_SUCCESS,
@@ -458,10 +472,16 @@ impl GdsFeatureStore {
             .collect();
 
         // Submit all reads in one kernel crossing.
+        // SAFETY: `batch_handle` was just set up by `cuFileBatchIOSetUp`,
+        // `io_params` owns its memory for the duration of this call, and
+        // `num_entries` matches `io_params.len()` (both derived from
+        // `sorted.len()`).
         let err = unsafe {
             ffi::cuFileBatchIOSubmit(batch_handle, num_entries, io_params.as_mut_ptr(), 0)
         };
         if err.err != ffi::CU_FILE_SUCCESS {
+            // SAFETY: cleanup of an already-set-up batch handle on the
+            // submit-failure path; documented as safe by the cuFile API.
             unsafe { ffi::cuFileBatchIODestroy(batch_handle) };
             anyhow::bail!(
                 "cuFileBatchIOSubmit failed: err={}, cu_err={}",
@@ -473,6 +493,9 @@ impl GdsFeatureStore {
         // Poll until all entries complete.
         let mut num_complete: u32 = 0;
         loop {
+            // SAFETY: `batch_handle` is still valid (we have not destroyed
+            // it yet), `io_params` and `num_complete` live on the stack
+            // with exclusive mutable access for the call.
             let err = unsafe {
                 ffi::cuFileBatchIOGetStatus(
                     batch_handle,
@@ -482,6 +505,8 @@ impl GdsFeatureStore {
                 )
             };
             if err.err != ffi::CU_FILE_SUCCESS {
+                // SAFETY: cleanup on the error path; see comment on the
+                // first `cuFileBatchIODestroy` call.
                 unsafe { ffi::cuFileBatchIODestroy(batch_handle) };
                 anyhow::bail!(
                     "cuFileBatchIOGetStatus failed: err={}, cu_err={}",
@@ -516,6 +541,8 @@ impl GdsFeatureStore {
             total_bytes += param.bytes_done as usize;
         }
 
+        // SAFETY: clean termination of a batch we set up and polled to
+        // completion above.
         unsafe { ffi::cuFileBatchIODestroy(batch_handle) };
         Ok(total_bytes)
     }
@@ -535,6 +562,10 @@ impl GdsFeatureStore {
                 self.features_start_offset as i64 + (node as i64) * (feature_size as i64);
             let dev_offset = (base_dev_offset + orig_idx * feature_size) as i64;
 
+            // SAFETY: `self.file_handle` and `self.gpu_buffer` were
+            // registered with cuFile in `open()` and remain valid for the
+            // store's lifetime; `feature_size` fits within the buffer per
+            // the bounds check in `open()`.
             let n = unsafe {
                 ffi::cuFileRead(
                     self.file_handle,
@@ -569,6 +600,8 @@ impl GdsFeatureStore {
 impl Drop for GdsFeatureStore {
     fn drop(&mut self) {
         // Deregister the GPU buffer first (while the file handle is still valid).
+        // SAFETY: `self.gpu_buffer` was registered in `open()` and we are
+        // the unique owner being dropped; no further cuFile ops will run.
         let err = unsafe { ffi::cuFileBufDeregister(self.gpu_buffer) };
         if err.err != ffi::CU_FILE_SUCCESS {
             warn!(
@@ -578,6 +611,8 @@ impl Drop for GdsFeatureStore {
         }
 
         // Deregister the file handle.
+        // SAFETY: `self.file_handle` was registered in `open()` and is
+        // about to go out of scope; cuFile reclaims its internal state.
         unsafe { ffi::cuFileHandleDeregister(self.file_handle) };
     }
 }
