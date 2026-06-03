@@ -37,7 +37,7 @@ futures.workspace = true
 ndarray.workspace = true
 half.workspace = true
 libc = "0.2"
-bitflags = "2.11"
+bitflags = "2.12"
 parquet = { version = "58", optional = true, default-features = false, features = ["arrow"] }
 arrow-array = { version = "58", optional = true }
 arrow-schema = { version = "58", optional = true }
