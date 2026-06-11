@@ -56,30 +56,59 @@ mod ffi {
 
     // -- Batch I/O types --
 
-    /// Operation type for batch I/O entries.
+    /// `CUfileOpcode_t`: operation selector for a batch entry.
     pub const CUFILE_READ: c_int = 0;
 
-    /// Completion status for a batch I/O entry.
-    pub const CUFILE_BATCH_NOT_STARTED: c_int = 0;
-    pub const CUFILE_BATCH_COMPLETE: c_int = 2;
+    /// `CUfileBatchMode_t`: the only defined mode value.
+    pub const CUFILE_BATCH: c_uint = 1;
 
-    /// Per-operation descriptor for batch I/O.
-    ///
-    /// This matches the `CUfileIOParams_t` struct from cufile.h.
-    /// Each entry describes one read or write operation.
+    /// `CUfileStatus_t` completion values reported in `CUfileIOEvents`.
+    pub const CUFILE_COMPLETE: c_uint = 0x10;
+
+    use std::os::raw::c_uint;
+
+    /// The `u.batch` member of `CUfileIOParams_t`. The union has exactly
+    /// one defined member, so it is modeled as a struct wrapped in a
+    /// single-member union to keep the C layout.
     #[repr(C)]
-    pub struct CUfileIOParams {
-        pub mode: c_int,               // CUFILE_READ or CUFILE_WRITE
-        pub pad: [u8; 4],              // padding for alignment
-        pub fh: CUfileHandle,          // registered file handle
-        pub opcode: c_int,             // internal, set to 0
-        pub status: c_int,             // completion status (output)
-        pub cookie: *mut c_void,       // user cookie (unused)
+    #[derive(Clone, Copy)]
+    pub struct CUfileBatchOp {
         pub dev_ptr_base: *mut c_void, // registered GPU buffer base
-        pub file_offset: i64,          // offset in file
-        pub dev_ptr_offset: i64,       // offset within GPU buffer
+        pub file_offset: i64,          // off_t: offset in file
+        pub dev_ptr_offset: i64,       // off_t: offset within GPU buffer
         pub size: usize,               // bytes to transfer
-        pub bytes_done: isize,         // bytes actually transferred (output)
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub union CUfileIOParamsUnion {
+        pub batch: CUfileBatchOp,
+    }
+
+    /// Per-operation descriptor for batch I/O (`CUfileIOParams_t`).
+    ///
+    /// Field order matches cufile.h exactly: `mode`, the transfer union,
+    /// `fh`, `opcode`, `cookie`. Completion status is NOT part of this
+    /// struct — it is reported through a separate [`CUfileIOEvents`]
+    /// array by `cuFileBatchIOGetStatus`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CUfileIOParams {
+        pub mode: c_uint, // CUfileBatchMode_t: CUFILE_BATCH
+        pub u: CUfileIOParamsUnion,
+        pub fh: CUfileHandle,    // registered file handle
+        pub opcode: c_int,       // CUfileOpcode_t: CUFILE_READ / CUFILE_WRITE
+        pub cookie: *mut c_void, // returned in the matching event
+    }
+
+    /// Completion record (`CUfileIOEvents_t`) filled by
+    /// `cuFileBatchIOGetStatus`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CUfileIOEvents {
+        pub cookie: *mut c_void,
+        pub status: c_uint, // CUfileStatus_t
+        pub ret: usize,     // bytes transferred (or negative errno bit-cast)
     }
 
     /// Opaque batch handle.
@@ -105,25 +134,31 @@ mod ffi {
             dev_offset: i64,
         ) -> isize;
 
-        // Batch I/O API
+        // Batch I/O API (signatures from cufile.h)
         pub fn cuFileBatchIOSetUp(
             batch_handle: *mut CUfileBatchHandle,
-            num_entries: u32,
+            num_entries: c_uint,
         ) -> CUfileError;
 
         pub fn cuFileBatchIOSubmit(
             batch_handle: CUfileBatchHandle,
-            num_entries: u32,
+            num_entries: c_uint,
             io_params: *mut CUfileIOParams,
-            flags: u32, // 0 for default
+            flags: c_uint, // 0 for default
         ) -> CUfileError;
 
+        /// `nr` is in/out: in = capacity of `events`, out = events filled.
+        /// Blocks until at least `min_nr` operations complete or `timeout`
+        /// elapses (null = no timeout).
         pub fn cuFileBatchIOGetStatus(
             batch_handle: CUfileBatchHandle,
-            num_entries: u32,
-            io_params: *mut CUfileIOParams,
-            num_complete: *mut u32,
+            min_nr: c_uint,
+            nr: *mut c_uint,
+            events: *mut CUfileIOEvents,
+            timeout: *mut libc::timespec,
         ) -> CUfileError;
+
+        pub fn cuFileBatchIOCancel(batch_handle: CUfileBatchHandle) -> CUfileError;
 
         pub fn cuFileBatchIODestroy(batch_handle: CUfileBatchHandle);
     }
@@ -447,29 +482,44 @@ impl GdsFeatureStore {
             err.cu_err,
         );
 
-        // Build IO params array.
+        // Build IO params array. Cookies carry the entry index so each
+        // completion event can be matched back to its read.
         let mut io_params: Vec<ffi::CUfileIOParams> = sorted
             .iter()
-            .map(|&(node, orig_idx)| {
+            .enumerate()
+            .map(|(entry_idx, &(node, orig_idx))| {
                 let file_offset =
                     self.features_start_offset as i64 + (node as i64) * (feature_size as i64);
                 let dev_offset = (base_dev_offset + orig_idx * feature_size) as i64;
 
                 ffi::CUfileIOParams {
-                    mode: ffi::CUFILE_READ,
-                    pad: [0; 4],
+                    mode: ffi::CUFILE_BATCH,
+                    u: ffi::CUfileIOParamsUnion {
+                        batch: ffi::CUfileBatchOp {
+                            dev_ptr_base: self.gpu_buffer,
+                            file_offset,
+                            dev_ptr_offset: dev_offset,
+                            size: feature_size,
+                        },
+                    },
                     fh: self.file_handle,
-                    opcode: 0,
-                    status: ffi::CUFILE_BATCH_NOT_STARTED,
-                    cookie: std::ptr::null_mut(),
-                    dev_ptr_base: self.gpu_buffer,
-                    file_offset,
-                    dev_ptr_offset: dev_offset,
-                    size: feature_size,
-                    bytes_done: 0,
+                    opcode: ffi::CUFILE_READ,
+                    cookie: entry_idx as *mut c_void,
                 }
             })
             .collect();
+
+        // Tear down a batch whose operations may still be in flight:
+        // cancel first so the driver quiesces DMA before the handle goes
+        // away. (The registered GPU buffer itself outlives the store, so
+        // a straggling write cannot land in freed memory either way.)
+        let cancel_and_destroy = |handle: ffi::CUfileBatchHandle| {
+            // SAFETY: `handle` came from a successful cuFileBatchIOSetUp
+            // and has not been destroyed yet.
+            let _ = unsafe { ffi::cuFileBatchIOCancel(handle) };
+            // SAFETY: same handle; cancel above quiesced its operations.
+            unsafe { ffi::cuFileBatchIODestroy(handle) };
+        };
 
         // Submit all reads in one kernel crossing.
         // SAFETY: `batch_handle` was just set up by `cuFileBatchIOSetUp`,
@@ -490,58 +540,82 @@ impl GdsFeatureStore {
             );
         }
 
-        // Poll until all entries complete.
-        let mut num_complete: u32 = 0;
-        loop {
-            // SAFETY: `batch_handle` is still valid (we have not destroyed
-            // it yet), `io_params` and `num_complete` live on the stack
-            // with exclusive mutable access for the call.
+        // Reap completion events until every entry reports in. Each call
+        // consumes newly completed events; a deadline bounds the loop so
+        // a wedged device surfaces as an error instead of a hang.
+        let mut events =
+            vec![
+                ffi::CUfileIOEvents {
+                    cookie: std::ptr::null_mut(),
+                    status: 0,
+                    ret: 0,
+                };
+                num_entries as usize
+            ];
+        let mut completed: usize = 0;
+        let mut total_bytes: usize = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while completed < num_entries as usize {
+            let mut nr: std::os::raw::c_uint = num_entries;
+            let mut timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 10_000_000, // 10ms per wait slice
+            };
+            // SAFETY: `batch_handle` is still valid (not destroyed yet);
+            // `events` has capacity for `nr` entries; `nr` and `timeout`
+            // are exclusive stack locals.
             let err = unsafe {
                 ffi::cuFileBatchIOGetStatus(
                     batch_handle,
-                    num_entries,
-                    io_params.as_mut_ptr(),
-                    &raw mut num_complete,
+                    1,
+                    &raw mut nr,
+                    events.as_mut_ptr(),
+                    &raw mut timeout,
                 )
             };
             if err.err != ffi::CU_FILE_SUCCESS {
-                // SAFETY: cleanup on the error path; see comment on the
-                // first `cuFileBatchIODestroy` call.
-                unsafe { ffi::cuFileBatchIODestroy(batch_handle) };
+                cancel_and_destroy(batch_handle);
                 anyhow::bail!(
                     "cuFileBatchIOGetStatus failed: err={}, cu_err={}",
                     err.err,
                     err.cu_err,
                 );
             }
-            if num_complete >= num_entries {
-                break;
+
+            for event in &events[..nr as usize] {
+                let entry_idx = event.cookie as usize;
+                if event.status != ffi::CUFILE_COMPLETE {
+                    cancel_and_destroy(batch_handle);
+                    anyhow::bail!(
+                        "GDS batch entry {} failed (status={:#x})",
+                        entry_idx,
+                        event.status,
+                    );
+                }
+                if event.ret != feature_size {
+                    cancel_and_destroy(batch_handle);
+                    anyhow::bail!(
+                        "GDS batch entry {} short read: expected {} bytes, got {}",
+                        entry_idx,
+                        feature_size,
+                        event.ret,
+                    );
+                }
+                total_bytes += event.ret;
             }
-            // Yield to avoid busy-spinning. GDS typically completes in <100us
-            // for a batch of 3000 nodes, so one yield is usually enough.
-            std::thread::yield_now();
+            completed += nr as usize;
+
+            if completed < num_entries as usize && std::time::Instant::now() >= deadline {
+                cancel_and_destroy(batch_handle);
+                anyhow::bail!(
+                    "GDS batch timed out: {} of {} reads completed within 30s",
+                    completed,
+                    num_entries,
+                );
+            }
         }
 
-        // Validate all entries completed successfully.
-        let mut total_bytes: usize = 0;
-        for (i, param) in io_params.iter().enumerate() {
-            ensure!(
-                param.status == ffi::CUFILE_BATCH_COMPLETE,
-                "GDS batch entry {} not complete (status={})",
-                i,
-                param.status,
-            );
-            ensure!(
-                param.bytes_done >= 0 && param.bytes_done as usize == feature_size,
-                "GDS batch entry {} short read: expected {} bytes, got {}",
-                i,
-                feature_size,
-                param.bytes_done,
-            );
-            total_bytes += param.bytes_done as usize;
-        }
-
-        // SAFETY: clean termination of a batch we set up and polled to
+        // SAFETY: clean termination of a batch we set up and reaped to
         // completion above.
         unsafe { ffi::cuFileBatchIODestroy(batch_handle) };
         Ok(total_bytes)

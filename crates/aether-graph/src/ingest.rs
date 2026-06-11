@@ -17,7 +17,7 @@
 //! });
 //! ```
 
-use crate::graph::{ArenaFull, DynamicGraph, WriterError};
+use crate::graph::{DynamicGraph, InsertError, WriterError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -32,7 +32,8 @@ pub struct IngestStats {
     pub inserted: AtomicU64,
     /// Duplicate edges skipped.
     pub duplicates: AtomicU64,
-    /// Errors (arena full, etc.).
+    /// Errors: out-of-range edges (dropped, ingest continues) and the
+    /// arena filling up (ingest stops).
     pub errors: AtomicU64,
 }
 
@@ -121,7 +122,10 @@ pub fn run(
             Ok(false) => {
                 stats.duplicates.fetch_add(1, Ordering::Relaxed);
             }
-            Err(ArenaFull) => {
+            Err(InsertError::VertexOutOfRange { .. }) => {
+                stats.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(InsertError::ArenaFull) => {
                 stats.errors.fetch_add(1, Ordering::Relaxed);
                 break;
             }
@@ -147,7 +151,10 @@ pub fn run_batches(
                 Ok(false) => {
                     stats.duplicates.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(ArenaFull) => {
+                Err(InsertError::VertexOutOfRange { .. }) => {
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(InsertError::ArenaFull) => {
                     stats.errors.fetch_add(1, Ordering::Relaxed);
                     break 'outer;
                 }
@@ -195,7 +202,10 @@ pub fn spawn(
                             Ok(false) => {
                                 stats_clone.duplicates.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(ArenaFull) => {
+                            Err(InsertError::VertexOutOfRange { .. }) => {
+                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(InsertError::ArenaFull) => {
                                 stats_clone.errors.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
@@ -237,7 +247,10 @@ pub fn drain_channel(
                     Ok(false) => {
                         stats.duplicates.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(ArenaFull) => {
+                    Err(InsertError::VertexOutOfRange { .. }) => {
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(InsertError::ArenaFull) => {
                         stats.errors.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -324,7 +337,10 @@ pub fn spawn_channel(
                             Ok(false) => {
                                 stats_clone.duplicates.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(ArenaFull) => {
+                            Err(InsertError::VertexOutOfRange { .. }) => {
+                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(InsertError::ArenaFull) => {
                                 stats_clone.errors.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }

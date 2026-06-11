@@ -578,6 +578,15 @@ pub fn create_feature_uring(direct_io: bool) -> Option<UringHandle> {
 /// `async_store`, and `async_graph` all funnel through here so SQPOLL/short-read
 /// fixes apply in one place.
 ///
+/// Every SQE handed to the kernel is reaped before this function returns,
+/// success or failure: the kernel may DMA into a read's buffer until its
+/// CQE arrives, so returning early on the first failed completion would
+/// let the caller free buffers the kernel is still writing. Errors
+/// (failed reads, short reads) are recorded and the first one is
+/// returned only after all submitted entries have completed. This also
+/// keeps the ring clean for the next batch — a leftover CQE would be
+/// misattributed to the next batch's `user_data` index space.
+///
 /// # Safety
 /// Each `dest_buffer_ptr` must point to writable memory of at least `length` bytes
 /// and remain valid for the duration of this call.
@@ -602,16 +611,32 @@ pub fn batch_read(
         );
     }
 
+    // Defensive: discard completions left over from a previous batch on
+    // this ring. Their user_data indexes a reads slice that no longer
+    // exists, so they must not be counted against this batch.
+    let mut stale = 0usize;
+    handle.cq_sync();
+    for _cqe in handle.completion() {
+        stale += 1;
+    }
+    if stale > 0 {
+        warn!("io_uring: discarded {stale} stale completions from a previous batch");
+    }
+
     // io-uring 0.7 removed types::Target; Fd and Fixed are distinct types, so the
     // choice has to be inlined at the opcode call site.
     let registered_idx = handle.registered_fd_index();
     let is_sqpoll = handle.is_sqpoll();
 
-    // Submit all reads
+    // Push all reads, counting how many SQEs the kernel will see. Each
+    // of them produces exactly one CQE that the drain loop below must
+    // reap before we return.
+    let mut first_err: Option<anyhow::Error> = None;
+    let mut submitted = 0usize;
     {
         let (submitter, mut sq, _cq) = handle.split();
 
-        for (i, &(offset, buf_ptr, len)) in reads.iter().enumerate() {
+        'push: for (i, &(offset, buf_ptr, len)) in reads.iter().enumerate() {
             let entry = match registered_idx {
                 Some(idx) => opcode::Read::new(types::Fixed(idx), buf_ptr, len as u32),
                 None => opcode::Read::new(types::Fd(fd), buf_ptr, len as u32),
@@ -620,64 +645,118 @@ pub fn batch_read(
             .build()
             .user_data(i as u64);
 
-            // Push to SQ, submitting if full
-            // SAFETY: `entry` and `buffer` referenced by the SQE live for the
-            // duration of this batch (until we drain the CQ below).
+            // Push to SQ, submitting if full. A submit failure stops the
+            // push phase — entries already pushed are (or will be) in
+            // flight and still need draining.
+            // SAFETY: the buffers referenced by the SQEs live until the
+            // drain loop below has reaped every submitted entry.
             unsafe {
                 while sq.push(&entry).is_err() {
                     sq.sync();
-                    if is_sqpoll {
+                    let res = if is_sqpoll {
                         // Check NEED_WAKEUP from SQ shared memory
                         if sq.need_wakeup() {
-                            submitter.submit()?;
+                            submitter.submit().map(|_| ())
+                        } else {
+                            Ok(())
                         }
                     } else {
-                        submitter.submit()?;
+                        submitter.submit().map(|_| ())
+                    };
+                    if let Err(e) = res {
+                        first_err =
+                            Some(anyhow::Error::from(e).context("io_uring submit failed"));
+                        break 'push;
                     }
                 }
             }
+            submitted += 1;
         }
 
         sq.sync();
     }
 
-    // Submit (respecting SQPOLL)
-    handle.submit()?;
+    // Kick off the submission (respecting SQPOLL). On failure the pushed
+    // entries are still visible to the kernel — SQPOLL consumes them
+    // asynchronously and the drain loop's submit_and_wait retries the
+    // non-SQPOLL case — so draining remains mandatory.
+    if let Err(e) = handle.submit()
+        && first_err.is_none()
+    {
+        first_err = Some(e);
+    }
 
-    // Wait for all completions
-    let mut completed = 0;
-    while completed < reads.len() {
+    // Drain exactly `submitted` completions, recording (not returning)
+    // errors so the kernel is provably done with every buffer first.
+    let mut completed = 0usize;
+    let mut wait_failures = 0u32;
+    while completed < submitted {
         handle.cq_sync();
 
-        {
-            let cq = handle.completion();
-            for cqe in cq {
-                let result = cqe.result();
-                if result < 0 {
-                    anyhow::bail!("io_uring read failed with error {}", -result);
+        for cqe in handle.completion() {
+            completed += 1;
+            let result = cqe.result();
+            let idx = cqe.user_data() as usize;
+            let Some(&(offset, _, expected_len)) = reads.get(idx) else {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!(
+                        "io_uring completion with unknown user_data {idx}"
+                    ));
                 }
-                // Short reads on local files mean truncation/corruption — fail fast.
-                let idx = cqe.user_data() as usize;
-                let (offset, _, expected_len) = reads[idx];
-                if (result as usize) < expected_len {
-                    anyhow::bail!(
-                        "io_uring short read at offset {}: got {} bytes, expected {} \
-                         (file may be truncated or corrupted)",
+                continue;
+            };
+            if result < 0 {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!(
+                        "io_uring read at offset {} failed with error {}",
                         offset,
-                        result,
-                        expected_len
-                    );
+                        -result
+                    ));
                 }
-                completed += 1;
+                continue;
+            }
+            // Short reads on local files mean truncation/corruption.
+            if ((result as usize) < expected_len) && first_err.is_none() {
+                first_err = Some(anyhow::anyhow!(
+                    "io_uring short read at offset {}: got {} bytes, expected {} \
+                     (file may be truncated or corrupted)",
+                    offset,
+                    result,
+                    expected_len
+                ));
             }
         }
 
-        if completed < reads.len() {
-            handle.submit_and_wait(1)?;
+        if completed < submitted {
+            match handle.submit_and_wait(1) {
+                Ok(_) => wait_failures = 0,
+                Err(e) => {
+                    // Returning here would free buffers the kernel may
+                    // still write into. Transient errnos (EINTR/EAGAIN/
+                    // EBUSY) clear on retry; if the wait fails persistently
+                    // we cannot prove quiescence, and aborting is the only
+                    // way to keep the kernel from corrupting freed memory.
+                    wait_failures += 1;
+                    if wait_failures >= 1000 {
+                        tracing::error!(
+                            error = %e,
+                            completed,
+                            submitted,
+                            "io_uring wait failed repeatedly with completions \
+                             outstanding; aborting to avoid use-after-free"
+                        );
+                        std::process::abort();
+                    }
+                    std::thread::yield_now();
+                }
+            }
         }
     }
 
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -769,6 +848,46 @@ mod tests {
                 println!("io_uring not available: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn error_batch_drains_fully_and_ring_stays_usable() {
+        // A batch where one read fails (short read past EOF) must still
+        // reap every completion before returning, and the same ring must
+        // serve the next batch with no stale-completion crosstalk.
+        let mut temp = NamedTempFile::new().unwrap();
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+
+        let Some(mut handle) = create_feature_uring(false) else {
+            println!("io_uring not available; skipping");
+            return;
+        };
+        let file = File::open(temp.path()).unwrap();
+        let fd = file.as_raw_fd();
+
+        let mut bufs: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 4096]).collect();
+        let ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+        let reads: Vec<(u64, *mut u8, usize)> = vec![
+            (0, ptrs[0], 4096),
+            (4096, ptrs[1], 4096),
+            (1 << 20, ptrs[2], 4096), // past EOF → short read
+            (4096, ptrs[3], 4096),
+        ];
+        let err = batch_read(&mut handle, fd, &reads);
+        assert!(err.is_err(), "short read past EOF must surface as Err");
+
+        // Fresh batch on the same handle: must succeed with correct data.
+        let mut buf_a = vec![0u8; 4096];
+        let mut buf_b = vec![0u8; 4096];
+        let reads2: Vec<(u64, *mut u8, usize)> = vec![
+            (0, buf_a.as_mut_ptr(), 4096),
+            (4096, buf_b.as_mut_ptr(), 4096),
+        ];
+        batch_read(&mut handle, fd, &reads2).unwrap();
+        assert_eq!(&buf_a[..], &data[..4096]);
+        assert_eq!(&buf_b[..], &data[4096..8192]);
     }
 
     #[test]

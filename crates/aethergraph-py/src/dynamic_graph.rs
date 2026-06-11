@@ -26,8 +26,17 @@ pub struct PyDynamicGraph {
 }
 
 impl PyDynamicGraph {
-    fn map_arena_full() -> PyErr {
-        pyo3::exceptions::PyRuntimeError::new_err("C-tree arena is full")
+    fn map_insert_err(err: aether_graph::InsertError) -> PyErr {
+        match err {
+            aether_graph::InsertError::ArenaFull => {
+                pyo3::exceptions::PyRuntimeError::new_err("C-tree arena is full")
+            }
+            aether_graph::InsertError::VertexOutOfRange { src, dst } => {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "edge ({src}, {dst}) references a vertex out of range for this graph"
+                ))
+            }
+        }
     }
 
     fn map_writer_err(err: aether_graph::WriterError) -> PyErr {
@@ -54,9 +63,17 @@ impl PyDynamicGraph {
             WalError::UnknownVersion(v) => pyo3::exceptions::PyValueError::new_err(format!(
                 "WAL version {v} not supported by this build"
             )),
-            WalError::Corrupt { offset } => pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "WAL corrupt at byte offset {offset}; truncate to recover"
+            WalError::RecordOutOfRange {
+                src,
+                dst,
+                num_vertices,
+            } => pyo3::exceptions::PyValueError::new_err(format!(
+                "WAL record ({src}, {dst}) exceeds num_vertices {num_vertices}; \
+                 reopen with the num_vertices the log was written against"
             )),
+            WalError::ReplayArenaFull => pyo3::exceptions::PyRuntimeError::new_err(
+                "arena filled during WAL replay; reopen with a larger arena_mb",
+            ),
         }
     }
 }
@@ -168,9 +185,7 @@ impl PyDynamicGraph {
         py.detach(move || {
             let _guard = self.write_lock.lock();
             let mut writer = inner.writer().map_err(Self::map_writer_err)?;
-            writer
-                .insert_edge(src, dst)
-                .map_err(|_| Self::map_arena_full())
+            writer.insert_edge(src, dst).map_err(Self::map_insert_err)
         })
     }
 
@@ -213,7 +228,7 @@ impl PyDynamicGraph {
                 match writer.insert_edge(s, d) {
                     Ok(true) => count += 1,
                     Ok(false) => {}
-                    Err(_) => return Err(Self::map_arena_full()),
+                    Err(e) => return Err(Self::map_insert_err(e)),
                 }
             }
             Ok(count)

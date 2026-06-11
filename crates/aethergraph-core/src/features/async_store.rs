@@ -23,20 +23,20 @@
 //! legacy files, we fall back to SQPOLL-only mode (tier 2).
 
 use super::header::{FeatureDtype, parse_feature_header};
-use super::store::FeatureLoadTelemetry;
+use super::store::{FeatureLoadTelemetry, TelemetryCells};
 use crate::graph::NodeId;
 use anyhow::{Context, Result};
 use half::f16;
-use parking_lot::RwLock;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, trace};
 
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 #[cfg(target_os = "linux")]
 use tracing::warn;
 
@@ -86,7 +86,7 @@ pub struct AsyncFeatureStore {
     direct_io: bool,
 
     /// Optional telemetry collector
-    telemetry: Option<Arc<RwLock<FeatureLoadTelemetry>>>,
+    telemetry: Option<Arc<TelemetryCells>>,
 }
 
 impl AsyncFeatureStore {
@@ -213,13 +213,13 @@ impl AsyncFeatureStore {
 
     /// Enable telemetry tracking
     pub fn with_telemetry(mut self) -> Self {
-        self.telemetry = Some(Arc::new(RwLock::new(FeatureLoadTelemetry::default())));
+        self.telemetry = Some(Arc::new(TelemetryCells::default()));
         self
     }
 
     /// Get telemetry statistics
     pub fn telemetry(&self) -> Option<FeatureLoadTelemetry> {
-        self.telemetry.as_ref().map(|t| t.read().clone())
+        self.telemetry.as_ref().map(|t| t.snapshot())
     }
 
     /// Get number of nodes
@@ -234,10 +234,12 @@ impl AsyncFeatureStore {
 
     /// Get features for a single node (async).
     ///
-    /// For single-node reads, uses sync read (io_uring overhead isn't worth it).
-    /// For batch reads, use `get_batch()` which leverages io_uring.
+    /// For single-node reads, a plain pread is used (io_uring overhead
+    /// isn't worth it), wrapped in `spawn_blocking` so a cold NVMe read
+    /// doesn't stall a tokio worker thread. For batch reads, use
+    /// `get_batch()` which leverages io_uring.
     pub async fn get(&self, node: NodeId) -> Result<Vec<f32>> {
-        let start = Instant::now();
+        let start = self.telemetry.is_some().then(Instant::now);
 
         anyhow::ensure!(
             (node as usize) < self.num_nodes,
@@ -247,37 +249,49 @@ impl AsyncFeatureStore {
 
         let feature_size = self.feature_dim * self.dtype.element_size();
         let offset = self.features_start_offset + (node as u64 * feature_size as u64);
+        let file = Arc::clone(&self.file);
+        let dtype = self.dtype;
 
-        // For single reads, sync pread is fine (no io_uring overhead)
-        let mut buffer = vec![0u8; feature_size];
-        self.read_sync(offset, &mut buffer)?;
+        let features: Vec<f32> = tokio::task::spawn_blocking(move || {
+            let mut buffer = vec![0u8; feature_size];
+            file.read_exact_at(&mut buffer, offset)
+                .context("sync read failed")?;
 
-        let features: Vec<f32> = match self.dtype {
-            FeatureDtype::F32 => {
-                anyhow::ensure!(
-                    buffer.len().is_multiple_of(4),
-                    "buffer length {} is not a multiple of 4",
-                    buffer.len()
-                );
-                buffer
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect()
-            }
-            FeatureDtype::F16 => buffer
-                .chunks_exact(2)
-                .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                .collect(),
-        };
+            let features: Vec<f32> = match dtype {
+                FeatureDtype::F32 => {
+                    anyhow::ensure!(
+                        buffer.len().is_multiple_of(4),
+                        "buffer length {} is not a multiple of 4",
+                        buffer.len()
+                    );
+                    buffer
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .collect()
+                }
+                FeatureDtype::F16 => buffer
+                    .chunks_exact(2)
+                    .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                    .collect(),
+            };
+            Ok::<_, anyhow::Error>(features)
+        })
+        .await
+        .context("spawn_blocking failed")??;
 
         // Track telemetry
-        if let Some(ref telemetry) = self.telemetry {
-            let mut stats = telemetry.write();
-            stats.single_gets += 1;
-            stats.total_nodes_loaded += 1;
-            stats.total_features_loaded += self.feature_dim as u64;
-            stats.total_bytes_loaded += feature_size as u64;
-            stats.get_time_ns += start.elapsed().as_nanos() as u64;
+        if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {
+            stats.single_gets.fetch_add(1, Ordering::Relaxed);
+            stats.total_nodes_loaded.fetch_add(1, Ordering::Relaxed);
+            stats
+                .total_features_loaded
+                .fetch_add(self.feature_dim as u64, Ordering::Relaxed);
+            stats
+                .total_bytes_loaded
+                .fetch_add(feature_size as u64, Ordering::Relaxed);
+            stats
+                .get_time_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         Ok(features)
@@ -289,7 +303,7 @@ impl AsyncFeatureStore {
     /// - Linux io_uring + O_DIRECT: Parallel reads with aligned buffers, ~100μs for 1000 nodes
     /// - Tokio fallback: Parallel spawn_blocking reads
     pub async fn get_batch(&self, nodes: &[NodeId]) -> Result<Vec<f32>> {
-        let start = Instant::now();
+        let start = self.telemetry.is_some().then(Instant::now);
 
         trace!("Batch loading {} node features (async)", nodes.len());
 
@@ -323,32 +337,49 @@ impl AsyncFeatureStore {
         }
 
         // Track telemetry
-        if let Some(ref telemetry) = self.telemetry {
-            let mut stats = telemetry.write();
-            stats.batch_gets += 1;
-            stats.total_nodes_loaded += nodes.len() as u64;
-            stats.total_features_loaded += (nodes.len() * self.feature_dim) as u64;
-            stats.total_bytes_loaded +=
-                all_features.len() as u64 * std::mem::size_of::<f32>() as u64;
-            stats.batch_time_ns += start.elapsed().as_nanos() as u64;
+        if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {
+            stats.batch_gets.fetch_add(1, Ordering::Relaxed);
+            stats
+                .total_nodes_loaded
+                .fetch_add(nodes.len() as u64, Ordering::Relaxed);
+            stats
+                .total_features_loaded
+                .fetch_add((nodes.len() * self.feature_dim) as u64, Ordering::Relaxed);
+            stats.total_bytes_loaded.fetch_add(
+                all_features.len() as u64 * std::mem::size_of::<f32>() as u64,
+                Ordering::Relaxed,
+            );
+            stats
+                .batch_time_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         Ok(all_features)
     }
 
-    /// Issue one prefetch hint spanning the min/max node range in this batch.
+    /// Issue one prefetch hint spanning the min/max node range in this batch,
+    /// but only when the batch is dense in that range.
+    ///
+    /// A WILLNEED hint forces readahead of the entire span. For a random
+    /// batch over a large file (the normal GNN sampling case) the
+    /// min..max span approximates the whole file, so an unconditional
+    /// hint would fault in gigabytes of unwanted pages and evict the
+    /// page cache — strictly worse than no hint.
     fn prefetch_batch_range(&self, nodes: &[NodeId], feature_size: usize) {
+        const MAX_SPAN_FACTOR: usize = 4;
         if let (Some(&min_node), Some(&max_node)) = (nodes.iter().min(), nodes.iter().max()) {
             // Defensive: min <= max guaranteed by min()/max(), but check anyway
             if min_node <= max_node
-                && let (Some(min_offset), Some(range_len)) = (
+                && let (Some(min_offset), Some(range_len), Some(batch_bytes)) = (
                     self.features_start_offset
                         .checked_add((min_node as u64).saturating_mul(feature_size as u64)),
                     (max_node as usize)
                         .checked_sub(min_node as usize)
                         .and_then(|d| d.checked_add(1))
                         .and_then(|n| n.checked_mul(feature_size)),
+                    nodes.len().checked_mul(feature_size),
                 )
+                && range_len <= batch_bytes.saturating_mul(MAX_SPAN_FACTOR)
             {
                 crate::internal::hint::prefetch_file_range(&*self.file, min_offset, range_len);
             }
@@ -447,8 +478,9 @@ impl AsyncFeatureStore {
 
                 let mut handle = uring_arc.lock();
                 // SAFETY: each ptr in `chunk` points into aligned_pool/regular_buffer,
-                // which live until after this function returns; batch_read completes
-                // synchronously before the lock is released.
+                // which live until after this function returns; batch_read reaps every
+                // submitted completion before returning — on success AND on error — so
+                // the kernel is done with these buffers by the time `?` can propagate.
                 crate::internal::uring::batch_read(&mut handle, fd, chunk)?;
 
                 trace!(
@@ -490,53 +522,64 @@ impl AsyncFeatureStore {
         Ok(features)
     }
 
-    /// Sync read fallback (non-Linux or io_uring unavailable)
-    fn read_sync(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
-        self.file
-            .read_exact_at(buffer, offset)
-            .context("sync read failed")?;
-        Ok(())
-    }
-
     /// Tokio fallback implementation - async with spawn_blocking
     ///
-    /// Uses tokio::task::spawn_blocking to perform sync reads in parallel.
-    /// Not as fast as io_uring, but still provides parallelism and works everywhere.
+    /// Splits the batch into one contiguous chunk per available core and
+    /// runs a pread loop inside each `spawn_blocking` task. One task per
+    /// node would put a blocking-pool dispatch (~µs) and a Vec allocation
+    /// in front of every read — for a 1000-node batch that overhead
+    /// dominates the preads whenever pages are cached.
     async fn batch_read_tokio(&self, nodes: &[NodeId], feature_size: usize) -> Result<Vec<f32>> {
         use tokio::task;
 
         trace!("Using tokio fallback for batch feature read (not io_uring)");
 
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(&max_node) = nodes.iter().max() {
+            anyhow::ensure!(
+                (max_node as usize) < self.num_nodes,
+                "node {} out of bounds (num_nodes={})",
+                max_node,
+                self.num_nodes
+            );
+        }
+
         let dtype = self.dtype;
+        let feature_dim = self.feature_dim;
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(nodes.len());
+        let chunk_len = nodes.len().div_ceil(parallelism);
+
         let tasks: Vec<_> = nodes
-            .iter()
-            .map(|&node| {
+            .chunks(chunk_len)
+            .map(|chunk| {
+                let chunk: Vec<NodeId> = chunk.to_vec();
                 let file = Arc::clone(&self.file);
                 let offset = self.features_start_offset;
-                let num_nodes = self.num_nodes;
 
                 task::spawn_blocking(move || {
-                    anyhow::ensure!((node as usize) < num_nodes, "node {} out of bounds", node);
-
-                    let byte_offset = offset + (node as u64 * feature_size as u64);
+                    let mut features = Vec::with_capacity(chunk.len() * feature_dim);
                     let mut buffer = vec![0u8; feature_size];
+                    for &node in &chunk {
+                        let byte_offset = offset + (node as u64 * feature_size as u64);
+                        file.read_exact_at(&mut buffer, byte_offset)
+                            .context("failed to read features")?;
 
-                    file.read_exact_at(&mut buffer, byte_offset)
-                        .context("failed to read features")?;
-
-                    let features: Vec<f32> = match dtype {
-                        FeatureDtype::F32 => buffer
-                            .chunks_exact(4)
-                            .map(|chunk| {
-                                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                            })
-                            .collect(),
-                        FeatureDtype::F16 => buffer
-                            .chunks_exact(2)
-                            .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                            .collect(),
-                    };
-
+                        match dtype {
+                            FeatureDtype::F32 => features.extend(buffer.chunks_exact(4).map(
+                                |chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                            )),
+                            FeatureDtype::F16 => features.extend(
+                                buffer
+                                    .chunks_exact(2)
+                                    .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()),
+                            ),
+                        }
+                    }
                     Ok::<_, anyhow::Error>(features)
                 })
             })

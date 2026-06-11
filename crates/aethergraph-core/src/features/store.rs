@@ -28,11 +28,11 @@ use crate::graph::NodeId;
 use anyhow::{Context, Result};
 use half::f16;
 use memmap2::{Mmap, MmapOptions};
-use parking_lot::RwLock;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, trace};
 
@@ -148,6 +148,36 @@ pub struct FeatureLoadTelemetry {
     pub batch_time_ns: u64,
 }
 
+/// Atomic counters behind [`FeatureLoadTelemetry`].
+///
+/// The read paths bump these with relaxed atomics so enabling telemetry
+/// does not put a lock on the per-node hot path; `snapshot()` assembles
+/// the public summary struct.
+#[derive(Debug, Default)]
+pub(crate) struct TelemetryCells {
+    pub(crate) single_gets: AtomicU64,
+    pub(crate) batch_gets: AtomicU64,
+    pub(crate) total_nodes_loaded: AtomicU64,
+    pub(crate) total_features_loaded: AtomicU64,
+    pub(crate) total_bytes_loaded: AtomicU64,
+    pub(crate) get_time_ns: AtomicU64,
+    pub(crate) batch_time_ns: AtomicU64,
+}
+
+impl TelemetryCells {
+    pub(crate) fn snapshot(&self) -> FeatureLoadTelemetry {
+        FeatureLoadTelemetry {
+            single_gets: self.single_gets.load(Ordering::Relaxed),
+            batch_gets: self.batch_gets.load(Ordering::Relaxed),
+            total_nodes_loaded: self.total_nodes_loaded.load(Ordering::Relaxed),
+            total_features_loaded: self.total_features_loaded.load(Ordering::Relaxed),
+            total_bytes_loaded: self.total_bytes_loaded.load(Ordering::Relaxed),
+            get_time_ns: self.get_time_ns.load(Ordering::Relaxed),
+            batch_time_ns: self.batch_time_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl FeatureLoadTelemetry {
     /// Get total time in seconds
     #[inline]
@@ -237,14 +267,13 @@ pub struct FeatureStore {
     feature_data_len_bytes: usize,
     dtype: FeatureDtype,
     /// Optional telemetry collector
-    telemetry: Option<Arc<RwLock<FeatureLoadTelemetry>>>,
+    telemetry: Option<Arc<TelemetryCells>>,
 }
 
-// SAFETY: FeatureStore exposes only read-only views into an Arc<Mmap>; the mmap
-// itself is immutable for the lifetime of the store, so concurrent send/sync is sound.
-unsafe impl Send for FeatureStore {}
-// SAFETY: see Send impl above — read-only Arc<Mmap> with no interior mutability of the mapping.
-unsafe impl Sync for FeatureStore {}
+// No hand-written `unsafe impl Send/Sync`: every field (`Arc<Mmap>`,
+// counters, plain data) is already Send + Sync, so the compiler derives
+// both. Writing the impls by hand would silently suppress that checking
+// if a non-thread-safe field were ever added.
 
 impl FeatureStore {
     /// Load features from memory-mapped file.
@@ -422,19 +451,19 @@ impl FeatureStore {
     ///
     /// Call this before operations to track performance metrics.
     pub fn with_telemetry(mut self) -> Self {
-        self.telemetry = Some(Arc::new(RwLock::new(FeatureLoadTelemetry::default())));
+        self.telemetry = Some(Arc::new(TelemetryCells::default()));
         self
     }
 
     /// Get telemetry statistics.
     pub fn telemetry(&self) -> Option<FeatureLoadTelemetry> {
-        self.telemetry.as_ref().map(|t| t.read().clone())
+        self.telemetry.as_ref().map(|t| t.snapshot())
     }
 
     /// Print telemetry summary.
     pub fn print_telemetry(&self) {
         if let Some(ref telemetry) = self.telemetry {
-            telemetry.read().print_summary();
+            telemetry.snapshot().print_summary();
         } else {
             debug!("Telemetry not enabled. Call with_telemetry() to enable.");
         }
@@ -453,7 +482,9 @@ impl FeatureStore {
             "get() is not supported for F16 features -- use get_batch() or get_into() instead"
         );
 
-        let start = Instant::now();
+        // Clock reads cost ~20-30ns on a ~100ns documented hot path —
+        // only pay for them when telemetry is enabled.
+        let start = self.telemetry.is_some().then(Instant::now);
 
         let node_idx = node as usize;
         anyhow::ensure!(
@@ -487,13 +518,19 @@ impl FeatureStore {
         let features = &data[start_idx..end_idx];
 
         // Track telemetry
-        if let Some(ref telemetry) = self.telemetry {
-            let mut stats = telemetry.write();
-            stats.single_gets += 1;
-            stats.total_nodes_loaded += 1;
-            stats.total_features_loaded += self.feature_dim as u64;
-            stats.total_bytes_loaded += self.feature_dim as u64 * std::mem::size_of::<f32>() as u64;
-            stats.get_time_ns += start.elapsed().as_nanos() as u64;
+        if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {
+            stats.single_gets.fetch_add(1, Ordering::Relaxed);
+            stats.total_nodes_loaded.fetch_add(1, Ordering::Relaxed);
+            stats
+                .total_features_loaded
+                .fetch_add(self.feature_dim as u64, Ordering::Relaxed);
+            stats.total_bytes_loaded.fetch_add(
+                self.feature_dim as u64 * std::mem::size_of::<f32>() as u64,
+                Ordering::Relaxed,
+            );
+            stats
+                .get_time_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         Ok(features)
@@ -550,7 +587,7 @@ impl FeatureStore {
         T: Copy + TryInto<NodeId>,
         <T as TryInto<NodeId>>::Error: std::fmt::Debug,
     {
-        let start = Instant::now();
+        let start = self.telemetry.is_some().then(Instant::now);
         trace!("Batch loading {} node features", nodes.len());
 
         let mut result = Vec::with_capacity(nodes.len() * self.feature_dim);
@@ -598,13 +635,21 @@ impl FeatureStore {
         }
 
         // Track telemetry (only if enabled)
-        if let Some(ref telemetry) = self.telemetry {
-            let mut stats = telemetry.write();
-            stats.batch_gets += 1;
-            stats.total_nodes_loaded += nodes.len() as u64;
-            stats.total_features_loaded += (nodes.len() * self.feature_dim) as u64;
-            stats.total_bytes_loaded += result.len() as u64 * std::mem::size_of::<f32>() as u64;
-            stats.batch_time_ns += start.elapsed().as_nanos() as u64;
+        if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {
+            stats.batch_gets.fetch_add(1, Ordering::Relaxed);
+            stats
+                .total_nodes_loaded
+                .fetch_add(nodes.len() as u64, Ordering::Relaxed);
+            stats
+                .total_features_loaded
+                .fetch_add((nodes.len() * self.feature_dim) as u64, Ordering::Relaxed);
+            stats.total_bytes_loaded.fetch_add(
+                result.len() as u64 * std::mem::size_of::<f32>() as u64,
+                Ordering::Relaxed,
+            );
+            stats
+                .batch_time_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         Ok(result)
@@ -612,23 +657,27 @@ impl FeatureStore {
 
     /// Get all features as a slice (zero-copy, f32 only).
     ///
-    /// # Panics
-    /// Debug-asserts that dtype is F32. For F16 stores, use `get_batch()`.
+    /// Errors for F16 stores — the payload is half-precision and cannot
+    /// be viewed as `&[f32]`; use `get_batch()` (which upcasts) instead.
     #[inline(always)]
-    pub fn features(&self) -> &[f32] {
+    pub fn features(&self) -> Result<&[f32]> {
+        anyhow::ensure!(
+            self.dtype == FeatureDtype::F32,
+            "features() is not supported for F16 stores -- the raw payload is not f32. \
+             Use get_batch() to upcast."
+        );
         let data = self.feature_data();
-        // Safety: constructor validates num_nodes * feature_dim doesn't overflow
-        // and that mmap has sufficient data
         let len = self
             .num_nodes
-            .saturating_mul(self.feature_dim)
-            .min(data.len());
-        debug_assert_eq!(
+            .checked_mul(self.feature_dim)
+            .ok_or_else(|| anyhow::anyhow!("num_nodes * feature_dim overflows"))?;
+        anyhow::ensure!(
+            len == data.len(),
+            "feature data length mismatch: header says {} values, payload has {}",
             len,
-            self.num_nodes * self.feature_dim,
-            "feature data invariant violated"
+            data.len()
         );
-        &data[..len]
+        Ok(data)
     }
 }
 
@@ -946,7 +995,7 @@ mod tests {
         assert!(node_features.iter().all(|&x| x == 42.0));
 
         // All features slice (zero-copy)
-        let all_features = store.features();
+        let all_features = store.features().unwrap();
         assert_eq!(all_features.len(), num_nodes * feature_dim);
     }
 

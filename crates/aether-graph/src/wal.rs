@@ -33,9 +33,11 @@
 //! [20..24] crc32   u32 LE  — CRC32 of bytes [0..20] (IEEE polynomial)
 //! ```
 //!
-//! Fixed-size records keep replay branchless. CRC catches partial writes:
-//! if the kernel only flushed the first 18 bytes of a record before the
-//! crash, the trailing CRC will mismatch and replay stops cleanly.
+//! Fixed-size records keep replay branchless. Torn writes are detected
+//! two ways: a tail shorter than one record is caught by the fixed
+//! stride, and a full-size but partially-flushed record is caught by its
+//! CRC. Both surface as [`ReplayOutcome::truncate_to`] so recovery
+//! truncates back to the last clean boundary before appending.
 //!
 //! # What is NOT in scope
 //!
@@ -57,9 +59,9 @@ pub(crate) const VERSION: u32 = 1;
 pub(crate) const HEADER_LEN: u64 = 16;
 pub(crate) const RECORD_LEN: usize = 24;
 
-/// Errors surfaced by WAL writes / replay. Distinct from [`io::Error`] so
-/// callers can react to "your WAL is corrupt" differently from "the disk
-/// is full".
+/// Errors surfaced by WAL writes / replay. Corruption is not an error:
+/// a torn or corrupt tail is reported through
+/// [`ReplayOutcome::truncate_to`] so callers can truncate-and-recover.
 #[derive(Debug)]
 pub enum WalError {
     /// Underlying I/O failure (open, read, write, fsync).
@@ -69,11 +71,13 @@ pub enum WalError {
     BadMagic { found: [u8; 8] },
     /// Header says a version we don't know how to read.
     UnknownVersion(u32),
-    /// Last record's CRC didn't match. The byte offset where validation
-    /// failed is reported so callers can truncate-and-recover. Records
-    /// strictly before this offset have already been delivered to the
-    /// replay callback and are durable.
-    Corrupt { offset: u64 },
+    /// A replayed record references a vertex at or beyond the
+    /// `num_vertices` the graph was opened with — the WAL was written
+    /// against a larger graph than the one being recovered into.
+    RecordOutOfRange { src: u32, dst: u32, num_vertices: u64 },
+    /// The arena filled up before every record was replayed. Reopen
+    /// with a larger arena.
+    ReplayArenaFull,
 }
 
 impl std::fmt::Display for WalError {
@@ -82,11 +86,17 @@ impl std::fmt::Display for WalError {
             Self::Io(e) => write!(f, "WAL io error: {e}"),
             Self::BadMagic { found } => write!(f, "WAL bad magic: {found:?}"),
             Self::UnknownVersion(v) => write!(f, "WAL version {v} not supported"),
-            Self::Corrupt { offset } => {
-                write!(
-                    f,
-                    "WAL corrupt at byte offset {offset}; truncate to recover"
-                )
+            Self::RecordOutOfRange {
+                src,
+                dst,
+                num_vertices,
+            } => write!(
+                f,
+                "WAL record ({src}, {dst}) exceeds num_vertices {num_vertices}; \
+                 the log was written against a larger graph"
+            ),
+            Self::ReplayArenaFull => {
+                write!(f, "arena filled during WAL replay; reopen with a larger arena")
             }
         }
     }
@@ -141,6 +151,17 @@ impl WalWriter {
             header[8..12].copy_from_slice(&VERSION.to_le_bytes());
             file.write_all(&header)?;
             file.sync_data()?;
+            // The new directory entry must also be durable: without an
+            // fsync of the parent directory, a power loss can lose the
+            // whole file even though every later sync() succeeded.
+            #[cfg(unix)]
+            {
+                let parent = match path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p,
+                    _ => Path::new("."),
+                };
+                File::open(parent)?.sync_all()?;
+            }
         } else if len < HEADER_LEN {
             return Err(WalError::BadMagic {
                 found: [0; 8], // truncated; report empty
@@ -216,9 +237,11 @@ impl Drop for WalWriter {
 }
 
 /// Replay every record in the WAL at `path`, invoking `apply` for each.
-/// Stops cleanly at end-of-file or at the first corrupt record (kernel
-/// crashed mid-write). Returns the number of records successfully
-/// applied and, if truncation is needed, the byte offset to truncate to.
+/// Stops cleanly at end-of-file or at the first torn record (kernel
+/// crashed mid-write), whether the tear is a short tail (fewer than
+/// `RECORD_LEN` trailing bytes) or a full-size record with a CRC
+/// mismatch. Returns the number of records successfully applied and, if
+/// truncation is needed, the byte offset to truncate to.
 ///
 /// A missing file or a zero-byte file is treated as "no records yet" —
 /// callers about to create a fresh WAL get an empty outcome rather than an
@@ -271,8 +294,17 @@ where
         match reader.read_exact(&mut buf) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // Either a clean end-of-file or a torn write that left
-                // fewer than RECORD_LEN bytes. Treat as end-of-log.
+                // Clean end-of-file when the file ends exactly on a record
+                // boundary. Anything shorter is a torn write: report the
+                // boundary so callers truncate before appending — appends
+                // on top of a partial record would land misaligned and be
+                // discarded wholesale by the next replay's CRC check.
+                if offset != total_len {
+                    return Ok(ReplayOutcome {
+                        applied,
+                        truncate_to: Some(offset),
+                    });
+                }
                 break;
             }
             Err(e) => return Err(WalError::Io(e)),
@@ -430,6 +462,35 @@ mod tests {
             out.truncate_to,
             Some(HEADER_LEN + RECORD_LEN as u64),
             "truncate-to points at the start of the bad record"
+        );
+    }
+
+    #[test]
+    fn short_torn_tail_reports_truncation() {
+        let tmp = tmp_wal();
+        {
+            let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
+            w.append_edge(EdgeRecord {
+                epoch: 1,
+                src: 0,
+                dst: 1,
+            })
+            .unwrap();
+            w.sync().unwrap();
+        }
+        // Simulate a torn write that flushed only part of a record.
+        {
+            let mut f = OpenOptions::new().append(true).open(tmp.path()).unwrap();
+            f.write_all(&[0xAA; 10]).unwrap();
+            f.sync_data().unwrap();
+        }
+        let mut got = Vec::new();
+        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        assert_eq!(got.len(), 1, "good record applied");
+        assert_eq!(
+            out.truncate_to,
+            Some(HEADER_LEN + RECORD_LEN as u64),
+            "short tail must be reported for truncation, not ignored"
         );
     }
 

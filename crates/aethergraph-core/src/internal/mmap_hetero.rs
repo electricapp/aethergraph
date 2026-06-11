@@ -1,12 +1,13 @@
 //! Heterogeneous graph binary format: save/load multi-relational CSR.
 //!
-//! File layout:
+//! File layout (version 1):
 //! ```text
 //! [Header: 64 bytes]
 //!   magic:          8 bytes  "AETHHETG"
+//!   version:        u32 (currently 1; readers reject newer versions)
 //!   num_node_types: u32
 //!   num_edge_types: u32
-//!   reserved:       48 bytes (zero)
+//!   reserved:       44 bytes (zero)
 //!
 //! [Node Type Table: num_node_types × 72 bytes each]
 //!   name:       64 bytes (UTF-8, zero-padded)
@@ -24,13 +25,23 @@
 //! [Per-edge-type CSR sections, concatenated]
 //!   For each edge type:
 //!     offsets: [u64; num_src_nodes + 1]
-//!     edges:   [u32; num_edges]
-//!     weights: [f32; num_edges]  (if has_weights)
+//!     edges:   [u32; num_edges]   (zero-padded to an 8-byte boundary)
+//!     weights: [f32; num_edges]   (if has_weights; zero-padded to 8 bytes)
 //! ```
+//!
+//! The 8-byte padding after the u32 sections keeps every following
+//! offsets array (u64) naturally aligned in the mapping — without it an
+//! odd edge count would misalign every subsequent section and the
+//! zero-copy u64 casts would fail.
+//!
+//! The loader validates everything it reads against the file length with
+//! checked arithmetic before constructing any view: a corrupt or
+//! truncated file must surface as `Err`, never as a panic or a SIGBUS on
+//! first access.
 
 use crate::graph::hetero::HeteroGraph;
 use crate::graph::{EdgeOffset, Graph, NodeId};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use memmap2::MmapOptions;
 use std::fs::File;
 use std::io::Write;
@@ -38,9 +49,22 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"AETHHETG";
+const VERSION: u32 = 1;
 const HEADER_SIZE: usize = 64;
 const NODE_TYPE_ENTRY_SIZE: usize = 72; // 64 name + 8 count
 const EDGE_TYPE_ENTRY_SIZE: usize = 216; // 64*3 names + 8+8+4+4
+
+/// Type IDs are u8 throughout `HeteroGraph`.
+const MAX_TYPES: usize = 256;
+/// Sanity caps mirroring the homogeneous loader — a corrupt header must
+/// not drive multi-GB allocations or offset arithmetic.
+const MAX_NODES: u64 = 10_000_000_000;
+const MAX_EDGES: u64 = 100_000_000_000;
+
+/// Bytes of zero padding needed to align `len` up to 8.
+fn pad8(len: usize) -> usize {
+    len.wrapping_neg() & 7
+}
 
 fn write_padded_name(buf: &mut Vec<u8>, name: &str) {
     let bytes = name.as_bytes();
@@ -61,12 +85,17 @@ pub fn save_hetero_graph(graph: &HeteroGraph, path: impl AsRef<Path>) -> Result<
 
     let num_nt = graph.node_type_count();
     let num_et = graph.edge_type_count();
+    ensure!(
+        num_nt <= MAX_TYPES && num_et <= MAX_TYPES,
+        "type counts ({num_nt} node, {num_et} edge) exceed the format limit of {MAX_TYPES}"
+    );
 
     // Header
     let mut header = vec![0u8; HEADER_SIZE];
     header[..8].copy_from_slice(MAGIC);
-    header[8..12].copy_from_slice(&(num_nt as u32).to_le_bytes());
-    header[12..16].copy_from_slice(&(num_et as u32).to_le_bytes());
+    header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&(num_nt as u32).to_le_bytes());
+    header[16..20].copy_from_slice(&(num_et as u32).to_le_bytes());
     file.write_all(&header)?;
 
     // Node type table
@@ -97,15 +126,22 @@ pub fn save_hetero_graph(graph: &HeteroGraph, path: impl AsRef<Path>) -> Result<
         file.write_all(&entry)?;
     }
 
-    // CSR sections
+    // CSR sections. The u32 sections (edges, weights) are padded to an
+    // 8-byte boundary so the next edge type's u64 offsets array stays
+    // naturally aligned in the mapping.
+    const ZERO_PAD: [u8; 8] = [0u8; 8];
     for et_id in 0..num_et as u8 {
         let csr = graph.csr(et_id);
         let offsets = csr.offsets_raw();
         let edges = csr.edges_raw();
         file.write_all(bytemuck::cast_slice(offsets))?;
-        file.write_all(bytemuck::cast_slice(edges))?;
+        let edges_bytes: &[u8] = bytemuck::cast_slice(edges);
+        file.write_all(edges_bytes)?;
+        file.write_all(&ZERO_PAD[..pad8(edges_bytes.len())])?;
         if let Some(weights) = csr.weights() {
-            file.write_all(bytemuck::cast_slice(weights))?;
+            let weight_bytes: &[u8] = bytemuck::cast_slice(weights);
+            file.write_all(weight_bytes)?;
+            file.write_all(&ZERO_PAD[..pad8(weight_bytes.len())])?;
         }
     }
 
@@ -120,17 +156,40 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
     // SAFETY: file is owned for the duration of the mapping; the Arc keeps the read-only
     // mmap alive and we never mutate its pages.
     let mmap = Arc::new(unsafe { MmapOptions::new().map(&file)? });
+    let file_len = mmap.len();
 
-    if mmap.len() < HEADER_SIZE {
-        bail!("file too small for header");
+    if file_len < HEADER_SIZE {
+        bail!("file too small for header: {file_len} bytes");
     }
 
     // Parse header
     if &mmap[..8] != MAGIC {
         bail!("invalid magic (expected AETHHETG)");
     }
-    let num_nt = u32::from_le_bytes(mmap[8..12].try_into()?) as usize;
-    let num_et = u32::from_le_bytes(mmap[12..16].try_into()?) as usize;
+    let version = u32::from_le_bytes(mmap[8..12].try_into()?);
+    ensure!(
+        version == VERSION,
+        "hetero graph file format version {version} is not supported by this build (max {VERSION})"
+    );
+    let num_nt = u32::from_le_bytes(mmap[12..16].try_into()?) as usize;
+    let num_et = u32::from_le_bytes(mmap[16..20].try_into()?) as usize;
+    ensure!(
+        num_nt <= MAX_TYPES && num_et <= MAX_TYPES,
+        "type counts ({num_nt} node, {num_et} edge) exceed the format limit of {MAX_TYPES} \
+         — file is corrupt"
+    );
+
+    // Both tables must fit before anything is sliced.
+    let tables_len = num_nt
+        .checked_mul(NODE_TYPE_ENTRY_SIZE)
+        .and_then(|n| num_et.checked_mul(EDGE_TYPE_ENTRY_SIZE).map(|e| (n, e)))
+        .and_then(|(n, e)| n.checked_add(e))
+        .and_then(|t| t.checked_add(HEADER_SIZE))
+        .ok_or_else(|| anyhow::anyhow!("type table size overflows"))?;
+    ensure!(
+        tables_len <= file_len,
+        "file truncated: type tables need {tables_len} bytes, file has {file_len}"
+    );
 
     let mut offset = HEADER_SIZE;
 
@@ -139,8 +198,12 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
     for _ in 0..num_nt {
         let entry = &mmap[offset..offset + NODE_TYPE_ENTRY_SIZE];
         let name = read_padded_name(&entry[..64])?;
-        let count = u64::from_le_bytes(entry[64..72].try_into()?) as usize;
-        node_types.push((name, count));
+        let count = u64::from_le_bytes(entry[64..72].try_into()?);
+        ensure!(
+            count <= MAX_NODES,
+            "node type '{name}' count {count} exceeds maximum {MAX_NODES} — file is corrupt"
+        );
+        node_types.push((name, count as usize));
         offset += NODE_TYPE_ENTRY_SIZE;
     }
 
@@ -159,42 +222,93 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
         let src_name = read_padded_name(&entry[0..64])?;
         let rel_name = read_padded_name(&entry[64..128])?;
         let dst_name = read_padded_name(&entry[128..192])?;
-        let num_src_nodes = u64::from_le_bytes(entry[192..200].try_into()?) as usize;
-        let num_edges = u64::from_le_bytes(entry[200..208].try_into()?) as usize;
+        let num_src_nodes = u64::from_le_bytes(entry[192..200].try_into()?);
+        let num_edges = u64::from_le_bytes(entry[200..208].try_into()?);
+        ensure!(
+            num_src_nodes <= MAX_NODES,
+            "edge type '{rel_name}' num_src_nodes {num_src_nodes} exceeds maximum {MAX_NODES} \
+             — file is corrupt"
+        );
+        ensure!(
+            num_edges <= MAX_EDGES,
+            "edge type '{rel_name}' num_edges {num_edges} exceeds maximum {MAX_EDGES} \
+             — file is corrupt"
+        );
         let has_weights = u32::from_le_bytes(entry[208..212].try_into()?) != 0;
         et_headers.push(EdgeTypeHeader {
             src_name,
             rel_name,
             dst_name,
-            num_src_nodes,
-            num_edges,
+            num_src_nodes: num_src_nodes as usize,
+            num_edges: num_edges as usize,
             has_weights,
         });
         offset += EDGE_TYPE_ENTRY_SIZE;
     }
 
-    // Parse CSR sections (mmap-backed, zero-copy)
+    // Validate and slice CSR sections (mmap-backed, zero-copy). Every
+    // range is bounds- and overflow-checked against the file length
+    // before a Graph view is built over it.
+    let take = |offset: &mut usize, len: usize, what: &str, rel: &str| -> Result<std::ops::Range<usize>> {
+        let start = *offset;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("section size overflows for edge type '{rel}'"))?;
+        ensure!(
+            end <= file_len,
+            "file truncated: {what} section of edge type '{rel}' needs bytes {start}..{end}, \
+             file has {file_len}"
+        );
+        *offset = end;
+        Ok(start..end)
+    };
+
     let mut edge_types: Vec<(String, String, String, Graph)> = Vec::with_capacity(num_et);
     for hdr in &et_headers {
-        let offsets_bytes = (hdr.num_src_nodes + 1) * std::mem::size_of::<EdgeOffset>();
-        let edges_bytes = hdr.num_edges * std::mem::size_of::<NodeId>();
-        let weights_bytes = if hdr.has_weights {
-            hdr.num_edges * std::mem::size_of::<f32>()
-        } else {
-            0
-        };
+        let rel = hdr.rel_name.as_str();
+        let offsets_bytes = hdr
+            .num_src_nodes
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<EdgeOffset>()))
+            .ok_or_else(|| anyhow::anyhow!("offsets size overflows for edge type '{rel}'"))?;
+        let edges_bytes = hdr
+            .num_edges
+            .checked_mul(std::mem::size_of::<NodeId>())
+            .ok_or_else(|| anyhow::anyhow!("edges size overflows for edge type '{rel}'"))?;
 
-        let offsets_range = offset..offset + offsets_bytes;
-        offset += offsets_bytes;
-        let edges_range = offset..offset + edges_bytes;
-        offset += edges_bytes;
+        let offsets_range = take(&mut offset, offsets_bytes, "offsets", rel)?;
+        ensure!(
+            offsets_range.start.is_multiple_of(std::mem::align_of::<EdgeOffset>()),
+            "offsets section of edge type '{rel}' is misaligned — file is corrupt"
+        );
+        // O(1) structural check: a CSR offsets array starts at 0 and ends
+        // at num_edges. Catches sections that landed on the wrong bytes
+        // without faulting in the whole file.
+        let first = u64::from_le_bytes(mmap[offsets_range.start..offsets_range.start + 8].try_into()?);
+        let last = u64::from_le_bytes(mmap[offsets_range.end - 8..offsets_range.end].try_into()?);
+        ensure!(
+            first == 0 && last == hdr.num_edges as u64,
+            "offsets of edge type '{rel}' are inconsistent (first={first}, last={last}, \
+             num_edges={}) — file is corrupt",
+            hdr.num_edges
+        );
+        let edges_range = take(&mut offset, edges_bytes, "edges", rel)?;
+        offset = offset
+            .checked_add(pad8(edges_bytes))
+            .ok_or_else(|| anyhow::anyhow!("section size overflows for edge type '{rel}'"))?;
         let weights_range = if hdr.has_weights {
-            let r = offset..offset + weights_bytes;
-            offset += weights_bytes;
+            let r = take(&mut offset, edges_bytes, "weights", rel)?;
+            offset = offset
+                .checked_add(pad8(edges_bytes))
+                .ok_or_else(|| anyhow::anyhow!("section size overflows for edge type '{rel}'"))?;
             Some(r)
         } else {
             None
         };
+        ensure!(
+            offset <= file_len,
+            "file truncated: section padding of edge type '{rel}' extends past EOF"
+        );
 
         let graph = Graph::from_mapped_parts(
             hdr.num_src_nodes,
@@ -213,7 +327,8 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
         ));
     }
 
-    Ok(HeteroGraph::from_parts(node_types, edge_types))
+    HeteroGraph::try_from_parts(node_types, edge_types)
+        .context("hetero graph type tables are inconsistent — file is corrupt")
 }
 
 #[cfg(test)]
@@ -532,15 +647,114 @@ mod tests {
         std::fs::write(&path, &data[..data.len() - 8]).unwrap();
 
         let result = load_hetero_graph(&path);
-        // Should either error or produce a graph with no/partial weights
-        // (mmap won't crash but the range will be out of bounds)
+        let msg = result.unwrap_err().to_string();
         assert!(
-            result.is_err() || {
-                // If it loads, the weights range extends past EOF — mmap will SIGBUS on access
-                // which we can't test cleanly. Accepting either error or success here.
-                true
-            }
+            msg.contains("truncated"),
+            "truncated file must fail at load time, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_odd_edge_count_keeps_next_section_aligned() {
+        // An unweighted edge type with an odd edge count leaves the file
+        // cursor 4 bytes past an 8-byte boundary; the writer must pad so
+        // the NEXT edge type's u64 offsets stay aligned. Reading the
+        // second type's neighbors exercises the zero-copy u64 cast.
+        let odd_edges: Vec<(u32, u32)> = vec![(0, 1), (1, 2), (2, 0)]; // 3 edges (odd)
+        let odd_csr = Graph::from_edges(3, &odd_edges, None).unwrap();
+        let second_edges: Vec<(u32, u32)> = vec![(0, 2), (1, 0)];
+        let second_csr = Graph::from_edges(3, &second_edges, None).unwrap();
+
+        let graph = HeteroGraph::from_parts(
+            vec![("n".into(), 3)],
+            vec![
+                ("n".into(), "odd".into(), "n".into(), odd_csr),
+                ("n".into(), "second".into(), "n".into(), second_csr),
+            ],
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("odd.bin");
+        save_hetero_graph(&graph, &path).unwrap();
+        let loaded = load_hetero_graph(&path).unwrap();
+
+        let odd_id = loaded.edge_type_id("n", "odd", "n").unwrap();
+        let second_id = loaded.edge_type_id("n", "second", "n").unwrap();
+        assert_eq!(loaded.csr(odd_id).neighbors(0), &[1u32]);
+        assert_eq!(loaded.csr(second_id).neighbors(0), &[2u32]);
+        assert_eq!(loaded.csr(second_id).neighbors(1), &[0u32]);
+    }
+
+    #[test]
+    fn test_corrupt_type_counts_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counts.bin");
+
+        // Valid magic + version, absurd type counts. Must error without
+        // attempting giant allocations.
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[..8].copy_from_slice(MAGIC);
+        bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let msg = load_hetero_graph(&path).unwrap_err().to_string();
+        assert!(msg.contains("exceed the format limit"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_truncated_type_table_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.bin");
+
+        // Header promises one node type but the file ends after the header.
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[..8].copy_from_slice(MAGIC);
+        bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let msg = load_hetero_graph(&path).unwrap_err().to_string();
+        assert!(msg.contains("truncated"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_newer_version_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.bin");
+
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[..8].copy_from_slice(MAGIC);
+        bytes[8..12].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let msg = load_hetero_graph(&path).unwrap_err().to_string();
+        assert!(msg.contains("not supported"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_corrupt_edge_count_rejected() {
+        // Build a valid file, then corrupt one edge type's num_edges so
+        // the section ranges extend past EOF.
+        let csr = Graph::from_edges(3, &[(0, 1), (1, 2)], None).unwrap();
+        let graph = HeteroGraph::from_parts(
+            vec![("n".into(), 3)],
+            vec![("n".into(), "e".into(), "n".into(), csr)],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badcount.bin");
+        save_hetero_graph(&graph, &path).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        // num_edges lives at header + node table + 200 bytes into the
+        // (single) edge type entry.
+        let pos = HEADER_SIZE + NODE_TYPE_ENTRY_SIZE + 200;
+        bytes[pos..pos + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(load_hetero_graph(&path).is_err());
     }
 
     #[test]

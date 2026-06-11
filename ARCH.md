@@ -87,8 +87,12 @@ C-tree for degree 45 node:
   atomic root swap
 - Readers see a consistent snapshot via functional persistence — old tree valid
   for concurrent readers
-- Arena: pre-allocated contiguous region, zero-alloc writes, bulk free on epoch
-  reclaim
+- C-tree balance: scapegoat scheme (α = 2/3) — an insert that pushes its path
+  past the α-height bound rebuilds the highest weight-unbalanced subtree, so
+  depth stays O(log degree) even for monotonically increasing neighbor IDs
+- Arena: pre-allocated contiguous region (max 2 GiB — u32 offsets with a tag
+  bit), zero-alloc writes; superseded nodes are reclaimed in bulk by
+  `DynamicGraph::compact`, which rebuilds live trees into a fresh arena
 - 9M inserts/sec, 38M neighbor reads/sec (criterion benchmarks)
 
 ## aether-stream — Real-Time Feature Serving
@@ -263,7 +267,9 @@ Layout (v1):
   num_nodes           u64
   num_edges           u64
   has_weights         u32  (0 = absent, 1 = present)
-  integrity_checksum  u32  (0 = absent; xxhash32 of body otherwise)
+  integrity_checksum  u32  (0 = absent; FNV-1a 32-bit of offsets+edges otherwise;
+                            verified only under Full validation — large files
+                            default to OffsetsOnly, which skips the body hash)
 
 [Offsets: (num_nodes + 1) × 8 bytes, u64 LE]
 [Edges:   num_edges × 4 bytes,        u32 LE]
@@ -278,6 +284,19 @@ Forward-compat policy:
 - Removing a field from a struct = bump major version.
 - Adding a trailing optional section = same magic, bump version, MUST read
   header.version before deciding whether to consume the new bytes.
+
+### Hetero graph (multi-relational CSR, `.bin`)
+
+| Version | Magic        | Status  | Notes                             |
+| ------- | ------------ | ------- | --------------------------------- |
+| **v1**  | `"AETHHETG"` | current | One CSR section per edge type.    |
+
+Layout (v1): 64-byte header (magic, `version` u32, type counts, reserved),
+node/edge type tables, then per-edge-type CSR sections. u32 sections (edges,
+weights) are zero-padded to 8-byte boundaries so every offsets array stays
+u64-aligned. See `aethergraph_core::internal::mmap_hetero` for field-level
+detail. The loader bounds-checks every section against the file length with
+checked arithmetic — corrupt or truncated files fail at load, not at access.
 
 ### Features (`.bin`)
 
@@ -448,10 +467,14 @@ writes from a kernel that crashed mid-flush.
 
 `open_with_wal` reads every record in order, invoking `Writer::insert_edge`
 internally to rebuild the in-memory state. The shared `EpochClock` advances once
-per replayed record, so `current_epoch()` after recovery matches the value the
-original process reached. If the file ends in a torn record (CRC mismatch /
+per replayed record, so `current_epoch()` after recovery equals the number of
+records replayed. A live run advances the clock once per writer-guard drop, so
+the two agree only when each guard inserted exactly one edge — never compare
+epoch values across a restart. If the file ends in a torn record (CRC mismatch /
 short read), recovery truncates back to the last clean boundary so subsequent
-appends sit on intact data.
+appends sit on intact data. A record referencing a vertex ≥ the `num_vertices`
+being recovered into, or an arena too small for the log's contents, aborts
+recovery with an error rather than silently dropping records.
 
 **What is NOT in scope today:**
 

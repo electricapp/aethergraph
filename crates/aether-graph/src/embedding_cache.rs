@@ -4,93 +4,136 @@
 //! only nodes in the dirty set are recomputed -- the rest use cached values.
 //! This turns a 230M-node problem into a ~100K-node problem per batch.
 
+use std::collections::HashMap;
+
+/// Row slot for one computed node.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    /// Row index into the flat storage (byte offset = row * dim * 4).
+    row: u32,
+    /// Epoch when the node was last computed. 0 = allocated but never
+    /// written through [`EmbeddingCache::update`].
+    generation: u64,
+}
+
 /// Per-layer embedding cache.
 ///
-/// Stores one embedding vector per node for a single GNN layer.
-/// Embeddings are f32 row-major: `data[node * dim .. (node+1) * dim]`.
+/// Stores one embedding vector per *computed* node for a single GNN
+/// layer. Storage is sparse and lazy: memory is allocated per node on
+/// first write, so resident size is `touched_nodes × dim × 4` bytes —
+/// `num_nodes` is only a validity bound, not an allocation. (A dense
+/// `num_nodes × dim` matrix would be ~118 GB per layer at 230M nodes ×
+/// 128 dims, allocated up front whether or not a node is ever touched.)
 #[derive(Debug)]
 pub struct EmbeddingCache {
-    /// Flat storage: num_nodes * embedding_dim f32 values.
+    /// Flat row storage for computed nodes: `computed × dim` f32 values.
     data: Vec<f32>,
+    /// node → row slot. Rows are never freed; a training epoch touches a
+    /// bounded working set, so the map tracks distinct touched nodes.
+    slots: HashMap<u32, Slot>,
     /// Embedding dimension.
     dim: usize,
-    /// Number of nodes.
+    /// Number of addressable nodes (validity bound only).
     num_nodes: usize,
-    /// Generation counter; nodes with `node_generation < generation` are stale.
+    /// Generation counter; nodes with `slot.generation < generation` are stale.
     generation: u64,
-    /// Per-node generation: `node_generation[i]` = epoch when node i was last computed.
-    node_generation: Vec<u64>,
 }
 
 impl EmbeddingCache {
-    /// Allocate a zeroed cache for `num_nodes` with `dim`-dimensional embeddings.
+    /// Create a cache for up to `num_nodes` nodes with `dim`-dimensional
+    /// embeddings. No per-node memory is allocated until a node is
+    /// written.
     ///
     /// # Panics
-    /// Panics if `dim == 0` or if `num_nodes * dim` overflows `usize`.
+    /// Panics if `dim == 0`.
     pub fn new(num_nodes: usize, dim: usize) -> Self {
         assert!(dim > 0, "embedding dim must be > 0");
-        let total = num_nodes
-            .checked_mul(dim)
-            .expect("num_nodes * dim overflows usize");
-        // Generation starts at 1 so node_generation == 0 is automatically stale.
+        // Generation starts at 1 so slot generation 0 is automatically stale.
         Self {
-            data: vec![0.0; total],
+            data: Vec::new(),
+            slots: HashMap::new(),
             dim,
             num_nodes,
             generation: 1,
-            node_generation: vec![0; num_nodes],
         }
     }
 
-    /// Return cached embedding slice for `node`.
+    /// Row slice for an existing slot.
     #[inline]
-    pub fn get(&self, node: u32) -> &[f32] {
-        let i = node as usize;
-        debug_assert!(i < self.num_nodes);
-        let start = i * self.dim;
+    fn row(&self, slot: Slot) -> &[f32] {
+        let start = slot.row as usize * self.dim;
         &self.data[start..start + self.dim]
     }
 
-    /// Return mutable embedding slice for `node` (caller writes new embedding).
+    /// Allocate (or find) the row for `node`. The new row is zeroed and
+    /// carries generation 0 until written via [`update`](Self::update).
+    fn slot_or_insert(&mut self, node: u32) -> Slot {
+        debug_assert!((node as usize) < self.num_nodes);
+        if let Some(&s) = self.slots.get(&node) {
+            return s;
+        }
+        let row = (self.data.len() / self.dim) as u32;
+        self.data.resize(self.data.len() + self.dim, 0.0);
+        let s = Slot { row, generation: 0 };
+        self.slots.insert(node, s);
+        s
+    }
+
+    /// Return cached embedding slice for `node`.
+    ///
+    /// # Panics
+    /// Panics if `node` has never been computed (check
+    /// [`is_uninitialized`](Self::is_uninitialized) first).
+    #[inline]
+    pub fn get(&self, node: u32) -> &[f32] {
+        let slot = self
+            .slots
+            .get(&node)
+            .unwrap_or_else(|| panic!("EmbeddingCache::get({node}): node never computed"));
+        self.row(*slot)
+    }
+
+    /// Return mutable embedding slice for `node`, allocating a zeroed row
+    /// on first access (caller writes the new embedding). Does not stamp
+    /// the generation — use [`update`](Self::update) for that.
     #[inline]
     pub fn get_mut(&mut self, node: u32) -> &mut [f32] {
-        let i = node as usize;
-        debug_assert!(i < self.num_nodes);
-        let start = i * self.dim;
+        let slot = self.slot_or_insert(node);
+        let start = slot.row as usize * self.dim;
         &mut self.data[start..start + self.dim]
     }
 
     /// Write embedding and stamp current generation.
     pub fn update(&mut self, node: u32, embedding: &[f32]) {
         debug_assert_eq!(embedding.len(), self.dim);
-        let i = node as usize;
-        debug_assert!(i < self.num_nodes);
-        let start = i * self.dim;
+        let slot = self.slot_or_insert(node);
+        let start = slot.row as usize * self.dim;
         self.data[start..start + self.dim].copy_from_slice(embedding);
-        self.node_generation[i] = self.generation;
+        self.slots
+            .get_mut(&node)
+            .expect("slot just inserted")
+            .generation = self.generation;
     }
 
     /// True if node's cached embedding is from a previous generation.
     ///
-    /// Out-of-range nodes are reported as stale so callers iterating over an
-    /// unfiltered candidate list don't panic — this matches `stale_nodes`,
-    /// which skips out-of-range entries rather than indexing them.
+    /// Out-of-range and never-computed nodes are reported as stale so
+    /// callers iterating over an unfiltered candidate list don't panic —
+    /// this matches `stale_nodes`, which skips out-of-range entries
+    /// rather than indexing them.
     #[inline]
     pub fn is_stale(&self, node: u32) -> bool {
-        match self.node_generation.get(node as usize) {
-            Some(&g) => g < self.generation,
+        match self.slots.get(&node) {
+            Some(s) => s.generation < self.generation,
             None => true,
         }
     }
 
     /// True if node has never had an embedding computed.
-    ///
-    /// Out-of-range nodes are reported as uninitialized for the same reason
-    /// `is_stale` reports them as stale.
     #[inline]
     pub fn is_uninitialized(&self, node: u32) -> bool {
-        match self.node_generation.get(node as usize) {
-            Some(&g) => g == 0,
+        match self.slots.get(&node) {
+            Some(s) => s.generation == 0,
             None => true,
         }
     }
@@ -133,6 +176,12 @@ impl EmbeddingCache {
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Number of nodes with allocated rows (memory ≈ this × dim × 4 bytes).
+    #[inline]
+    pub fn computed_nodes(&self) -> usize {
+        self.slots.len()
     }
 }
 
@@ -199,5 +248,25 @@ mod tests {
         slot[1] = 8.0;
         slot[2] = 9.0;
         assert_eq!(cache.get(2), &[7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn allocation_is_lazy_and_proportional_to_touched_nodes() {
+        // A billion-node cache costs nothing until nodes are written.
+        let mut cache = EmbeddingCache::new(1_000_000_000, 128);
+        assert_eq!(cache.computed_nodes(), 0);
+        for n in 0..100u32 {
+            cache.update(n * 1_000_000, &[1.0; 128]);
+        }
+        assert_eq!(cache.computed_nodes(), 100);
+        assert!(cache.is_uninitialized(5));
+        assert!(!cache.is_uninitialized(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "never computed")]
+    fn get_uncomputed_panics() {
+        let cache = EmbeddingCache::new(10, 4);
+        let _ = cache.get(3);
     }
 }

@@ -184,7 +184,10 @@ impl PyFeatureStore {
     fn features<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let (ptr, num_nodes, feature_dim) = {
             let store = slf.borrow();
-            let features = store.inner.features();
+            let features = store
+                .inner
+                .features()
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
             let num_nodes = store.inner.num_nodes();
             let feature_dim = store.inner.feature_dim();
             debug_assert_eq!(features.len(), num_nodes * feature_dim);

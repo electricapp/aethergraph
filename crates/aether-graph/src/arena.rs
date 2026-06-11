@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fixed-capacity bump arena. Pre-allocates all memory upfront.
 ///
-/// Nodes are allocated by bumping `offset`. Freed only when the entire
-/// arena is dropped (epoch-based reclamation at the graph level).
+/// Nodes are allocated by bumping `offset`. Individual nodes are never
+/// freed; space is reclaimed in bulk by [`reset`](Self::reset) (used by
+/// `DynamicGraph::compact`) or by dropping the arena.
 ///
 /// The backing buffer is a raw `NonNull<u8>` paired with the `Layout` it was
 /// allocated with. `Vec<u8>` is not used because `Vec` would deallocate with
@@ -41,17 +42,25 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
+    /// Largest legal arena capacity: 2 GiB.
+    ///
+    /// Offsets are u32 and the C-tree steals bit 31 as a leaf/interior
+    /// tag, so any offset at or above `1 << 31` would be misread as a
+    /// tagged interior node — silent corruption. Capping capacity here
+    /// makes the collision impossible.
+    pub const MAX_CAPACITY: usize = 1 << 31;
+
     /// Create an arena with `capacity` bytes, 64-byte aligned.
     ///
     /// # Panics
-    /// Panics if `capacity == 0` or `capacity > u32::MAX` (offsets are u32).
+    /// Panics if `capacity == 0` or `capacity > Self::MAX_CAPACITY`
+    /// (offsets are u32 with bit 31 reserved as a node-type tag).
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "Arena capacity must be > 0");
-        // Offsets returned by alloc are u32; arenas larger than u32::MAX would
-        // truncate silently and corrupt readers. Cap at u32::MAX up front.
         assert!(
-            capacity <= u32::MAX as usize,
-            "Arena capacity {capacity} exceeds u32::MAX (offsets are u32)"
+            capacity <= Self::MAX_CAPACITY,
+            "Arena capacity {capacity} exceeds MAX_CAPACITY {} (offsets are u32 with a tag bit)",
+            Self::MAX_CAPACITY
         );
         let layout = Layout::from_size_align(capacity, 64)
             .expect("Layout: capacity > 0, alignment is power of two");
@@ -90,7 +99,8 @@ impl Arena {
             return None; // arena full
         }
         self.offset.store(new_offset, Ordering::Relaxed);
-        // Capacity ≤ u32::MAX (enforced in `new`), so this cast cannot truncate.
+        // Capacity ≤ MAX_CAPACITY = 2^31 (enforced in `new`), so the cast
+        // cannot truncate and bit 31 is never set on a returned offset.
         Some(aligned as u32)
     }
 
@@ -244,5 +254,13 @@ mod tests {
     #[should_panic(expected = "Arena capacity must be > 0")]
     fn zero_capacity_panics() {
         let _ = Arena::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_CAPACITY")]
+    fn over_max_capacity_panics() {
+        // The assert fires before any allocation happens, so this test
+        // does not actually try to reserve >2 GiB.
+        let _ = Arena::new(Arena::MAX_CAPACITY + 1);
     }
 }

@@ -395,7 +395,14 @@ fn validate_checksum_if_present(
     layout: &GraphFileLayout,
     validation: GraphValidationMode,
 ) -> Result<()> {
-    if validation == GraphValidationMode::HeaderOnly {
+    // Only Full validation pays for the checksum. Hashing covers the
+    // entire offsets+edges body, which faults every page of the mapping
+    // into memory — for the multi-GB files that default to OffsetsOnly,
+    // that turns the O(1)-startup mmap load into a full sequential read
+    // of the file. OffsetsOnly still gets structural protection from
+    // `validate_with_mode` (monotonic offsets, edge-count consistency)
+    // without touching the edge pages.
+    if validation != GraphValidationMode::Full {
         return Ok(());
     }
 
@@ -602,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_mismatch_detected() {
+    fn test_checksum_mismatch_detected_under_full_validation() {
         let edges = vec![(0, 1), (1, 2), (2, 0)];
         let graph = Graph::from_edges(3, &edges, None).unwrap();
 
@@ -613,7 +620,7 @@ mod tests {
         let data_start = Header::SIZE + (graph.num_nodes() + 1) * std::mem::size_of::<EdgeOffset>();
         bytes[data_start] ^= 0xFF;
 
-        let result = load_graph_from_mmap_with_validation(&bytes, GraphValidationMode::OffsetsOnly);
+        let result = load_graph_from_mmap_with_validation(&bytes, GraphValidationMode::Full);
         assert!(result.is_err());
         assert!(
             result
@@ -621,5 +628,26 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch")
         );
+    }
+
+    #[test]
+    fn test_offsets_only_skips_body_checksum() {
+        // OffsetsOnly is the default for large files precisely because it
+        // must not fault the whole body in; hashing every byte would do
+        // exactly that. A corrupt edge byte therefore goes undetected in
+        // this mode (structural offsets checks still run) — that's the
+        // documented trade-off, not an accident.
+        let edges = vec![(0, 1), (1, 2), (2, 0)];
+        let graph = Graph::from_edges(3, &edges, None).unwrap();
+
+        let temp_file = NamedTempFile::new().unwrap();
+        save_graph(&graph, temp_file.path()).unwrap();
+
+        let mut bytes = std::fs::read(temp_file.path()).unwrap();
+        let data_start = Header::SIZE + (graph.num_nodes() + 1) * std::mem::size_of::<EdgeOffset>();
+        bytes[data_start] ^= 0x01;
+
+        let result = load_graph_from_mmap_with_validation(&bytes, GraphValidationMode::OffsetsOnly);
+        assert!(result.is_ok());
     }
 }
