@@ -11,7 +11,7 @@
 //! let graph = from_parquet("edges.parquet", "src", "dst", 1_000_000)?;
 //!
 //! // Multiple files (partitioned dataset)
-//! let graph = from_parquet_glob("edges/*.parquet", "src_id", "dst_id", 2_000_000_000)?;
+//! let graph = from_parquet_files(&paths, "src_id", "dst_id", 2_000_000_000)?;
 //! ```
 
 use crate::graph::{Graph, NodeId};
@@ -43,23 +43,23 @@ pub fn from_parquet(
 
     let reader = builder.build().context("build parquet reader")?;
 
-    let mut all_src: Vec<NodeId> = Vec::new();
-    let mut all_dst: Vec<NodeId> = Vec::new();
+    // Accumulate edges in their final (src, dst) shape directly. A
+    // dataset-sized intermediate in parallel arrays plus a tuple copy
+    // would add another 16 bytes per edge of transient peak memory on
+    // top of the ~12 bytes/edge the CSR build itself needs.
+    let mut edges: Vec<(NodeId, NodeId)> = Vec::new();
 
     for batch_result in reader {
         let batch = batch_result.context("read record batch")?;
         let (src, dst) = extract_edge_columns(&batch, src_col, dst_col)?;
-        all_src.extend_from_slice(&src);
-        all_dst.extend_from_slice(&dst);
+        edges.extend(src.into_iter().zip(dst));
     }
 
     info!(
         path = %path.display(),
-        edges = all_src.len(),
+        edges = edges.len(),
         "read edges from parquet"
     );
-
-    let edges: Vec<(NodeId, NodeId)> = all_src.into_iter().zip(all_dst).collect();
 
     Graph::from_edges(num_nodes, &edges, None)
 }
@@ -74,8 +74,7 @@ pub fn from_parquet_files(
     dst_col: &str,
     num_nodes: usize,
 ) -> Result<Graph> {
-    let mut all_src: Vec<NodeId> = Vec::new();
-    let mut all_dst: Vec<NodeId> = Vec::new();
+    let mut edges: Vec<(NodeId, NodeId)> = Vec::new();
 
     for path in paths {
         let path = path.as_ref();
@@ -91,23 +90,17 @@ pub fn from_parquet_files(
         for batch_result in reader {
             let batch = batch_result.context("read record batch")?;
             let (src, dst) = extract_edge_columns(&batch, src_col, dst_col)?;
-            all_src.extend_from_slice(&src);
-            all_dst.extend_from_slice(&dst);
+            edges.extend(src.into_iter().zip(dst));
         }
 
         info!(
             path = %path.display(),
-            total_edges = all_src.len(),
+            total_edges = edges.len(),
             "accumulated edges from parquet file"
         );
     }
 
-    info!(
-        total_edges = all_src.len(),
-        "building CSR from parquet data"
-    );
-
-    let edges: Vec<(NodeId, NodeId)> = all_src.into_iter().zip(all_dst).collect();
+    info!(total_edges = edges.len(), "building CSR from parquet data");
 
     Graph::from_edges(num_nodes, &edges, None)
 }

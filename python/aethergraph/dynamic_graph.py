@@ -49,8 +49,10 @@ class DynamicGraph:
 
         Args:
             num_vertices: Number of vertices (fixed at construction).
-            arena_mb: Arena capacity in megabytes. At ~80 bytes per edge,
-                256 MB supports ~3.2M edges.
+            arena_mb: Arena capacity in megabytes (max 2048). Each insert
+                consumes ~100-250 bytes of arena (path-copying leaves the
+                superseded nodes behind), so capacity tracks total inserts,
+                not live edges.
         """
         self._inner = _DynamicGraph(num_vertices=num_vertices, arena_mb=arena_mb)
 
@@ -74,13 +76,14 @@ class DynamicGraph:
             arena_mb: Arena capacity in megabytes.
 
         Returns:
-            DynamicGraph at the same epoch the previous run reached, ready
-            to accept new writers.
+            DynamicGraph with ``current_epoch`` equal to the number of
+            replayed records, ready to accept new writers.
 
         Raises:
             OSError: I/O failure opening, reading, or writing the WAL.
-            ValueError: File exists but is not a valid AetherGraph WAL.
-            RuntimeError: WAL is corrupt past the recoverable prefix.
+            ValueError: File exists but is not a valid AetherGraph WAL, or
+                a replayed record exceeds ``num_vertices``.
+            RuntimeError: Arena filled up during replay.
         """
         obj = cls.__new__(cls)
         obj._inner = _DynamicGraph.open_with_wal(path, num_vertices, arena_mb)
@@ -134,6 +137,7 @@ class DynamicGraph:
 
         Raises:
             RuntimeError: If the arena is full.
+            ValueError: If src or dst is >= num_vertices.
         """
         return self._inner.insert_edge(src, dst)
 
@@ -148,7 +152,8 @@ class DynamicGraph:
             Number of new edges inserted (duplicates are skipped).
 
         Raises:
-            ValueError: If src and dst have different lengths.
+            ValueError: If src and dst have different lengths, or an edge
+                references a vertex >= num_vertices.
             RuntimeError: If the arena is full.
         """
         src_arr: npt.NDArray[np.uint32] = np.asarray(src, dtype=np.uint32)

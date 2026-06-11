@@ -7,7 +7,7 @@
 //! Chunks are always sorted. Binary search for contains/insert position.
 //! No heap allocation — chunks live inside arena-allocated tree nodes.
 
-/// Maximum neighbors per chunk. 15 × 4 = 60 bytes + 2 byte header + 2 pad = 64.
+/// Maximum neighbors per chunk. 15 × 4 = 60 bytes + 1-byte count + 3 pad = 64.
 pub const CHUNK_CAP: usize = 15;
 
 /// A sorted, cache-line-sized array of neighbor IDs.

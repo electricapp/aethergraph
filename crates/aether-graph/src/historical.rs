@@ -93,11 +93,35 @@ impl HistoricalSampler {
 
     /// Drain dirty set from graph and advance cache generation.
     ///
-    /// Call once per epoch. After this, previously-dirty nodes will be
-    /// stale in the cache (requiring recomputation) unless they were
-    /// updated in this epoch.
+    /// Call once per epoch — and only for a **single-sampler** setup.
+    /// `DynamicGraph::drain_dirty` destructively clears the graph's
+    /// bitmap, so with one sampler per GNN layer (the normal
+    /// GNNAutoScale arrangement) the first layer to call this would
+    /// steal every dirty bit and leave the other layers serving stale
+    /// embeddings. Multi-layer training must drain once and fan the
+    /// list out via [`advance_epoch_with`](Self::advance_epoch_with):
+    ///
+    /// ```ignore
+    /// let dirty = graph.drain_dirty();
+    /// for layer in &mut samplers {
+    ///     layer.advance_epoch_with(&dirty);
+    /// }
+    /// ```
+    ///
+    /// After this, previously-dirty nodes will be stale in the cache
+    /// (requiring recomputation) unless they were updated in this epoch.
     pub fn advance_epoch(&mut self, graph: &DynamicGraph) {
-        self.dirty_set = graph.drain_dirty();
+        let dirty = graph.drain_dirty();
+        self.advance_epoch_with(&dirty);
+    }
+
+    /// Advance using an externally drained dirty list. Non-destructive:
+    /// the same list can be fed to every layer's sampler, which is the
+    /// correct pattern for multi-layer training (see
+    /// [`advance_epoch`](Self::advance_epoch)).
+    pub fn advance_epoch_with(&mut self, dirty: &[u32]) {
+        self.dirty_set.clear();
+        self.dirty_set.extend_from_slice(dirty);
         self.dirty_set.sort_unstable();
         self.cache.advance_epoch();
     }
@@ -151,6 +175,44 @@ mod tests {
 
         let batch2 = sampler.prepare_batch(&[0, 1]);
         assert!(!batch2.cached_nodes.is_empty(), "should have cached nodes");
+    }
+
+    #[test]
+    fn multi_layer_samplers_share_one_drain() {
+        let g = DynamicGraph::new(100, 4096);
+        fill_graph(&g, &[(0, 1)]);
+
+        let mut layers = [
+            HistoricalSampler::new(100, 4),
+            HistoricalSampler::new(100, 4),
+        ];
+        let dirty = g.drain_dirty();
+        for layer in &mut layers {
+            layer.advance_epoch_with(&dirty);
+        }
+
+        // Compute + commit embeddings for both layers, then dirty node 0
+        // again. Every layer must see the invalidation — not just the
+        // first one to advance.
+        for layer in &mut layers {
+            let batch = layer.prepare_batch(&[0, 1]);
+            let emb = vec![1.0; batch.recompute_nodes.len() * 4];
+            layer.commit_batch(&batch, &emb);
+        }
+
+        fill_graph(&g, &[(0, 5)]);
+        let dirty = g.drain_dirty();
+        for layer in &mut layers {
+            layer.advance_epoch_with(&dirty);
+        }
+
+        for (i, layer) in layers.iter().enumerate() {
+            let batch = layer.prepare_batch(&[0, 1]);
+            assert!(
+                batch.recompute_nodes.contains(&0),
+                "layer {i} missed the node-0 invalidation"
+            );
+        }
     }
 
     #[test]

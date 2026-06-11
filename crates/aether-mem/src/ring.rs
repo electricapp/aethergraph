@@ -729,7 +729,9 @@ impl Drop for RingSlot<'_> {
 /// A slot whose RAII release has been deferred to an explicit call.
 ///
 /// The Drop impl `panic!`s on a still-armed instance, so a forgotten release
-/// surfaces as a test failure rather than a silent capacity leak.
+/// surfaces as a test failure rather than a silent capacity leak. If the
+/// thread is already unwinding from another panic, the drop releases the
+/// slot quietly instead — panicking during unwind would abort the process.
 #[must_use = "DetachedSlot must be released or reattached before drop"]
 pub struct DetachedSlot<'a> {
     ring: &'a SharedMemoryRing,
@@ -765,14 +767,24 @@ impl<'a> DetachedSlot<'a> {
 
 impl Drop for DetachedSlot<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            // Loud panic so a forgotten release shows up under `cargo test`.
-            // The slot stays leaked but the bug becomes observable.
-            panic!(
-                "DetachedSlot for index {} dropped without release or reattach — ring capacity leaked",
-                self.slot_index
-            );
+        if !self.armed {
+            return;
         }
+        if std::thread::panicking() {
+            // Already unwinding (e.g. the completion path this slot was
+            // detached for panicked). A panic here would be a panic-in-
+            // drop-during-unwind, which aborts the whole process —
+            // release the slot instead and let the original panic
+            // propagate.
+            self.ring.release_index(self.slot_index);
+            return;
+        }
+        // Loud panic so a forgotten release shows up under `cargo test`.
+        // The slot stays leaked but the bug becomes observable.
+        panic!(
+            "DetachedSlot for index {} dropped without release or reattach — ring capacity leaked",
+            self.slot_index
+        );
     }
 }
 
@@ -864,6 +876,83 @@ mod tests {
         let slot = ring.acquire_slot().unwrap();
         let _detached = slot.detach();
         // Implicit drop of `_detached` at end of scope panics.
+    }
+
+    #[test]
+    fn detached_drop_during_unwind_releases_instead_of_aborting() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let ring = build(2, 1024);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let slot = ring.acquire_slot().unwrap();
+            let _detached = slot.detach();
+            // The completion path this slot was detached for fails. The
+            // DetachedSlot drop must not turn this into a process abort.
+            panic!("completion path failed");
+        }));
+        assert!(result.is_err(), "original panic must propagate");
+        // The unwind-path drop released the slot.
+        let a = ring.acquire_slot().unwrap();
+        let b = ring.acquire_slot().unwrap();
+        drop((a, b));
+    }
+
+    #[test]
+    fn concurrent_acquire_release_never_double_leases() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        const SLOTS: usize = 8;
+        const THREADS: usize = 8;
+        const ITERS: usize = 20_000;
+
+        let ring = Arc::new(SharedMemoryRing::new_or_panic(SLOTS, 64, vec![]));
+        let occupied: Arc<[AtomicBool; SLOTS]> =
+            Arc::new(std::array::from_fn(|_| AtomicBool::new(false)));
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let ring = Arc::clone(&ring);
+            let occupied = Arc::clone(&occupied);
+            handles.push(thread::spawn(move || {
+                for i in 0..ITERS {
+                    let Some(idx) = ring.acquire_index() else {
+                        std::hint::spin_loop();
+                        continue;
+                    };
+                    // The free list must never lease one slot to two
+                    // holders at once.
+                    assert!(
+                        !occupied[idx].swap(true, Ordering::AcqRel),
+                        "slot {idx} double-leased"
+                    );
+                    // Touch the slot memory so a sanitizer run sees the
+                    // cross-thread handoff, not just the index protocol.
+                    // SAFETY: idx < SLOTS and this thread holds the lease.
+                    unsafe {
+                        ring.slot_ptr_for_ffi(idx)
+                            .write_volatile((t * 31 + i) as u8)
+                    };
+                    occupied[idx].store(false, Ordering::Release);
+                    ring.release_index(idx);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every slot must be back on the free list, exactly once.
+        let mut leased: Vec<usize> = (0..SLOTS)
+            .map(|_| ring.acquire_index().expect("slot missing from free list"))
+            .collect();
+        leased.sort_unstable();
+        assert_eq!(leased, (0..SLOTS).collect::<Vec<_>>());
+        assert!(ring.acquire_index().is_none());
+        for idx in leased {
+            ring.release_index(idx);
+        }
     }
 
     #[test]

@@ -165,9 +165,15 @@ pub struct DynamicGraph {
 impl DynamicGraph {
     /// Create a graph with `num_vertices` vertices and no edges.
     ///
-    /// `arena_bytes` controls the arena capacity. At ~80 bytes per edge
-    /// (chunk amortized + interior node overhead), 1GB supports ~12M edges.
-    /// For 100M edges, use ~8GB.
+    /// `arena_bytes` controls the arena capacity, at most
+    /// [`Arena::MAX_CAPACITY`] (2 GiB — offsets are u32 with a tag bit).
+    /// Each insert path-copies its tree path (~100–250 bytes including
+    /// superseded nodes), so arena consumption tracks total inserts, not
+    /// live edges. Long-running ingest should call [`compact`] when
+    /// usage approaches capacity; compacted storage is ~6–10 bytes per
+    /// live edge.
+    ///
+    /// [`compact`]: Self::compact
     ///
     /// The graph owns a private [`EpochClock`]. Use [`new_with_epoch`] to
     /// share a clock with another subsystem (e.g. a feature store).
@@ -207,9 +213,14 @@ impl DynamicGraph {
     /// at `path` already contains records (a previous run's edges), they
     /// are replayed into the in-memory state before this returns; if the
     /// WAL ends in a torn record (mid-write crash), the file is
-    /// truncated to the last clean record. After this returns the graph
-    /// is at the same epoch the prior run had reached, ready to accept
-    /// new writers.
+    /// truncated to the last clean record.
+    ///
+    /// After this returns, `current_epoch()` equals the number of
+    /// replayed records — replay advances the clock once per record,
+    /// while a live run advances once per writer-guard drop. The two
+    /// agree only when every guard inserted exactly one edge, so do not
+    /// compare epoch values across a restart; treat the post-recovery
+    /// epoch as a fresh, deterministic starting point.
     #[cfg(feature = "wal")]
     pub fn open_with_wal(
         path: impl AsRef<Path>,
@@ -244,11 +255,35 @@ impl DynamicGraph {
         // giving callers a deterministic "where did we end up" signal.
         let mut graph = Self::new_with_epoch(num_vertices, arena_bytes, Arc::clone(&epoch));
 
+        // The WAL does not record the graph dimensions it was written
+        // against, so a mismatched `num_vertices` or an undersized arena
+        // surfaces here, record by record. Both must abort recovery: a
+        // silently partial replay would present itself as a smaller but
+        // valid graph.
+        let mut replay_err: Option<WalError> = None;
         let outcome = crate::wal::replay(path, |rec| {
+            if replay_err.is_some() {
+                return;
+            }
             let mut w = graph.writer_or_panic();
-            let _ = w.insert_edge(rec.src, rec.dst);
+            match w.insert_edge(rec.src, rec.dst) {
+                Ok(_) => {}
+                Err(InsertError::VertexOutOfRange { src, dst }) => {
+                    replay_err = Some(WalError::RecordOutOfRange {
+                        src,
+                        dst,
+                        num_vertices: num_vertices as u64,
+                    });
+                }
+                Err(InsertError::ArenaFull) => {
+                    replay_err = Some(WalError::ReplayArenaFull);
+                }
+            }
             let _ = rec.epoch; // reserved for future MVCC pinning
         })?;
+        if let Some(e) = replay_err {
+            return Err(e);
+        }
 
         // If the WAL ended in a torn record, truncate so future appends
         // sit on top of clean data.
@@ -392,6 +427,60 @@ impl DynamicGraph {
         self.arena.capacity()
     }
 
+    /// Rebuild every vertex's C-tree into a fresh arena, reclaiming the
+    /// garbage that path-copying inserts leave behind.
+    ///
+    /// Arena consumption grows with every insert (superseded nodes are
+    /// never reused), so a long-running ingest eventually fills the
+    /// arena. Compacting rebuilds each adjacency list perfectly balanced
+    /// from a CSR snapshot — afterwards usage is proportional to live
+    /// edges (~6–10 bytes each). Use [`compact_with_capacity`] to grow
+    /// (or shrink) the arena at the same time.
+    ///
+    /// `&mut self` guarantees no concurrent readers or writers, so the
+    /// old arena can be dropped safely. Peak transient memory is the new
+    /// arena plus the CSR snapshot (~12 bytes per live edge): the old
+    /// arena is freed only after the rebuild succeeds, which also means
+    /// a failed compaction leaves the graph untouched.
+    ///
+    /// [`compact_with_capacity`]: Self::compact_with_capacity
+    pub fn compact(&mut self) -> Result<(), CompactError> {
+        self.compact_with_capacity(self.arena.capacity())
+    }
+
+    /// Like [`compact`](Self::compact), but the rebuilt trees go into an
+    /// arena of `new_capacity` bytes. The escape hatch for recovering
+    /// from [`ArenaFull`]: compact into a larger arena and keep
+    /// ingesting.
+    ///
+    /// # Panics
+    /// Panics if `new_capacity` is 0 or exceeds [`Arena::MAX_CAPACITY`]
+    /// (the [`Arena::new`] contract).
+    pub fn compact_with_capacity(&mut self, new_capacity: usize) -> Result<(), CompactError> {
+        if self.is_poisoned() {
+            return Err(CompactError::Poisoned);
+        }
+
+        let (offsets, edges) = self.snapshot_csr();
+        let new_arena = Arena::new(new_capacity);
+
+        let mut new_roots = Vec::with_capacity(self.num_vertices);
+        for v in 0..self.num_vertices {
+            let start = offsets[v] as usize;
+            let end = offsets[v + 1] as usize;
+            // SAFETY: `&mut self` makes this thread the only one touching
+            // the new arena.
+            let tree = unsafe { CTree::from_sorted(&new_arena, &edges[start..end]) }
+                .ok_or(CompactError::ArenaFull)?;
+            new_roots.push(AtomicU32::new(tree.root));
+        }
+
+        // Rebuild succeeded in full — only now replace the live state.
+        self.arena = new_arena;
+        self.roots = new_roots;
+        Ok(())
+    }
+
     /// Snapshot the dynamic graph into raw CSR arrays.
     ///
     /// Returns `(offsets, edges)` where `offsets[v]` is the start of vertex
@@ -447,12 +536,23 @@ impl DynamicGraph {
     }
 
     /// Build from a batch of edges.
+    ///
+    /// Convenience for trusted input: duplicate edges are skipped and
+    /// edges referencing vertices ≥ `num_vertices` are dropped. Use
+    /// [`Writer::insert_edge`] directly when those need to be surfaced,
+    /// or compare `num_edges()` against the input length afterwards.
+    /// Panics if the arena fills up.
     pub fn from_edges(num_vertices: usize, edges: &[(u32, u32)], arena_bytes: usize) -> Self {
         let graph = Self::new(num_vertices, arena_bytes);
         {
             let mut writer = graph.writer_or_panic();
             for &(src, dst) in edges {
-                let _ = writer.insert_edge(src, dst);
+                match writer.insert_edge(src, dst) {
+                    Ok(_) | Err(InsertError::VertexOutOfRange { .. }) => {}
+                    Err(InsertError::ArenaFull) => {
+                        panic!("DynamicGraph::from_edges: arena full ({arena_bytes} bytes)")
+                    }
+                }
             }
         }
         graph
@@ -477,15 +577,12 @@ impl<'a> Writer<'a> {
     /// Insert a directed edge from `src` to `dst`.
     ///
     /// Returns `Ok(true)` if the edge was new, `Ok(false)` if it already
-    /// existed (no allocation occurred), or `Err(ArenaFull)` if the arena
-    /// has no remaining capacity.
-    pub fn insert_edge(&mut self, src: u32, dst: u32) -> Result<bool, ArenaFull> {
+    /// existed (no allocation occurred). Errors distinguish a full arena
+    /// (compact or grow, then retry) from an out-of-range vertex (the
+    /// edge is invalid for this graph and was not inserted).
+    pub fn insert_edge(&mut self, src: u32, dst: u32) -> Result<bool, InsertError> {
         if (src as usize) >= self.graph.num_vertices || (dst as usize) >= self.graph.num_vertices {
-            // Out-of-range vertices are silently dropped to keep insert_edge
-            // hot-path branchless under the documented contract that callers
-            // pre-validate IDs. We still panic in debug to catch test bugs.
-            debug_assert!(false, "insert_edge: vertex out of range");
-            return Ok(false);
+            return Err(InsertError::VertexOutOfRange { src, dst });
         }
 
         let current_root = self.graph.roots[src as usize].load(Ordering::Acquire);
@@ -527,7 +624,7 @@ impl<'a> Writer<'a> {
                 Ok(true)
             }
             InsertResult::Duplicate => Ok(false),
-            InsertResult::ArenaFull => Err(ArenaFull),
+            InsertResult::ArenaFull => Err(InsertError::ArenaFull),
         }
     }
 }
@@ -602,17 +699,53 @@ impl std::fmt::Display for WriterError {
 
 impl std::error::Error for WriterError {}
 
-/// Error when arena is full.
-#[derive(Debug, Clone, Copy)]
-pub struct ArenaFull;
+/// Reason [`DynamicGraph::compact`] refused to run or failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactError {
+    /// The graph is poisoned (a previous writer panicked); its state may
+    /// be inconsistent, so compacting it would persist the damage.
+    Poisoned,
+    /// The rebuilt trees did not fit in the requested capacity. The
+    /// graph is unchanged; retry with a larger capacity.
+    ArenaFull,
+}
 
-impl std::fmt::Display for ArenaFull {
+impl std::fmt::Display for CompactError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "C-tree arena is full")
+        match self {
+            Self::Poisoned => f.write_str("cannot compact a poisoned graph"),
+            Self::ArenaFull => {
+                f.write_str("compacted trees exceed the requested arena capacity")
+            }
+        }
     }
 }
 
-impl std::error::Error for ArenaFull {}
+impl std::error::Error for CompactError {}
+
+/// Error from [`Writer::insert_edge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertError {
+    /// The arena has no remaining capacity. Recover with
+    /// [`DynamicGraph::compact`] / [`DynamicGraph::compact_with_capacity`].
+    ArenaFull,
+    /// `src` or `dst` is not a vertex of this graph
+    /// (≥ `num_vertices`). The edge was not inserted.
+    VertexOutOfRange { src: u32, dst: u32 },
+}
+
+impl std::fmt::Display for InsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArenaFull => write!(f, "C-tree arena is full"),
+            Self::VertexOutOfRange { src, dst } => {
+                write!(f, "edge ({src}, {dst}) references a vertex out of range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InsertError {}
 
 #[cfg(test)]
 mod tests {
@@ -840,11 +973,124 @@ mod tests {
     }
 
     #[test]
+    fn ascending_high_degree_insert_completes() {
+        // Streaming-ingest worst case: one hub vertex receiving
+        // monotonically increasing neighbor IDs. Must stay balanced
+        // (bounded depth, no stack overflow, sub-quadratic arena use).
+        let g = DynamicGraph::new(100_000, 128 << 20);
+        {
+            let mut w = g.writer_or_panic();
+            for i in 0..50_000u32 {
+                assert!(w.insert_edge(0, i).unwrap());
+            }
+        }
+        assert_eq!(g.degree(0), 50_000);
+        let mut buf = Vec::new();
+        g.neighbors_into(0, &mut buf);
+        assert_eq!(buf.len(), 50_000);
+        for w in buf.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+    }
+
+    #[test]
+    fn compact_reclaims_garbage_and_preserves_graph() {
+        let mut g = DynamicGraph::new(5000, 16 << 20);
+        {
+            let mut w = g.writer_or_panic();
+            for v in 0..64u32 {
+                for d in 0..200u32 {
+                    let _ = w.insert_edge(v, (d * 7 + v) % 5000);
+                }
+            }
+        }
+        let edges_before = g.num_edges();
+        let mut snapshot_before: Vec<Vec<u32>> = Vec::new();
+        for v in 0..64u32 {
+            let mut buf = Vec::new();
+            g.neighbors_into(v, &mut buf);
+            snapshot_before.push(buf);
+        }
+        let used_before = g.arena_used();
+
+        g.compact().unwrap();
+
+        assert!(
+            g.arena_used() < used_before / 4,
+            "compact reclaimed too little: {} -> {}",
+            used_before,
+            g.arena_used()
+        );
+        assert_eq!(g.num_edges(), edges_before);
+        for v in 0..64u32 {
+            let mut buf = Vec::new();
+            g.neighbors_into(v, &mut buf);
+            assert_eq!(buf, snapshot_before[v as usize], "vertex {v} changed");
+        }
+
+        // Graph keeps accepting inserts after compaction.
+        {
+            let mut w = g.writer_or_panic();
+            assert!(w.insert_edge(0, 4999).unwrap());
+        }
+        assert!(g.has_edge(0, 4999));
+    }
+
+    #[test]
+    fn compact_with_capacity_grows_arena() {
+        let mut g = DynamicGraph::new(1000, 1 << 20);
+        {
+            let mut w = g.writer_or_panic();
+            for d in 0..1000u32 {
+                let _ = w.insert_edge(0, d);
+            }
+        }
+        g.compact_with_capacity(4 << 20).unwrap();
+        assert_eq!(g.arena_capacity(), 4 << 20);
+        assert_eq!(g.degree(0), 1000);
+    }
+
+    #[test]
+    fn compact_too_small_fails_and_preserves_graph() {
+        let mut g = DynamicGraph::new(2000, 1 << 20);
+        {
+            let mut w = g.writer_or_panic();
+            for d in 0..2000u32 {
+                let _ = w.insert_edge(0, d);
+            }
+        }
+        // 2000 edges cannot fit in 256 bytes.
+        assert_eq!(
+            g.compact_with_capacity(256),
+            Err(CompactError::ArenaFull)
+        );
+        assert_eq!(g.degree(0), 2000, "failed compact must not lose data");
+        assert_eq!(g.arena_capacity(), 1 << 20);
+    }
+
+    #[test]
     fn dirty_out_of_range_is_safe() {
         let g = DynamicGraph::new(10, 1024);
         // Out-of-range queries must not panic.
         assert!(!g.is_dirty(u32::MAX));
         assert!(!g.is_dirty(10));
+    }
+
+    #[test]
+    fn insert_out_of_range_is_an_error() {
+        let g = DynamicGraph::new(10, 1024);
+        let mut w = g.writer_or_panic();
+        assert_eq!(
+            w.insert_edge(0, 10),
+            Err(InsertError::VertexOutOfRange { src: 0, dst: 10 })
+        );
+        assert_eq!(
+            w.insert_edge(10, 0),
+            Err(InsertError::VertexOutOfRange { src: 10, dst: 0 })
+        );
+        drop(w);
+        assert_eq!(g.num_edges(), 0);
+        assert_eq!(g.dirty_count(), 0);
     }
 
     #[test]

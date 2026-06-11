@@ -21,7 +21,7 @@ pub use arena::Arena;
 pub use chunk::Chunk;
 pub use ctree::{CTree, InsertResult};
 pub use embedding_cache::EmbeddingCache;
-pub use graph::{ArenaFull, DynamicGraph, Writer, WriterError};
+pub use graph::{CompactError, DynamicGraph, InsertError, Writer, WriterError};
 pub use historical::{HistoricalBatch, HistoricalSampler};
 #[cfg(feature = "wal")]
 pub use wal::{EdgeRecord, ReplayOutcome, WalError, WalWriter, replay as replay_wal};

@@ -38,7 +38,10 @@ pub fn prefetch_file_range<F: AsRawFd>(file: &F, offset: u64, len: usize) {
 
     let advice = radvisory {
         ra_offset: offset as libc::off_t,
-        ra_count: len as libc::c_int,
+        // ra_count is a c_int: clamp instead of `as`-casting, which would
+        // wrap spans over 2 GiB into a negative count and silently no-op
+        // the hint for exactly the large files it targets.
+        ra_count: len.min(libc::c_int::MAX as usize) as libc::c_int,
     };
 
     // SAFETY: fcntl(F_RDADVISE) reads a `radvisory` from the variadic arg; we pass a properly

@@ -147,3 +147,53 @@ nvidia-smi
 sudo modprobe nvidia-peermem
 dmesg | grep peermem  # expect "nvidia-peermem registered"
 ```
+
+---
+
+## Competitive landscape
+
+The real comparators are not vanilla PyG. When pitching or writing related work,
+benchmark and position against these:
+
+### Production systems
+
+- **DGL‑GraphBolt** — closest competitor. Has an explicit `OnDiskDataset` with
+  mmap'd CSC, `gpu_cached_feature` for partial caching, async prefetching, and a
+  sampler designed around the disk path. This is "AetherGraph but in the DGL
+  ecosystem and with two years of head start." If we can't point at concrete
+  deltas (io_uring vs their `pread`+threadpool, Rabbit Order built into the
+  format, dynamic ingest, Rust core), a reviewer will ask why we didn't just
+  contribute upstream.
+- **WholeGraph (cuGraph)** — NVIDIA's distributed shared‑memory store. Stripes
+  features across host RAM on multi‑GPU boxes with NVLink/RDMA. Doesn't really
+  do NVMe spill, but owns the GPUDirect / RDMA feature‑serving story we're
+  claiming as a differentiator. If we say "GPUDirect RDMA, <5µs," the question
+  back is "how is this not just WholeGraph?" Clean answer: single‑machine NVMe
+  focus, dynamic ingest, billion‑edge tier where WholeGraph runs out of host
+  RAM.
+- **cuGraph‑PyG** — GPU sampler. Different niche (graph in GPU/host RAM, not on
+  disk), but it's what people reach for when they say "PyG NeighborLoader is too
+  slow." When we publish the 240 µs/batch number, the comparison they care
+  about is "vs cuGraph‑PyG on the same hardware," not "vs PyG CPU sampler." 1.4×
+  over CPU PyG is fine; cuGraph‑PyG can be 10×+ on small graphs.
+- **Kùzu (PyG remote backend)** — disk‑based columnar graph DB with an official
+  PyG `FeatureStore`/`GraphStore` integration. Already covers "static graph on
+  NVMe, stream into PyG NeighborLoader." Differentiators are real but specific:
+  Kùzu pays query‑engine overhead per fetch, no GPU‑direct path, no dynamic
+  ingest tuned for streaming. Lead with those.
+
+### Academic systems for the related‑work section
+
+These will appear in our related‑work section whether we like it or not:
+
+- **MariusGNN / Marius++** (Mohoney et al.) — disk‑based single‑machine
+  billion‑edge GNN training. Same pitch.
+- **Ginex** (Park et al., VLDB '22) — SSD‑resident GNN training with explicit
+  feature cache eviction policy. Has the "graphs don't fit, NVMe is fast
+  enough" thesis we're quoting.
+- **GIDS** (Park et al.) — GPU‑initiated direct storage, exactly the
+  io_uring/SPDK‑from‑GPU path. If we don't cite this and explain how AetherGraph
+  differs, a PC reviewer will reject on novelty.
+- **BaM** (NVIDIA) — same direction, GPU as storage initiator.
+- **Legion / P3 / DistDGL** — distributed training comparators if we ever claim
+  scale.

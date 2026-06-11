@@ -6,7 +6,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use aether_epoch::EpochClock;
-use aether_graph::{DynamicGraph, replay_wal};
+use aether_graph::{DynamicGraph, WalError, replay_wal};
 
 fn collect_neighbors(g: &DynamicGraph, v: u32) -> Vec<u32> {
     let mut buf = Vec::new();
@@ -144,6 +144,53 @@ fn corrupt_tail_is_truncated_on_recovery() {
 }
 
 #[test]
+fn short_torn_tail_is_truncated_and_later_appends_survive() {
+    use std::io::Write;
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    {
+        let g = DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
+        let mut w = g.writer().unwrap();
+        w.insert_edge(0, 1).unwrap();
+        w.insert_edge(2, 3).unwrap();
+    }
+    let len_after_good = std::fs::metadata(&path).unwrap().len();
+
+    // Torn write that flushed fewer bytes than one record.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&[0xAA; 7]).unwrap();
+        f.sync_data().unwrap();
+    }
+
+    // First recovery must truncate the short tail before appending, so
+    // the new record lands on a record boundary.
+    {
+        let g = DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
+        assert_eq!(g.num_edges(), 2);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len_after_good,
+            "short tail must be truncated before new appends"
+        );
+        let mut w = g.writer().unwrap();
+        w.insert_edge(4, 5).unwrap();
+    }
+
+    // Second recovery: the post-truncation append must survive.
+    let g = DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
+    assert_eq!(g.num_edges(), 3);
+    assert_eq!(collect_neighbors(&g, 0), vec![1]);
+    assert_eq!(collect_neighbors(&g, 2), vec![3]);
+    assert_eq!(collect_neighbors(&g, 4), vec![5]);
+}
+
+#[test]
 fn shared_epoch_clock_is_consistent_after_recovery() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
@@ -160,12 +207,46 @@ fn shared_epoch_clock_is_consistent_after_recovery() {
         assert_eq!(g.current_epoch().as_u64(), 3);
     }
 
-    // Recovery: clock advances once per record applied, so the external
-    // observer sees the same final epoch as the original process.
+    // Recovery: clock advances once per record applied. (It matches the
+    // original run's epoch here only because each writer guard above
+    // inserted exactly one edge.)
     let clock = Arc::new(EpochClock::new());
     let g = DynamicGraph::open_with_wal_and_epoch(&path, 16, 1 << 20, Arc::clone(&clock)).unwrap();
     assert_eq!(g.num_edges(), 3);
     assert_eq!(clock.current().as_u64(), 3);
+}
+
+#[test]
+fn replay_into_smaller_graph_fails_instead_of_dropping_records() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    {
+        let g = DynamicGraph::open_with_wal(&path, 100, 1 << 20).unwrap();
+        let mut w = g.writer().unwrap();
+        w.insert_edge(0, 1).unwrap();
+        w.insert_edge(50, 99).unwrap();
+    }
+
+    // Reopen with fewer vertices than the log was written against. The
+    // (50, 99) record cannot be represented — recovery must error, not
+    // silently produce a graph missing edges.
+    match DynamicGraph::open_with_wal(&path, 10, 1 << 20) {
+        Err(WalError::RecordOutOfRange {
+            src,
+            dst,
+            num_vertices,
+        }) => {
+            assert_eq!((src, dst), (50, 99));
+            assert_eq!(num_vertices, 10);
+        }
+        Err(other) => panic!("expected RecordOutOfRange, got {other:?}"),
+        Ok(_) => panic!("expected RecordOutOfRange, got a recovered graph"),
+    }
+
+    // The correct num_vertices still recovers cleanly.
+    let g = DynamicGraph::open_with_wal(&path, 100, 1 << 20).unwrap();
+    assert_eq!(g.num_edges(), 2);
 }
 
 #[test]
