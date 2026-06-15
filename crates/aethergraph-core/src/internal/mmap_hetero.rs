@@ -249,19 +249,20 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
     // Validate and slice CSR sections (mmap-backed, zero-copy). Every
     // range is bounds- and overflow-checked against the file length
     // before a Graph view is built over it.
-    let take = |offset: &mut usize, len: usize, what: &str, rel: &str| -> Result<std::ops::Range<usize>> {
-        let start = *offset;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| anyhow::anyhow!("section size overflows for edge type '{rel}'"))?;
-        ensure!(
-            end <= file_len,
-            "file truncated: {what} section of edge type '{rel}' needs bytes {start}..{end}, \
+    let take =
+        |offset: &mut usize, len: usize, what: &str, rel: &str| -> Result<std::ops::Range<usize>> {
+            let start = *offset;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| anyhow::anyhow!("section size overflows for edge type '{rel}'"))?;
+            ensure!(
+                end <= file_len,
+                "file truncated: {what} section of edge type '{rel}' needs bytes {start}..{end}, \
              file has {file_len}"
-        );
-        *offset = end;
-        Ok(start..end)
-    };
+            );
+            *offset = end;
+            Ok(start..end)
+        };
 
     let mut edge_types: Vec<(String, String, String, Graph)> = Vec::with_capacity(num_et);
     for hdr in &et_headers {
@@ -278,13 +279,16 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
 
         let offsets_range = take(&mut offset, offsets_bytes, "offsets", rel)?;
         ensure!(
-            offsets_range.start.is_multiple_of(std::mem::align_of::<EdgeOffset>()),
+            offsets_range
+                .start
+                .is_multiple_of(std::mem::align_of::<EdgeOffset>()),
             "offsets section of edge type '{rel}' is misaligned — file is corrupt"
         );
         // O(1) structural check: a CSR offsets array starts at 0 and ends
         // at num_edges. Catches sections that landed on the wrong bytes
         // without faulting in the whole file.
-        let first = u64::from_le_bytes(mmap[offsets_range.start..offsets_range.start + 8].try_into()?);
+        let first =
+            u64::from_le_bytes(mmap[offsets_range.start..offsets_range.start + 8].try_into()?);
         let last = u64::from_le_bytes(mmap[offsets_range.end - 8..offsets_range.end].try_into()?);
         ensure!(
             first == 0 && last == hdr.num_edges as u64,

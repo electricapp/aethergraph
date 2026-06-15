@@ -269,9 +269,11 @@ impl CTree {
         if depth + split_levels > depth_limit(total) {
             // SAFETY: caller upholds single-writer invariant.
             match unsafe { rebalance(arena, new_root, &new_path[..depth], &went_left[..depth]) } {
-                Some(balanced_root) => return InsertResult::Inserted(CTree {
-                    root: balanced_root,
-                }),
+                Some(balanced_root) => {
+                    return InsertResult::Inserted(CTree {
+                        root: balanced_root,
+                    });
+                }
                 None => return InsertResult::Inserted(CTree { root: new_root }),
             }
         }

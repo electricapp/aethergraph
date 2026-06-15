@@ -664,8 +664,7 @@ pub fn batch_read(
                         submitter.submit().map(|_| ())
                     };
                     if let Err(e) = res {
-                        first_err =
-                            Some(anyhow::Error::from(e).context("io_uring submit failed"));
+                        first_err = Some(anyhow::Error::from(e).context("io_uring submit failed"));
                         break 'push;
                     }
                 }

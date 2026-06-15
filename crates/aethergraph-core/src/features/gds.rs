@@ -543,15 +543,14 @@ impl GdsFeatureStore {
         // Reap completion events until every entry reports in. Each call
         // consumes newly completed events; a deadline bounds the loop so
         // a wedged device surfaces as an error instead of a hang.
-        let mut events =
-            vec![
-                ffi::CUfileIOEvents {
-                    cookie: std::ptr::null_mut(),
-                    status: 0,
-                    ret: 0,
-                };
-                num_entries as usize
-            ];
+        let mut events = vec![
+            ffi::CUfileIOEvents {
+                cookie: std::ptr::null_mut(),
+                status: 0,
+                ret: 0,
+            };
+            num_entries as usize
+        ];
         let mut completed: usize = 0;
         let mut total_bytes: usize = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

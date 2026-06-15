@@ -173,9 +173,9 @@ benchmark and position against these:
   RAM.
 - **cuGraph‑PyG** — GPU sampler. Different niche (graph in GPU/host RAM, not on
   disk), but it's what people reach for when they say "PyG NeighborLoader is too
-  slow." When we publish the 240 µs/batch number, the comparison they care
-  about is "vs cuGraph‑PyG on the same hardware," not "vs PyG CPU sampler." 1.4×
-  over CPU PyG is fine; cuGraph‑PyG can be 10×+ on small graphs.
+  slow." When we publish the 240 µs/batch number, the comparison they care about
+  is "vs cuGraph‑PyG on the same hardware," not "vs PyG CPU sampler." 1.4× over
+  CPU PyG is fine; cuGraph‑PyG can be 10×+ on small graphs.
 - **Kùzu (PyG remote backend)** — disk‑based columnar graph DB with an official
   PyG `FeatureStore`/`GraphStore` integration. Already covers "static graph on
   NVMe, stream into PyG NeighborLoader." Differentiators are real but specific:
@@ -189,8 +189,8 @@ These will appear in our related‑work section whether we like it or not:
 - **MariusGNN / Marius++** (Mohoney et al.) — disk‑based single‑machine
   billion‑edge GNN training. Same pitch.
 - **Ginex** (Park et al., VLDB '22) — SSD‑resident GNN training with explicit
-  feature cache eviction policy. Has the "graphs don't fit, NVMe is fast
-  enough" thesis we're quoting.
+  feature cache eviction policy. Has the "graphs don't fit, NVMe is fast enough"
+  thesis we're quoting.
 - **GIDS** (Park et al.) — GPU‑initiated direct storage, exactly the
   io_uring/SPDK‑from‑GPU path. If we don't cite this and explain how AetherGraph
   differs, a PC reviewer will reject on novelty.
