@@ -37,10 +37,10 @@ futures.workspace = true
 ndarray.workspace = true
 half.workspace = true
 libc = "0.2"
-bitflags = "2.11"
-parquet = { version = "58", optional = true, default-features = false, features = ["arrow"] }
-arrow-array = { version = "58", optional = true }
-arrow-schema = { version = "58", optional = true }
+bitflags = "2.13"
+parquet = { version = "59", optional = true, default-features = false, features = ["arrow"] }
+arrow-array = { version = "59", optional = true }
+arrow-schema = { version = "59", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5"
