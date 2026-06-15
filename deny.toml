@@ -48,15 +48,7 @@ yanked = "deny"
 # Track open advisories here with a reason + revisit date. Every entry MUST
 # have a comment explaining why the advisory is accepted. Empty by default so
 # any new RUSTSEC advisory becomes a hard fail in CI.
-ignore = [
-    # `paste` is unmaintained as of 2024-10-07 (RUSTSEC-2024-0436) but is a
-    # proc-macro: it only runs at compile time and never ships in the produced
-    # binary, so "unmaintained" has zero runtime attack surface for us. It is
-    # a transitive dep of `parquet` (latest version still pulls it). Revisit
-    # whenever we bump the `parquet` crate — drop this ignore once a parquet
-    # release no longer depends on paste.
-    { id = "RUSTSEC-2024-0436", reason = "paste: build-time proc-macro only, no runtime impact; pulled in by parquet" },
-]
+ignore = []
 
 [sources]
 unknown-registry = "deny"
