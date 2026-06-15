@@ -45,7 +45,7 @@ Repository = "https://github.com/electricapp/aethergraph"
 Documentation = "https://github.com/electricapp/aethergraph#readme"
 
 [build-system]
-requires = ["maturin>=1.4,<2.0"]
+requires = ["maturin>=1.14.0,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -99,7 +99,7 @@ ignore_missing_imports = true
 [dependency-groups]
 dev = [
     "hypothesis>=6.152.8",
-    "maturin>=1.10.2",
+    "maturin>=1.14.0",
     "mypy>=2.1.0",
     "opentelemetry-api>=1.41.0",
     "opentelemetry-exporter-otlp>=1.41.1",
