@@ -74,7 +74,11 @@ pub enum WalError {
     /// A replayed record references a vertex at or beyond the
     /// `num_vertices` the graph was opened with — the WAL was written
     /// against a larger graph than the one being recovered into.
-    RecordOutOfRange { src: u32, dst: u32, num_vertices: u64 },
+    RecordOutOfRange {
+        src: u32,
+        dst: u32,
+        num_vertices: u64,
+    },
     /// The arena filled up before every record was replayed. Reopen
     /// with a larger arena.
     ReplayArenaFull,
@@ -96,7 +100,10 @@ impl std::fmt::Display for WalError {
                  the log was written against a larger graph"
             ),
             Self::ReplayArenaFull => {
-                write!(f, "arena filled during WAL replay; reopen with a larger arena")
+                write!(
+                    f,
+                    "arena filled during WAL replay; reopen with a larger arena"
+                )
             }
         }
     }

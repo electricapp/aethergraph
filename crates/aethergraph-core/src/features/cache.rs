@@ -445,9 +445,8 @@ impl FeatureCache {
                     }
                     Err(e) => {
                         self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                        return Err(e).with_context(|| {
-                            format!("failed to load features for node {}", node)
-                        });
+                        return Err(e)
+                            .with_context(|| format!("failed to load features for node {}", node));
                     }
                 }
             }

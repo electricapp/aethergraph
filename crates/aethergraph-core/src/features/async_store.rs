@@ -570,9 +570,11 @@ impl AsyncFeatureStore {
                             .context("failed to read features")?;
 
                         match dtype {
-                            FeatureDtype::F32 => features.extend(buffer.chunks_exact(4).map(
-                                |chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-                            )),
+                            FeatureDtype::F32 => {
+                                features.extend(buffer.chunks_exact(4).map(|chunk| {
+                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                }))
+                            }
                             FeatureDtype::F16 => features.extend(
                                 buffer
                                     .chunks_exact(2)

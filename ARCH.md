@@ -287,9 +287,9 @@ Forward-compat policy:
 
 ### Hetero graph (multi-relational CSR, `.bin`)
 
-| Version | Magic        | Status  | Notes                             |
-| ------- | ------------ | ------- | --------------------------------- |
-| **v1**  | `"AETHHETG"` | current | One CSR section per edge type.    |
+| Version | Magic        | Status  | Notes                          |
+| ------- | ------------ | ------- | ------------------------------ |
+| **v1**  | `"AETHHETG"` | current | One CSR section per edge type. |
 
 Layout (v1): 64-byte header (magic, `version` u32, type counts, reserved),
 node/edge type tables, then per-edge-type CSR sections. u32 sections (edges,

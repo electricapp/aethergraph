@@ -714,9 +714,7 @@ impl std::fmt::Display for CompactError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Poisoned => f.write_str("cannot compact a poisoned graph"),
-            Self::ArenaFull => {
-                f.write_str("compacted trees exceed the requested arena capacity")
-            }
+            Self::ArenaFull => f.write_str("compacted trees exceed the requested arena capacity"),
         }
     }
 }
@@ -1060,10 +1058,7 @@ mod tests {
             }
         }
         // 2000 edges cannot fit in 256 bytes.
-        assert_eq!(
-            g.compact_with_capacity(256),
-            Err(CompactError::ArenaFull)
-        );
+        assert_eq!(g.compact_with_capacity(256), Err(CompactError::ArenaFull));
         assert_eq!(g.degree(0), 2000, "failed compact must not lose data");
         assert_eq!(g.arena_capacity(), 1 << 20);
     }
