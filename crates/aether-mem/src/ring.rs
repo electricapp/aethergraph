@@ -18,6 +18,12 @@
 //! the allocator to any specific domain.
 
 use std::ptr::NonNull;
+// The free-list atomics are aliased to loom's under the `loom` feature so the
+// `loom_lockfree` test model-checks the real `FreeList` code rather than a copy.
+// Off by default; production builds use the std atomics.
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Hook called after allocation and before deallocation.
@@ -216,18 +222,114 @@ const fn unpack_free_head(value: u64) -> (u32, u32) {
     (value as u32, (value >> 32) as u32)
 }
 
-fn build_free_list(slot_count: usize) -> (CachePadded<AtomicU64>, Box<[AtomicU32]>) {
-    let mut next_free: Vec<AtomicU32> = Vec::with_capacity(slot_count);
-    for i in 0..slot_count {
-        let next = if i + 1 < slot_count {
-            (i + 1) as u32
-        } else {
-            FREE_LIST_EMPTY
-        };
-        next_free.push(AtomicU32::new(next));
+/// Lock-free index allocator: an ABA-tagged Treiber stack of free slot indices.
+///
+/// This is the single source of truth for the free-list protocol —
+/// [`SharedMemoryRing`] holds one and delegates slot acquisition to it. Keeping
+/// it as a standalone type (with no pointer/mmap state) is what lets the
+/// `loom_lockfree` test model-check the *real* [`acquire`](FreeList::acquire) /
+/// [`release`](FreeList::release) under the `loom` feature instead of a copy.
+pub struct FreeList {
+    /// Free-list head with ABA tag, isolated on its own cache line.
+    head: CachePadded<AtomicU64>,
+    /// `next[i]` is the next free index after `i` (or `FREE_LIST_EMPTY`).
+    next: Box<[AtomicU32]>,
+    /// Number of slots; also the valid index bound.
+    slot_count: usize,
+}
+
+impl FreeList {
+    /// Build a free list over `slot_count` slots, all initially free and
+    /// chained `0 -> 1 -> ... -> slot_count-1 -> empty`.
+    pub fn new(slot_count: usize) -> Self {
+        let mut next: Vec<AtomicU32> = Vec::with_capacity(slot_count);
+        for i in 0..slot_count {
+            let n = if i + 1 < slot_count {
+                (i + 1) as u32
+            } else {
+                FREE_LIST_EMPTY
+            };
+            next.push(AtomicU32::new(n));
+        }
+        Self {
+            head: CachePadded(AtomicU64::new(pack_free_head(0, 0))),
+            next: next.into_boxed_slice(),
+            slot_count,
+        }
     }
-    let free_head = CachePadded(AtomicU64::new(pack_free_head(0, 0)));
-    (free_head, next_free.into_boxed_slice())
+
+    /// Acquire a free slot index, or `None` if the list is exhausted.
+    #[inline]
+    pub fn acquire(&self) -> Option<usize> {
+        let mut backoff = Backoff::new();
+        loop {
+            let state = self.head.load(Ordering::Acquire);
+            let (head, tag) = unpack_free_head(state);
+            if head == FREE_LIST_EMPTY {
+                return None;
+            }
+
+            // A valid free-list head is always an in-range slot index. An
+            // out-of-range value here means the head was corrupted; surface it
+            // in tests rather than letting `get` return `None` and masquerade
+            // as "ring full".
+            debug_assert!(
+                (head as usize) < self.slot_count,
+                "acquire: corrupt free-list head {head} >= slot_count {}",
+                self.slot_count
+            );
+
+            let next_cell = self.next.get(head as usize)?;
+            let next = next_cell.load(Ordering::Relaxed);
+            let new_state = pack_free_head(next, tag.wrapping_add(1));
+
+            // Success only observes the freed slot's `next` (already read above
+            // under the prior `release`'s Release); it publishes nothing, so
+            // Acquire suffices.
+            if self
+                .head
+                .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(head as usize);
+            }
+            backoff.spin();
+        }
+    }
+
+    /// Release a slot index back to the free list.
+    ///
+    /// Out-of-range indices are ignored in both debug and release builds; the
+    /// runtime check protects against silent memory corruption.
+    #[inline]
+    pub fn release(&self, index: usize) {
+        if index >= self.slot_count {
+            debug_assert!(
+                false,
+                "release: index {index} >= slot_count {}",
+                self.slot_count
+            );
+            return;
+        }
+        let slot = &self.next[index];
+
+        let mut backoff = Backoff::new();
+        loop {
+            let state = self.head.load(Ordering::Acquire);
+            let (head, tag) = unpack_free_head(state);
+            slot.store(head, Ordering::Relaxed);
+            let new_state = pack_free_head(index as u32, tag.wrapping_add(1));
+
+            if self
+                .head
+                .compare_exchange_weak(state, new_state, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            backoff.spin();
+        }
+    }
 }
 
 /// Ring buffer with pre-allocated slots.
@@ -263,10 +365,8 @@ pub struct SharedMemoryRing {
     page_align: usize,
     /// Always a power of two
     slot_count: usize,
-    /// Free-list head with ABA tag
-    free_head: CachePadded<AtomicU64>,
-    /// Next pointers for free list
-    next_free: Box<[AtomicU32]>,
+    /// Lock-free index allocator over the slots.
+    free_list: FreeList,
     #[cfg(target_os = "linux")]
     uses_huge_pages: bool,
     /// Post-allocation hooks (CUDA pinning, mlock, etc.)
@@ -340,8 +440,10 @@ impl SharedMemoryRing {
             "Allocating shared memory ring buffer"
         );
 
-        // Try huge pages on Linux; fall back to regular pages.
-        #[cfg(target_os = "linux")]
+        // Try huge pages on Linux; fall back to regular pages. Skipped under
+        // miri, which cannot execute the mmap syscall — the regular std-alloc
+        // path below is what miri exercises.
+        #[cfg(all(target_os = "linux", not(miri)))]
         let hooks = match Self::try_alloc_huge(
             slot_count,
             aligned_slot_size,
@@ -392,7 +494,7 @@ impl SharedMemoryRing {
 
     /// Try to allocate using huge pages (Linux only).
     /// Returns `Err(hooks)` on failure so they can be reused by the fallback path.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     #[allow(clippy::type_complexity)]
     fn try_alloc_huge(
         slot_count: usize,
@@ -439,9 +541,8 @@ impl SharedMemoryRing {
         // MAP_POPULATE pre-faults every page in the kernel, so the manual
         // prefault loop is only needed when that flag is absent.
         if map_flags & MAP_POPULATE == 0 {
-            let base_addr = ptr.0.as_ptr() as usize;
             let num_pages = alloc_size / HUGE_PAGE_SIZE;
-            prefault_pages(base_addr, num_pages, HUGE_PAGE_SIZE);
+            prefault_pages(ptr.0.as_ptr(), num_pages, HUGE_PAGE_SIZE);
         }
 
         // Pass `addressable_size` to hooks, NOT `alloc_size` — the slop bytes
@@ -460,7 +561,7 @@ impl SharedMemoryRing {
             "Ring buffer allocated with huge pages"
         );
 
-        let (free_head, next_free) = build_free_list(slot_count);
+        let free_list = FreeList::new(slot_count);
         Ok((
             Self {
                 ptr,
@@ -469,8 +570,7 @@ impl SharedMemoryRing {
                 slot_size,
                 page_align,
                 slot_count,
-                free_head,
-                next_free,
+                free_list,
                 uses_huge_pages: true,
                 hooks,
             },
@@ -499,9 +599,8 @@ impl SharedMemoryRing {
         };
         let ptr = SyncPtr(non_null);
 
-        let base_addr = ptr.0.as_ptr() as usize;
         let num_pages = addressable_size / page_align;
-        prefault_pages(base_addr, num_pages, page_align);
+        prefault_pages(ptr.0.as_ptr(), num_pages, page_align);
 
         let mut failures = Vec::new();
         for hook in &hooks {
@@ -513,7 +612,7 @@ impl SharedMemoryRing {
         #[cfg(feature = "tracing")]
         tracing::info!(addressable_size, "Ring buffer allocated with regular pages");
 
-        let (free_head, next_free) = build_free_list(slot_count);
+        let free_list = FreeList::new(slot_count);
         Ok((
             Self {
                 ptr,
@@ -522,8 +621,7 @@ impl SharedMemoryRing {
                 slot_size,
                 page_align,
                 slot_count,
-                free_head,
-                next_free,
+                free_list,
                 #[cfg(target_os = "linux")]
                 uses_huge_pages: false,
                 hooks,
@@ -546,40 +644,7 @@ impl SharedMemoryRing {
     /// Acquire a slot index from the free list.
     #[inline]
     pub fn acquire_index(&self) -> Option<usize> {
-        let mut backoff = Backoff::new();
-        loop {
-            let state = self.free_head.load(Ordering::Acquire);
-            let (head, tag) = unpack_free_head(state);
-            if head == FREE_LIST_EMPTY {
-                return None;
-            }
-
-            // A valid free-list head is always an in-range slot index. An
-            // out-of-range value here means the head was corrupted; surface it
-            // in tests rather than letting `get` return `None` and masquerade
-            // as "ring full".
-            debug_assert!(
-                (head as usize) < self.slot_count,
-                "acquire_index: corrupt free-list head {head} >= slot_count {}",
-                self.slot_count
-            );
-
-            let next_cell = self.next_free.get(head as usize)?;
-            let next = next_cell.load(Ordering::Relaxed);
-            let new_state = pack_free_head(next, tag.wrapping_add(1));
-
-            // Success only observes the freed slot's `next` (already read above
-            // under the prior `release_index`'s Release); it publishes nothing,
-            // so Acquire suffices.
-            if self
-                .free_head
-                .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Acquire)
-                .is_ok()
-            {
-                return Some(head as usize);
-            }
-            backoff.spin();
-        }
+        self.free_list.acquire()
     }
 
     /// Release a slot index back to the free list.
@@ -588,33 +653,7 @@ impl SharedMemoryRing {
     /// the runtime check protects against silent memory corruption.
     #[inline]
     pub fn release_index(&self, index: usize) {
-        if index >= self.slot_count {
-            debug_assert!(
-                false,
-                "release_index: index {index} >= slot_count {}",
-                self.slot_count
-            );
-            return;
-        }
-        // SAFETY: bounds-checked above.
-        let slot = &self.next_free[index];
-
-        let mut backoff = Backoff::new();
-        loop {
-            let state = self.free_head.load(Ordering::Acquire);
-            let (head, tag) = unpack_free_head(state);
-            slot.store(head, Ordering::Relaxed);
-            let new_state = pack_free_head(index as u32, tag.wrapping_add(1));
-
-            if self
-                .free_head
-                .compare_exchange_weak(state, new_state, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-            backoff.spin();
-        }
+        self.free_list.release(index);
     }
 
     /// Get pointer to a specific slot.
@@ -677,22 +716,29 @@ impl SharedMemoryRing {
 }
 
 #[cfg(feature = "parallel-prefault")]
-fn prefault_pages(base_addr: usize, num_pages: usize, page_size: usize) {
+fn prefault_pages(base: *mut u8, num_pages: usize, page_size: usize) {
     use rayon::prelude::*;
-    (0..num_pages).into_par_iter().for_each(|page_idx| {
-        let addr = base_addr + page_idx * page_size;
-        // SAFETY: addr is within the freshly-allocated mapping; each thread
-        // writes to a distinct page so there is no aliasing.
-        unsafe { std::ptr::write_volatile(addr as *mut u8, 0u8) };
+    // Raw pointers aren't `Send`; carry provenance across rayon tasks in a
+    // `SyncPtr` and offset from it rather than reconstructing from an integer.
+    let base = SyncPtr(NonNull::new(base).expect("mapping pointer is non-null"));
+    (0..num_pages).into_par_iter().for_each(move |page_idx| {
+        // Capture the whole `SyncPtr` (Send + Sync), not its inner `NonNull`
+        // field, which disjoint closure captures would otherwise grab.
+        let base = base;
+        // SAFETY: page_idx * page_size stays within the freshly-allocated mapping.
+        let page = unsafe { base.0.as_ptr().add(page_idx * page_size) };
+        // SAFETY: each task writes a distinct, in-bounds page — no aliasing.
+        unsafe { std::ptr::write_volatile(page, 0u8) };
     });
 }
 
 #[cfg(not(feature = "parallel-prefault"))]
-fn prefault_pages(base_addr: usize, num_pages: usize, page_size: usize) {
+fn prefault_pages(base: *mut u8, num_pages: usize, page_size: usize) {
     for page_idx in 0..num_pages {
-        let addr = base_addr + page_idx * page_size;
-        // SAFETY: sequential access into the freshly-allocated mapping.
-        unsafe { std::ptr::write_volatile(addr as *mut u8, 0u8) };
+        // SAFETY: page_idx * page_size stays within the freshly-allocated mapping.
+        let page = unsafe { base.add(page_idx * page_size) };
+        // SAFETY: sequential single-threaded access to an in-bounds page.
+        unsafe { std::ptr::write_volatile(page, 0u8) };
     }
 }
 

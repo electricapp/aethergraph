@@ -9,5 +9,6 @@ mod ring;
 pub mod hooks;
 
 pub use ring::{
-    DetachedSlot, HookError, MemoryHook, RingBuilderError, RingSlot, SharedMemoryRing, SlotOverflow,
+    DetachedSlot, FreeList, HookError, MemoryHook, RingBuilderError, RingSlot, SharedMemoryRing,
+    SlotOverflow,
 };
