@@ -41,6 +41,10 @@ pub struct RdmaRead {
 /// via `connect`, then used for RDMA READ operations.
 pub struct RdmaQp {
     qp: *mut IbvQp,
+    /// Send-queue depth this QP was created with. Posts are bounded against it
+    /// so an over-long chain fails fast in Rust instead of overflowing the
+    /// queue inside `ibv_post_send`.
+    max_send_wr: u32,
 }
 
 // SAFETY: QP is thread-safe after creation (single-threaded posting assumed).
@@ -48,7 +52,13 @@ unsafe impl Send for RdmaQp {}
 // SAFETY: see Send impl above.
 unsafe impl Sync for RdmaQp {}
 
-/// Default PSN for new QPs.
+/// Default starting packet sequence number for new QPs.
+///
+/// Held at 0 rather than randomized per QP: this crate pulls in no randomness
+/// source, and the QP endpoints are exchanged over an out-of-band TCP control
+/// plane on a trusted fabric, so the off-path packet-injection guard a random
+/// PSN provides is not relied on here. Both ends use this same value so the
+/// RTR `rq_psn` and RTS `sq_psn` agree.
 const DEFAULT_PSN: u32 = 0;
 
 /// Default QP capabilities — sized for batched RDMA READ workloads typical of
@@ -97,7 +107,10 @@ impl RdmaQp {
             return Err(io::Error::other("ibv_create_qp failed"));
         }
 
-        Ok(Self { qp })
+        Ok(Self {
+            qp,
+            max_send_wr: cap.max_send_wr,
+        })
     }
 
     /// Get local endpoint for exchange over TCP control plane.
@@ -113,6 +126,13 @@ impl RdmaQp {
     }
 
     /// Transition RESET → INIT → RTR → RTS to connect to a remote QP.
+    ///
+    /// The RDMA-atomic depths (`max_dest_rd_atomic` / `max_rd_atomic`) are
+    /// requested as 16. This crate links only the subset of ibverbs in
+    /// `ffi.rs`, which has no `ibv_query_device`, so the value is not clamped to
+    /// the device's `max_qp_rd_atom`. On an HCA that reports a smaller cap,
+    /// `ibv_modify_qp` rejects the RTR/RTS transition and `connect` returns the
+    /// underlying error — feed a smaller value here if you target such hardware.
     pub fn connect(&self, ctx: &RdmaContext, remote: &QpEndpoint) -> io::Result<()> {
         self.to_init(ctx)?;
         self.to_rtr(ctx, remote)?;
@@ -151,6 +171,19 @@ impl RdmaQp {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "signal_every_n must be >= 1",
+            ));
+        }
+        // A chain longer than the QP's send-queue depth would overflow inside
+        // `ibv_post_send` (ENOMEM) or, worse, be partially accepted. Reject up
+        // front so the failure is observable here.
+        if reads.len() > self.max_send_wr as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "reads.len() {} exceeds QP max_send_wr {}",
+                    reads.len(),
+                    self.max_send_wr
+                ),
             ));
         }
 
@@ -202,7 +235,28 @@ impl RdmaQp {
         // SAFETY: `self.qp` is alive; `wrs[0]` is the head of a valid WR chain.
         let ret = unsafe { ibv_post_send(self.qp, &mut wrs[0], &mut bad_wr) };
         if ret != 0 {
-            return Err(io::Error::other(format!("ibv_post_send failed: {ret}")));
+            // `ibv_post_send` sets `bad_wr` to the first WR it did NOT process;
+            // every WR before it in the chain was accepted onto the send queue.
+            // Surface that count so the caller's completion accounting stays
+            // correct (those accepted WRs will still generate CQEs).
+            let accepted = if bad_wr.is_null() {
+                // Whole chain rejected with no specific offender reported.
+                0
+            } else {
+                // SAFETY: `bad_wr`, when non-null, points at one of the WRs in
+                // `wrs` (the chain we just handed in); the offset is therefore
+                // a valid in-bounds element index.
+                let off = unsafe { bad_wr.offset_from(wrs.as_ptr()) };
+                if (0..wrs.len() as isize).contains(&off) {
+                    off as usize
+                } else {
+                    0
+                }
+            };
+            return Err(io::Error::other(format!(
+                "ibv_post_send failed: {ret} ({accepted} of {} WRs accepted before bad_wr)",
+                wrs.len()
+            )));
         }
 
         Ok(())

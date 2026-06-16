@@ -319,7 +319,9 @@ impl PyNeighborLoader {
             .as_ref()
             .ok_or_else(|| sampling_error("Prefetcher has been shut down"))?;
 
-        match inner.next() {
+        // The blocking recv can stall while the worker samples; release the GIL
+        // so other Python threads run. No Python object is touched inside.
+        match py.detach(|| inner.next()) {
             Some(subgraph) => {
                 let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;
                 Ok(Some(py_subgraph))
@@ -339,7 +341,9 @@ impl PyNeighborLoader {
             .as_ref()
             .ok_or_else(|| sampling_error("Prefetcher has been shut down"))?;
 
-        match inner.try_next() {
+        // Non-blocking, but the channel recv still does a little work; release
+        // the GIL across it for consistency with `next()`.
+        match py.detach(|| inner.try_next()) {
             Some(subgraph) => {
                 let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;
                 Ok(Some(py_subgraph))
@@ -362,7 +366,10 @@ impl PyNeighborLoader {
             .as_ref()
             .ok_or_else(|| sampling_error("Prefetcher has been shut down"))?;
 
-        match inner.next_with_features() {
+        // The blocking recv can stall while the worker samples and loads
+        // features; release the GIL across it. The numpy/py outputs are built
+        // afterward, back under the GIL.
+        match py.detach(|| inner.next_with_features()) {
             Some((subgraph, features_opt)) => {
                 let num_nodes = subgraph.nodes.len();
                 let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;

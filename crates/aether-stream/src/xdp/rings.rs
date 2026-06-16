@@ -53,6 +53,9 @@ pub type UmemDesc = u64;
 pub struct XdpRing<T: Copy> {
     producer: *const AtomicU32,
     consumer: *const AtomicU32,
+    /// Kernel-owned ring flags (carries `XDP_RING_NEED_WAKEUP`). Lives in the
+    /// same mmap'd region as the producer/consumer pointers.
+    flags: *const AtomicU32,
     ring: *mut T,
     mask: u32,
 }
@@ -77,13 +80,31 @@ impl<T: Copy> XdpRing<T> {
         // SAFETY: per the function's safety contract above.
         let consumer = unsafe { base.add(offsets.consumer as usize) } as *const AtomicU32;
         // SAFETY: per the function's safety contract above.
+        let flags = unsafe { base.add(offsets.flags as usize) } as *const AtomicU32;
+        // SAFETY: per the function's safety contract above.
         let ring = unsafe { base.add(offsets.desc as usize) } as *mut T;
         Self {
             producer,
             consumer,
+            flags,
             ring,
             mask: ring_size - 1,
         }
+    }
+
+    /// Whether the kernel has flagged this ring as needing a syscall wakeup.
+    ///
+    /// Zero-copy / busy-poll drivers stop draining the FILL ring (and stop
+    /// pulling from TX) once they catch up, setting `XDP_RING_NEED_WAKEUP`.
+    /// When this returns `true`, userspace must issue `recvfrom`/`sendto` on
+    /// the socket fd to resume the driver; otherwise the busy-poll loop spins
+    /// forever without the kernel ever moving frames.
+    #[inline]
+    pub fn needs_wakeup(&self) -> bool {
+        // SAFETY: `flags` points into the ring's mmap'd region, valid for the
+        // ring's lifetime.
+        let flags = unsafe { (*self.flags).load(Ordering::Acquire) };
+        flags & super::constants::XDP_RING_NEED_WAKEUP != 0
     }
 
     /// Number of entries available for consumption.

@@ -17,6 +17,7 @@ from aethergraph._core import (
     SampledSubgraph as _SampledSubgraph,
     SamplingConfig as _SamplingConfig,
     SamplingError,
+    SamplingTelemetry,
 )
 from aethergraph.graph import Graph
 
@@ -27,6 +28,7 @@ __all__ = [
     "NeighborSampler",  # PyG-compatible alias
     "ParallelBatchSampler",
     "SamplingError",
+    "SamplingTelemetry",
 ]
 
 SeedInput = Sequence[int] | npt.NDArray[np.int64] | npt.NDArray[np.uint32]
@@ -54,6 +56,13 @@ class SamplingConfig:
         disjoint: When ``True``, each seed produces its own isolated subgraph
             (no node dedup across seeds). The returned subgraph carries a
             ``batch`` vector mapping each node to its seed index.
+        deterministic: When ``True``, sampling is bit-deterministic given a
+            ``seed`` (at some throughput cost). When ``False``, output is
+            statistically reproducible given a ``seed`` but the exact node
+            ordering may vary across parallel runs.
+        telemetry: Optional :class:`SamplingTelemetry` collector. When set,
+            per-sample metrics are recorded into it; ``None`` disables
+            collection.
 
     Example:
         >>> config = SamplingConfig(num_neighbors=[25, 10], replace=False)
@@ -73,6 +82,8 @@ class SamplingConfig:
     track_edge_ids: bool = True
     temporal_strategy: str | None = None
     disjoint: bool = False
+    deterministic: bool = False
+    telemetry: SamplingTelemetry | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration parameters.
@@ -118,6 +129,8 @@ class SamplingConfig:
             track_edge_ids=self.track_edge_ids,
             temporal_strategy=self.temporal_strategy,
             disjoint=self.disjoint,
+            deterministic=self.deterministic,
+            telemetry=self.telemetry,
         )
 
 

@@ -150,9 +150,19 @@ impl WalWriter {
             .open(path)?;
 
         let len = file.metadata()?.len();
-        if len == 0 {
-            // Brand-new file — write the header and durably persist it
-            // before anyone appends a record.
+        if len < HEADER_LEN {
+            // Brand-new file (len == 0), or a header torn by a crash during
+            // the very first creation (0 < len < HEADER_LEN). A partial
+            // header carries no records — every append lands after a fully
+            // written, fsynced header — so clearing it back to empty is
+            // lossless. Truncate first so stray partial bytes don't sit
+            // ahead of the header we write.
+            if len != 0 {
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+            }
+            // Write the header and durably persist it before anyone appends
+            // a record.
             let mut header = [0u8; HEADER_LEN as usize];
             header[..8].copy_from_slice(&MAGIC);
             header[8..12].copy_from_slice(&VERSION.to_le_bytes());
@@ -169,10 +179,6 @@ impl WalWriter {
                 };
                 File::open(parent)?.sync_all()?;
             }
-        } else if len < HEADER_LEN {
-            return Err(WalError::BadMagic {
-                found: [0; 8], // truncated; report empty
-            });
         } else {
             file.seek(SeekFrom::Start(0))?;
             let mut header = [0u8; HEADER_LEN as usize];
@@ -252,8 +258,9 @@ impl Drop for WalWriter {
 ///
 /// A missing file or a zero-byte file is treated as "no records yet" —
 /// callers about to create a fresh WAL get an empty outcome rather than an
-/// error. Files that exist but are shorter than the header surface as
-/// [`WalError::BadMagic`].
+/// error. A file shorter than the header is a header torn during initial
+/// creation; it holds no records and surfaces as `truncate_to: Some(0)` so
+/// the caller can clear the partial header before reopening.
 pub fn replay<F>(path: impl AsRef<Path>, mut apply: F) -> Result<ReplayOutcome, WalError>
 where
     F: FnMut(EdgeRecord),
@@ -278,8 +285,15 @@ where
     }
     let mut reader = BufReader::new(file);
 
+    // A header torn by a crash during initial creation (0 < len < HEADER_LEN,
+    // since len == 0 returned above) holds no records. Report a truncate-to-0
+    // so the caller clears the partial header before reopening; the writer's
+    // create path then writes a fresh one.
     if total_len < HEADER_LEN {
-        return Err(WalError::BadMagic { found: [0; 8] });
+        return Ok(ReplayOutcome {
+            applied: 0,
+            truncate_to: Some(0),
+        });
     }
 
     let mut header = [0u8; HEADER_LEN as usize];
@@ -515,16 +529,50 @@ mod tests {
     }
 
     #[test]
-    fn truncated_header_rejected() {
+    fn torn_header_is_reinitialized_by_create_or_open() {
+        // A crash during initial creation can leave a header shorter than
+        // HEADER_LEN. It carries no records, so create_or_open clears it
+        // and writes a fresh header rather than failing.
         let tmp = tmp_wal();
         {
             let mut f = File::create(tmp.path()).unwrap();
             f.write_all(&MAGIC[..4]).unwrap(); // half the magic, no version
         }
-        match WalWriter::create_or_open(tmp.path()) {
-            Err(WalError::BadMagic { .. }) => {}
-            other => panic!("expected BadMagic, got {other:?}"),
+        {
+            let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
+            w.append_edge(EdgeRecord {
+                epoch: 1,
+                src: 0,
+                dst: 1,
+            })
+            .unwrap();
+            w.sync().unwrap();
         }
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&bytes[..8], &MAGIC, "header rewritten");
+        assert_eq!(bytes.len(), HEADER_LEN as usize + RECORD_LEN);
+
+        let mut got = Vec::new();
+        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(out.truncate_to.is_none());
+    }
+
+    #[test]
+    fn torn_header_replay_reports_truncate_to_zero() {
+        let tmp = tmp_wal();
+        {
+            let mut f = File::create(tmp.path()).unwrap();
+            f.write_all(&MAGIC[..4]).unwrap();
+        }
+        let mut got = Vec::new();
+        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        assert!(got.is_empty(), "a torn header carries no records");
+        assert_eq!(
+            out.truncate_to,
+            Some(0),
+            "partial header must be cleared before reopening"
+        );
     }
 
     #[test]

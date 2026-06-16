@@ -24,6 +24,13 @@ use super::context::RdmaContext;
 use super::qp::{DEFAULT_QP_CAP, QpEndpoint, RdmaQp};
 
 /// Advertisement sent to GPU nodes over the TCP control channel.
+///
+/// The region exposed for one-sided reads is bounded by `schema.node_count`
+/// slots of `schema.slot_size` bytes starting at `base_addr`; the client
+/// validates every node id against that bound before issuing a READ (see
+/// `RdmaFeatureClient::remote_addr_for`). No separate region-length field is
+/// carried because `schema.node_count` already pins the logical slot count and
+/// the server registers at least `node_count * slot_size` bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RdmaAdvertisement {
     /// Base virtual address of the feature table (for computing RDMA offsets).
@@ -51,8 +58,16 @@ struct ClientHello {
 
 /// Send a length-prefixed JSON message over a TCP stream.
 fn send_msg(conn: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
-    let len = (payload.len() as u32).to_le_bytes();
-    conn.write_all(&len)?;
+    // The wire prefix is a u32; a payload ≥ 4 GiB cannot be framed. Error
+    // rather than truncate the length (which would desync the stream and let
+    // the peer read a short, attacker-influenced body).
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control message too large to frame: {} bytes", payload.len()),
+        )
+    })?;
+    conn.write_all(&len.to_le_bytes())?;
     conn.write_all(payload)?;
     Ok(())
 }
@@ -86,6 +101,15 @@ fn set_timeouts(conn: &TcpStream) -> std::io::Result<()> {
 /// Run this in a dedicated thread.
 ///
 /// Without the `rdma` feature, this sends the advertisement only (no QP exchange).
+///
+/// # Trust model
+/// This handshake is UNAUTHENTICATED. The advertisement carries the MR `rkey`
+/// and `base_addr`, so any TCP peer that connects can obtain everything needed
+/// to issue one-sided RDMA reads against the registered region — i.e. the
+/// region is effectively readable by every host that can reach this port. The
+/// region is registered `IBV_ACCESS_REMOTE_READ` only (no remote write/atomic),
+/// so exposure is limited to reading feature bytes. Deploy this only on a
+/// trusted fabric / private network, or front it with an authenticated channel.
 pub fn serve_control_plane(
     bind_addr: &str,
     advertisement: &RdmaAdvertisement,
@@ -129,6 +153,20 @@ pub fn serve_control_plane(
 /// 4. Connects the server QP to the client
 ///
 /// Blocks forever. Run in a dedicated thread.
+///
+/// # Concurrency and lifetime
+/// The accept loop is single-threaded: each handshake is processed to
+/// completion before the next connection is accepted, so a client that stalls
+/// mid-handshake blocks all other clients until the TCP timeout fires (see
+/// [`TCP_TIMEOUT`]). Each server QP must outlive the RDMA connection it backs,
+/// so QPs are retained in `active_qps` for the server's entire lifetime; the
+/// table grows monotonically with the number of clients ever served and is
+/// freed only when this function returns (server shutdown).
+///
+/// # Trust model
+/// Like [`serve_control_plane`], the handshake is UNAUTHENTICATED — any peer
+/// that connects receives the MR `rkey` + `base_addr` and can read the
+/// registered (REMOTE_READ-only) region. Deploy on a trusted fabric only.
 #[cfg(feature = "rdma")]
 pub fn serve_control_plane_with_qp(
     bind_addr: &str,

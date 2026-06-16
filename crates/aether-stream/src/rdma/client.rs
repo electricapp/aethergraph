@@ -13,9 +13,16 @@ use crate::rdma::ffi::IbvWc;
 use crate::rdma::qp::{RdmaQp, RdmaRead};
 use cudarc::driver::CudaContext;
 use std::io;
+use std::time::{Duration, Instant};
 
 /// Maximum retries for torn reads before giving up.
 const MAX_RETRIES: usize = 8;
+
+/// Wall-clock deadline for a single `post_and_wait` completion drain. A
+/// healthy RDMA READ of a feature batch completes in microseconds; if no
+/// signaled completion lands within this window the QP has stalled (link
+/// down, remote gone) and we error out rather than spin a core forever.
+const POLL_DEADLINE: Duration = Duration::from_secs(10);
 
 /// GPUDirect RDMA feature client.
 ///
@@ -132,18 +139,24 @@ impl RdmaFeatureClient {
         let batch_size = node_ids.len();
         let lkey = self.buffer.lkey();
 
-        // Build initial RDMA READ list for all nodes
+        // Build initial RDMA READ list for all nodes. Each remote address is
+        // validated against the advertised table bounds (see `remote_addr_for`)
+        // before it's turned into a one-sided READ — a node_id past the table
+        // must never be translated into a read outside the server's registered
+        // region.
         let reads: Vec<RdmaRead> = node_ids
             .iter()
             .enumerate()
-            .map(|(i, &node_id)| RdmaRead {
-                local_addr: self.buffer.slot_addr(i),
-                local_lkey: lkey,
-                remote_addr: self.remote_base + (node_id as u64) * (self.schema.slot_size as u64),
-                remote_rkey: self.remote_rkey,
-                length: self.schema.slot_size as u32,
+            .map(|(i, &node_id)| {
+                Ok(RdmaRead {
+                    local_addr: self.buffer.slot_addr(i),
+                    local_lkey: lkey,
+                    remote_addr: self.remote_addr_for(node_id)?,
+                    remote_rkey: self.remote_rkey,
+                    length: self.schema.slot_size as u32,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
         // Post RDMA READs and wait for completion
         self.post_and_wait(&reads)?;
@@ -167,18 +180,21 @@ impl RdmaFeatureClient {
                 break;
             }
 
-            // Re-post reads only for failed nodes
+            // Re-post reads only for failed nodes. node_ids were already
+            // bounds-checked when the initial batch was built, but re-validate
+            // here so this loop is correct independent of the caller above.
             let retry_reads: Vec<RdmaRead> = retry_indices
                 .iter()
-                .map(|&i| RdmaRead {
-                    local_addr: self.buffer.slot_addr(i),
-                    local_lkey: lkey,
-                    remote_addr: self.remote_base
-                        + (node_ids[i] as u64) * (self.schema.slot_size as u64),
-                    remote_rkey: self.remote_rkey,
-                    length: self.schema.slot_size as u32,
+                .map(|&i| {
+                    Ok(RdmaRead {
+                        local_addr: self.buffer.slot_addr(i),
+                        local_lkey: lkey,
+                        remote_addr: self.remote_addr_for(node_ids[i])?,
+                        remote_rkey: self.remote_rkey,
+                        length: self.schema.slot_size as u32,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
             self.post_and_wait(&retry_reads)?;
             let remaining = self.validator.validate(
@@ -192,7 +208,60 @@ impl RdmaFeatureClient {
             }
         }
 
-        Ok(())
+        // Exhausted MAX_RETRIES with slots still torn. Returning Ok here would
+        // hand the caller a buffer containing inconsistent (partially-written)
+        // feature rows, which the GPU consumes as if valid. Surface the failure
+        // instead so the caller can back off or re-issue.
+        Err(format!(
+            "seqlock validation did not converge after {MAX_RETRIES} retries"
+        )
+        .into())
+    }
+
+    /// Translate a node id into the remote VRAM/host address to READ from,
+    /// validating it against the advertised table bounds.
+    ///
+    /// Two independent guards, both required:
+    ///   1. `node_id < schema.node_count` — the table holds exactly
+    ///      `node_count` logical slots.
+    ///   2. `(node_id + 1) * slot_size <= node_count * slot_size` via checked
+    ///      arithmetic — the offset of the slot's last byte must stay inside
+    ///      the region the server registered. The server registers the whole
+    ///      feature table (`node_count` rounded up to a power of two, each slot
+    ///      page-rounded), so `node_count * slot_size` is a conservative lower
+    ///      bound on the registered MR length; staying within it guarantees the
+    ///      one-sided READ never targets memory outside the MR even if a peer
+    ///      supplies an out-of-range id.
+    fn remote_addr_for(&self, node_id: u32) -> Result<u64, Box<dyn std::error::Error>> {
+        let node_count = self.schema.node_count as u64;
+        let slot_size = self.schema.slot_size as u64;
+        if (node_id as u64) >= node_count {
+            return Err(format!(
+                "node_id {node_id} out of range (node_count {node_count})"
+            )
+            .into());
+        }
+        // end_offset = (node_id + 1) * slot_size, checked.
+        let end_offset = (node_id as u64)
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(slot_size))
+            .ok_or("remote offset overflow")?;
+        let region_len = node_count
+            .checked_mul(slot_size)
+            .ok_or("region length overflow")?;
+        if end_offset > region_len {
+            return Err(format!(
+                "node_id {node_id} slot end {end_offset} exceeds region length {region_len}"
+            )
+            .into());
+        }
+        // start = base + node_id * slot_size, checked against u64 wrap.
+        let start_offset = (node_id as u64)
+            .checked_mul(slot_size)
+            .ok_or("remote offset overflow")?;
+        self.remote_base
+            .checked_add(start_offset)
+            .ok_or_else(|| "remote address overflow".into())
     }
 
     /// Access the validator (for stream-ordered access to the output tensor).
@@ -217,7 +286,9 @@ impl RdmaFeatureClient {
         let mut wc_buf = [unsafe { std::mem::zeroed::<IbvWc>() }; 16];
 
         // Poll until we see the signaled WR's completion (success or error).
-        // Error CQEs from unsignaled WRs are consumed along the way.
+        // Error CQEs from unsignaled WRs are consumed along the way. A deadline
+        // bounds the spin so a stalled QP can't pin a core indefinitely.
+        let deadline = Instant::now() + POLL_DEADLINE;
         loop {
             let n = self.qp.poll_cq(&self.ctx, &mut wc_buf)?;
             for i in 0..n {
@@ -237,6 +308,13 @@ impl RdmaFeatureClient {
                 }
             }
             if n == 0 {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "RDMA READ completion timed out after {POLL_DEADLINE:?} \
+                         (signaled wr_id {signaled_wr_id} never landed)"
+                    )
+                    .into());
+                }
                 std::hint::spin_loop();
             }
         }

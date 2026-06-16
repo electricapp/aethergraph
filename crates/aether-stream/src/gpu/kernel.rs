@@ -120,8 +120,16 @@ impl SeqlockValidator {
                 .launch(cfg)?;
         }
 
-        // Synchronize stream before reading back to host.
-        // This ensures the kernel and all preceding async ops have completed.
+        // Synchronize the stream before reading back to host so the kernel and
+        // all preceding async ops have completed.
+        //
+        // Cost note: this full device sync plus the D2H `retry_count` copy below
+        // runs on EVERY `validate` call — once per gather and again on each
+        // torn-read retry iteration in `RdmaFeatureClient::gather`. On a clean
+        // (untorn) gather that is one host/device round-trip per batch. A
+        // lower-latency design would poll a host-pinned mapped counter or fuse
+        // validation into the post path to avoid the per-retry sync; that
+        // restructuring is deferred (it needs on-hardware verification).
         self.stream.synchronize()?;
 
         // Read retry count back to host

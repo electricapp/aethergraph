@@ -65,6 +65,11 @@ const MAX_GRAPH_NODES: u64 = 10_000_000_000;
 #[cfg(target_os = "linux")]
 const MAX_GRAPH_EDGES: u64 = 100_000_000_000;
 
+/// Upper bound on a single readahead hint span. A random batch over a large
+/// feature file has a min..max span approximating the whole file, so the hint
+/// is clamped here to avoid faulting in (and evicting) gigabytes of pages.
+const PREFETCH_SPAN_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Work item for the prefetch thread.
 #[derive(Debug)]
 pub struct PrefetchWork {
@@ -229,13 +234,20 @@ impl SyncFeatureStore {
         self.features_start_offset
     }
 
-    /// Issue prefetch hint for a set of nodes (for lookahead)
+    /// Issue prefetch hint for a set of nodes (for lookahead).
+    ///
+    /// The min..max span is computed in `u64` and clamped to a few MB so a
+    /// single low+high node pair can't hint the whole file (which would fault
+    /// in gigabytes and evict the page cache).
     pub fn prefetch_nodes(&self, nodes: &[NodeId]) {
         let feature_size = self.feature_dim * self.dtype.element_size();
         if let (Some(&min), Some(&max)) = (nodes.iter().min(), nodes.iter().max()) {
             let offset = self.features_start_offset + (min as u64 * feature_size as u64);
-            let len = ((max - min) as usize + 1) * feature_size;
-            hint::prefetch_file_range(&*self.file, offset, len);
+            let span_rows = (max as u64 - min as u64) + 1;
+            let len = span_rows
+                .saturating_mul(feature_size as u64)
+                .min(PREFETCH_SPAN_CAP_BYTES);
+            hint::prefetch_file_range(&*self.file, offset, len as usize);
         }
     }
 
@@ -265,11 +277,15 @@ impl SyncFeatureStore {
             }
         }
 
-        // Sync fallback: issue single prefetch hint for the range
+        // Sync fallback: issue single prefetch hint for the range, computed in
+        // u64 and clamped so a low+high node pair can't hint the whole file.
         if let (Some(&min_node), Some(&max_node)) = (nodes.iter().min(), nodes.iter().max()) {
             let min_offset = self.features_start_offset + (min_node as u64 * feature_size as u64);
-            let range_len = ((max_node - min_node) as usize + 1) * feature_size;
-            hint::prefetch_file_range(&*self.file, min_offset, range_len);
+            let span_rows = (max_node as u64 - min_node as u64) + 1;
+            let range_len = span_rows
+                .saturating_mul(feature_size as u64)
+                .min(PREFETCH_SPAN_CAP_BYTES);
+            hint::prefetch_file_range(&*self.file, min_offset, range_len as usize);
         }
 
         self.batch_read_sync(nodes, feature_size)
@@ -841,8 +857,10 @@ impl NeighborLoader {
 
     /// Get next sampled subgraph (blocking).
     ///
-    /// Returns `None` if the channel is disconnected or if the worker times out
-    /// (which may indicate a deadlock or very slow I/O).
+    /// Returns `None` both when the worker has exited (channel disconnected —
+    /// the normal end-of-epoch state, logged at debug) and when the 30s wait
+    /// elapses (logged at warn, indicating a deadlock or very slow I/O). The
+    /// two cases are distinguishable in the logs.
     pub fn next(&self) -> Option<SampledSubgraph> {
         self.stats.total.fetch_add(1, Ordering::Relaxed);
 
@@ -868,10 +886,18 @@ impl NeighborLoader {
                         );
                         None
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        // Distinct from a timeout: the worker has exited (epoch
+                        // drained or shut down), which is the normal end state.
+                        debug!("prefetch channel disconnected - worker exited");
+                        None
+                    }
                 }
             }
-            Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Disconnected) => {
+                debug!("prefetch channel disconnected - worker exited");
+                None
+            }
         }
     }
 
@@ -907,8 +933,10 @@ impl NeighborLoader {
     /// Returns (subgraph, optional features). Features are `Some` if the
     /// prefetcher was created with `with_features()`.
     ///
-    /// Returns `None` if the channel is disconnected or if the worker times out
-    /// (which may indicate a deadlock or very slow I/O).
+    /// Returns `None` both when the worker has exited (channel disconnected —
+    /// the normal end-of-epoch state, logged at debug) and when the 30s wait
+    /// elapses (logged at warn, indicating a deadlock or very slow I/O). The
+    /// two cases are distinguishable in the logs.
     pub fn next_with_features(&self) -> Option<(SampledSubgraph, Option<Vec<f32>>)> {
         self.stats.total.fetch_add(1, Ordering::Relaxed);
 
@@ -932,10 +960,16 @@ impl NeighborLoader {
                         );
                         None
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        debug!("prefetch channel disconnected - worker exited");
+                        None
+                    }
                 }
             }
-            Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Disconnected) => {
+                debug!("prefetch channel disconnected - worker exited");
+                None
+            }
         }
     }
 
@@ -1256,6 +1290,13 @@ impl Drop for NeighborLoader {
 }
 
 /// io_uring-based k-hop sampling for NVMe graphs.
+///
+/// This path honors `fanout`, `replace`, `cumulative`, and `seed`. It does NOT
+/// yet honor the following `SamplingConfig` fields, which are silently ignored:
+/// `weighted`, `temporal_strategy`, `disjoint`, `deterministic`,
+/// `track_edge_ids` (edge ids are always tracked), `max_degree`, and
+/// `subgraph_type` (edges are always returned directional). Callers needing
+/// those must use the in-memory [`NeighborSampler`] path.
 #[cfg(target_os = "linux")]
 fn sample_with_uring(
     handle: &mut crate::internal::uring::UringHandle,
@@ -1277,7 +1318,9 @@ fn sample_with_uring(
     let mut num_sampled_nodes = Vec::with_capacity(num_hops);
     let mut num_sampled_edges = Vec::with_capacity(num_hops);
 
-    let mut rng = WyRand::new(config.seed.unwrap_or(42));
+    // Match the in-memory sampler: fall back to system entropy when no seed is
+    // given, instead of a fixed constant.
+    let mut rng = WyRand::new(config.seed.unwrap_or_else(rand::random::<u64>));
 
     for hop in 0..num_hops {
         let fanout = config.fanout[hop];
@@ -1301,11 +1344,13 @@ fn sample_with_uring(
             }
 
             let node_idx = node as usize;
-            let edge_offset = if node_idx < offsets.len() {
-                offsets[node_idx]
-            } else {
-                0
-            };
+            // Frontier nodes are valid IDs, so this index is always in range.
+            // Skip rather than mint a bogus edge id 0 if it somehow is not.
+            debug_assert!(node_idx < offsets.len());
+            if node_idx >= offsets.len() {
+                continue;
+            }
+            let edge_offset = offsets[node_idx];
 
             // Sample fanout neighbors (returns indices into neighbors array)
             let sampled_indices =

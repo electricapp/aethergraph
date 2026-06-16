@@ -72,7 +72,12 @@ impl EmbeddingCache {
         if let Some(&s) = self.slots.get(&node) {
             return s;
         }
-        let row = (self.data.len() / self.dim) as u32;
+        let next_row = self.data.len() / self.dim;
+        debug_assert!(
+            next_row <= u32::MAX as usize,
+            "EmbeddingCache row index {next_row} overflows u32"
+        );
+        let row = next_row as u32;
         self.data.resize(self.data.len() + self.dim, 0.0);
         let s = Slot { row, generation: 0 };
         self.slots.insert(node, s);

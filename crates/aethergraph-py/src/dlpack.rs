@@ -77,6 +77,33 @@ unsafe extern "C" fn dlpack_deleter(managed: *mut DLManagedTensor) {
     drop(unsafe { Box::from_raw(managed) });
 }
 
+/// PyCapsule destructor — frees the managed tensor if the capsule was never
+/// consumed.
+///
+/// `torch.from_dlpack()` takes ownership by renaming the capsule from
+/// "dltensor" to "used_dltensor" and then drives `deleter` itself. If the
+/// capsule is dropped while still named "dltensor" (never consumed), no one
+/// else will ever call `deleter`, so we do it here exactly once. A consumed
+/// capsule fails the "dltensor" validity check and we leave it alone.
+unsafe extern "C" fn dlpack_capsule_destructor(capsule: *mut pyffi::PyObject) {
+    // SAFETY: `capsule` is the PyCapsule being finalized; the GIL is held
+    // during capsule destruction. `c"dltensor"` outlives the call.
+    let valid = unsafe { pyffi::PyCapsule_IsValid(capsule, c"dltensor".as_ptr()) };
+    if valid == 0 {
+        return;
+    }
+    // SAFETY: the validity check above confirms the capsule still carries a
+    // pointer under the "dltensor" name, so this returns it without error.
+    let ptr = unsafe { pyffi::PyCapsule_GetPointer(capsule, c"dltensor".as_ptr()) };
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: the stored pointer is the `*mut DLManagedTensor` produced by
+    // `build_managed_tensor`; the unconsumed capsule is its sole owner, so the
+    // deleter runs exactly once here, freeing the managed tensor and context.
+    unsafe { dlpack_deleter(ptr as *mut DLManagedTensor) };
+}
+
 /// Build the raw `DLManagedTensor` Box for a CUDA f32 `(num_nodes, feature_dim)`
 /// view backed by `ptr`. Pure-Rust so we can assert on the struct fields
 /// without going through the Python GIL — see `tests` module below.
@@ -179,9 +206,16 @@ pub fn create_dlpack_capsule(
     // Create PyCapsule with name "dltensor" (required by DLPack spec)
     let name = CString::new("dltensor").unwrap();
     // SAFETY: PyCapsule_New requires the GIL, which `Python<'_>` proves.
-    // `name` outlives the call. Destructor is `None` — cleanup is driven by the
-    // DLPack `deleter` field, which the consumer invokes when releasing.
-    let raw = unsafe { pyffi::PyCapsule_New(managed_ptr as *mut c_void, name.as_ptr(), None) };
+    // `name` outlives the call. The destructor frees the managed tensor if the
+    // capsule is dropped without being consumed; a consumer (torch.from_dlpack)
+    // renames the capsule and takes over the DLPack `deleter` itself.
+    let raw = unsafe {
+        pyffi::PyCapsule_New(
+            managed_ptr as *mut c_void,
+            name.as_ptr(),
+            Some(dlpack_capsule_destructor),
+        )
+    };
     if raw.is_null() {
         // SAFETY: `managed_ptr` was just returned by `build_managed_tensor`.
         unsafe { dlpack_deleter(managed_ptr) };

@@ -115,7 +115,11 @@ class AetherGraphDatasource(Datasource):
         if input_nodes is None:
             from aethergraph import Graph
 
-            graph = Graph.load(self.graph_path)
+            # Only the node count is needed here. Open mmap-backed with
+            # header-only validation so the driver reads just the file header
+            # instead of paging in (and validating) the whole graph; topology
+            # pages stay on disk and are never touched.
+            graph = Graph.load(self.graph_path, storage="mmap", validation="header_only")
             self._input_nodes = None
             self._num_input_nodes = graph.num_nodes
         elif isinstance(input_nodes, np.ndarray):
@@ -199,7 +203,7 @@ class AetherGraphDatasource(Datasource):
                     metadata=BlockMetadata(
                         num_rows=num_batches,
                         size_bytes=None,
-                        input_files=[self.graph_path],
+                        input_files=(self.graph_path,),
                         exec_stats=None,
                     ),
                 )
@@ -242,7 +246,7 @@ class AetherGraphDatasource(Datasource):
                     metadata=BlockMetadata(
                         num_rows=num_batches,
                         size_bytes=None,
-                        input_files=[self.graph_path],
+                        input_files=(self.graph_path,),
                         exec_stats=None,
                     ),
                 )
@@ -374,6 +378,12 @@ def _pyg_data_to_arrow(data: Data) -> pa.Table:
     Creates a single-row Arrow table from the PyG Data object with list
     columns for variable-length arrays. Uses zero-copy where possible.
 
+    Contract: one PyG batch maps to exactly one Arrow row. The variable-length
+    arrays (edge_index, n_id, e_id, x) are packed into single list cells so a
+    whole batch survives as one row. :func:`aethergraph.ray.collate_to_pyg`
+    relies on this and must be fed one row at a time
+    (``iter_batches(batch_size=1)``).
+
     Args:
         data: PyG Data object from NeighborLoader containing edge_index,
             n_id, e_id, batch_size, and optionally x (features).
@@ -382,16 +392,16 @@ def _pyg_data_to_arrow(data: Data) -> pa.Table:
         PyArrow Table with columns: edge_index_0, edge_index_1, n_id, e_id,
         batch_size, and optionally x, x_shape_0, x_shape_1.
     """
-    edge_src: npt.NDArray[np.int64] = np.ascontiguousarray(
-        data.edge_index[0].numpy(), dtype=np.int64
-    )
-    edge_dst: npt.NDArray[np.int64] = np.ascontiguousarray(
-        data.edge_index[1].numpy(), dtype=np.int64
-    )
-    n_id: npt.NDArray[np.int64] = np.ascontiguousarray(data.n_id.numpy(), dtype=np.int64)
+    # These tensors are already int64/float32 from the loader; the only
+    # array that isn't C-contiguous is the edge_index row slice, and
+    # `_numpy_to_list_array` makes its input contiguous anyway, so no extra
+    # dtype cast or copy is needed here.
+    edge_src: npt.NDArray[np.int64] = data.edge_index[0].numpy()
+    edge_dst: npt.NDArray[np.int64] = data.edge_index[1].numpy()
+    n_id: npt.NDArray[np.int64] = data.n_id.numpy()
     e_id: npt.NDArray[np.int64]
     if data.e_id is not None:
-        e_id = np.ascontiguousarray(data.e_id.numpy(), dtype=np.int64)
+        e_id = data.e_id.numpy()
     else:
         e_id = np.array([], dtype=np.int64)
 
@@ -404,9 +414,7 @@ def _pyg_data_to_arrow(data: Data) -> pa.Table:
     }
 
     if data.x is not None:
-        x_np: npt.NDArray[np.float32] = np.ascontiguousarray(
-            data.x.numpy().ravel(), dtype=np.float32
-        )
+        x_np: npt.NDArray[np.float32] = data.x.numpy().ravel()
         columns["x"] = _numpy_to_list_array(x_np, pa.float32())
         columns["x_shape_0"] = pa.array([data.x.shape[0]], type=pa.int32())
         columns["x_shape_1"] = pa.array([data.x.shape[1]], type=pa.int32())

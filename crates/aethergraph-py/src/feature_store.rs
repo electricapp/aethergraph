@@ -156,9 +156,14 @@ impl PyFeatureStore {
         // The core `get_batch<T>` is generic over `T: TryInto<NodeId>` and
         // returns a clear error per-element. So negatives, out-of-range
         // values, and out-of-graph IDs all surface as Python ValueError.
-        let features = self
-            .inner
-            .get_batch(nodes_slice)
+        //
+        // A cold mmap page fault during the gather can block; release the GIL
+        // across the gather so other Python threads run. The store and the
+        // input slice are plain memory (no Python objects), and the numpy
+        // array is built afterward, back under the GIL.
+        let store = &self.inner;
+        let features = py
+            .detach(|| store.get_batch(nodes_slice))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
 
         let num_nodes = nodes_slice.len();
@@ -333,7 +338,9 @@ impl PyFeatureData {
             pyo3::exceptions::PyValueError::new_err(format!("node {} out of bounds", node))
         })?;
 
-        slot.copy_from_slice(features_array.as_slice().unwrap());
+        slot.copy_from_slice(features_array.as_slice().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("features array must be C-contiguous")
+        })?);
         Ok(())
     }
 

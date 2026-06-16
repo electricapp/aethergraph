@@ -15,6 +15,38 @@ from aethergraph._core import HeteroCsrGraph
 
 __all__ = ["HeteroGraph"]
 
+_U32_MAX = np.iinfo(np.uint32).max
+
+
+def _to_uint32_ids(arr: npt.NDArray[Any], what: str) -> npt.NDArray[np.uint32]:
+    """Convert node IDs to ``uint32`` after range-checking.
+
+    The Rust ``HeteroCsrGraph`` indexes nodes with ``u32``. A bare
+    ``astype(np.uint32)`` would silently wrap IDs >= 2**32 and turn negative
+    sentinels (e.g. ``-1``) into huge IDs, so the range is validated first.
+
+    Args:
+        arr: Array-like of node IDs.
+        what: Human-readable description of the array, used in error messages.
+
+    Returns:
+        A ``uint32`` array of node IDs.
+
+    Raises:
+        ValueError: If any ID is negative or exceeds ``2**32 - 1``.
+    """
+    a = np.asarray(arr)
+    if a.size:
+        a_min = int(a.min())
+        a_max = int(a.max())
+        if a_min < 0:
+            raise ValueError(f"{what} contains negative node IDs (min {a_min})")
+        if a_max > _U32_MAX:
+            raise ValueError(
+                f"{what} contains node IDs exceeding uint32 range (max {a_max} > {_U32_MAX})"
+            )
+    return a.astype(np.uint32)
+
 
 class HeteroGraph:
     """Heterogeneous graph with multiple node and edge types.
@@ -70,14 +102,15 @@ class HeteroGraph:
             node_types: Dict mapping node type name to node count.
                 Example: {"user": 1000, "post": 5000}
             edge_types: List of (src_type, relation, dst_type, src_array, dst_array)
-                tuples. Arrays are converted to uint32.
+                tuples. Arrays are range-checked and converted to uint32.
                 Example: [("user", "votes", "post", src_ids, dst_ids)]
 
         Returns:
             A HeteroGraph instance.
 
         Raises:
-            ValueError: If arrays have mismatched lengths or node types are unknown.
+            ValueError: If arrays have mismatched lengths, node types are
+                unknown, or any node ID is negative or exceeds the uint32 range.
 
         Example:
             >>> src = np.array([0, 0, 1], dtype=np.uint32)
@@ -89,8 +122,12 @@ class HeteroGraph:
         """
         converted: list[tuple[str, str, str, npt.NDArray[np.uint32], npt.NDArray[np.uint32]]] = []
         for src_type, rel, dst_type, src_arr, dst_arr in edge_types:
-            src_np: npt.NDArray[np.uint32] = np.asarray(src_arr, dtype=np.uint32)
-            dst_np: npt.NDArray[np.uint32] = np.asarray(dst_arr, dtype=np.uint32)
+            src_np = _to_uint32_ids(
+                src_arr, f"src ids of edge type ({src_type}, {rel}, {dst_type})"
+            )
+            dst_np = _to_uint32_ids(
+                dst_arr, f"dst ids of edge type ({src_type}, {rel}, {dst_type})"
+            )
             converted.append((src_type, rel, dst_type, src_np, dst_np))
 
         inner = HeteroCsrGraph.from_edge_arrays(node_types, converted)
@@ -143,14 +180,17 @@ class HeteroGraph:
                     f"Set data['{nt}'].num_nodes or provide data['{nt}'].x"
                 )
 
-        # Extract edge types
-        edge_list: list[tuple[str, str, str, npt.NDArray[np.uint32], npt.NDArray[np.uint32]]] = []
+        # Extract edge types. Keep the native int64 edge index here; range
+        # validation and the narrowing to uint32 happen once in
+        # ``from_edge_arrays`` so out-of-range or negative IDs raise rather
+        # than silently wrapping.
+        edge_list: list[tuple[str, str, str, npt.NDArray[Any], npt.NDArray[Any]]] = []
         for et in data.edge_types:
             src_type, rel, dst_type = et
             store = data[et]
             ei = store.edge_index
-            src_arr = ei[0].cpu().numpy().astype(np.uint32)
-            dst_arr = ei[1].cpu().numpy().astype(np.uint32)
+            src_arr = ei[0].cpu().numpy()
+            dst_arr = ei[1].cpu().numpy()
             edge_list.append((src_type, rel, dst_type, src_arr, dst_arr))
 
         return cls.from_edge_arrays(node_types, edge_list)

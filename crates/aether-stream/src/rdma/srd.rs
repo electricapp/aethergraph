@@ -508,8 +508,15 @@ const SRD_CONTROL_MAX_MSG: usize = 64 * 1024;
 const SRD_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn send_len_prefixed(conn: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
-    let len = (payload.len() as u32).to_le_bytes();
-    conn.write_all(&len)?;
+    // The wire prefix is a u32; a payload ≥ 4 GiB cannot be framed. Error
+    // rather than truncate the length (which would desync the stream).
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("control message too large to frame: {} bytes", payload.len()),
+        )
+    })?;
+    conn.write_all(&len.to_le_bytes())?;
     conn.write_all(payload)?;
     Ok(())
 }
@@ -703,10 +710,13 @@ impl SrdFeatureClient {
         let dst_len = max_inflight * adv.schema.slot_size;
         let mut dst = vec![0u8; dst_len].into_boxed_slice();
         let dst_ptr = dst.as_mut_ptr();
-        // Leak the box so it stays alive for the client's lifetime; the MR
-        // registration pins the pages and `_dst_mr` owns the dereg via Drop.
-        std::mem::forget(dst);
+        // Register against the still-owned allocation; its pages are valid for
+        // the duration of this call. Only leak the box AFTER registration
+        // succeeds so a `reg_mr` failure frees the buffer instead of leaking
+        // it. On success the leaked allocation stays pinned for the client's
+        // lifetime and `_dst_mr` owns the dereg via Drop.
         let dst_mr = ctx.reg_mr(dst_ptr, dst_len, super::ffi::IBV_ACCESS_LOCAL_WRITE)?;
+        std::mem::forget(dst);
         let dst_lkey = dst_mr.lkey();
 
         Ok(Self {
@@ -734,6 +744,51 @@ impl SrdFeatureClient {
         unsafe { std::slice::from_raw_parts(self.dst_ptr, self.dst_len) }
     }
 
+    /// Translate a node id into the remote address to READ from, validating it
+    /// against the advertised table bounds.
+    ///
+    /// Two independent guards, both required:
+    ///   1. `node < schema.node_count` — the table holds exactly `node_count`
+    ///      logical slots.
+    ///   2. `(node + 1) * slot_size <= node_count * slot_size` via checked
+    ///      arithmetic — the slot's last byte must stay inside the region the
+    ///      server registered. The server registers the whole feature table
+    ///      (`node_count` rounded up to a power of two, each slot page-rounded),
+    ///      so `node_count * slot_size` is a conservative lower bound on the
+    ///      registered MR length; staying within it guarantees the one-sided
+    ///      READ never targets memory outside the MR even for an out-of-range id.
+    fn remote_addr_for(&self, node: usize) -> io::Result<u64> {
+        let node_count = self.adv.schema.node_count as u64;
+        let slot_size = self.adv.schema.slot_size as u64;
+        let node = node as u64;
+        if node >= node_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("node {node} out of range (node_count {node_count})"),
+            ));
+        }
+        let end_offset = node
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(slot_size))
+            .ok_or_else(|| io::Error::other("remote offset overflow"))?;
+        let region_len = node_count
+            .checked_mul(slot_size)
+            .ok_or_else(|| io::Error::other("region length overflow"))?;
+        if end_offset > region_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("node {node} slot end {end_offset} exceeds region length {region_len}"),
+            ));
+        }
+        let start_offset = node
+            .checked_mul(slot_size)
+            .ok_or_else(|| io::Error::other("remote offset overflow"))?;
+        self.adv
+            .base_addr
+            .checked_add(start_offset)
+            .ok_or_else(|| io::Error::other("remote address overflow"))
+    }
+
     /// Read the `nodes` slots from the server, landing them back-to-back in
     /// the local destination buffer. Returns once every completion has
     /// drained.
@@ -753,16 +808,21 @@ impl SrdFeatureClient {
             nodes.len() * slot as usize <= self.dst_len,
             "caller exceeded advertised max_inflight"
         );
+        // Validate every node id against the advertised table bounds before
+        // turning it into a one-sided READ. An id past the table must never be
+        // translated into a read outside the server's registered region.
         let reads: Vec<AetherSrdRead> = nodes
             .iter()
             .enumerate()
-            .map(|(i, &node)| AetherSrdRead {
-                remote_addr: self.adv.base_addr + (node as u64) * (slot as u64),
-                local_addr: self.dst_ptr as u64 + (i * slot as usize) as u64,
-                length: slot,
-                _pad: 0,
+            .map(|(i, &node)| {
+                Ok(AetherSrdRead {
+                    remote_addr: self.remote_addr_for(node)?,
+                    local_addr: self.dst_ptr as u64 + (i * slot as usize) as u64,
+                    length: slot,
+                    _pad: 0,
+                })
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
         let rc = unsafe {
             aether_ibv_post_rdma_reads_srd_batch(
                 self.qp.qp_ex_ptr(),

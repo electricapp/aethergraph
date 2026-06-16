@@ -242,7 +242,17 @@ impl PyCsrGraph {
     ///     timestamps: numpy array of f64 timestamps (length must equal num_edges)
     fn set_timestamps(&mut self, timestamps: PyReadonlyArray1<f64>) -> PyResult<()> {
         let ts = timestamps.as_slice()?.to_vec();
-        Arc::make_mut(&mut self.inner)
+        // `Arc::get_mut` mutates the single shared allocation in place. If a
+        // sampler or loader already captured an `inner_arc()` clone, there is
+        // more than one owner and we refuse rather than silently deep-copying
+        // (which would leave those consumers reading the timestamp-less graph).
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "cannot set timestamps: the graph is already shared with a sampler/loader; \
+                     set timestamps before constructing them",
+                )
+            })?
             .set_timestamps(ts)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(())

@@ -24,7 +24,11 @@ pub struct SamplingTelemetry {
     /// Total edges sampled across all operations
     pub total_edges_sampled: AtomicU64,
 
-    /// Cumulative sampling latency (microseconds)
+    /// Cumulative sampling latency (microseconds).
+    ///
+    /// A single shared counter, so it is a contention point under many
+    /// concurrent samplers; it is incremented with `Relaxed` ordering and
+    /// only read in `summary()`, which keeps the per-record cost minimal.
     cumulative_latency_us: AtomicU64,
 }
 

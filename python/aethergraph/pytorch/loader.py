@@ -46,6 +46,37 @@ if TYPE_CHECKING:
 __all__ = ["NeighborLoader", "LoaderMetrics"]
 
 
+def normalize_input_nodes(
+    input_nodes: torch.Tensor | npt.NDArray[Any] | list[int],
+) -> npt.NDArray[np.int64]:
+    """Normalize ``input_nodes`` to a contiguous 1D int64 index array.
+
+    Accepts a torch tensor, numpy array, or Python sequence. A boolean
+    tensor/array is treated as a PyG-style mask and converted to the indices
+    of its ``True`` entries via ``np.nonzero``; everything else is taken as
+    explicit node IDs. The result is always a contiguous ``int64`` array so it
+    can be passed to the Rust sampler without further copying or narrowing.
+
+    Args:
+        input_nodes: Mask or explicit node IDs.
+
+    Returns:
+        Contiguous ``int64`` array of node IDs.
+    """
+    if isinstance(input_nodes, torch.Tensor):
+        if input_nodes.dtype == torch.bool:
+            arr: npt.NDArray[np.int64] = np.nonzero(input_nodes.cpu().numpy())[0].astype(np.int64)
+        else:
+            arr = input_nodes.cpu().numpy().astype(np.int64)
+    else:
+        a = np.asarray(input_nodes)
+        if a.dtype == np.bool_:
+            arr = np.nonzero(a)[0].astype(np.int64)
+        else:
+            arr = a.astype(np.int64)
+    return np.ascontiguousarray(arr)
+
+
 @dataclass
 class LoaderMetrics:
     """Observability metrics for NeighborLoader.
@@ -119,7 +150,10 @@ class NeighborLoader(IterableDataset[Data]):
         replace: Whether to sample with replacement.
         prefetch_factor: Number of batches to prefetch ahead.
         transform: Optional transform to apply to each batch.
-        rng: Random number generator for shuffling.
+
+    Each ``__iter__`` derives a fresh child generator from the loader's seed
+    so epochs are reproducible (when ``seed`` is set) and concurrent
+    iterations do not share mutable RNG state.
 
     Example:
         >>> from aethergraph import Graph
@@ -150,7 +184,12 @@ class NeighborLoader(IterableDataset[Data]):
     prefetch_factor: int
     pin_memory: bool
     transform: Callable[[Data], Data] | None
-    rng: np.random.Generator
+    _seed: int | None
+    _rng: np.random.Generator
+    _max_degree: int | None
+    _cumulative: bool
+    _subgraph_type: str
+    _track_edge_ids: bool
     _metrics: LoaderMetrics
     _input_time: npt.NDArray[np.float64] | None
     _temporal_strategy: Literal["uniform", "last"] | None
@@ -175,6 +214,12 @@ class NeighborLoader(IterableDataset[Data]):
         input_time: npt.NDArray[np.float64] | None = None,
         temporal_strategy: Literal["uniform", "last"] | None = None,
         disjoint: bool = False,
+        seed: int | None = None,
+        generator: np.random.Generator | None = None,
+        max_degree: int | None = None,
+        cumulative: bool = True,
+        subgraph_type: str = "directional",
+        track_edge_ids: bool = True,
         neighbor_sampler: Callable[..., Data] | None = None,
         features: npt.NDArray[np.float32] | None = None,
         feature_path: str | Path | None = None,
@@ -191,7 +236,9 @@ class NeighborLoader(IterableDataset[Data]):
             num_neighbors: Number of neighbors per hop. For example, [15, 10]
                 samples 15 neighbors at hop 1 and 10 at hop 2.
             input_nodes: Node IDs to sample from. If None, uses all nodes in
-                the graph. Can be a torch.Tensor or numpy array.
+                the graph. Can be a torch.Tensor, numpy array, or list. A
+                boolean tensor/array is treated as a PyG-style mask and
+                converted to the indices of its ``True`` entries.
             batch_size: Number of seed nodes per batch.
             shuffle: Whether to shuffle nodes between epochs.
             replace: Whether to sample neighbors with replacement.
@@ -218,6 +265,22 @@ class NeighborLoader(IterableDataset[Data]):
             disjoint: If True, each seed gets an isolated subgraph with no
                 node dedup across seeds. Output includes a ``batch`` tensor
                 mapping each node to its seed index.
+            seed: Random seed. Controls both seed-node shuffling (a fresh
+                child generator is derived per epoch, so epochs are
+                reproducible) and the Rust sampler's neighbor selection. None
+                uses OS entropy (non-reproducible).
+            generator: Explicit numpy ``Generator`` for seed-node shuffling.
+                Takes precedence over ``seed`` for shuffling. The Rust sampler
+                still uses ``seed`` for neighbor selection.
+            max_degree: Maximum degree to consider for hub nodes. None means
+                no cap.
+            cumulative: PyG-style cumulative sampling. When True, each hop
+                samples from all nodes seen so far (larger subgraphs); when
+                False, only from the new frontier.
+            subgraph_type: One of ``"directional"``, ``"induced"``,
+                ``"bidirectional"``. Controls which edges are kept in the
+                output subgraph.
+            track_edge_ids: Whether to track original edge IDs (``e_id``).
             neighbor_sampler: Custom sampling callable. If provided, bypasses
                 the Rust backend entirely. Signature:
                 ``(graph, seeds: np.ndarray) -> Data``.
@@ -273,6 +336,11 @@ class NeighborLoader(IterableDataset[Data]):
             )
         self._temporal_strategy = temporal_strategy
         self._disjoint = disjoint
+        self._seed = seed
+        self._max_degree = max_degree
+        self._cumulative = cumulative
+        self._subgraph_type = subgraph_type
+        self._track_edge_ids = track_edge_ids
         self._neighbor_sampler = neighbor_sampler
 
         if features is not None and feature_path is not None:
@@ -295,11 +363,8 @@ class NeighborLoader(IterableDataset[Data]):
         if input_nodes is None:
             self._input_nodes = None
             self._num_input_nodes = num_nodes
-        elif isinstance(input_nodes, torch.Tensor):
-            self._input_nodes = input_nodes.cpu().numpy().astype(np.int64)
-            self._num_input_nodes = len(self._input_nodes)
         else:
-            self._input_nodes = np.asarray(input_nodes, dtype=np.int64)
+            self._input_nodes = normalize_input_nodes(input_nodes)
             self._num_input_nodes = len(self._input_nodes)
 
         if self._input_nodes is not None:
@@ -317,7 +382,12 @@ class NeighborLoader(IterableDataset[Data]):
 
         self._input_time = input_time
 
-        self.rng = np.random.default_rng()
+        # Master generator for seed-node shuffling. An explicit `generator`
+        # wins; otherwise seed from `seed` (reproducible) or OS entropy.
+        # `__iter__` spawns a fresh child from this per epoch so iteration is
+        # reproducible and never shares mutable RNG state across concurrent
+        # iterators.
+        self._rng = generator if generator is not None else np.random.default_rng(seed)
         self._metrics = LoaderMetrics()
 
     @property
@@ -378,10 +448,15 @@ class NeighborLoader(IterableDataset[Data]):
         num_batches = len(self)
         num_nodes = self._num_input_nodes
 
+        # Fresh child generator per epoch: concurrent iterators don't share
+        # mutable RNG state, and the sequence is reproducible when the loader
+        # was seeded.
+        rng = self._rng.spawn(1)[0]
+
         if self._input_nodes is not None:
             epoch_nodes = self._input_nodes.copy()
             if self.shuffle:
-                self.rng.shuffle(epoch_nodes)
+                rng.shuffle(epoch_nodes)
 
             def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
                 start = batch_idx * batch_size
@@ -389,18 +464,14 @@ class NeighborLoader(IterableDataset[Data]):
                 return epoch_nodes[start:end]
 
         elif self.shuffle and num_nodes > 0:
-            offset = int(self.rng.integers(0, num_nodes))
-            stride = self._random_coprime_stride(num_nodes)
+            offset = int(rng.integers(0, num_nodes))
+            stride = self._random_coprime_stride(num_nodes, rng)
 
             def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
                 start = batch_idx * batch_size
                 end = min(start + batch_size, num_nodes)
-                count = end - start
-                return np.fromiter(
-                    ((offset + (start + i) * stride) % num_nodes for i in range(count)),
-                    dtype=np.int64,
-                    count=count,
-                )
+                idx = np.arange(start, end, dtype=np.int64)
+                return (offset + idx * stride) % num_nodes
 
         else:
 
@@ -421,20 +492,30 @@ class NeighborLoader(IterableDataset[Data]):
         rust_config = RustSamplingConfig(
             num_neighbors=self.num_neighbors,
             replace=self.replace,
+            seed=self._seed,
+            max_degree=self._max_degree,
+            cumulative=self._cumulative,
             weighted=self.weighted,
+            subgraph_type=self._subgraph_type,
+            track_edge_ids=self._track_edge_ids,
             temporal_strategy=self._temporal_strategy,
             disjoint=self._disjoint,
         )
 
         if self.feature_source and self.feature_source.startswith("rdma://"):
             server_addr = self.feature_source[len("rdma://") :]
+            # Upper bound on nodes per batch: batch_size * product of the
+            # per-hop fanout, doubled for slack. `math.prod` is arbitrary
+            # precision so it can't overflow into a negative int64, and the
+            # fanout is clamped to >= 1 so a hop of 0 doesn't zero it out.
+            fanout = max(1, math.prod(self.num_neighbors))
+            max_batch_nodes = self.batch_size * fanout * 2
             sampler = RustNeighborLoader.with_rdma_features(
                 self.graph,
                 rust_config,
                 server_addr,
                 self.gpu_id,
-                # Upper bound: batch_size * product of fanout at each hop
-                max_batch_nodes=self.batch_size * max(1, int(np.prod(self.num_neighbors))) * 2,
+                max_batch_nodes=max_batch_nodes,
                 prefetch_depth=self.prefetch_factor,
             )
             yield from self._iter_rdma(sampler, num_batches, get_batch)
@@ -713,7 +794,7 @@ class NeighborLoader(IterableDataset[Data]):
             num_sampled_edges=subgraph.num_sampled_edges_per_hop,
         )
 
-    def _random_coprime_stride(self, modulus: int) -> int:
+    def _random_coprime_stride(self, modulus: int, rng: np.random.Generator) -> int:
         """Pick a random stride coprime with modulus for O(1)-memory shuffling.
 
         Used to generate a full permutation of ``[0, modulus)`` without
@@ -722,6 +803,7 @@ class NeighborLoader(IterableDataset[Data]):
 
         Args:
             modulus: The range size (number of input nodes).
+            rng: Generator to draw the stride from.
 
         Returns:
             A random integer in ``[1, modulus)`` coprime with modulus.
@@ -729,7 +811,7 @@ class NeighborLoader(IterableDataset[Data]):
         if modulus <= 1:
             return 1
         while True:
-            stride = int(self.rng.integers(1, modulus))
+            stride = int(rng.integers(1, modulus))
             if math.gcd(stride, modulus) == 1:
                 return stride
 

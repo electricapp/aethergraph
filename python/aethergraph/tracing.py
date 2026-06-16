@@ -27,6 +27,7 @@ __all__ = ["configure_tracing", "get_tracer", "TracingConfig"]
 
 _TRACER_NAME = "aethergraph"
 _tracer: Tracer | None = None
+_configured: bool = False
 
 
 class TracingConfig:
@@ -96,7 +97,7 @@ def configure_tracing(
         ... )
         >>> configure_tracing(config=config)
     """
-    global _tracer
+    global _tracer, _configured
 
     try:
         from opentelemetry import trace
@@ -128,14 +129,17 @@ def configure_tracing(
 
     trace.set_tracer_provider(provider)
     _tracer = trace.get_tracer(_TRACER_NAME)
+    _configured = True
 
 
 def get_tracer() -> Tracer | None:
     """Get the configured tracer instance.
 
-    Returns the global tracer if configure_tracing() has been called,
-    otherwise returns None. Modules should check for None to gracefully
-    handle the case where tracing is not configured.
+    Returns the tracer only when :func:`configure_tracing` has been called;
+    otherwise returns ``None``. Merely having ``opentelemetry-api`` installed
+    is not enough — without an explicit configure call there is no exporter,
+    so spans would be created and silently dropped. Modules check for ``None``
+    to skip span creation entirely when tracing is not configured.
 
     Returns:
         The OpenTelemetry Tracer instance, or None if not configured.
@@ -146,18 +150,6 @@ def get_tracer() -> Tracer | None:
         ...     with tracer.start_as_current_span("my_operation"):
         ...         do_work()
     """
-    global _tracer
-
-    if _tracer is not None:
-        return _tracer
-
-    try:
-        from opentelemetry import trace
-
-        provider = trace.get_tracer_provider()
-        if hasattr(provider, "get_tracer"):
-            return provider.get_tracer(_TRACER_NAME)
-    except ImportError:
-        pass
-
-    return None
+    if not _configured:
+        return None
+    return _tracer

@@ -55,7 +55,9 @@ impl Default for IngestConfig {
 /// * `umem` - Shared UMEM frame pool
 /// * `tx` - Channel for sending received frames to processing threads
 /// * `config` - Batching configuration
-/// * `core_id` - CPU core to pin this thread to
+///
+/// Core pinning is done by the caller ([`spawn_ingest_threads`]) before this
+/// loop starts, not here.
 pub fn ingest_loop(
     socket: &mut XdpSocket,
     umem: &Arc<Umem>,
@@ -81,8 +83,21 @@ pub fn ingest_loop(
             // SAFETY: i < available, so peek is valid
             let desc: RxTxDesc = unsafe { socket.rx.peek(i) };
 
-            // Convert UMEM addr to frame index
+            // Convert UMEM addr to frame index. The kernel supplies `desc.addr`;
+            // a buggy/hostile driver could hand back an address outside the
+            // UMEM, so validate before turning it into a pointer (the
+            // `frame_ptr` bound is only a debug_assert and would be UB in
+            // release). Drop the descriptor on violation; it's not a UMEM frame
+            // we own, so we must not release it back to the pool.
             let frame_idx = (desc.addr / umem.frame_size() as u64) as usize;
+            if desc.addr >= umem.total_size() as u64 || frame_idx >= umem.frame_count() {
+                tracing::warn!(
+                    addr = desc.addr,
+                    frame_idx,
+                    "RX descriptor addr out of UMEM bounds; dropping frame"
+                );
+                continue;
+            }
 
             let frame = InboundFrame {
                 umem_idx: frame_idx,
@@ -111,6 +126,16 @@ fn drain_completions(socket: &mut XdpSocket, umem: &Umem) {
         // SAFETY: i < available
         let addr: u64 = unsafe { socket.completion.peek(i) };
         let frame_idx = (addr / umem.frame_size() as u64) as usize;
+        // Guard the kernel-supplied completion addr before releasing: a
+        // bad index would corrupt the UMEM free list.
+        if addr >= umem.total_size() as u64 || frame_idx >= umem.frame_count() {
+            tracing::warn!(
+                addr,
+                frame_idx,
+                "completion addr out of UMEM bounds; skipping release"
+            );
+            continue;
+        }
         umem.release_frame(frame_idx);
     }
     if available > 0 {
@@ -144,6 +169,34 @@ fn refill_fill_ring(socket: &mut XdpSocket, umem: &Umem, max_refill: u32) {
         unsafe {
             socket.fill.advance_producer(filled);
         }
+    }
+
+    // Zero-copy / busy-poll drivers stop draining the FILL ring once caught up
+    // and raise XDP_RING_NEED_WAKEUP. Without a syscall kick the kernel never
+    // pulls the descriptors we just published and the RX busy-poll livelocks.
+    if socket.fill.needs_wakeup() {
+        kick_rx(socket.fd());
+    }
+}
+
+/// Wake the kernel's RX/FILL processing for a socket whose FILL ring raised
+/// `XDP_RING_NEED_WAKEUP`. A non-blocking zero-length `recvfrom` is the
+/// documented kick for the RX side; it moves no data, it only nudges the
+/// driver. Errors (e.g. `EAGAIN`) are expected and ignored — the next loop
+/// iteration re-checks the flag.
+fn kick_rx(fd: i32) {
+    // SAFETY: `fd` is the live AF_XDP socket fd owned by the XdpSocket; all
+    // pointer args are null and the length is 0, so the kernel reads/writes no
+    // user buffer. This is the standard AF_XDP wakeup syscall.
+    unsafe {
+        libc::recvfrom(
+            fd,
+            std::ptr::null_mut(),
+            0,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
     }
 }
 

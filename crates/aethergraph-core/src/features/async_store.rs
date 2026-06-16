@@ -252,27 +252,27 @@ impl AsyncFeatureStore {
         let file = Arc::clone(&self.file);
         let dtype = self.dtype;
 
+        let feature_dim = self.feature_dim;
         let features: Vec<f32> = tokio::task::spawn_blocking(move || {
-            let mut buffer = vec![0u8; feature_size];
-            file.read_exact_at(&mut buffer, offset)
-                .context("sync read failed")?;
-
             let features: Vec<f32> = match dtype {
                 FeatureDtype::F32 => {
-                    anyhow::ensure!(
-                        buffer.len().is_multiple_of(4),
-                        "buffer length {} is not a multiple of 4",
-                        buffer.len()
-                    );
+                    // Read straight into an aligned f32 buffer: on little-endian
+                    // targets the bytes are already native order, so this is a
+                    // bulk copy with no per-element decode.
+                    let mut features = vec![0f32; feature_dim];
+                    file.read_exact_at(bytemuck::cast_slice_mut(&mut features), offset)
+                        .context("sync read failed")?;
+                    features
+                }
+                FeatureDtype::F16 => {
+                    let mut buffer = vec![0u8; feature_size];
+                    file.read_exact_at(&mut buffer, offset)
+                        .context("sync read failed")?;
                     buffer
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .chunks_exact(2)
+                        .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
                         .collect()
                 }
-                FeatureDtype::F16 => buffer
-                    .chunks_exact(2)
-                    .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                    .collect(),
             };
             Ok::<_, anyhow::Error>(features)
         })
@@ -563,23 +563,30 @@ impl AsyncFeatureStore {
 
                 task::spawn_blocking(move || {
                     let mut features = Vec::with_capacity(chunk.len() * feature_dim);
-                    let mut buffer = vec![0u8; feature_size];
-                    for &node in &chunk {
-                        let byte_offset = offset + (node as u64 * feature_size as u64);
-                        file.read_exact_at(&mut buffer, byte_offset)
-                            .context("failed to read features")?;
-
-                        match dtype {
-                            FeatureDtype::F32 => {
-                                features.extend(buffer.chunks_exact(4).map(|chunk| {
-                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                                }))
+                    match dtype {
+                        FeatureDtype::F32 => {
+                            // Read each row straight into an aligned f32 buffer
+                            // (bulk copy on little-endian) and append it.
+                            let mut row = vec![0f32; feature_dim];
+                            for &node in &chunk {
+                                let byte_offset = offset + (node as u64 * feature_size as u64);
+                                file.read_exact_at(bytemuck::cast_slice_mut(&mut row), byte_offset)
+                                    .context("failed to read features")?;
+                                features.extend_from_slice(&row);
                             }
-                            FeatureDtype::F16 => features.extend(
-                                buffer
-                                    .chunks_exact(2)
-                                    .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()),
-                            ),
+                        }
+                        FeatureDtype::F16 => {
+                            let mut buffer = vec![0u8; feature_size];
+                            for &node in &chunk {
+                                let byte_offset = offset + (node as u64 * feature_size as u64);
+                                file.read_exact_at(&mut buffer, byte_offset)
+                                    .context("failed to read features")?;
+                                features.extend(
+                                    buffer
+                                        .chunks_exact(2)
+                                        .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()),
+                                );
+                            }
                         }
                     }
                     Ok::<_, anyhow::Error>(features)

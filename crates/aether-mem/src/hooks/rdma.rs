@@ -32,8 +32,28 @@ pub struct IbvPd {
 
 /// ibverbs memory region — non-opaque layout.
 ///
-/// This struct layout has been stable since libibverbs 1.0. The fields
-/// through `rkey` are ABI-stable across all MLNX and rdma-core versions.
+/// # ABI contract
+/// This is a hand-mirror of `struct ibv_mr` from rdma-core's
+/// `infiniband/verbs.h`. The field order, types, and `#[repr(C)]` layout must
+/// match that header exactly, because `lkey`/`rkey` are read by offset from the
+/// pointer `ibv_reg_mr` returns:
+///
+/// ```text
+/// struct ibv_mr {
+///     struct ibv_context *context;   // *mut c_void
+///     struct ibv_pd      *pd;        // *mut IbvPd
+///     void               *addr;      // *mut c_void
+///     size_t              length;    // usize
+///     uint32_t            handle;    // u32
+///     uint32_t            lkey;      // u32
+///     uint32_t            rkey;      // u32
+/// };
+/// ```
+///
+/// This prefix has been stable across all MLNX and rdma-core releases. If a
+/// future rdma-core inserts or reorders a field before `rkey`, `lkey()`/`rkey()`
+/// would read the wrong offset and silently return a bogus key; correctness
+/// depends entirely on this layout matching the linked `libibverbs`.
 #[repr(C)]
 pub struct IbvMr {
     pub context: *mut libc::c_void,

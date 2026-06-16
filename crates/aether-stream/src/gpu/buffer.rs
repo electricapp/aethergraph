@@ -58,7 +58,14 @@ impl GpuGatherBuffer {
     ) -> io::Result<Self> {
         let slot_size = schema.slot_size;
         let feature_bytes = schema.feature_dim * std::mem::size_of::<f32>();
-        let total_bytes = slot_size * max_batch_size;
+        let total_bytes = slot_size.checked_mul(max_batch_size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "staging buffer size overflow: slot_size {slot_size} * max_batch_size {max_batch_size}"
+                ),
+            )
+        })?;
 
         // Allocate VRAM
         let allocation: CudaSlice<u8> = stream

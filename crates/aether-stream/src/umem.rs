@@ -44,7 +44,7 @@ impl Umem {
             frame_size
         );
 
-        let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook)];
+        let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook::new())];
         hooks.extend(extra_hooks);
 
         let (ring, _hook_failures) =

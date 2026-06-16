@@ -76,10 +76,11 @@ impl EpochClock {
     }
 
     /// Increment and return the new epoch. Releases prior writes so that a
-    /// reader observing the returned epoch is guaranteed to see them.
+    /// reader observing the returned epoch via [`current`](Self::current)'s
+    /// Acquire load is guaranteed to see them.
     #[inline]
     pub fn advance(&self) -> Epoch {
-        Epoch(self.counter.fetch_add(1, Ordering::AcqRel) + 1)
+        Epoch(self.counter.fetch_add(1, Ordering::Release) + 1)
     }
 }
 

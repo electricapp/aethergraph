@@ -74,7 +74,13 @@ fn write_padded_name(buf: &mut Vec<u8>, name: &str) {
 }
 
 fn read_padded_name(data: &[u8]) -> Result<String> {
-    let end = data.iter().position(|&b| b == 0).unwrap_or(64);
+    // Names are written NUL-terminated and zero-padded. A field with no NUL
+    // is unterminated — treat it as corruption rather than silently using
+    // all 64 bytes.
+    let end = data
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| anyhow::anyhow!("type name field has no NUL terminator — file is corrupt"))?;
     String::from_utf8(data[..end].to_vec()).context("invalid UTF-8 in type name")
 }
 
@@ -157,6 +163,10 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
     // mmap alive and we never mutate its pages.
     let mmap = Arc::new(unsafe { MmapOptions::new().map(&file)? });
     let file_len = mmap.len();
+
+    // Hint the kernel to fault in the mapping ahead of the section-by-section
+    // structural validation that streams the offsets/edges pages below.
+    crate::internal::hint::prefetch_mmap_range(mmap.as_ptr(), file_len);
 
     if file_len < HEADER_SIZE {
         bail!("file too small for header: {file_len} bytes");
@@ -265,7 +275,7 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
         };
 
     let mut edge_types: Vec<(String, String, String, Graph)> = Vec::with_capacity(num_et);
-    for hdr in &et_headers {
+    for hdr in et_headers {
         let rel = hdr.rel_name.as_str();
         let offsets_bytes = hdr
             .num_src_nodes
@@ -323,12 +333,9 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
             weights_range,
         );
 
-        edge_types.push((
-            hdr.src_name.clone(),
-            hdr.rel_name.clone(),
-            hdr.dst_name.clone(),
-            graph,
-        ));
+        // `et_headers` is consumed by value, so move the names instead of
+        // cloning them into the edge-type list.
+        edge_types.push((hdr.src_name, hdr.rel_name, hdr.dst_name, graph));
     }
 
     HeteroGraph::try_from_parts(node_types, edge_types)

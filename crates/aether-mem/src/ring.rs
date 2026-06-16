@@ -118,9 +118,43 @@ unsafe impl Send for SyncPtr {}
 // SAFETY: Same rationale as Send.
 unsafe impl Sync for SyncPtr {}
 
-/// Regular page size (4 KiB). Verified at runtime in `new()` against
-/// `libc::sysconf(_SC_PAGESIZE)` on Unix; DMA paths assume 4 KiB.
+/// Isolates a hot, frequently-CAS'd atomic on its own cache line so it does
+/// not share one with the cold read-only ring fields (`slot_size`,
+/// `slot_count`, `hooks`, `next_free`). Without this, every successful free-list
+/// CAS would invalidate those fields in other cores' caches (false sharing).
+///
+/// 64 bytes matches the cache line on x86_64 and aarch64.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// Minimum regular page size (4 KiB). The actual alignment used for the
+/// allocation is `max(sysconf(_SC_PAGESIZE), PAGE_SIZE)`, resolved once in
+/// `new()` so DMA paths never round to less than the kernel page size.
 pub const PAGE_SIZE: usize = 4096;
+
+/// Query the OS page size, clamped to at least [`PAGE_SIZE`].
+///
+/// `sysconf(_SC_PAGESIZE)` can return a value smaller than 4 KiB only on
+/// exotic configurations; we floor at [`PAGE_SIZE`] so DMA alignment is never
+/// weaker than the documented 4 KiB. A non-positive return (error) also falls
+/// back to [`PAGE_SIZE`].
+fn runtime_page_size() -> usize {
+    // SAFETY: sysconf with a valid name has no preconditions and no side effects.
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if raw > 0 {
+        (raw as usize).max(PAGE_SIZE)
+    } else {
+        PAGE_SIZE
+    }
+}
 
 /// Huge page size (2 MiB on x86_64 Linux).
 #[cfg(target_os = "linux")]
@@ -128,6 +162,36 @@ const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 /// Sentinel for free list end.
 const FREE_LIST_EMPTY: u32 = u32::MAX;
+
+/// Exponential backoff for contended CAS loops on the free-list head.
+///
+/// Each `spin()` issues a burst of `spin_loop()` hints, doubling the burst
+/// length on every call up to [`Backoff::MAX_SHIFT`]. Brief contention costs a
+/// single hint; sustained contention backs off geometrically so contending
+/// cores stop hammering the same line.
+struct Backoff {
+    shift: u32,
+}
+
+impl Backoff {
+    /// Caps the burst at `1 << MAX_SHIFT` spin hints.
+    const MAX_SHIFT: u32 = 6;
+
+    #[inline]
+    const fn new() -> Self {
+        Self { shift: 0 }
+    }
+
+    #[inline]
+    fn spin(&mut self) {
+        for _ in 0..(1u32 << self.shift) {
+            std::hint::spin_loop();
+        }
+        if self.shift < Self::MAX_SHIFT {
+            self.shift += 1;
+        }
+    }
+}
 
 /// Free-list head layout: low 32 bits hold the slot index, high 32 bits hold
 /// an ABA tag. The tag is incremented (with `wrapping_add`) on each successful
@@ -152,7 +216,7 @@ const fn unpack_free_head(value: u64) -> (u32, u32) {
     (value as u32, (value >> 32) as u32)
 }
 
-fn build_free_list(slot_count: usize) -> (AtomicU64, Box<[AtomicU32]>) {
+fn build_free_list(slot_count: usize) -> (CachePadded<AtomicU64>, Box<[AtomicU32]>) {
     let mut next_free: Vec<AtomicU32> = Vec::with_capacity(slot_count);
     for i in 0..slot_count {
         let next = if i + 1 < slot_count {
@@ -162,7 +226,7 @@ fn build_free_list(slot_count: usize) -> (AtomicU64, Box<[AtomicU32]>) {
         };
         next_free.push(AtomicU32::new(next));
     }
-    let free_head = AtomicU64::new(pack_free_head(0, 0));
+    let free_head = CachePadded(AtomicU64::new(pack_free_head(0, 0)));
     (free_head, next_free.into_boxed_slice())
 }
 
@@ -194,10 +258,13 @@ pub struct SharedMemoryRing {
     addressable_size: usize,
     /// Actual slot size after alignment (>= requested size, page-aligned)
     slot_size: usize,
+    /// Page alignment used for the allocation (`max(sysconf page, PAGE_SIZE)`).
+    /// Stored so `Drop` reconstructs the exact `Layout` passed to `alloc`.
+    page_align: usize,
     /// Always a power of two
     slot_count: usize,
     /// Free-list head with ABA tag
-    free_head: AtomicU64,
+    free_head: CachePadded<AtomicU64>,
     /// Next pointers for free list
     next_free: Box<[AtomicU32]>,
     #[cfg(target_os = "linux")]
@@ -221,7 +288,8 @@ pub struct RingSlot<'a> {
 impl SharedMemoryRing {
     /// Create a new ring buffer.
     ///
-    /// `slot_size` is rounded up to a 4 KiB page boundary. Total memory =
+    /// `slot_size` is rounded up to the OS page boundary (resolved via
+    /// `sysconf(_SC_PAGESIZE)`, never below 4 KiB). Total memory =
     /// `slot_count * aligned_slot_size`.
     ///
     /// Returns the allocated ring along with a list of hook failures (if any
@@ -249,11 +317,15 @@ impl SharedMemoryRing {
             return Err(RingBuilderError::InvalidSlotSize("slot_size must be > 0"));
         }
 
-        // Align slot_size to page boundary (4 KiB) using checked arithmetic.
+        // Resolve the real page size once and align everything to it. Floored
+        // at PAGE_SIZE so DMA alignment is never weaker than 4 KiB.
+        let page_align = runtime_page_size();
+
+        // Align slot_size to the page boundary using checked arithmetic.
         let aligned_slot_size = slot_size
-            .checked_add(PAGE_SIZE - 1)
+            .checked_add(page_align - 1)
             .ok_or(RingBuilderError::SizeOverflow)?
-            & !(PAGE_SIZE - 1);
+            & !(page_align - 1);
 
         let addressable_size = slot_count
             .checked_mul(aligned_slot_size)
@@ -274,6 +346,7 @@ impl SharedMemoryRing {
             slot_count,
             aligned_slot_size,
             addressable_size,
+            page_align,
             hooks,
         ) {
             Ok(result) => return Ok(result),
@@ -287,17 +360,27 @@ impl SharedMemoryRing {
             }
         };
 
-        Self::try_alloc_regular(slot_count, aligned_slot_size, addressable_size, hooks)
+        Self::try_alloc_regular(slot_count, aligned_slot_size, addressable_size, page_align, hooks)
     }
 
-    /// Convenience: panics on builder error. Hook failures are silently dropped.
+    /// Convenience: panics on builder error. Hook failures are non-fatal and
+    /// logged at `warn` level (when the `tracing` feature is enabled) so a
+    /// silently-unlocked or unpinned region is still observable. Callers that
+    /// must react to a failure should use [`Self::new`] and inspect the returned
+    /// list instead.
     pub fn new_or_panic(
         slot_count: usize,
         slot_size: usize,
         hooks: Vec<Box<dyn MemoryHook>>,
     ) -> Self {
-        let (ring, _failures) =
+        let (ring, failures) =
             Self::new(slot_count, slot_size, hooks).expect("SharedMemoryRing::new failed");
+        for failure in &failures {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(error = %failure, "memory hook failed; region not registered");
+            #[cfg(not(feature = "tracing"))]
+            let _ = failure;
+        }
         ring
     }
 
@@ -309,6 +392,7 @@ impl SharedMemoryRing {
         slot_count: usize,
         slot_size: usize,
         addressable_size: usize,
+        page_align: usize,
         hooks: Vec<Box<dyn MemoryHook>>,
     ) -> Result<(Self, Vec<HookError>), Vec<Box<dyn MemoryHook>>> {
         use libc::{
@@ -322,6 +406,8 @@ impl SharedMemoryRing {
             None => return Err(hooks),
         };
 
+        let map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE;
+
         // SAFETY: mmap with MAP_ANONYMOUS creates a new private anonymous mapping
         // backed by huge pages; ptr is either valid for `alloc_size` bytes or MAP_FAILED.
         let ptr = unsafe {
@@ -329,7 +415,7 @@ impl SharedMemoryRing {
                 std::ptr::null_mut(),
                 alloc_size,
                 PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE,
+                map_flags,
                 -1,
                 0,
             )
@@ -344,11 +430,13 @@ impl SharedMemoryRing {
         };
         let ptr = SyncPtr(non_null);
 
-        // Pre-fault all huge pages to guarantee physical backing.
-        let base_addr = ptr.0.as_ptr() as usize;
-        let num_pages = alloc_size / HUGE_PAGE_SIZE;
-
-        prefault_pages(base_addr, num_pages, HUGE_PAGE_SIZE);
+        // MAP_POPULATE pre-faults every page in the kernel, so the manual
+        // prefault loop is only needed when that flag is absent.
+        if map_flags & MAP_POPULATE == 0 {
+            let base_addr = ptr.0.as_ptr() as usize;
+            let num_pages = alloc_size / HUGE_PAGE_SIZE;
+            prefault_pages(base_addr, num_pages, HUGE_PAGE_SIZE);
+        }
 
         // Pass `addressable_size` to hooks, NOT `alloc_size` — the slop bytes
         // beyond addressable_size are not user-visible memory.
@@ -373,6 +461,7 @@ impl SharedMemoryRing {
                 total_size: alloc_size,
                 addressable_size,
                 slot_size,
+                page_align,
                 slot_count,
                 free_head,
                 next_free,
@@ -388,15 +477,16 @@ impl SharedMemoryRing {
         slot_count: usize,
         slot_size: usize,
         addressable_size: usize,
+        page_align: usize,
         hooks: Vec<Box<dyn MemoryHook>>,
     ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
         use std::alloc::{Layout, alloc};
 
-        let layout = Layout::from_size_align(addressable_size, PAGE_SIZE)
+        let layout = Layout::from_size_align(addressable_size, page_align)
             .map_err(|_| RingBuilderError::SizeOverflow)?;
 
         // SAFETY: layout is non-zero (slot_count >= 1, aligned_slot_size > 0) and
-        // PAGE_SIZE alignment is a power of two; alloc is sound.
+        // page_align is a power of two (a page size floored at PAGE_SIZE); alloc is sound.
         let raw = unsafe { alloc(layout) };
         let Some(non_null) = NonNull::new(raw) else {
             return Err(RingBuilderError::AllocationFailed);
@@ -404,8 +494,8 @@ impl SharedMemoryRing {
         let ptr = SyncPtr(non_null);
 
         let base_addr = ptr.0.as_ptr() as usize;
-        let num_pages = addressable_size / PAGE_SIZE;
-        prefault_pages(base_addr, num_pages, PAGE_SIZE);
+        let num_pages = addressable_size / page_align;
+        prefault_pages(base_addr, num_pages, page_align);
 
         let mut failures = Vec::new();
         for hook in &hooks {
@@ -424,6 +514,7 @@ impl SharedMemoryRing {
                 total_size: addressable_size,
                 addressable_size,
                 slot_size,
+                page_align,
                 slot_count,
                 free_head,
                 next_free,
@@ -449,6 +540,7 @@ impl SharedMemoryRing {
     /// Acquire a slot index from the free list.
     #[inline]
     pub fn acquire_index(&self) -> Option<usize> {
+        let mut backoff = Backoff::new();
         loop {
             let state = self.free_head.load(Ordering::Acquire);
             let (head, tag) = unpack_free_head(state);
@@ -456,18 +548,31 @@ impl SharedMemoryRing {
                 return None;
             }
 
+            // A valid free-list head is always an in-range slot index. An
+            // out-of-range value here means the head was corrupted; surface it
+            // in tests rather than letting `get` return `None` and masquerade
+            // as "ring full".
+            debug_assert!(
+                (head as usize) < self.slot_count,
+                "acquire_index: corrupt free-list head {head} >= slot_count {}",
+                self.slot_count
+            );
+
             let next_cell = self.next_free.get(head as usize)?;
             let next = next_cell.load(Ordering::Relaxed);
             let new_state = pack_free_head(next, tag.wrapping_add(1));
 
+            // Success only observes the freed slot's `next` (already read above
+            // under the prior `release_index`'s Release); it publishes nothing,
+            // so Acquire suffices.
             if self
                 .free_head
-                .compare_exchange_weak(state, new_state, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Acquire)
                 .is_ok()
             {
                 return Some(head as usize);
             }
-            std::hint::spin_loop();
+            backoff.spin();
         }
     }
 
@@ -488,6 +593,7 @@ impl SharedMemoryRing {
         // SAFETY: bounds-checked above.
         let slot = &self.next_free[index];
 
+        let mut backoff = Backoff::new();
         loop {
             let state = self.free_head.load(Ordering::Acquire);
             let (head, tag) = unpack_free_head(state);
@@ -501,7 +607,7 @@ impl SharedMemoryRing {
             {
                 break;
             }
-            std::hint::spin_loop();
+            backoff.spin();
         }
     }
 
@@ -514,6 +620,12 @@ impl SharedMemoryRing {
     }
 
     /// Get raw pointer to a specific slot for FFI use.
+    ///
+    /// The full `slot_size` bytes are addressable, but a slot is never zeroed
+    /// between lessees: bytes past the current write hold initialized-but-stale
+    /// data from a prior holder of this index. FFI/DMA consumers must bound
+    /// their read to the valid length they were handed (see [`RingSlot::len`])
+    /// and never treat the slot tail as meaningful.
     ///
     /// # Safety Contract
     /// Caller must ensure:
@@ -607,7 +719,7 @@ impl Drop for SharedMemoryRing {
             return;
         }
 
-        let layout = std::alloc::Layout::from_size_align(self.addressable_size, PAGE_SIZE)
+        let layout = std::alloc::Layout::from_size_align(self.addressable_size, self.page_align)
             .expect("Invalid layout");
         // SAFETY: ptr was allocated with this exact layout in try_alloc_regular.
         unsafe {
@@ -658,6 +770,10 @@ impl<'a> RingSlot<'a> {
     }
 
     /// Get the slot contents as a slice.
+    ///
+    /// The slice spans exactly the [`len`](Self::len) bytes written to this
+    /// slot, so the initialized-but-stale tail left by a prior lessee is never
+    /// exposed.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: data_len was set by a successful write_with; the slot is exclusive.
@@ -670,6 +786,11 @@ impl<'a> RingSlot<'a> {
     }
 
     /// Get raw pointer for FFI.
+    ///
+    /// The pointer carries no length: only the first [`len`](Self::len) bytes
+    /// are valid for this lessee. Bytes beyond that are initialized-but-stale
+    /// data from a prior holder of this slot index, so FFI/DMA consumers must
+    /// bound their read to `len()`.
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.ring.slot_ptr(self.slot_index)
@@ -755,6 +876,12 @@ impl<'a> DetachedSlot<'a> {
     /// Re-attach to RAII: convert back into a [`RingSlot`] whose drop
     /// releases automatically. Useful in error paths that want to abandon a
     /// deferred completion plan.
+    ///
+    /// The returned slot has a length of zero — it does not carry the data
+    /// length the original [`RingSlot`] held before [`RingSlot::detach`]. The
+    /// underlying bytes are untouched (and thus stale), so consumers must write
+    /// before reading; [`RingSlot::as_slice`] returns an empty slice until the
+    /// next write.
     pub fn reattach(mut self) -> RingSlot<'a> {
         self.armed = false;
         RingSlot {
@@ -822,8 +949,11 @@ mod tests {
     fn ring_buffer_basic() {
         let ring = build(4, 1024);
         assert_eq!(ring.slot_count(), 4);
-        assert_eq!(ring.slot_size(), PAGE_SIZE);
-        assert_eq!(ring.addressable_size(), 4 * PAGE_SIZE);
+        // A 1 KiB request rounds up to exactly one page; the page size is
+        // resolved at runtime and is always a multiple of PAGE_SIZE.
+        assert!(ring.slot_size() >= PAGE_SIZE);
+        assert_eq!(ring.slot_size() % PAGE_SIZE, 0);
+        assert_eq!(ring.addressable_size(), 4 * ring.slot_size());
     }
 
     #[test]
@@ -1000,10 +1130,13 @@ mod tests {
     fn copy_returns_error_on_overflow() {
         let ring = build(4, 64);
         let mut slot = ring.acquire_slot().unwrap();
-        let data = vec![0u8; PAGE_SIZE + 1];
+        // Capacity is the page-aligned slot size, resolved at runtime; one byte
+        // past it must overflow.
+        let capacity = ring.slot_size();
+        let data = vec![0u8; capacity + 1];
         let err = slot.copy_from_slice(&data).unwrap_err();
-        assert_eq!(err.requested, PAGE_SIZE + 1);
-        assert_eq!(err.capacity, PAGE_SIZE);
+        assert_eq!(err.requested, capacity + 1);
+        assert_eq!(err.capacity, capacity);
     }
 
     #[test]

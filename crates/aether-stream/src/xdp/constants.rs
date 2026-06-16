@@ -59,6 +59,14 @@ pub const XDP_COPY: u16 = 1 << 1;
 /// Zero-copy mode.
 pub const XDP_ZEROCOPY: u16 = 1 << 2;
 
+// --- Ring flags (in each ring's `flags` field) ---
+
+/// Set by the kernel in a ring's `flags` field when the driver needs a
+/// syscall to resume processing that ring (zero-copy / busy-poll drivers stop
+/// draining FILL/TX once caught up). When observed, the userspace side must
+/// issue `recvfrom`/`sendto` to kick the driver, or the ring livelocks.
+pub const XDP_RING_NEED_WAKEUP: u32 = 1 << 0;
+
 // --- Descriptor flags ---
 
 /// Frame size for standard UMEM frames.
