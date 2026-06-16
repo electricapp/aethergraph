@@ -193,13 +193,14 @@ jobs:
         with:
           key: loom
       - run: cargo test -p aether-graph --features loom --test loom_writer_guard
+      - run: cargo test -p aethergraph-core --features loom --test loom_union_find
       - name: Summary
         if: always()
         run: |
           {
             echo "## loom"
             echo ""
-            echo "Exhaustive interleaving check of the writer-guard CAS."
+            echo "Exhaustive interleaving checks of the writer-guard CAS and the lock-free union-find."
           } >> "$GITHUB_STEP_SUMMARY"
 
   supply-chain:
