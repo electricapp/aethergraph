@@ -29,6 +29,9 @@ use tracing::info;
 /// `num_nodes` is the total number of nodes in the graph (determines the
 /// CSR offsets array size). If you don't know it, pass a value larger than
 /// the max node ID in the data.
+///
+/// All edges are buffered in memory before the CSR is built; there is no
+/// streaming cap, so peak RAM scales with the total edge count of the file.
 pub fn from_parquet(
     path: impl AsRef<Path>,
     src_col: &str,
@@ -51,6 +54,7 @@ pub fn from_parquet(
 
     for batch_result in reader {
         let batch = batch_result.context("read record batch")?;
+        edges.reserve(batch.num_rows());
         let (src, dst) = extract_edge_columns(&batch, src_col, dst_col)?;
         edges.extend(src.into_iter().zip(dst));
     }
@@ -68,6 +72,9 @@ pub fn from_parquet(
 ///
 /// Files are read sequentially and edges are accumulated before CSR construction.
 /// The CSR construction itself is parallelized via Rayon.
+///
+/// All edges across every file are buffered in memory before the CSR is built;
+/// there is no streaming cap, so peak RAM scales with the combined edge count.
 pub fn from_parquet_files(
     paths: &[impl AsRef<Path>],
     src_col: &str,
@@ -89,6 +96,7 @@ pub fn from_parquet_files(
 
         for batch_result in reader {
             let batch = batch_result.context("read record batch")?;
+            edges.reserve(batch.num_rows());
             let (src, dst) = extract_edge_columns(&batch, src_col, dst_col)?;
             edges.extend(src.into_iter().zip(dst));
         }

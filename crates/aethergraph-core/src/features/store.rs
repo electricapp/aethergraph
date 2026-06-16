@@ -71,21 +71,30 @@ pub struct FeatureData {
 }
 
 impl FeatureData {
-    /// Create new feature data with zeros
+    /// Create new feature data with zeros.
+    ///
+    /// Panics if `num_nodes * feature_dim` overflows `usize` (this constructor
+    /// has no error channel; the overflow would otherwise wrap silently).
     pub fn new(num_nodes: usize, feature_dim: usize) -> Self {
+        let len = num_nodes
+            .checked_mul(feature_dim)
+            .expect("num_nodes * feature_dim overflows usize");
         Self {
             num_nodes: num_nodes as u64,
             feature_dim: feature_dim as u64,
-            features: vec![0.0; num_nodes * feature_dim],
+            features: vec![0.0; len],
         }
     }
 
     /// Create from existing features
     pub fn from_features(features: Vec<f32>, num_nodes: usize, feature_dim: usize) -> Result<Self> {
+        let expected = num_nodes
+            .checked_mul(feature_dim)
+            .ok_or_else(|| anyhow::anyhow!("num_nodes * feature_dim overflows usize"))?;
         anyhow::ensure!(
-            features.len() == num_nodes * feature_dim,
+            features.len() == expected,
             "feature array size mismatch: expected {}, got {}",
-            num_nodes * feature_dim,
+            expected,
             features.len()
         );
 
@@ -148,20 +157,38 @@ pub struct FeatureLoadTelemetry {
     pub batch_time_ns: u64,
 }
 
+/// A `AtomicU64` padded to its own 64-byte cache line.
+///
+/// Concurrent loaders bump several of these counters at once; without padding
+/// they would share cache lines and ping-pong them between cores (false
+/// sharing). `Deref` keeps the `.fetch_add()` / `.load()` call sites unchanged.
+#[repr(align(64))]
+#[derive(Debug, Default)]
+pub(crate) struct PaddedAtomicU64(pub(crate) AtomicU64);
+
+impl std::ops::Deref for PaddedAtomicU64 {
+    type Target = AtomicU64;
+    #[inline(always)]
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
+
 /// Atomic counters behind [`FeatureLoadTelemetry`].
 ///
 /// The read paths bump these with relaxed atomics so enabling telemetry
 /// does not put a lock on the per-node hot path; `snapshot()` assembles
-/// the public summary struct.
+/// the public summary struct. Each counter is cache-line padded to avoid
+/// false sharing between concurrent loaders.
 #[derive(Debug, Default)]
 pub(crate) struct TelemetryCells {
-    pub(crate) single_gets: AtomicU64,
-    pub(crate) batch_gets: AtomicU64,
-    pub(crate) total_nodes_loaded: AtomicU64,
-    pub(crate) total_features_loaded: AtomicU64,
-    pub(crate) total_bytes_loaded: AtomicU64,
-    pub(crate) get_time_ns: AtomicU64,
-    pub(crate) batch_time_ns: AtomicU64,
+    pub(crate) single_gets: PaddedAtomicU64,
+    pub(crate) batch_gets: PaddedAtomicU64,
+    pub(crate) total_nodes_loaded: PaddedAtomicU64,
+    pub(crate) total_features_loaded: PaddedAtomicU64,
+    pub(crate) total_bytes_loaded: PaddedAtomicU64,
+    pub(crate) get_time_ns: PaddedAtomicU64,
+    pub(crate) batch_time_ns: PaddedAtomicU64,
 }
 
 impl TelemetryCells {
@@ -211,7 +238,10 @@ impl FeatureLoadTelemetry {
     #[inline]
     pub fn avg_batch_size(&self) -> f64 {
         if self.batch_gets > 0 {
-            (self.total_nodes_loaded - self.single_gets) as f64 / self.batch_gets as f64
+            // saturating_sub: counters are bumped independently, so a snapshot
+            // taken mid-update can momentarily show single_gets > total.
+            self.total_nodes_loaded.saturating_sub(self.single_gets) as f64
+                / self.batch_gets as f64
         } else {
             0.0
         }
@@ -288,8 +318,12 @@ impl FeatureStore {
         debug!("Loading feature store from {}", path.display());
 
         let file = File::open(path).context("failed to open feature file")?;
-        // SAFETY: the file remains owned for the duration of the mmap (held in `file` until
-        // the mapping is established); we never mutate the mapped region after creation.
+        // SAFETY: mmap requires the backing file to stay immutable for the
+        // mapping's lifetime. The `file` handle is dropped once the mapping is
+        // established (the kernel keeps the mapping valid regardless), so the
+        // real contract is on the caller: the file at `path` must not be
+        // truncated or modified while this store is alive. We never write to
+        // the mapped region.
         let mmap = Arc::new(unsafe {
             MmapOptions::new()
                 .map(&file)
@@ -358,39 +392,43 @@ impl FeatureStore {
             FeatureDtype::F32
         };
 
-        let num_nodes =
-            usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;
-        let feature_dim =
-            usize::try_from(feature_dim_u64).context("feature_dim does not fit in usize")?;
-
-        // Validate data size (with overflow protection)
-        let expected_data_size = num_nodes
-            .checked_mul(feature_dim)
-            .and_then(|n| n.checked_mul(dtype.element_size()))
+        // Validate data size entirely in u64 first, so a 32-bit usize can't
+        // truncate the product before it's range-checked. Cast to usize only
+        // after the mapped file is known large enough to hold the payload.
+        let expected_data_size_u64 = num_nodes_u64
+            .checked_mul(feature_dim_u64)
+            .and_then(|n| n.checked_mul(dtype.element_size() as u64))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "feature data size overflow: {} nodes * {} dims * {} bytes",
-                    num_nodes,
-                    feature_dim,
+                    num_nodes_u64,
+                    feature_dim_u64,
                     dtype.element_size()
                 )
             })?;
-        let actual_data_size = mmap.len() - data_offset;
+        let actual_data_size = (mmap.len() - data_offset) as u64;
         anyhow::ensure!(
-            actual_data_size >= expected_data_size,
+            actual_data_size >= expected_data_size_u64,
             "feature file truncated: expected {} bytes of data, got {}",
-            expected_data_size,
+            expected_data_size_u64,
             actual_data_size
         );
-        let feature_data_end = data_offset
-            .checked_add(expected_data_size)
+        let feature_data_end = (data_offset as u64)
+            .checked_add(expected_data_size_u64)
             .ok_or_else(|| anyhow::anyhow!("feature_data_end overflow"))?;
         anyhow::ensure!(
-            feature_data_end <= mmap.len(),
+            feature_data_end <= mmap.len() as u64,
             "feature payload end {} exceeds file size {}",
             feature_data_end,
             mmap.len()
         );
+
+        let num_nodes =
+            usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;
+        let feature_dim =
+            usize::try_from(feature_dim_u64).context("feature_dim does not fit in usize")?;
+        let expected_data_size = usize::try_from(expected_data_size_u64)
+            .context("feature data size does not fit in usize")?;
 
         debug!(
             "Feature store loaded: {} nodes, {} dims, dtype={:?}, offset={}, {:.2} GB",
@@ -558,8 +596,18 @@ impl FeatureStore {
         let raw = self.feature_data_raw();
         let elem_size = self.dtype.element_size();
         let row_bytes = self.feature_dim * elem_size;
-        let start = node_idx * row_bytes;
-        let end = start + row_bytes;
+        let start = node_idx.checked_mul(row_bytes).ok_or_else(|| {
+            anyhow::anyhow!("index overflow: node {} * row_bytes {}", node_idx, row_bytes)
+        })?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("index overflow: {} + {}", start, row_bytes))?;
+        anyhow::ensure!(
+            end <= raw.len(),
+            "feature data bounds error: end {} > len {}",
+            end,
+            raw.len()
+        );
         let row = &raw[start..end];
 
         match self.dtype {
@@ -655,6 +703,52 @@ impl FeatureStore {
         Ok(result)
     }
 
+    /// Gather features for multiple nodes into a caller-provided buffer.
+    ///
+    /// Writes node `i`'s feature row into `out[i * feature_dim .. (i+1) * feature_dim]`,
+    /// so the result is packed contiguously in `nodes` order. `out` must have
+    /// length >= `nodes.len() * feature_dim`. Works for both F32 (memcpy) and
+    /// F16 (upcast). Avoids the per-call `Vec` that [`get_batch`] allocates.
+    pub fn get_batch_into(&self, nodes: &[NodeId], out: &mut [f32]) -> Result<()> {
+        let total = nodes
+            .len()
+            .checked_mul(self.feature_dim)
+            .ok_or_else(|| anyhow::anyhow!("nodes.len() * feature_dim overflows usize"))?;
+        anyhow::ensure!(
+            out.len() >= total,
+            "output buffer too small: {} < {}",
+            out.len(),
+            total
+        );
+
+        let start = self.telemetry.is_some().then(Instant::now);
+
+        for (i, &node) in nodes.iter().enumerate() {
+            // i * feature_dim is bounded by `total`, already checked above.
+            let row_start = i * self.feature_dim;
+            self.get_into(node, &mut out[row_start..row_start + self.feature_dim])?;
+        }
+
+        if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {
+            stats.batch_gets.fetch_add(1, Ordering::Relaxed);
+            stats
+                .total_nodes_loaded
+                .fetch_add(nodes.len() as u64, Ordering::Relaxed);
+            stats
+                .total_features_loaded
+                .fetch_add(total as u64, Ordering::Relaxed);
+            stats.total_bytes_loaded.fetch_add(
+                total as u64 * std::mem::size_of::<f32>() as u64,
+                Ordering::Relaxed,
+            );
+            stats
+                .batch_time_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
     /// Get all features as a slice (zero-copy, f32 only).
     ///
     /// Errors for F16 stores — the payload is half-precision and cannot
@@ -716,10 +810,13 @@ pub fn save_features(
         feature_dim
     );
 
+    let expected = num_nodes
+        .checked_mul(feature_dim)
+        .ok_or_else(|| anyhow::anyhow!("num_nodes * feature_dim overflows usize"))?;
     anyhow::ensure!(
-        features.len() == num_nodes * feature_dim,
+        features.len() == expected,
         "feature array size mismatch: expected {}, got {}",
-        num_nodes * feature_dim,
+        expected,
         features.len()
     );
 
@@ -779,10 +876,13 @@ pub fn save_features_f16(
         feature_dim
     );
 
+    let expected = num_nodes
+        .checked_mul(feature_dim)
+        .ok_or_else(|| anyhow::anyhow!("num_nodes * feature_dim overflows usize"))?;
     anyhow::ensure!(
-        features.len() == num_nodes * feature_dim,
+        features.len() == expected,
         "feature array size mismatch: expected {}, got {}",
-        num_nodes * feature_dim,
+        expected,
         features.len()
     );
 

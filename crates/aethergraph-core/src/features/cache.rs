@@ -24,6 +24,9 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
+/// Monotonic token for unique NVMe temp filenames during atomic save.
+static NVME_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Feature dimension
 pub type FeatureDim = usize;
 
@@ -105,27 +108,15 @@ impl FreqCache {
 
     fn get(&mut self, node: NodeId) -> Option<&FeatureVector> {
         if self.cache.contains_key(&node) {
+            // O(1) on a hit: only bump the access count. The heap is NOT
+            // touched here — a hit's raised frequency only makes a node less
+            // likely to be evicted, and `evict_one` reconciles stale heap
+            // values lazily, so the heap never needs the per-hit push that
+            // would otherwise grow it unboundedly.
             *self.access_counts.entry(node).or_insert(0) += 1;
-            // Push updated frequency into heap (stale entries handled lazily).
-            // Compact if heap grows too large relative to cache size to bound memory.
-            self.eviction_heap.push(Reverse((self.freq(node), node)));
-            // TODO: tune compaction threshold under real workloads. 4x is a
-            // heuristic -- too low thrashes on high-churn caches, too high
-            // wastes memory. Profile with Reddit-scale access patterns.
-            if self.eviction_heap.len() > self.capacity * 4 {
-                self.compact_heap();
-            }
             self.cache.get(&node)
         } else {
             None
-        }
-    }
-
-    /// Rebuild the heap with only current cache entries at their true frequencies.
-    fn compact_heap(&mut self) {
-        self.eviction_heap.clear();
-        for &node in self.cache.keys() {
-            self.eviction_heap.push(Reverse((self.freq(node), node)));
         }
     }
 
@@ -136,9 +127,15 @@ impl FreqCache {
             return None;
         }
 
-        // Evict if at capacity
+        // Evict if at capacity.
         let evicted = if self.cache.len() >= self.capacity {
-            self.evict_one()
+            match self.evict_one() {
+                Some(victim) => Some(victim),
+                // Nothing is evictable (every entry is pinned). Inserting anyway
+                // would push len() past capacity, so refuse the new node and hand
+                // it back as the demotion candidate for the next tier instead.
+                None => return Some((node, features)),
+            }
         } else {
             None
         };
@@ -153,6 +150,12 @@ impl FreqCache {
 
     /// Pop lowest-frequency unpinned node. Lazy deletion: skip stale entries.
     ///
+    /// Because hits raise a node's frequency without re-pushing the heap, a
+    /// popped entry's recorded frequency can be stale (lower than the node's
+    /// true current frequency). When that happens the entry is re-pushed at its
+    /// true frequency and popping continues, so the node actually evicted is the
+    /// current minimum rather than a stale one.
+    ///
     /// Pinned entries popped along the way are simply dropped from the
     /// heap — they are not evictable, and re-pushing them would make this
     /// loop spin forever once every cached node is pinned (each pop would
@@ -160,12 +163,20 @@ impl FreqCache {
     /// `unpin` re-registers the node in the heap. Returns `None` when
     /// nothing is evictable.
     fn evict_one(&mut self) -> Option<(NodeId, FeatureVector)> {
-        while let Some(Reverse((_, node))) = self.eviction_heap.pop() {
+        while let Some(Reverse((heap_freq, node))) = self.eviction_heap.pop() {
             // Skip if no longer in cache (already evicted)
             if !self.cache.contains_key(&node) {
                 continue;
             }
             if self.pinned.contains(&node) {
+                continue;
+            }
+            // Lazy staleness check: if the recorded frequency is below the
+            // node's current frequency, this pop is stale. Re-push at the true
+            // value and keep looking for the real minimum.
+            let current_freq = self.freq(node);
+            if heap_freq < current_freq {
+                self.eviction_heap.push(Reverse((current_freq, node)));
                 continue;
             }
             // Evict this node
@@ -343,7 +354,13 @@ impl FeatureCache {
             return Ok(features);
         }
 
-        // Load from NVMe (cold tier)
+        // Load from NVMe (cold tier).
+        //
+        // No single-flight guard: concurrent cold misses on the same node each
+        // issue their own NVMe read and promote independently. The reads are
+        // idempotent (the file is immutable once written) and the last promote
+        // wins, so the only cost is redundant I/O on a simultaneous miss — an
+        // acceptable trade vs. the complexity of an in-flight future map.
         trace!("Loading node {} from NVMe", node);
         match self.load_from_nvme(node).await {
             Ok(features) => {
@@ -509,39 +526,56 @@ impl FeatureCache {
             .await
             .with_context(|| format!("failed to open NVMe feature file: {}", path.display()))?;
 
-        let expected_bytes = self.config.feature_dim * std::mem::size_of::<f32>();
-        let mut buffer = vec![0u8; expected_bytes];
-
-        file.read_exact(&mut buffer)
+        // Read straight into a properly-aligned f32 buffer. On little-endian
+        // targets the on-disk bytes are already in native order, so this is a
+        // bulk copy with no per-element decode.
+        let mut features = vec![0f32; self.config.feature_dim];
+        file.read_exact(bytemuck::cast_slice_mut(&mut features))
             .await
             .context("failed to read features from NVMe")?;
-
-        let features: Vec<f32> = buffer
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
 
         Ok(features)
     }
 
-    /// Save features to NVMe storage
+    /// Save features to NVMe storage.
+    ///
+    /// Writes to a uniquely-named temp file then atomically renames it into
+    /// place, so a torn write never leaves a full-length file of garbage that
+    /// would read back as silent corruption — a reader sees either the old
+    /// contents or the complete new ones.
     async fn save_to_nvme(&self, node: NodeId, features: &[f32]) -> Result<()> {
         let path = self.nvme_feature_path(node);
+        // Unique temp name so concurrent writes (even of the same node) don't
+        // clobber each other's in-progress file before the rename.
+        let token = NVME_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self
+            .nvme_path
+            .join(format!("node_{}.bin.tmp.{}", node, token));
 
-        let mut file = File::create(&path)
-            .await
-            .with_context(|| format!("failed to create NVMe feature file: {}", path.display()))?;
+        // Bulk little-endian copy: f32 is more aligned than u8, so casting the
+        // slice to bytes is a plain memcpy with no per-element encode.
+        let bytes: &[u8] = bytemuck::cast_slice(features);
 
-        let bytes: Vec<u8> = features.iter().flat_map(|&f| f.to_le_bytes()).collect();
+        {
+            let mut file = File::create(&tmp_path).await.with_context(|| {
+                format!("failed to create NVMe temp file: {}", tmp_path.display())
+            })?;
+            file.write_all(bytes)
+                .await
+                .context("failed to write features to NVMe")?;
+        }
 
-        file.write_all(&bytes)
-            .await
-            .context("failed to write features to NVMe")?;
+        // Atomic publish. If it fails, drop the temp file rather than leak it.
+        if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e).with_context(|| {
+                format!("failed to rename NVMe feature file into place: {}", path.display())
+            });
+        }
 
         // No fsync: this is a rebuildable cache, and an fsync per inserted
         // or evicted node serializes the write path on device flushes. A
-        // crash at worst loses or truncates cache entries, which surface
-        // as misses.
+        // crash at worst loses a cache entry, which surfaces as a miss.
         Ok(())
     }
 

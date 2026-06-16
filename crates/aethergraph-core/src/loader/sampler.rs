@@ -1,8 +1,10 @@
-//! Zero-allocation neighborhood sampling for GNN training.
+//! Neighborhood sampling for GNN training.
 //!
-//! All buffers are pre-allocated at sampler construction and reused across
-//! `sample_neighbors` calls via `clear()`. Local node indices are assigned
-//! during sampling — no post-sort, no binary search.
+//! Internal scratch (frontiers, dedup arrays, sample buffers) is pre-allocated
+//! at sampler construction and reset across `sample_neighbors` calls via
+//! `clear()`. The output buffers handed back in each `SampledSubgraph` are
+//! freshly allocated per call (swapped out of the sampler). Local node indices
+//! are assigned during sampling — no post-sort, no binary search.
 
 use crate::graph::{Graph, NodeId};
 use crate::internal::telemetry::{SamplingTelemetry, SamplingTimer};
@@ -58,25 +60,18 @@ impl WyRand {
         self.next_u64() as u32
     }
 }
-/// Fast approximate -ln(u) for a random u64 interpreted as U(0,1).
+/// Exact `-ln(u)` for a random u64 mapped to a uniform `u` in (0, 1].
 ///
-/// Extracts the IEEE 754 exponent to get -log2(u), then scales by ln(2).
-/// Monotone (preserves ordering) which is all Efraimidis-Spirakis needs.
-/// ~3-4x faster than `f64::ln()` — avoids the iterative polynomial evaluation.
+/// The top 53 bits of `bits` form a uniform integer in `[0, 2^53)`; adding 1
+/// and scaling by `2^-53` yields `u` in `(0, 1]`, so `-u.ln()` is finite and
+/// non-negative for every input — `bits == 0` gives `u = 2^-53` (a large but
+/// finite key) and `bits == u64::MAX` gives `u = 1.0` (key `0.0`). Used as the
+/// Efraimidis-Spirakis key exponent, where exactness keeps weighted
+/// sampling unbiased.
 #[inline(always)]
 fn fast_neg_ln_u64(bits: u64) -> f64 {
-    // Reinterpret bits as f64 in [1.0, 2.0) by setting exponent to 1023
-    // then use: -ln(u) where u = mantissa * 2^(-64)
-    // Approximation: -ln(u) ≈ (64 - leading_zeros) * ln(2) + correction
-    // Using the IEEE trick: cast to f64 and extract exponent directly.
-    let u = (bits >> 11) | 0x3FF0_0000_0000_0000; // [1.0, 2.0)
-    let f = f64::from_bits(u) - 1.0; // [0.0, 1.0)
-    // -ln(f) for f near 0 is large; for f near 1 is near 0
-    // Use: -ln(1 - x) ≈ x + x²/2 for small x ... but this loses for large x
-    // Simpler: count leading zeros for the integer part, use mantissa for fractional
-    let lz = bits.leading_zeros() as f64;
-    // -ln(u) ≈ (lz + 1 - frac) * ln(2), where frac is the mantissa contribution
-    (lz + 1.0 - f) * std::f64::consts::LN_2
+    let u = ((bits >> 11) as f64 + 1.0) * (1.0 / (1u64 << 53) as f64);
+    -u.ln()
 }
 
 use rayon::prelude::*;
@@ -213,17 +208,20 @@ impl std::error::Error for TemporalSamplingError {}
 
 /// A neighborhood sampler for GNN training.
 ///
-/// All internal buffers are pre-allocated at construction and reused across
-/// `sample_neighbors` calls. Zero allocations in the hot path.
+/// Internal scratch buffers are pre-allocated at construction and reset across
+/// `sample_neighbors` calls; the per-call output buffers are freshly allocated
+/// and swapped out into the returned `SampledSubgraph`.
 ///
-/// Dedup uses either a generation-tagged direct array (for graphs < 1M nodes,
+/// Dedup uses either a generation-tagged direct array (for graphs with
+/// <= 100K nodes, or when the estimated sample exceeds 1% of the graph;
 /// O(1) lookup, ~8 bytes/node memory) or an FxHashMap-backed index for sparser
 /// sampling patterns (e.g. 12K nodes touched out of 10M).
 pub struct NeighborSampler<'a> {
     graph: &'a Graph,
     config: SamplingConfig,
     rng: WyRand,
-    /// Direct array path (graphs < DIRECT_ARRAY_THRESHOLD nodes).
+    /// Direct array path (selected by `use_direct`: <= 100K nodes, or a
+    /// sample estimated to touch > 1% of the graph).
     node_gen: Vec<u32>,
     node_local_idx: Vec<u32>,
     current_gen: u32,
@@ -254,6 +252,8 @@ pub struct NeighborSampler<'a> {
     temporal_filtered: Vec<(usize, f64)>,
     /// Weighted no-replace: reusable key buffer to avoid per-call allocation.
     weighted_keys: Vec<(f64, usize)>,
+    /// Weighted with-replace: reusable cumulative-distribution buffer.
+    cumsum_buf: Vec<f64>,
 }
 
 impl<'a> NeighborSampler<'a> {
@@ -311,6 +311,7 @@ impl<'a> NeighborSampler<'a> {
             node_times: Vec::new(),
             temporal_filtered: Vec::with_capacity(max_fanout),
             weighted_keys: Vec::with_capacity(256),
+            cumsum_buf: Vec::with_capacity(256),
         }
     }
 
@@ -430,8 +431,9 @@ impl<'a> NeighborSampler<'a> {
         let mut batch = Vec::with_capacity(est);
         let mut all_src_local = Vec::with_capacity(est);
         let mut all_dst_local = Vec::with_capacity(est);
-        let mut num_sampled_nodes = Vec::new();
-        let mut num_sampled_edges = Vec::new();
+        // Per-hop counts accumulated across every seed (PyG compatibility).
+        let mut num_sampled_nodes = vec![0usize; num_hops];
+        let mut num_sampled_edges = vec![0usize; num_hops];
 
         for (seed_idx, &seed) in seeds.iter().enumerate() {
             // Reset dedup state per seed (cheap: no dealloc, just counter bump or clear)
@@ -461,6 +463,7 @@ impl<'a> NeighborSampler<'a> {
 
             // Run hop loop inline (same logic as sample_neighbors_inner)
             for hop in 0..num_hops {
+                let edges_before = self.edge_src_buf.len();
                 let sample_size = self.config.fanout[hop];
                 self.next_frontier.clear();
 
@@ -478,6 +481,10 @@ impl<'a> NeighborSampler<'a> {
                     }
                 }
 
+                // Accumulate this seed's per-hop counts into the combined totals.
+                num_sampled_nodes[hop] += self.next_frontier.len();
+                num_sampled_edges[hop] += self.edge_src_buf.len() - edges_before;
+
                 if self.config.cumulative {
                     self.frontier.extend_from_slice(&self.next_frontier);
                 } else {
@@ -485,22 +492,26 @@ impl<'a> NeighborSampler<'a> {
                 }
             }
 
-            // Compute local edge indices and offset into combined output
+            // Compute local edge indices and offset into combined output.
+            // The dedup structure already maps each global id to its local index
+            // within this seed's subgraph (node_local_idx for the direct array,
+            // local_index for the HashMap), so no per-seed map needs rebuilding.
             let node_offset = all_nodes.len() as u32;
 
-            // Build local_index for this seed's subgraph
-            let seed_local: FxHashMap<NodeId, u32> = self
-                .node_vec
-                .iter()
-                .enumerate()
-                .map(|(idx, &id)| (id, idx as u32))
-                .collect();
-
-            for &src in &self.edge_src_buf {
-                all_src_local.push(seed_local[&src] + node_offset);
-            }
-            for &dst in &self.edge_dst_buf {
-                all_dst_local.push(seed_local[&dst] + node_offset);
+            if self.use_direct {
+                for &src in &self.edge_src_buf {
+                    all_src_local.push(self.node_local_idx[src as usize] + node_offset);
+                }
+                for &dst in &self.edge_dst_buf {
+                    all_dst_local.push(self.node_local_idx[dst as usize] + node_offset);
+                }
+            } else {
+                for &src in &self.edge_src_buf {
+                    all_src_local.push(self.local_index[&src] + node_offset);
+                }
+                for &dst in &self.edge_dst_buf {
+                    all_dst_local.push(self.local_index[&dst] + node_offset);
+                }
             }
 
             all_nodes.extend_from_slice(&self.node_vec);
@@ -510,12 +521,6 @@ impl<'a> NeighborSampler<'a> {
 
             let node_count = self.node_vec.len();
             batch.resize(batch.len() + node_count, seed_idx as u32);
-
-            if seed_idx == 0 {
-                num_sampled_nodes = self.next_frontier.iter().map(|_| 0).collect();
-                num_sampled_edges = Vec::new();
-                // Approximate: just use counts from first seed
-            }
         }
 
         SampledSubgraph {
@@ -607,7 +612,9 @@ impl<'a> NeighborSampler<'a> {
 
             // Update frontier based on sampling mode (double-buffer swap)
             if self.config.cumulative {
-                // PyG-style: accumulate all nodes for next hop
+                // PyG-style: accumulate all nodes for next hop. By design this
+                // re-processes the whole accumulated frontier each hop, so the
+                // total work is O(Σ frontier sizes) rather than O(new nodes).
                 self.frontier.extend_from_slice(&self.next_frontier);
             } else {
                 // Pure GraphSAGE: only use new frontier
@@ -615,7 +622,10 @@ impl<'a> NeighborSampler<'a> {
             }
         }
 
-        // Move buffers out, replacing with fresh capacity for reuse
+        // Hand the filled buffers to the caller and swap fresh ones back in.
+        // The four returned buffers (nodes + the three edge arrays) are
+        // therefore freshly allocated on every call; only the internal scratch
+        // (frontiers, dedup arrays, sample buffers) is reset and reused.
         let mut node_vec = Vec::with_capacity(512);
         std::mem::swap(&mut self.node_vec, &mut node_vec);
 
@@ -795,6 +805,9 @@ impl<'a> NeighborSampler<'a> {
                     return;
                 }
                 let take = valid.min(sample_size);
+                if take == 0 {
+                    return;
+                }
                 if take < valid {
                     // select_nth_unstable: O(n) partial sort — only partition, no full sort
                     self.temporal_filtered
@@ -1073,25 +1086,25 @@ impl<'a> NeighborSampler<'a> {
         let n = neighbors.len();
         debug_assert_eq!(n, weights.len());
 
-        // Build cumulative distribution
-        let mut cumsum = Vec::with_capacity(n);
+        // Build cumulative distribution in the reusable buffer.
+        self.cumsum_buf.clear();
         let mut total = 0.0f64;
         for &w in weights {
             total += w as f64;
-            cumsum.push(total);
+            self.cumsum_buf.push(total);
         }
 
         for _ in 0..k {
             let u = (self.rng.next_u64() as f64) / (u64::MAX as f64) * total;
-            let idx = cumsum.partition_point(|&c| c <= u).min(n - 1);
+            let idx = self.cumsum_buf.partition_point(|&c| c <= u).min(n - 1);
             self.sample_buf.push((neighbors[idx], idx));
         }
     }
 
     /// Weighted sampling without replacement (Efraimidis-Spirakis) — pushes into self.sample_buf.
     ///
-    /// Uses pre-allocated `weighted_keys` buffer. Key computation uses fast_neg_ln
-    /// (bit-hack log2 approximation) since we only need relative ordering, not exact values.
+    /// Uses the pre-allocated `weighted_keys` buffer. Key computation uses
+    /// `fast_neg_ln_u64`, which computes `-ln(u)` exactly so the sampling is unbiased.
     fn weighted_sample_without_replacement_into(
         &mut self,
         neighbors: &[NodeId],
@@ -1101,6 +1114,9 @@ impl<'a> NeighborSampler<'a> {
         let n = neighbors.len();
         debug_assert_eq!(n, weights.len());
 
+        if k == 0 {
+            return;
+        }
         if k >= n {
             for (i, &neighbor) in neighbors.iter().enumerate() {
                 self.sample_buf.push((neighbor, i));
@@ -1113,16 +1129,15 @@ impl<'a> NeighborSampler<'a> {
         self.weighted_keys
             .reserve(n.saturating_sub(self.weighted_keys.capacity()));
 
-        // Compute keys: key[i] = -ln(u) / w[i], u ~ Uniform(0,1)
-        // We use fast_neg_ln: bit-extract log2 approximation (~4x faster than ln())
-        // Only relative ordering matters, so approximation is fine.
+        // Compute keys: key[i] = -ln(u) / w[i], u ~ Uniform(0,1).
+        // fast_neg_ln_u64 computes -ln(u) exactly, so the keys are unbiased.
         //
         // Guard against non-finite weights (NaN, ±inf): NaN > 0.0 is false so
         // it routes to INFINITY, but +inf > 0.0 is true and would produce
         // INFINITY / INFINITY = NaN, which makes `partial_cmp` return None and
         // poisons the sort. Require strictly finite, strictly positive weight.
         for (i, &weight) in weights[..n].iter().enumerate() {
-            let u_bits = self.rng.next_u64() | 1; // ensure nonzero
+            let u_bits = self.rng.next_u64();
             let w = weight as f64;
             let key = if w.is_finite() && w > 0.0 {
                 fast_neg_ln_u64(u_bits) / w
@@ -1316,20 +1331,22 @@ impl<'a> ParallelBatchSampler<'a> {
     /// regression tests, audit logs, or strict reproducibility.
     pub fn sample_batches(&self, batches: &[Vec<NodeId>]) -> Vec<SampledSubgraph> {
         if self.config.deterministic {
+            // Serial path stays byte-identical: one sampler reused in order.
+            let mut sampler = NeighborSampler::new(self.graph, self.config.clone());
             batches
                 .iter()
-                .map(|seeds| {
-                    let mut sampler = NeighborSampler::new(self.graph, self.config.clone());
-                    sampler.sample_neighbors(seeds)
-                })
+                .map(|seeds| sampler.sample_neighbors(seeds))
                 .collect()
         } else {
+            // One sampler per Rayon worker (built lazily via map_init), reused
+            // across the batches that thread handles — avoids reallocating the
+            // num_nodes-sized dedup arrays per batch.
             batches
                 .par_iter()
-                .map(|seeds| {
-                    let mut sampler = NeighborSampler::new(self.graph, self.config.clone());
-                    sampler.sample_neighbors(seeds)
-                })
+                .map_init(
+                    || NeighborSampler::new(self.graph, self.config.clone()),
+                    |sampler, seeds| sampler.sample_neighbors(seeds),
+                )
                 .collect()
         }
     }

@@ -388,6 +388,15 @@ impl GdsFeatureStore {
         self.feature_dim * self.dtype.element_size()
     }
 
+    /// File byte offset of `node`'s feature row, with overflow checking.
+    fn file_offset(&self, node: NodeId) -> Result<i64> {
+        let off = (node as u64)
+            .checked_mul(self.feature_size() as u64)
+            .and_then(|o| o.checked_add(self.features_start_offset))
+            .ok_or_else(|| anyhow::anyhow!("file offset overflow for node {}", node))?;
+        i64::try_from(off).map_err(|_| anyhow::anyhow!("file offset exceeds i64 for node {}", node))
+    }
+
     /// Read features for `nodes` directly into the start of the GPU buffer.
     ///
     /// Returns a `GdsReadResult` with the device pointer and metadata.
@@ -416,9 +425,15 @@ impl GdsFeatureStore {
     /// Returns the total number of bytes written to the GPU buffer.
     pub fn get_batch_into(&self, nodes: &[NodeId], dev_offset: usize) -> Result<usize> {
         let feature_size = self.feature_size();
-        let total_bytes = nodes.len() * feature_size;
+        let total_bytes = nodes
+            .len()
+            .checked_mul(feature_size)
+            .ok_or_else(|| anyhow::anyhow!("batch byte size overflow"))?;
+        let end = dev_offset
+            .checked_add(total_bytes)
+            .ok_or_else(|| anyhow::anyhow!("GPU buffer end offset overflow"))?;
         ensure!(
-            dev_offset + total_bytes <= self.gpu_buffer_size,
+            end <= self.gpu_buffer_size,
             "batch of {} nodes at offset {} exceeds GPU buffer ({} bytes)",
             nodes.len(),
             dev_offset,
@@ -469,30 +484,23 @@ impl GdsFeatureStore {
             return self.read_nodes_sequential(&sorted, feature_size, base_dev_offset);
         }
 
-        // Set up batch handle.
-        let num_entries = sorted.len() as u32;
-        let mut batch_handle: ffi::CUfileBatchHandle = std::ptr::null_mut();
-        // SAFETY: `batch_handle` is a stack local with exclusive mutable
-        // access; cuFile writes a fresh opaque pointer into it.
-        let err = unsafe { ffi::cuFileBatchIOSetUp(&raw mut batch_handle, num_entries) };
-        ensure!(
-            err.err == ffi::CU_FILE_SUCCESS,
-            "cuFileBatchIOSetUp failed: err={}, cu_err={}",
-            err.err,
-            err.cu_err,
-        );
-
-        // Build IO params array. Cookies carry the entry index so each
-        // completion event can be matched back to its read.
+        // Build the IO params array first (before setting up the batch handle,
+        // so an offset-overflow error can't leak the handle). Cookies carry the
+        // entry index so each completion event can be matched back to its read;
+        // the GetStatus loop below reads `event.cookie` to map a completion back
+        // to its entry.
         let mut io_params: Vec<ffi::CUfileIOParams> = sorted
             .iter()
             .enumerate()
             .map(|(entry_idx, &(node, orig_idx))| {
-                let file_offset =
-                    self.features_start_offset as i64 + (node as i64) * (feature_size as i64);
-                let dev_offset = (base_dev_offset + orig_idx * feature_size) as i64;
+                let file_offset = self.file_offset(node)?;
+                let dev_offset = orig_idx
+                    .checked_mul(feature_size)
+                    .and_then(|o| o.checked_add(base_dev_offset))
+                    .and_then(|o| i64::try_from(o).ok())
+                    .ok_or_else(|| anyhow::anyhow!("GPU buffer device offset overflow"))?;
 
-                ffi::CUfileIOParams {
+                Ok(ffi::CUfileIOParams {
                     mode: ffi::CUFILE_BATCH,
                     u: ffi::CUfileIOParamsUnion {
                         batch: ffi::CUfileBatchOp {
@@ -505,9 +513,22 @@ impl GdsFeatureStore {
                     fh: self.file_handle,
                     opcode: ffi::CUFILE_READ,
                     cookie: entry_idx as *mut c_void,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
+
+        // Set up batch handle.
+        let num_entries = sorted.len() as u32;
+        let mut batch_handle: ffi::CUfileBatchHandle = std::ptr::null_mut();
+        // SAFETY: `batch_handle` is a stack local with exclusive mutable
+        // access; cuFile writes a fresh opaque pointer into it.
+        let err = unsafe { ffi::cuFileBatchIOSetUp(&raw mut batch_handle, num_entries) };
+        ensure!(
+            err.err == ffi::CU_FILE_SUCCESS,
+            "cuFileBatchIOSetUp failed: err={}, cu_err={}",
+            err.err,
+            err.cu_err,
+        );
 
         // Tear down a batch whose operations may still be in flight:
         // cancel first so the driver quiesces DMA before the handle goes
@@ -581,6 +602,11 @@ impl GdsFeatureStore {
                 );
             }
 
+            // `nr` events landed this slice. Each event's cookie is the entry
+            // index we stamped at submit time, used here only for diagnostics;
+            // `completed` advances by `nr` and the loop ends once every entry
+            // has reported. total_bytes sums feature_size per event, bounded by
+            // num_entries * feature_size (which fits in usize given the buffer).
             for event in &events[..nr as usize] {
                 let entry_idx = event.cookie as usize;
                 if event.status != ffi::CUFILE_COMPLETE {
@@ -631,9 +657,12 @@ impl GdsFeatureStore {
         let mut total_bytes: usize = 0;
 
         for &(node, orig_idx) in sorted {
-            let file_offset =
-                self.features_start_offset as i64 + (node as i64) * (feature_size as i64);
-            let dev_offset = (base_dev_offset + orig_idx * feature_size) as i64;
+            let file_offset = self.file_offset(node)?;
+            let dev_offset = orig_idx
+                .checked_mul(feature_size)
+                .and_then(|o| o.checked_add(base_dev_offset))
+                .and_then(|o| i64::try_from(o).ok())
+                .ok_or_else(|| anyhow::anyhow!("GPU buffer device offset overflow"))?;
 
             // SAFETY: `self.file_handle` and `self.gpu_buffer` were
             // registered with cuFile in `open()` and remain valid for the

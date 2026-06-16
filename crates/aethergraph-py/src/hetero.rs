@@ -528,7 +528,7 @@ impl PyHeteroNeighborSampler {
 
     fn sample(
         &mut self,
-        _py: Python<'_>,
+        py: Python<'_>,
         seed_type: &str,
         seeds: &Bound<'_, PyAny>,
     ) -> PyResult<PyHeteroSampledSubgraph> {
@@ -538,10 +538,13 @@ impl PyHeteroNeighborSampler {
             .ok_or_else(|| sampling_error(format!("unknown seed type '{seed_type}'")))?;
 
         let seeds_vec: Vec<u32> = crate::error::extract_seeds(seeds)?;
-        let sub = self
-            .inner
-            .sampler_mut()
-            .sample_neighbors(seed_type_id, &seeds_vec);
+
+        // Run the core sampler with the GIL released. The closure touches no
+        // Python state — it walks the owned `HeteroGraph` (kept alive by the
+        // sampler's Arc) and the plain `seeds_vec`, returning an owned
+        // `HeteroSampledSubgraph`.
+        let sampler = self.inner.sampler_mut();
+        let sub = py.detach(move || sampler.sample_neighbors(seed_type_id, &seeds_vec));
 
         Ok(PyHeteroSampledSubgraph {
             inner: sub,

@@ -25,9 +25,12 @@ const FEATURE_OFFSET: usize = 8;
 /// [8+N+P..16+N+P] tail_version: AtomicU64       (P = padding to 8-byte align)
 /// ```
 ///
-/// Slot size = 16 + N + P, rounded up to page boundary by SharedMemoryRing.
-/// The 56-byte cache-line padding is removed — compactness is critical for
-/// RDMA bandwidth.
+/// Logical slot size = 16 + N + P. There is no inter-field cache-line padding:
+/// the head and tail counters sit directly around the feature payload so a
+/// single one-sided RDMA READ of the slot fetches both version stamps. Note the
+/// stored stride is NOT this compact size — `SharedMemoryRing` rounds each
+/// slot up to a page boundary, so the per-slot stride (`schema.slot_size`) is
+/// page-aligned and the gather reads one page-rounded slot per node.
 pub struct FeatureTable {
     ring: SharedMemoryRing,
     node_count: usize,
@@ -113,7 +116,7 @@ impl FeatureTable {
         let tail_offset = compute_tail_offset(feature_dim);
         let slot_size = compute_slot_size(feature_dim);
 
-        let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook)];
+        let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook::new())];
         hooks.extend(extra_hooks);
 
         let (ring, _hook_failures) = SharedMemoryRing::new(slot_count, slot_size, hooks).ok()?;
@@ -211,6 +214,19 @@ impl FeatureTable {
     /// We keep the `head == tail` check too — it's still required for the
     /// RDMA path (one-shot read of the entire slot, no second load possible)
     /// and provides a cheap early-out here.
+    ///
+    /// # RDMA reader invariant
+    /// A remote HCA reads the slot once and can only compare `head == tail`; it
+    /// cannot re-load head. Correctness rests on: the writer's first step
+    /// (`head → odd`) is a LOCK-prefixed read-modify-write (`fetch_add`), which
+    /// is atomic and globally ordered across the coherence fabric, and the HCA's
+    /// DMA reads participate in that same cache coherence. So the HCA can never
+    /// observe the pre-write even `head` together with a half-written payload:
+    /// once the writer is mid-write, head is odd to every coherent observer
+    /// (CPU or NIC), and a torn read shows up as `head != tail`. The payload and
+    /// tail stores between the odd and final-even head are ordinary `Release`
+    /// stores, so the matching even `head == tail` the reader requires is only
+    /// visible after the whole generation has landed.
     pub fn read_node(&self, node: usize, out: &mut [f32]) -> bool {
         debug_assert!(node < self.node_count);
         debug_assert!(out.len() >= self.feature_dim);

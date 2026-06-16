@@ -49,6 +49,10 @@ pub enum HeteroBuildError {
     TooManyNodeTypes(usize),
     TooManyEdgeTypes(usize),
     UnknownNodeType(String),
+    /// A node type name appeared more than once.
+    DuplicateNodeType(String),
+    /// An edge type (src, relation, dst) triple appeared more than once.
+    DuplicateEdgeType(String, String, String),
 }
 
 impl std::fmt::Display for HeteroBuildError {
@@ -57,6 +61,10 @@ impl std::fmt::Display for HeteroBuildError {
             Self::TooManyNodeTypes(n) => write!(f, "too many node types ({n}, max 255)"),
             Self::TooManyEdgeTypes(n) => write!(f, "too many edge types ({n}, max 255)"),
             Self::UnknownNodeType(name) => write!(f, "unknown node type: {name}"),
+            Self::DuplicateNodeType(name) => write!(f, "duplicate node type: {name}"),
+            Self::DuplicateEdgeType(src, rel, dst) => {
+                write!(f, "duplicate edge type: ({src}, {rel}, {dst})")
+            }
         }
     }
 }
@@ -87,7 +95,9 @@ impl HeteroGraph {
         let mut node_metas = Vec::with_capacity(node_types.len());
 
         for (i, (name, count)) in node_types.into_iter().enumerate() {
-            node_type_index.insert(name.clone(), i as NodeTypeId);
+            if node_type_index.insert(name.clone(), i as NodeTypeId).is_some() {
+                return Err(HeteroBuildError::DuplicateNodeType(name));
+            }
             node_metas.push(NodeTypeMeta { name, count });
         }
 
@@ -103,7 +113,12 @@ impl HeteroGraph {
                 .get(&dst)
                 .ok_or_else(|| HeteroBuildError::UnknownNodeType(dst.clone()))?;
 
-            edge_type_index.insert((src.clone(), rel.clone(), dst.clone()), i as EdgeTypeId);
+            if edge_type_index
+                .insert((src.clone(), rel.clone(), dst.clone()), i as EdgeTypeId)
+                .is_some()
+            {
+                return Err(HeteroBuildError::DuplicateEdgeType(src, rel, dst));
+            }
             edge_metas.push(EdgeTypeMeta {
                 src_type: src_id,
                 relation: rel,

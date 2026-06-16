@@ -19,17 +19,25 @@ struct DendrogramNode {
     right: u32,
 }
 
-/// Lock-free concurrent union-find with path splitting and union by rank.
+/// Lock-free concurrent union-find with path halving and union by id.
+///
+/// The link direction is chosen purely from the immutable node ids — the
+/// smaller id is always linked under the larger id. Because that choice is a
+/// pure function of the unordered pair `{ra, rb}`, two threads unioning the
+/// same two roots concurrently always pick the *same* direction, so they can
+/// never install opposite links. That makes the parent forest provably
+/// acyclic, which is what keeps `find`'s loop guaranteed to terminate.
+/// Union-by-rank cannot offer the same guarantee here without a lock: rank
+/// reads/increments are not atomic with the linking CAS, so concurrent unions
+/// can pick opposing directions and form a cycle.
 struct ConcurrentUnionFind {
     parent: Vec<AtomicU32>,
-    rank: Vec<AtomicU32>,
 }
 
 impl ConcurrentUnionFind {
     fn new(n: usize) -> Self {
         Self {
             parent: (0..n as u32).map(AtomicU32::new).collect(),
-            rank: (0..n).map(|_| AtomicU32::new(0)).collect(),
         }
     }
 
@@ -52,7 +60,8 @@ impl ConcurrentUnionFind {
     }
 
     /// Lock-free union. Returns `Some((winner, loser))` if a merge happened,
-    /// `None` if already in the same set.
+    /// `None` if already in the same set. `winner` is the surviving
+    /// representative (the larger root id); `loser` is linked under it.
     #[inline]
     fn union(&self, a: u32, b: u32) -> Option<(u32, u32)> {
         loop {
@@ -62,28 +71,18 @@ impl ConcurrentUnionFind {
                 return None;
             }
 
-            let rank_a = self.rank[ra as usize].load(Ordering::Relaxed);
-            let rank_b = self.rank[rb as usize].load(Ordering::Relaxed);
+            // Link smaller id under larger id. This direction is a pure
+            // function of the pair, so concurrent unions can never create a
+            // cycle (see the type-level comment).
+            let (winner, loser) = if ra < rb { (rb, ra) } else { (ra, rb) };
 
-            let (winner, loser) = if rank_a < rank_b { (rb, ra) } else { (ra, rb) };
-
-            match self.parent[loser as usize].compare_exchange_weak(
+            match self.parent[loser as usize].compare_exchange(
                 loser,
                 winner,
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => {
-                    if rank_a == rank_b {
-                        let _ = self.rank[winner as usize].compare_exchange_weak(
-                            rank_a,
-                            rank_a + 1,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
-                    }
-                    return Some((winner, loser));
-                }
+                Ok(_) => return Some((winner, loser)),
                 Err(_) => continue,
             }
         }
@@ -169,9 +168,9 @@ impl Graph {
                     if dv >= max_deg_v {
                         return None;
                     }
-                    if uf_ref.find(u) == uf_ref.find(v) {
-                        return None;
-                    }
+                    // `union` already returns `None` for the same-set case, so a
+                    // separate `find == find` pre-check would only add a
+                    // redundant traversal on this hot loop.
                     uf_ref.union(u, v)
                 })
             })
@@ -188,6 +187,10 @@ impl Graph {
     ///
     /// Parallel phases 1+2 (merge), sequential phase 3 (dendrogram traversal).
     /// Returns `perm` where `perm[new_id] = old_id`.
+    ///
+    /// Dendrogram indices (leaves `0..n`, internal nodes `n..n+merges`) are
+    /// `u32`, so reordering is bounded to roughly 2.1B nodes even though the
+    /// rest of the crate allows up to 4B (`NodeId` is `u32`).
     pub fn reorder_rabbit(&self) -> Vec<NodeId> {
         let n = self.num_nodes();
         let Some(merge_log) = self.rabbit_merge() else {
@@ -201,6 +204,14 @@ impl Graph {
         //
         // community_dendro[root] = current dendrogram index for that community.
         // Leaves: node i => index i. Internal: n + k.
+        //
+        // Internal-node indices are `n + k`; the largest is `n + merges - 1`,
+        // and a forest over `n` leaves has at most `n - 1` internal nodes, so
+        // the index space fits u32 whenever `n` does (up to ~2.1B leaves).
+        debug_assert!(
+            (n as u64 + merge_log.merges.len() as u64) <= u32::MAX as u64,
+            "dendrogram index space exceeds u32"
+        );
         let mut community_dendro: Vec<u32> = (0..n as u32).collect();
         let mut dendrogram: Vec<DendrogramNode> = Vec::with_capacity(merge_log.merges.len());
 
@@ -269,7 +280,11 @@ impl Graph {
             }
         }
 
+        // The traversal flips `visited[idx]` before pushing, and the tail pushes
+        // exactly the still-unvisited ids, so each id in `0..n` appears once.
+        // A length check is enough to confirm the bijection given that gating.
         debug_assert_eq!(perm.len(), n);
+        debug_assert!(perm.iter().all(|&id| (id as usize) < n));
         perm
     }
 
@@ -313,6 +328,9 @@ impl Graph {
     ///
     /// Avoids running the parallel merge phases twice when both the reordered
     /// graph and cluster-aligned batching are needed.
+    ///
+    /// Like [`Self::reorder_rabbit`], the `u32` dendrogram index space bounds
+    /// reordering to roughly 2.1B nodes.
     pub fn reorder_rabbit_with_partitions(&self) -> (Vec<NodeId>, Vec<u32>) {
         let n = self.num_nodes();
         let Some(merge_log) = self.rabbit_merge() else {
@@ -338,6 +356,10 @@ impl Graph {
         }
 
         // Build the dendrogram permutation (same as reorder_rabbit).
+        debug_assert!(
+            (n as u64 + merge_log.merges.len() as u64) <= u32::MAX as u64,
+            "dendrogram index space exceeds u32"
+        );
         let mut community_dendro: Vec<u32> = (0..n as u32).collect();
         let mut dendrogram: Vec<DendrogramNode> = Vec::with_capacity(merge_log.merges.len());
         let mut seq_uf = SequentialUnionFind::new(n);
@@ -393,6 +415,7 @@ impl Graph {
             }
         }
         debug_assert_eq!(perm.len(), n);
+        debug_assert!(perm.iter().all(|&id| (id as usize) < n));
 
         (perm, partitions)
     }
@@ -570,9 +593,16 @@ pub fn partition_aligned_batches(
 ) -> Vec<Vec<NodeId>> {
     assert!(batch_size > 0, "batch_size must be >= 1");
 
-    // Group seeds by partition.
+    // Group seeds by partition. A seed id must index into `partitions`
+    // (length == num_nodes); otherwise it would silently fall into
+    // partition 0 and be mis-grouped.
     let mut by_partition: FxHashMap<u32, Vec<NodeId>> = FxHashMap::default();
     for &s in seeds {
+        debug_assert!(
+            (s as usize) < partitions.len(),
+            "seed {s} is out of range for partitions of length {}",
+            partitions.len()
+        );
         let p = partitions.get(s as usize).copied().unwrap_or(0);
         by_partition.entry(p).or_default().push(s);
     }

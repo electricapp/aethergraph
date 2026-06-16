@@ -168,10 +168,34 @@ impl CTree {
     /// [`InsertResult::ArenaFull`] if a fresh node could not be allocated.
     /// All new nodes are allocated from `arena`. The old tree is untouched.
     ///
+    /// Allocates a fresh scratch buffer per call for any rebalance.
+    /// Callers on a hot insert path should use
+    /// [`insert_with_scratch`](Self::insert_with_scratch) with a reused
+    /// buffer instead.
+    ///
     /// # Safety
     /// Single-writer invariant on the arena: only one thread may call `insert`
     /// concurrently for a given arena. See [`Arena::alloc`].
     pub unsafe fn insert(&self, arena: &Arena, val: u32) -> InsertResult {
+        let mut scratch = Vec::new();
+        // SAFETY: caller upholds the single-writer invariant.
+        unsafe { self.insert_with_scratch(arena, val, &mut scratch) }
+    }
+
+    /// Insert `val`, reusing `scratch` for any scapegoat rebalance instead
+    /// of allocating one. `scratch` is cleared on entry to a rebuild; its
+    /// contents on return are unspecified. Semantics otherwise match
+    /// [`insert`](Self::insert).
+    ///
+    /// # Safety
+    /// Single-writer invariant on the arena: only one thread may insert
+    /// concurrently for a given arena. See [`Arena::alloc`].
+    pub(crate) unsafe fn insert_with_scratch(
+        &self,
+        arena: &Arena,
+        val: u32,
+        scratch: &mut Vec<u32>,
+    ) -> InsertResult {
         if self.root == NULL {
             let chunk = Chunk::from_sorted(&[val]);
             // SAFETY: caller upholds single-writer invariant.
@@ -268,7 +292,15 @@ impl CTree {
         let total = subtree_size(new_root, arena);
         if depth + split_levels > depth_limit(total) {
             // SAFETY: caller upholds single-writer invariant.
-            match unsafe { rebalance(arena, new_root, &new_path[..depth], &went_left[..depth]) } {
+            match unsafe {
+                rebalance(
+                    arena,
+                    new_root,
+                    &new_path[..depth],
+                    &went_left[..depth],
+                    scratch,
+                )
+            } {
                 Some(balanced_root) => {
                     return InsertResult::Inserted(CTree {
                         root: balanced_root,
@@ -324,7 +356,11 @@ fn subtree_size(offset: u32, arena: &Arena) -> usize {
 /// (α = 2/3), i.e. a scapegoat exists.
 #[inline]
 fn depth_limit(n: usize) -> usize {
-    ((n.max(2) as f64).log2() / 1.5f64.log2()) as usize
+    // log_{3/2}(n) = log2(n) / log2(1.5) = log2(n) * (1 / log2(1.5)).
+    // Multiplying by the precomputed reciprocal keeps this off the
+    // floating-point divide on every insert's write path.
+    const INV_LOG2_1_5: f64 = 1.709511291351454;
+    ((n.max(2) as f64).log2() * INV_LOG2_1_5) as usize
 }
 
 /// Is `3 * child > 2 * parent` for either child — the α = 2/3 weight check.
@@ -341,6 +377,9 @@ fn alpha_unbalanced(node: &Interior, arena: &Arena) -> bool {
 /// path node trips the weight check. Returns the new root, or `None` if
 /// the arena filled up mid-rebuild.
 ///
+/// `scratch` is reused to gather the scapegoat subtree's elements; it is
+/// cleared before use, so any prior contents are discarded.
+///
 /// # Safety
 /// Single-writer invariant on the arena. See [`Arena::alloc`].
 unsafe fn rebalance(
@@ -348,6 +387,7 @@ unsafe fn rebalance(
     new_root: u32,
     new_path: &[u32],
     went_left: &[bool],
+    scratch: &mut Vec<u32>,
 ) -> Option<u32> {
     let mut scapegoat = 0usize; // rebuild the root unless a deeper node is unbalanced
     for (i, &off) in new_path.iter().enumerate() {
@@ -366,13 +406,15 @@ unsafe fn rebalance(
     };
 
     // Collect the scapegoat subtree's elements (sorted by construction)
-    // and rebuild it perfectly weight-balanced.
-    let mut vals = Vec::with_capacity(subtree_size(target, arena));
+    // and rebuild it perfectly weight-balanced. The scratch buffer is
+    // reused across inserts to keep the write path allocation-free.
+    scratch.clear();
+    scratch.reserve(subtree_size(target, arena));
     visit_chunks(target, arena, &mut |chunk: &Chunk| {
-        vals.extend_from_slice(chunk.as_slice());
+        scratch.extend_from_slice(chunk.as_slice());
     });
     // SAFETY: caller upholds single-writer invariant.
-    let mut child = unsafe { build_balanced(arena, &vals)? };
+    let mut child = unsafe { build_balanced(arena, &scratch[..])? };
 
     // Re-copy the ancestors above the scapegoat (counts and split keys
     // are unchanged — only the child pointer moved).

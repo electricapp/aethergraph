@@ -36,6 +36,12 @@ def collate_to_pyg(batch: dict[str, Any]) -> Data:
     pass. It reconstructs the PyG Data object from the batch format returned
     by Ray's iter_batches().
 
+    Contract: the datasource emits one PyG batch per Ray row (each row's
+    variable-length arrays live in single list cells). This collate therefore
+    expects exactly one row and must be driven with
+    ``dataset.iter_batches(batch_size=1)``; passing more than one row stacks
+    unrelated subgraphs and is rejected.
+
     Arrays are copied during conversion because Ray iter_batches may return
     non-writable numpy arrays, and PyTorch requires writable backing arrays
     for tensor creation.
@@ -66,8 +72,9 @@ def collate_to_pyg(batch: dict[str, Any]) -> Data:
     num_rows = len(batch["batch_size"])
     if num_rows != 1:
         raise ValueError(
-            "collate_to_pyg expects exactly one row. "
-            f"Got {num_rows}; iterate with dataset.iter_batches(batch_size=1)."
+            "collate_to_pyg expects exactly one row: the datasource packs one "
+            f"PyG batch per Ray row, so rows cannot be stacked. Got {num_rows} "
+            "rows; iterate with dataset.iter_batches(batch_size=1)."
         )
 
     edge_src = np.array(batch["edge_index_0"][0], dtype=np.int64, copy=True)

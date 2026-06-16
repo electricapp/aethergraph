@@ -601,6 +601,16 @@ pub fn batch_read(
         return Ok(());
     }
 
+    // A negative fd would be handed straight to the kernel as a read target;
+    // failures then surface only as CQE errors, and a persistently failing
+    // wait can drive the drain loop to `process::abort()`. Reject it up front.
+    // (When a registered fd is in use the raw `fd` is ignored — see below — so
+    // this only matters for the non-registered path, but checking always is
+    // cheap and keeps the contract simple.)
+    if handle.registered_fd_index().is_none() {
+        anyhow::ensure!(fd >= 0, "batch_read called with invalid fd {fd}");
+    }
+
     // Validate read lengths don't exceed u32::MAX (io_uring limit)
     for &(_, _, len) in reads {
         anyhow::ensure!(
@@ -625,6 +635,11 @@ pub fn batch_read(
 
     // io-uring 0.7 removed types::Target; Fd and Fixed are distinct types, so the
     // choice has to be inlined at the opcode call site.
+    //
+    // When a registered fd is present every SQE targets that registered index
+    // (`types::Fixed`); the raw `fd` argument is deliberately not used in that
+    // mode. Callers must pass the same file they registered — there is no
+    // per-call fd override once a fd is registered on the handle.
     let registered_idx = handle.registered_fd_index();
     let is_sqpoll = handle.is_sqpoll();
 

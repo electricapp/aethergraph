@@ -117,11 +117,16 @@ impl Graph {
     /// * `weights` - Optional edge weights
     ///
     /// # Safety
-    /// Caller must ensure arrays are valid CSR format:
+    /// Caller must ensure arrays are valid CSR format. These invariants are
+    /// checked with `debug_assert!` (active in debug builds, compiled out in
+    /// release):
+    /// - offsets.len() == num_nodes + 1
     /// - offsets[0] == 0
     /// - offsets is monotonically increasing
     /// - offsets[num_nodes] == edges.len()
-    /// - All edge destinations < num_nodes
+    ///
+    /// Edge-destination range (all destinations < num_nodes) is not asserted
+    /// here; use [`Graph::validate`] for that.
     pub fn from_csr_arrays(
         num_nodes: usize,
         offsets: Vec<EdgeOffset>,
@@ -129,6 +134,23 @@ impl Graph {
         weights: Option<Vec<f32>>,
     ) -> Self {
         let num_edges = edges.len();
+        debug_assert_eq!(
+            offsets.len(),
+            num_nodes + 1,
+            "offsets length must be num_nodes + 1"
+        );
+        debug_assert!(
+            offsets.first().is_none_or(|&first| first == 0),
+            "offsets[0] must be 0"
+        );
+        debug_assert!(
+            offsets.windows(2).all(|w| w[0] <= w[1]),
+            "offsets must be monotonically increasing"
+        );
+        debug_assert!(
+            offsets.last().is_none_or(|&last| last == num_edges as EdgeOffset),
+            "offsets[num_nodes] must equal edges.len()"
+        );
         Self {
             num_nodes,
             num_edges,

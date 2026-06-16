@@ -139,6 +139,9 @@ def convert(
         None, "--delimiter", "-d", help="Delimiter (auto-detect if not set)"
     ),
     skip_lines: int = typer.Option(0, "--skip-lines", help="Skip first N lines (for headers)"),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Overwrite the output file if it already exists"
+    ),
 ) -> None:
     """Convert an edge list file to AetherGraph binary format.
 
@@ -156,6 +159,10 @@ def convert(
         _print_error(f"File not found: {resolved_input}")
         raise typer.Exit(1)
 
+    if resolved_output.exists() and not force:
+        _print_error(f"Output file already exists: {resolved_output} (use --force to overwrite)")
+        raise typer.Exit(1)
+
     log.info("Converting edge list to AetherGraph format")
     log.debug(f"Input: {resolved_input}")
     log.debug(f"Output: {resolved_output}")
@@ -164,6 +171,11 @@ def convert(
     edges: list[tuple[int, int]] = []
     errors: list[str] = []
     max_errors = 10  # Collect up to this many errors before stopping
+
+    # Delimiter is detected once from the first data line and reused for the
+    # whole file, so a stray tab/comma in one row can't switch the parser
+    # mid-stream.
+    delim: str | None = delimiter
 
     with Progress(
         SpinnerColumn(),
@@ -181,11 +193,22 @@ def convert(
                 if not line or line.startswith("#"):
                     continue
 
-                delim = _detect_delimiter(line, delimiter)
+                if delim is None:
+                    delim = _detect_delimiter(line, delimiter)
 
                 parts = line.split(delim)
                 if len(parts) >= 2:
-                    src, dst = int(parts[0]), int(parts[1])
+                    try:
+                        src, dst = int(parts[0]), int(parts[1])
+                    except ValueError:
+                        errors.append(
+                            f"bad token at line {i + 1}: could not parse "
+                            f"'{parts[0]}' / '{parts[1]}' as integers"
+                        )
+                        if len(errors) >= max_errors:
+                            break
+                        continue
+
                     error = _validate_edge(src, dst, num_nodes, i + 1)
                     if error:
                         errors.append(error)
@@ -323,14 +346,30 @@ def stats(
     log.debug(f"Loading graph from {resolved_path}")
     graph = Graph.load(str(resolved_path))
 
-    log.info("Graph Statistics:")
-    log.info(f"  Nodes: {graph.num_nodes:,}")
-    log.info(f"  Edges: {graph.num_edges:,}")
+    # Headline aggregates come from the Rust `stats()` call, which computes
+    # max/avg degree in parallel over the CSR offsets without crossing the
+    # FFI boundary per node.
+    summary = graph.stats()
+    num_nodes = int(summary["num_nodes"])
+    num_edges = int(summary["num_edges"])
+    max_degree = int(summary["max_degree"])
+    avg_degree = float(summary["avg_degree"])
 
+    log.info("Graph Statistics:")
+    log.info(f"  Nodes: {num_nodes:,}")
+    log.info(f"  Edges: {num_edges:,}")
+
+    log.info(f"  Max degree: {max_degree:,}")
+    log.info(f"  Avg degree: {avg_degree:.2f}")
+    log.info(f"  Has weights: {bool(summary['has_weights'])}")
+
+    # Percentiles and the isolated-node count need the full per-node degree
+    # distribution, which `_core` does not expose as a bulk offsets/degrees
+    # array. Build it with a per-node loop; for very large graphs this is the
+    # slow part and would benefit from a degrees accessor on CsrGraph.
     log.debug("Analyzing degree distribution")
 
     degrees: list[int] = []
-    max_degree = 0
 
     with Progress(
         BarColumn(),
@@ -339,32 +378,24 @@ def stats(
         transient=True,
         disable=quiet,
     ) as progress:
-        task = progress.add_task("Analyzing", total=graph.num_nodes)
+        task = progress.add_task("Analyzing", total=num_nodes)
 
-        for node in range(graph.num_nodes):
-            deg = graph.degree(node)
-            degrees.append(deg)
-            if deg > max_degree:
-                max_degree = deg
+        for node in range(num_nodes):
+            degrees.append(graph.degree(node))
             if node % 10000 == 0:
                 progress.update(task, completed=node)
-        progress.update(task, completed=graph.num_nodes)
+        progress.update(task, completed=num_nodes)
 
     degrees_arr: npt.NDArray[np.int64] = np.array(degrees, dtype=np.int64)
-    avg_degree = float(degrees_arr.mean())
-
-    log.info(f"  Max degree: {max_degree:,}")
-    log.info(f"  Avg degree: {avg_degree:.2f}")
-    log.info(f"  Has weights: {graph.has_weights}")
 
     file_size = resolved_path.stat().st_size
     log.info("")
     log.info("File Information:")
     log.info(f"  Size: {file_size / 1_000_000:.2f} MB")
-    if graph.num_nodes > 0:
-        log.info(f"  Bytes per node: {file_size / graph.num_nodes:.2f}")
-    if graph.num_edges > 0:
-        log.info(f"  Bytes per edge: {file_size / graph.num_edges:.2f}")
+    if num_nodes > 0:
+        log.info(f"  Bytes per node: {file_size / num_nodes:.2f}")
+    if num_edges > 0:
+        log.info(f"  Bytes per edge: {file_size / num_edges:.2f}")
 
     log.info("")
     log.info("Degree Distribution:")
@@ -376,8 +407,8 @@ def stats(
     log.info(f"  99th percentile: {p99}")
 
     isolated = int(np.sum(degrees_arr == 0))
-    if isolated > 0 and graph.num_nodes > 0:
-        pct = 100.0 * isolated / graph.num_nodes
+    if isolated > 0 and num_nodes > 0:
+        pct = 100.0 * isolated / num_nodes
         log.warn(f"Isolated nodes (degree 0): {isolated:,} ({pct:.2f}%)")
 
 

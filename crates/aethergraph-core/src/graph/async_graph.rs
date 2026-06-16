@@ -19,6 +19,7 @@
 
 use super::csr::{EdgeOffset, NodeId};
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -205,23 +206,11 @@ impl AsyncCsrGraph {
             offsets.len()
         );
         anyhow::ensure!(offsets[0] == 0, "invalid offsets: offsets[0] must be 0");
-        for (i, window) in offsets.windows(2).enumerate() {
-            anyhow::ensure!(
-                window[0] <= window[1],
-                "invalid offsets: offsets[{}]={} > offsets[{}]={}",
-                i,
-                window[0],
-                i + 1,
-                window[1]
-            );
-            anyhow::ensure!(
-                window[1] <= num_edges as u64,
-                "invalid offsets: offsets[{}]={} exceeds num_edges {}",
-                i + 1,
-                window[1],
-                num_edges
-            );
-        }
+        // Parallel monotonic scan for billion-node loads (matches csr.rs).
+        let is_monotonic = offsets.par_windows(2).all(|w| w[0] <= w[1]);
+        anyhow::ensure!(is_monotonic, "invalid offsets: not monotonically increasing");
+        // With monotonic offsets and the tail equal to num_edges, every
+        // entry is <= num_edges, so no per-window upper-bound check is needed.
         anyhow::ensure!(
             offsets[num_nodes] == num_edges as u64,
             "invalid offsets tail: offsets[last]={} != num_edges {}",
@@ -341,7 +330,9 @@ impl AsyncCsrGraph {
         if idx >= self.num_nodes {
             return 0;
         }
-        (self.offsets[idx + 1] - self.offsets[idx]) as usize
+        // saturating_sub mirrors the sync `Graph::degree`: it keeps a
+        // non-monotonic offsets pair from underflowing into a huge degree.
+        self.offsets[idx + 1].saturating_sub(self.offsets[idx]) as usize
     }
 
     /// Async read neighbors for a single node from NVMe.
@@ -356,7 +347,7 @@ impl AsyncCsrGraph {
 
         let start_edge = self.offsets[idx] as usize;
         let end_edge = self.offsets[idx + 1] as usize;
-        let num_neighbors = end_edge - start_edge;
+        let num_neighbors = end_edge.saturating_sub(start_edge);
 
         if num_neighbors == 0 {
             return Ok(Vec::new());
@@ -443,7 +434,7 @@ impl AsyncCsrGraph {
 
                 let start_edge = offsets[idx] as usize;
                 let end_edge = offsets[idx + 1] as usize;
-                let num_neighbors = end_edge - start_edge;
+                let num_neighbors = end_edge.saturating_sub(start_edge);
 
                 if num_neighbors == 0 {
                     buffers.push(Vec::new());
@@ -521,7 +512,7 @@ impl AsyncCsrGraph {
 
                     let start_edge = offsets[idx] as usize;
                     let end_edge = offsets[idx + 1] as usize;
-                    let num_neighbors = end_edge - start_edge;
+                    let num_neighbors = end_edge.saturating_sub(start_edge);
 
                     if num_neighbors == 0 {
                         return Ok(Vec::new());

@@ -54,6 +54,16 @@ pub struct IbvQp {
     _opaque: [u8; 0],
 }
 
+// ABI drift guard: `qp_num` is read by offset from the pointer `ibv_create_qp`
+// returns. Six 8-byte pointers + `handle` (u32) place it at byte 52.
+const _: () = assert!(core::mem::offset_of!(IbvQp, qp_num) == 52);
+
+// ABI drift guards for the re-exported `IbvMr` — `lkey()`/`rkey()` read these
+// by offset from the `ibv_reg_mr` pointer. `context`+`pd`+`addr`+`length`
+// (4×8) then `handle` (u32) place `lkey` at 36 and `rkey` at 40.
+const _: () = assert!(core::mem::offset_of!(IbvMr, lkey) == 36);
+const _: () = assert!(core::mem::offset_of!(IbvMr, rkey) == 40);
+
 // ---------------------------------------------------------------------------
 // QP init attributes
 // ---------------------------------------------------------------------------
@@ -210,6 +220,14 @@ pub union IbvSendWrUnion {
     _atomic_pad: [u8; 32],
 }
 
+// ABI drift guard: `struct ibv_send_wr` is 128 bytes on rdma-core (LP64). A
+// short Rust mirror makes `ibv_post_send` read past our allocation for opcodes
+// that touch the trailing unions. Pin the size so any layout change is a build
+// error, not silent memory corruption.
+const _: () = assert!(core::mem::size_of::<IbvSendWr>() == 128);
+// The wr union must cover the largest variant (atomic = 28 bytes, padded to 32).
+const _: () = assert!(core::mem::size_of::<IbvSendWrUnion>() == 32);
+
 // ---------------------------------------------------------------------------
 // Work completion
 // ---------------------------------------------------------------------------
@@ -232,6 +250,12 @@ pub struct IbvWc {
     pub sl: u8,
     pub dlid_path_bits: u8,
 }
+
+// ABI drift guard: `struct ibv_wc` is u64 + 8×u32 + 2×u16 + 2×u8 = 46 bytes,
+// rounded to 48 by the u64's 8-byte alignment. `ibv_poll_cq` writes one full
+// `ibv_wc` per completion into our array, so an undersized mirror = the kernel
+// writing past our buffer.
+const _: () = assert!(core::mem::size_of::<IbvWc>() == 48);
 
 // ---------------------------------------------------------------------------
 // Port attributes (partial — only fields we need)
@@ -268,6 +292,12 @@ pub struct IbvPortAttr {
     pub port_cap_flags2: u16,
     pub active_speed_ex: u32,
 }
+
+// ABI drift guard: `struct ibv_port_attr` is 56 bytes on current rdma-core
+// (the trailing `active_speed_ex` sits at offset 52 after 2 bytes of padding
+// behind `port_cap_flags2`). `ibv_query_port` writes the full struct, so a
+// short mirror = a stack overrun on every query.
+const _: () = assert!(core::mem::size_of::<IbvPortAttr>() == 56);
 
 // ---------------------------------------------------------------------------
 // GID

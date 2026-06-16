@@ -88,9 +88,6 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         feature_dim_u64,
         MAX_FEATURE_DIM
     );
-    let num_nodes = usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;
-    let feature_dim =
-        usize::try_from(feature_dim_u64).context("feature_dim does not fit in usize")?;
 
     let stored_offset = u64::from_le_bytes(header[24..32].try_into()?);
     let features_start_offset = if stored_offset == 0 {
@@ -102,6 +99,16 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         features_start_offset >= HEADER_SIZE,
         "invalid feature payload offset {}",
         features_start_offset
+    );
+    // Mirror FeatureStore::load: the f32 fast path casts the payload to
+    // &[f32], which requires a 4-byte-aligned start. Legitimate files (legacy
+    // offset 32, new offset 512) are always aligned; reject anything else here
+    // so every reader validates it consistently.
+    anyhow::ensure!(
+        features_start_offset % std::mem::align_of::<f32>() as u64 == 0,
+        "invalid feature payload offset {} (must be {}-byte aligned)",
+        features_start_offset,
+        std::mem::align_of::<f32>()
     );
 
     // Read dtype tag from byte 32 (first byte of padding region).
@@ -116,14 +123,17 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         FeatureDtype::F32
     };
 
-    let feature_size = feature_dim
-        .checked_mul(dtype.element_size())
+    // Do the byte-size and file-size validation entirely in u64 first, so a
+    // 32-bit usize can't truncate the intermediate products before they're
+    // checked. Cast to usize only after the file is known large enough.
+    let feature_size_u64 = feature_dim_u64
+        .checked_mul(dtype.element_size() as u64)
         .ok_or_else(|| anyhow::anyhow!("feature_size overflow"))?;
-    let total_bytes = num_nodes
-        .checked_mul(feature_size)
+    let total_bytes_u64 = num_nodes_u64
+        .checked_mul(feature_size_u64)
         .ok_or_else(|| anyhow::anyhow!("feature data size overflow"))?;
     let min_file_size = features_start_offset
-        .checked_add(total_bytes as u64)
+        .checked_add(total_bytes_u64)
         .ok_or_else(|| anyhow::anyhow!("minimum feature file size overflow"))?;
     let file_size = file
         .metadata()
@@ -135,6 +145,12 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         min_file_size,
         file_size
     );
+
+    let num_nodes = usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;
+    let feature_dim =
+        usize::try_from(feature_dim_u64).context("feature_dim does not fit in usize")?;
+    let feature_size =
+        usize::try_from(feature_size_u64).context("feature_size does not fit in usize")?;
 
     Ok(FeatureHeader {
         num_nodes,

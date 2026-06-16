@@ -343,6 +343,7 @@ impl DynamicGraph {
         }
         Ok(Writer {
             graph: self,
+            rebalance_scratch: Vec::new(),
             #[cfg(feature = "wal")]
             wal_failed: false,
         })
@@ -498,13 +499,13 @@ impl DynamicGraph {
     pub fn snapshot_csr(&self) -> (Vec<u64>, Vec<u32>) {
         let mut offsets = Vec::with_capacity(self.num_vertices + 1);
         let mut edges = Vec::new();
-        let mut buf = Vec::new();
 
         offsets.push(0);
         // Iterate via usize to avoid u32 truncation when num_vertices is large.
+        // Each vertex's neighbors are appended straight onto `edges`; the
+        // running length after each append is the next CSR offset.
         for v in 0..self.num_vertices {
-            self.neighbors_into(v as u32, &mut buf);
-            edges.extend_from_slice(&buf);
+            self.tree_for(v as u32).collect_into(&self.arena, &mut edges);
             offsets.push(edges.len() as u64);
         }
 
@@ -566,6 +567,10 @@ impl DynamicGraph {
 /// a CAS-based flag and is the primary safety invariant of the crate.
 pub struct Writer<'a> {
     graph: &'a DynamicGraph,
+    /// Scratch buffer reused across inserts to hold a scapegoat subtree's
+    /// elements during a rebalance. Owned by the guard so the write path
+    /// allocates at most once per writer instead of once per rebalance.
+    rebalance_scratch: Vec<u32>,
     /// True if any WAL append failed during this writer's lifetime. The
     /// drop path consults this to poison the graph rather than advance the
     /// epoch on data that isn't durable.
@@ -589,16 +594,17 @@ impl<'a> Writer<'a> {
         let tree = CTree { root: current_root };
 
         // SAFETY: Writer existence guarantees single-writer access to the arena.
-        match unsafe { tree.insert(&self.graph.arena, dst) } {
+        match unsafe {
+            tree.insert_with_scratch(&self.graph.arena, dst, &mut self.rebalance_scratch)
+        } {
             InsertResult::Inserted(new_tree) => {
                 // Release ordering ensures all arena writes (new nodes) are
                 // visible before the root pointer becomes visible to readers.
+                // The edge is observable to readers from here on; the
+                // counter and dirty bits are published only after the WAL
+                // append below succeeds so they never count an insert that
+                // recovery will discard.
                 self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
-                self.graph.num_edges.fetch_add(1, Ordering::Relaxed);
-                // Out-of-range src/dst are already rejected by the bounds
-                // check at the top of `insert_edge`, so both marks succeed.
-                let _ = self.graph.dirty.mark(src);
-                let _ = self.graph.dirty.mark(dst);
 
                 // WAL append (buffered; fsync happens in `Writer::drop`).
                 // Errors here mean the in-memory state is ahead of the log
@@ -612,13 +618,34 @@ impl<'a> Writer<'a> {
                         src,
                         dst,
                     };
-                    // Mutex is uncontended (we hold the only Writer).
-                    let mut w = wal_mu.lock().expect("WAL mutex poisoned");
+                    // The Writer guard already enforces single-writer, so
+                    // the mutex is uncontended. Take the guard even if a
+                    // prior holder poisoned it — the buffered writer behind
+                    // the lock is still usable, and panicking here (in a
+                    // path that may run during unwinding) would abort.
+                    let mut w = wal_mu.lock().unwrap_or_else(|e| e.into_inner());
                     if let Err(e) = w.append_edge(rec) {
                         // Record the failure so `Writer::drop` can poison.
                         self.wal_failed = true;
                         tracing::error!(error = %e, "WAL append failed");
                     }
+                }
+
+                // Bookkeeping runs only when the edge is durable-pending:
+                // no WAL attached, or the append above (and every earlier
+                // append in this guard) succeeded. A failed append leaves
+                // the log torn, so the guard's edges are dropped on
+                // recovery — counting them here would over-report.
+                #[cfg(feature = "wal")]
+                let durable = !self.wal_failed;
+                #[cfg(not(feature = "wal"))]
+                let durable = true;
+                if durable {
+                    self.graph.num_edges.fetch_add(1, Ordering::Relaxed);
+                    // Out-of-range src/dst are already rejected by the bounds
+                    // check at the top of `insert_edge`, so both marks succeed.
+                    let _ = self.graph.dirty.mark(src);
+                    let _ = self.graph.dirty.mark(dst);
                 }
 
                 Ok(true)
@@ -656,7 +683,10 @@ impl Drop for Writer<'_> {
 
         #[cfg(feature = "wal")]
         if let Some(wal_mu) = self.graph.wal.as_ref() {
-            let mut w = wal_mu.lock().expect("WAL mutex poisoned");
+            // Take the guard even if poisoned — the buffered writer behind
+            // it is still usable, and a panic in `Drop` during unwinding
+            // would abort the process.
+            let mut w = wal_mu.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = w.sync() {
                 tracing::error!(error = %e, "WAL fsync failed; poisoning graph");
                 durable_failure = true;

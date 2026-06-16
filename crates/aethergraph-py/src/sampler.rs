@@ -623,9 +623,11 @@ impl PySampledSubgraph {
 /// Convert a Rust Arrow `RecordBatch` into a `pyarrow.RecordBatch`.
 ///
 /// arrow-rs and pyarrow share a binary buffer layout but no stable PyO3
-/// bridge, so we round-trip column buffers through Python lists. Acceptable
-/// because Python-side Arrow consumers (Ray Data, etc.) are not on a tight
-/// per-batch hot path — this conversion runs once per epoch / batch boundary.
+/// bridge, so we round-trip column buffers through Python lists. This is a
+/// per-call O(n) conversion (one Python list element per value) and is meant
+/// for epoch / batch boundaries, not a per-batch hot path — Python-side Arrow
+/// consumers (Ray Data, etc.) consume these infrequently. A zero-copy Arrow C
+/// Data Interface path would remove the element-by-element conversion.
 fn build_py_record_batch(
     py: Python<'_>,
     pyarrow: &Bound<'_, pyo3::types::PyModule>,
@@ -702,24 +704,39 @@ impl PyNeighborSampler {
         seeds: &Bound<'_, PyAny>,
         input_times: Option<numpy::PyReadonlyArray1<f64>>,
     ) -> PyResult<PySampledSubgraph> {
-        let graph = self.graph.borrow(py);
-        let mut sampler = NeighborSampler::new(graph.inner(), self.config.inner.clone());
-
+        // Pull everything out of Python objects up front: the seeds, the owned
+        // graph handle, and the per-seed timestamps. Once these are plain Rust
+        // data we can run the sampler with the GIL released so background
+        // Python threads keep running.
         let seeds_vec: Vec<u32> = crate::error::extract_seeds(seeds)?;
+        let graph_arc = self.graph.borrow(py).inner_arc();
+        let times_vec: Option<Vec<f64>> = input_times
+            .as_ref()
+            .map(|t| t.as_slice().map(|s| s.to_vec()))
+            .transpose()?;
+        let config = self.config.inner.clone();
+        let disjoint = config.disjoint;
+        let temporal = config.temporal_strategy.is_some();
 
-        let subgraph = if self.config.inner.disjoint {
-            let times = input_times.as_ref().map(|t| t.as_slice()).transpose()?;
-            sampler.sample_neighbors_disjoint(&seeds_vec, times)
-        } else if self.config.inner.temporal_strategy.is_some() {
-            let times = input_times
-                .as_ref()
-                .ok_or_else(|| sampling_error("temporal_strategy requires input_times"))?;
-            sampler
-                .sample_neighbors_temporal(&seeds_vec, times.as_slice()?)
-                .map_err(|e| sampling_error(e.to_string()))?
-        } else {
-            sampler.sample_neighbors(&seeds_vec)
-        };
+        // Heavy sampling runs without the GIL. No Python object is touched
+        // inside this closure — it works purely on owned Rust data and returns
+        // a plain `SampledSubgraph`.
+        let subgraph = py.detach(move || -> PyResult<SampledSubgraph> {
+            let mut sampler = NeighborSampler::new(&graph_arc, config);
+            let subgraph = if disjoint {
+                sampler.sample_neighbors_disjoint(&seeds_vec, times_vec.as_deref())
+            } else if temporal {
+                let times = times_vec
+                    .as_deref()
+                    .ok_or_else(|| sampling_error("temporal_strategy requires input_times"))?;
+                sampler
+                    .sample_neighbors_temporal(&seeds_vec, times)
+                    .map_err(|e| sampling_error(e.to_string()))?
+            } else {
+                sampler.sample_neighbors(&seeds_vec)
+            };
+            Ok(subgraph)
+        })?;
 
         PySampledSubgraph::from_subgraph(py, subgraph)
     }
@@ -766,9 +783,17 @@ impl PyParallelBatchSampler {
         py: Python<'_>,
         batches: Vec<Vec<u32>>,
     ) -> PyResult<Vec<PySampledSubgraph>> {
-        let graph = self.graph.borrow(py);
-        let sampler = ParallelBatchSampler::new(graph.inner(), self.config.inner.clone());
-        let subgraphs = sampler.sample_batches(&batches);
+        // Capture an owned graph handle and config so the parallel sampling
+        // sweep can run with the GIL released.
+        let graph_arc = self.graph.borrow(py).inner_arc();
+        let config = self.config.inner.clone();
+
+        // The rayon-parallel batch sweep touches no Python state; run it
+        // detached and convert the plain `SampledSubgraph`s afterward.
+        let subgraphs = py.detach(move || {
+            let sampler = ParallelBatchSampler::new(&graph_arc, config);
+            sampler.sample_batches(&batches)
+        });
 
         subgraphs
             .into_iter()

@@ -63,7 +63,12 @@ impl Header {
 
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.magic == MAGIC, "invalid magic number");
-        anyhow::ensure!(self.version == VERSION, "unsupported version");
+        anyhow::ensure!(
+            self.version == VERSION,
+            "unsupported version: expected {}, got {}",
+            VERSION,
+            self.version
+        );
         Ok(())
     }
 
@@ -219,6 +224,13 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
     let mmap = Arc::new(mmap);
 
     let layout = parse_layout(&mmap)?;
+
+    // Tell the kernel we will read the offsets+edges body so it can fault
+    // those pages in ahead of the access pattern that follows — the Full
+    // validation checksum and structural checks both stream the whole body.
+    let body = &mmap[layout.offsets_range.start..layout.edges_range.end];
+    crate::internal::hint::prefetch_mmap_range(body.as_ptr(), body.len());
+
     validate_checksum_if_present(&mmap, &layout, validation)?;
 
     let graph = Graph::from_mapped_parts(
@@ -380,11 +392,39 @@ fn parse_layout(bytes: &[u8]) -> Result<GraphFileLayout> {
         bytes.len()
     );
 
+    // Each section length must be an exact multiple of its element size for the
+    // zero-copy `try_cast_slice` reads to succeed (the mmap base is page-aligned
+    // and Header::SIZE keeps the offsets start 8-byte aligned, so alignment
+    // already holds). Enforcing it here surfaces any future range-computation
+    // change as a load-time `Err` rather than a panic on first access.
+    let offsets_range = offsets_start..offsets_end;
+    let edges_range = edges_start..edges_end;
+    anyhow::ensure!(
+        offsets_range.len().is_multiple_of(std::mem::size_of::<EdgeOffset>()),
+        "offsets section length {} is not a multiple of {}",
+        offsets_range.len(),
+        std::mem::size_of::<EdgeOffset>()
+    );
+    anyhow::ensure!(
+        edges_range.len().is_multiple_of(std::mem::size_of::<NodeId>()),
+        "edges section length {} is not a multiple of {}",
+        edges_range.len(),
+        std::mem::size_of::<NodeId>()
+    );
+    if let Some(range) = &weights_range {
+        anyhow::ensure!(
+            range.len().is_multiple_of(std::mem::size_of::<f32>()),
+            "weights section length {} is not a multiple of {}",
+            range.len(),
+            std::mem::size_of::<f32>()
+        );
+    }
+
     Ok(GraphFileLayout {
         num_nodes,
         num_edges,
-        offsets_range: offsets_start..offsets_end,
-        edges_range: edges_start..edges_end,
+        offsets_range,
+        edges_range,
         weights_range,
         checksum32: header.checksum32(),
     })

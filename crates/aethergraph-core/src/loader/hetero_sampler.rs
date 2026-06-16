@@ -1,7 +1,9 @@
 //! Heterogeneous neighborhood sampling for multi-relational GNN training.
 //!
-//! Zero allocations in the hot path. All buffers are pre-allocated at
-//! sampler construction and reused across calls via `clear()`.
+//! Internal scratch (frontiers, dedup maps, sample buffers) is pre-allocated at
+//! sampler construction and reset across calls via `clear()`. The per-type node
+//! and edge buffers handed back in each `HeteroSampledSubgraph` are freshly
+//! allocated per call (swapped out of the sampler).
 //!
 //! Local node indices are assigned during sampling — no post-sort, no
 //! binary search. Edges are stored with local indices directly.
@@ -63,8 +65,9 @@ pub struct HeteroSampledSubgraph {
 
 /// Heterogeneous neighborhood sampler.
 ///
-/// All internal buffers are pre-allocated at construction and reused
-/// across `sample_neighbors` calls. Zero allocations in the hot path.
+/// Internal scratch buffers are pre-allocated at construction and reset across
+/// `sample_neighbors` calls; the per-call output buffers are freshly allocated
+/// and swapped out into the returned `HeteroSampledSubgraph`.
 pub struct HeteroNeighborSampler<'a> {
     graph: &'a HeteroGraph,
     config: HeteroSamplingConfig,
@@ -175,15 +178,27 @@ impl<'a> HeteroNeighborSampler<'a> {
             for fi in 0..frontier_len {
                 let (node_type, local_id) = self.frontier[fi];
 
-                // Stack-copy edge type IDs to avoid borrow conflict
-                let mut et_buf = [0u8; 32];
-                let et_count = self.src_edge_types[node_type as usize].len();
-                et_buf[..et_count].copy_from_slice(&self.src_edge_types[node_type as usize]);
+                // Copy the source node type's edge-type IDs out so the inner
+                // loop can call &mut self sampling methods without holding a
+                // borrow of self.src_edge_types. Common case (<= 32 types) uses
+                // a stack buffer; a node type with more types falls back to a
+                // heap Vec rather than overflowing the fixed array.
+                let src_ets = &self.src_edge_types[node_type as usize];
+                let et_count = src_ets.len();
+                let mut et_stack = [0u8; 32];
+                let mut et_heap: Vec<EdgeTypeId> = Vec::new();
+                let et_slice: &[EdgeTypeId] = if et_count <= et_stack.len() {
+                    et_stack[..et_count].copy_from_slice(src_ets);
+                    &et_stack[..et_count]
+                } else {
+                    et_heap.extend_from_slice(src_ets);
+                    &et_heap[..]
+                };
 
                 // Look up the local index of the source node
                 let src_local_idx = self.local_index[node_type as usize][&local_id];
 
-                for &et_id in &et_buf[..et_count] {
+                for &et_id in et_slice {
                     let fanout = self.config.fanout[et_id as usize][hop];
                     if fanout == 0 {
                         continue;
@@ -220,7 +235,9 @@ impl<'a> HeteroNeighborSampler<'a> {
             std::mem::swap(&mut self.frontier, &mut self.next_frontier);
         }
 
-        // Build output — move buffers out, replace with fresh capacity
+        // Build output: hand the filled per-type buffers to the caller and swap
+        // fresh ones back in. The returned buffers are therefore allocated per
+        // call; only the dedup maps and frontiers are reset and reused.
         let num_nt = self.node_vecs.len();
         let num_et = self.edge_src_buf.len();
 

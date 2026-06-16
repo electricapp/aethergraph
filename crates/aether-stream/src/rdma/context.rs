@@ -61,7 +61,14 @@ impl RdmaContext {
         let mut num_devices: i32 = 0;
         // SAFETY: ibverbs FFI; `num_devices` is a valid out-param.
         let device_list = unsafe { ibv_get_device_list(&mut num_devices) };
-        if device_list.is_null() || num_devices == 0 {
+        // `num_devices <= 0` covers both "no devices" and a defensively-handled
+        // negative count: casting a negative `i32` to `usize` below would
+        // produce a huge bound and let `device_index` pass the range check.
+        if device_list.is_null() || num_devices <= 0 {
+            if !device_list.is_null() {
+                // SAFETY: `device_list` is non-null here.
+                unsafe { ibv_free_device_list(device_list) };
+            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no RDMA devices found",

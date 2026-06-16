@@ -36,6 +36,7 @@ except ImportError as e:
 from aethergraph._core import HeteroNeighborSampler as RustHeteroSampler
 from aethergraph._core import HeteroSampledSubgraph as RustHeteroSubgraph
 from aethergraph._core import HeteroSamplingConfig as RustHeteroSamplingConfig
+from aethergraph.pytorch.loader import normalize_input_nodes
 from aethergraph.tracing import get_tracer
 
 if TYPE_CHECKING:
@@ -110,7 +111,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
     replace: bool
     pin_memory: bool
     transform: Callable[[HeteroData], HeteroData] | None
-    rng: np.random.Generator
+    _rng: np.random.Generator
     _metrics: HeteroLoaderMetrics
 
     def __init__(
@@ -136,8 +137,10 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                 neighbor counts. Example: {("user","votes","post"): [15, 10]}
             input_nodes: Tuple of (node_type, node_ids) specifying which nodes
                 to iterate over as seeds. If None, raises ValueError.
-                node_ids can be a Tensor, numpy array, or list. If node_ids
-                is None, all nodes of that type are used.
+                node_ids can be a Tensor, numpy array, or list; a boolean
+                tensor/array is treated as a PyG-style mask and converted to
+                the indices of its ``True`` entries. If node_ids is None, all
+                nodes of that type are used.
             batch_size: Number of seed nodes per batch.
             shuffle: Whether to shuffle seed nodes between epochs.
             replace: Whether to sample neighbors with replacement.
@@ -190,11 +193,8 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         if node_ids is None:
             self._input_nodes = None
             self._num_input_nodes = data.num_nodes(seed_type)
-        elif isinstance(node_ids, torch.Tensor):
-            self._input_nodes = node_ids.cpu().numpy().astype(np.int64)
-            self._num_input_nodes = len(self._input_nodes)
         else:
-            self._input_nodes = np.asarray(node_ids, dtype=np.int64)
+            self._input_nodes = normalize_input_nodes(node_ids)
             self._num_input_nodes = len(self._input_nodes)
 
         if self._input_nodes is not None:
@@ -211,7 +211,10 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                     f"'{seed_type}' with num_nodes={max_node}"
                 )
 
-        self.rng = np.random.default_rng()
+        # Seed the shuffle generator from `seed` so epochs are reproducible;
+        # `__iter__` spawns a fresh child per epoch so concurrent iterators
+        # don't share mutable RNG state.
+        self._rng = np.random.default_rng(seed)
         self._metrics = HeteroLoaderMetrics()
 
     @property
@@ -239,11 +242,15 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         num_batches = len(self)
         num_nodes = self._num_input_nodes
 
+        # Fresh child generator per epoch: concurrent iterators don't share
+        # mutable RNG state, and the sequence is reproducible when seeded.
+        rng = self._rng.spawn(1)[0]
+
         # Build batch getter (same lazy/shuffle pattern as NeighborLoader)
         if self._input_nodes is not None:
             epoch_nodes = self._input_nodes.copy()
             if self.shuffle:
-                self.rng.shuffle(epoch_nodes)
+                rng.shuffle(epoch_nodes)
 
             def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
                 start = batch_idx * batch_size
@@ -251,18 +258,14 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                 return epoch_nodes[start:end]
 
         elif self.shuffle and num_nodes > 0:
-            offset = int(self.rng.integers(0, num_nodes))
-            stride = self._random_coprime_stride(num_nodes)
+            offset = int(rng.integers(0, num_nodes))
+            stride = self._random_coprime_stride(num_nodes, rng)
 
             def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
                 start = batch_idx * batch_size
                 end = min(start + batch_size, num_nodes)
-                count = end - start
-                return np.fromiter(
-                    ((offset + (start + i) * stride) % num_nodes for i in range(count)),
-                    dtype=np.int64,
-                    count=count,
-                )
+                idx = np.arange(start, end, dtype=np.int64)
+                return (offset + idx * stride) % num_nodes
 
         else:
 
@@ -295,10 +298,10 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
             for batch_idx in range(num_batches):
                 seeds = get_batch(batch_idx)
 
-                # Convert seeds to uint32 for Rust
-                seeds_u32 = seeds.astype(np.uint32)
-
-                subgraph = sampler.sample(self._seed_type, seeds_u32)
+                # Pass int64 seeds straight through: the Rust sampler accepts
+                # int64 (range-checked at the FFI boundary). Narrowing to
+                # uint32 here would wrap node IDs >= 2**32.
+                subgraph = sampler.sample(self._seed_type, seeds)
                 received += 1
 
                 data = self._to_pyg_hetero_data(subgraph, in_memory_features)
@@ -372,12 +375,12 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
 
         return data
 
-    def _random_coprime_stride(self, modulus: int) -> int:
+    def _random_coprime_stride(self, modulus: int, rng: np.random.Generator) -> int:
         """Pick a random stride in [1, modulus) coprime with modulus."""
         if modulus <= 1:
             return 1
         while True:
-            stride = int(self.rng.integers(1, modulus))
+            stride = int(rng.integers(1, modulus))
             if math.gcd(stride, modulus) == 1:
                 return stride
 
