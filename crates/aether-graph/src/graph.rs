@@ -505,7 +505,8 @@ impl DynamicGraph {
         // Each vertex's neighbors are appended straight onto `edges`; the
         // running length after each append is the next CSR offset.
         for v in 0..self.num_vertices {
-            self.tree_for(v as u32).collect_into(&self.arena, &mut edges);
+            self.tree_for(v as u32)
+                .collect_into(&self.arena, &mut edges);
             offsets.push(edges.len() as u64);
         }
 

@@ -513,7 +513,10 @@ fn send_len_prefixed(conn: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("control message too large to frame: {} bytes", payload.len()),
+            format!(
+                "control message too large to frame: {} bytes",
+                payload.len()
+            ),
         )
     })?;
     conn.write_all(&len.to_le_bytes())?;

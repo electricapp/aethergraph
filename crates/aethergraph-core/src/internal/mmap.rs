@@ -400,13 +400,17 @@ fn parse_layout(bytes: &[u8]) -> Result<GraphFileLayout> {
     let offsets_range = offsets_start..offsets_end;
     let edges_range = edges_start..edges_end;
     anyhow::ensure!(
-        offsets_range.len().is_multiple_of(std::mem::size_of::<EdgeOffset>()),
+        offsets_range
+            .len()
+            .is_multiple_of(std::mem::size_of::<EdgeOffset>()),
         "offsets section length {} is not a multiple of {}",
         offsets_range.len(),
         std::mem::size_of::<EdgeOffset>()
     );
     anyhow::ensure!(
-        edges_range.len().is_multiple_of(std::mem::size_of::<NodeId>()),
+        edges_range
+            .len()
+            .is_multiple_of(std::mem::size_of::<NodeId>()),
         "edges section length {} is not a multiple of {}",
         edges_range.len(),
         std::mem::size_of::<NodeId>()

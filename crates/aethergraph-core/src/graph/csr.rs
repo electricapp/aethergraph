@@ -148,7 +148,9 @@ impl Graph {
             "offsets must be monotonically increasing"
         );
         debug_assert!(
-            offsets.last().is_none_or(|&last| last == num_edges as EdgeOffset),
+            offsets
+                .last()
+                .is_none_or(|&last| last == num_edges as EdgeOffset),
             "offsets[num_nodes] must equal edges.len()"
         );
         Self {

@@ -569,7 +569,10 @@ impl FeatureCache {
         if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e).with_context(|| {
-                format!("failed to rename NVMe feature file into place: {}", path.display())
+                format!(
+                    "failed to rename NVMe feature file into place: {}",
+                    path.display()
+                )
             });
         }
 

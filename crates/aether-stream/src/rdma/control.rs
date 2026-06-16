@@ -64,7 +64,10 @@ fn send_msg(conn: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
     let len = u32::try_from(payload.len()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("control message too large to frame: {} bytes", payload.len()),
+            format!(
+                "control message too large to frame: {} bytes",
+                payload.len()
+            ),
         )
     })?;
     conn.write_all(&len.to_le_bytes())?;

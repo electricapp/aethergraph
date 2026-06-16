@@ -212,10 +212,7 @@ impl RdmaFeatureClient {
         // hand the caller a buffer containing inconsistent (partially-written)
         // feature rows, which the GPU consumes as if valid. Surface the failure
         // instead so the caller can back off or re-issue.
-        Err(format!(
-            "seqlock validation did not converge after {MAX_RETRIES} retries"
-        )
-        .into())
+        Err(format!("seqlock validation did not converge after {MAX_RETRIES} retries").into())
     }
 
     /// Translate a node id into the remote VRAM/host address to READ from,
@@ -236,10 +233,7 @@ impl RdmaFeatureClient {
         let node_count = self.schema.node_count as u64;
         let slot_size = self.schema.slot_size as u64;
         if (node_id as u64) >= node_count {
-            return Err(format!(
-                "node_id {node_id} out of range (node_count {node_count})"
-            )
-            .into());
+            return Err(format!("node_id {node_id} out of range (node_count {node_count})").into());
         }
         // end_offset = (node_id + 1) * slot_size, checked.
         let end_offset = (node_id as u64)

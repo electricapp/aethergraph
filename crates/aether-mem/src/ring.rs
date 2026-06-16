@@ -360,7 +360,13 @@ impl SharedMemoryRing {
             }
         };
 
-        Self::try_alloc_regular(slot_count, aligned_slot_size, addressable_size, page_align, hooks)
+        Self::try_alloc_regular(
+            slot_count,
+            aligned_slot_size,
+            addressable_size,
+            page_align,
+            hooks,
+        )
     }
 
     /// Convenience: panics on builder error. Hook failures are non-fatal and
