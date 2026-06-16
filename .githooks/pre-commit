@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Reject unformatted code before it is committed, so the CI fmt gate never
+# fails on a push for formatting alone.
+#
+# Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# Bypass for a single commit (e.g. a WIP) with `git commit --no-verify`.
+
+set -uo pipefail
+
+status=0
+
+# Rust: check the whole workspace (fast; rustfmt only reads).
+if command -v cargo >/dev/null 2>&1; then
+    if ! cargo fmt --all --check; then
+        echo "pre-commit: Rust is not formatted — run 'cargo fmt --all' and re-stage." >&2
+        status=1
+    fi
+fi
+
+# Python: uv-managed; --no-sync keeps the hook fast. Skipped if uv is absent.
+if command -v uv >/dev/null 2>&1; then
+    if ! (cd python && uv run --no-sync ruff format --check .); then
+        echo "pre-commit: Python is not formatted — run 'cd python && uv run ruff format .' and re-stage." >&2
+        status=1
+    fi
+fi
+
+exit "$status"

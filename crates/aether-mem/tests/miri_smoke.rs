@@ -19,7 +19,8 @@ fn ring_slot_roundtrip_is_ub_free() {
     for round in 0..3u8 {
         let mut slot = ring.acquire_slot().expect("a slot is free");
         let payload = [round; 32];
-        slot.copy_from_slice(&payload).expect("payload fits in slot");
+        slot.copy_from_slice(&payload)
+            .expect("payload fits in slot");
         assert_eq!(slot.as_slice(), &payload);
         // RingSlot auto-releases on drop at the end of the iteration.
     }

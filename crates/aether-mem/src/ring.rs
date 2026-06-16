@@ -162,8 +162,9 @@ fn runtime_page_size() -> usize {
     }
 }
 
-/// Huge page size (2 MiB on x86_64 Linux).
-#[cfg(target_os = "linux")]
+/// Huge page size (2 MiB on x86_64 Linux). Only used by the huge-page path,
+/// which is compiled out under miri, so the gate matches `try_alloc_huge`.
+#[cfg(all(target_os = "linux", not(miri)))]
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 /// Sentinel for free list end.
