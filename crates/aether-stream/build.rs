@@ -19,6 +19,16 @@ fn main() {
         }
         build.compile("aether_ibv_shim");
         println!("cargo:rerun-if-changed=csrc/ibv_shim.c");
+
+        // Cross-check our #[repr(C)] ibverbs mirrors against the real headers.
+        // The file is only `_Static_assert`s, so it compiles to an empty object
+        // but fails the build on any ABI drift. Separate `cc::Build` so it
+        // cannot perturb the shim's compile flags.
+        cc::Build::new()
+            .file("csrc/abi_assert.c")
+            .compile("aether_abi_assert");
+        println!("cargo:rerun-if-changed=csrc/abi_assert.c");
+
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo:rustc-link-lib=ibverbs");
         if efa {

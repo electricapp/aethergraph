@@ -153,6 +153,9 @@ jobs:
       - run: cargo +nightly miri test -p aether-graph --test miri_smoke
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
+      - run: cargo +nightly miri test -p aether-mem --test miri_smoke
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
       - name: Summary
         if: always()
         run: |
@@ -194,13 +197,14 @@ jobs:
           key: loom
       - run: cargo test -p aether-graph --features loom --test loom_writer_guard
       - run: cargo test -p aethergraph-core --features loom --test loom_union_find
+      - run: cargo test -p aether-mem --features loom --test loom_lockfree
       - name: Summary
         if: always()
         run: |
           {
             echo "## loom"
             echo ""
-            echo "Exhaustive interleaving checks of the writer-guard CAS and the lock-free union-find."
+            echo "Exhaustive interleaving checks of the writer-guard CAS, the lock-free union-find, and the free-list."
           } >> "$GITHUB_STEP_SUMMARY"
 
   supply-chain:
