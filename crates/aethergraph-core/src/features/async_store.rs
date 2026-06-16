@@ -581,11 +581,9 @@ impl AsyncFeatureStore {
                                 let byte_offset = offset + (node as u64 * feature_size as u64);
                                 file.read_exact_at(&mut buffer, byte_offset)
                                     .context("failed to read features")?;
-                                features.extend(
-                                    buffer
-                                        .chunks_exact(2)
-                                        .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()),
-                                );
+                                features.extend(buffer.chunks_exact(2).map(|chunk| {
+                                    f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()
+                                }));
                             }
                         }
                     }

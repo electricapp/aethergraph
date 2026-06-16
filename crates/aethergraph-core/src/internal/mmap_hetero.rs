@@ -77,10 +77,9 @@ fn read_padded_name(data: &[u8]) -> Result<String> {
     // Names are written NUL-terminated and zero-padded. A field with no NUL
     // is unterminated — treat it as corruption rather than silently using
     // all 64 bytes.
-    let end = data
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or_else(|| anyhow::anyhow!("type name field has no NUL terminator — file is corrupt"))?;
+    let end = data.iter().position(|&b| b == 0).ok_or_else(|| {
+        anyhow::anyhow!("type name field has no NUL terminator — file is corrupt")
+    })?;
     String::from_utf8(data[..end].to_vec()).context("invalid UTF-8 in type name")
 }
 

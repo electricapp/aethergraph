@@ -240,8 +240,7 @@ impl FeatureLoadTelemetry {
         if self.batch_gets > 0 {
             // saturating_sub: counters are bumped independently, so a snapshot
             // taken mid-update can momentarily show single_gets > total.
-            self.total_nodes_loaded.saturating_sub(self.single_gets) as f64
-                / self.batch_gets as f64
+            self.total_nodes_loaded.saturating_sub(self.single_gets) as f64 / self.batch_gets as f64
         } else {
             0.0
         }
@@ -597,7 +596,11 @@ impl FeatureStore {
         let elem_size = self.dtype.element_size();
         let row_bytes = self.feature_dim * elem_size;
         let start = node_idx.checked_mul(row_bytes).ok_or_else(|| {
-            anyhow::anyhow!("index overflow: node {} * row_bytes {}", node_idx, row_bytes)
+            anyhow::anyhow!(
+                "index overflow: node {} * row_bytes {}",
+                node_idx,
+                row_bytes
+            )
         })?;
         let end = start
             .checked_add(row_bytes)

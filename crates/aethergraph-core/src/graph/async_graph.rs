@@ -208,7 +208,10 @@ impl AsyncCsrGraph {
         anyhow::ensure!(offsets[0] == 0, "invalid offsets: offsets[0] must be 0");
         // Parallel monotonic scan for billion-node loads (matches csr.rs).
         let is_monotonic = offsets.par_windows(2).all(|w| w[0] <= w[1]);
-        anyhow::ensure!(is_monotonic, "invalid offsets: not monotonically increasing");
+        anyhow::ensure!(
+            is_monotonic,
+            "invalid offsets: not monotonically increasing"
+        );
         // With monotonic offsets and the tail equal to num_edges, every
         // entry is <= num_edges, so no per-window upper-bound check is needed.
         anyhow::ensure!(

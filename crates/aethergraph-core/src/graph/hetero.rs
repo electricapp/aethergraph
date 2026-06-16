@@ -95,7 +95,10 @@ impl HeteroGraph {
         let mut node_metas = Vec::with_capacity(node_types.len());
 
         for (i, (name, count)) in node_types.into_iter().enumerate() {
-            if node_type_index.insert(name.clone(), i as NodeTypeId).is_some() {
+            if node_type_index
+                .insert(name.clone(), i as NodeTypeId)
+                .is_some()
+            {
                 return Err(HeteroBuildError::DuplicateNodeType(name));
             }
             node_metas.push(NodeTypeMeta { name, count });
