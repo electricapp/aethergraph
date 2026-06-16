@@ -69,6 +69,10 @@ fn concurrent_readers_never_observe_a_torn_tree() {
     let mut buf = Vec::new();
     for v in 0..NUM_VERTICES {
         g.neighbors_into(v, &mut buf);
-        assert_eq!(buf.len(), EDGES_PER_VERTEX as usize, "vertex {v} lost edges");
+        assert_eq!(
+            buf.len(),
+            EDGES_PER_VERTEX as usize,
+            "vertex {v} lost edges"
+        );
     }
 }
