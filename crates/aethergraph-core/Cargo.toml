@@ -16,6 +16,9 @@ default = []
 io-uring = []
 gds = []
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
+# Enables loom-backed model checking of the lock-free union-find. Run with:
+#   cargo test -p aethergraph-core --features loom --test loom_union_find
+loom = []
 
 [dependencies]
 aether-epoch = { path = "../aether-epoch", version = "0.1" }
@@ -49,6 +52,14 @@ io-uring = "0.7"
 [dev-dependencies]
 tempfile.workspace = true
 criterion.workspace = true
+# Opt-in model checker for the lock-free union-find; only built under the
+# `loom` feature (see the `loom_union_find` test target below).
+loom = "0.7"
+
+[[test]]
+name = "loom_union_find"
+path = "tests/loom_union_find.rs"
+required-features = ["loom"]
 
 [[bench]]
 name = "graph_benchmarks"
