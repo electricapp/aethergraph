@@ -11,6 +11,7 @@
         "wal recovery",
         "loom model checker",
         "cargo-deny + audit",
+        "Unused Dependencies",
         "python ubuntu-latest",
         "python macos-latest",
         "cargo-fuzz short budget",
