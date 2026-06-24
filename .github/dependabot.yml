@@ -1,45 +1,43 @@
-# Dependabot configuration for AetherGraph
-# Keeps dependencies up to date automatically
-
 version: 2
 updates:
-  # Monitor Rust dependencies
-  - package-ecosystem: "cargo"
+  # Rust dependencies (Cargo.toml / Cargo.lock).
+  - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "rust"
+      interval: daily
+    open-pull-requests-limit: 99
+    commit-message:
+      prefix: "deps(rust)"
+    labels: ["dependencies", "rust"]
     groups:
-      # Group patch updates together
-      production-dependencies:
-        patterns:
-          - "*"
-        update-types:
-          - "patch"
-          - "minor"
+      cargo:
+        patterns: ["*"]
+        update-types: ["patch", "minor", "major"]
 
-  # Monitor Python dependencies
-  - package-ecosystem: "pip"
+  # Python packaging — build-system + dev/test requirements under /python.
+  - package-ecosystem: pip
     directory: "/python"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "python"
+      interval: daily
+    open-pull-requests-limit: 99
+    commit-message:
+      prefix: "deps(python)"
+    labels: ["dependencies", "python"]
+    groups:
+      python:
+        patterns: ["*"]
+        update-types: ["patch", "minor", "major"]
 
-  # Monitor GitHub Actions
-  - package-ecosystem: "github-actions"
+  # GitHub Actions workflows — Dependabot bumps both the SHA pin and
+  # the trailing version comment.
+  - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "ci"
+      interval: daily
+    open-pull-requests-limit: 99
+    commit-message:
+      prefix: "deps(actions)"
+    labels: ["dependencies", "actions"]
+    groups:
+      actions:
+        patterns: ["*"]

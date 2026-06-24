@@ -5,18 +5,34 @@ on:
     - cron: "0 7 * * *" # daily at 07:00 UTC
   workflow_dispatch:
 
+# Deny-all by default; each job re-grants only what it needs.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         target: [ctree_insert_sequences, csr_loader_bytes]
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: fuzz-${{ matrix.target }}
       - run: cargo install cargo-fuzz --locked
@@ -28,7 +44,7 @@ jobs:
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=5400
       - name: Upload corpus and crashes
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-${{ matrix.target }}-artifacts
           path: |

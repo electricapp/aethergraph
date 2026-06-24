@@ -25,22 +25,17 @@ aether-epoch = { path = "../aether-epoch", version = "0.1" }
 memmap2.workspace = true
 bytemuck.workspace = true
 rayon.workspace = true
-postcard.workspace = true
-serde.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
-wide.workspace = true
 rand.workspace = true
 rustc-hash.workspace = true
 ahash.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-futures.workspace = true
 ndarray.workspace = true
 half.workspace = true
 libc = "0.2"
-bitflags = "2.13"
 parquet = { version = "59", optional = true, default-features = false, features = ["arrow"] }
 arrow-array = { version = "59", optional = true }
 arrow-schema = { version = "59", optional = true }
