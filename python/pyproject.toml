@@ -28,13 +28,13 @@ dependencies = [
 [project.optional-dependencies]
 torch = ["torch>=2.12.1"]
 ray = ["ray[data]>=2.55.1"]
-pytorch-geometric = ["torch-geometric>=2.4", "torch>=2.12.1"]
+pytorch-geometric = ["torch-geometric>=2.8.0", "torch>=2.12.1"]
 otel = [
     "opentelemetry-api>=1.42.1",
     "opentelemetry-sdk>=1.41.1",
     "opentelemetry-exporter-otlp>=1.42.1",
 ]
-all = ["torch>=2.12.1", "ray[data]>=2.55.1", "torch-geometric>=2.4"]
+all = ["torch>=2.12.1", "ray[data]>=2.55.1", "torch-geometric>=2.8.0"]
 
 [project.scripts]
 aethergraph = "aethergraph.cli:main"
@@ -110,6 +110,6 @@ dev = [
 ]
 test = [
     "torch>=2.12.1",
-    "torch-geometric>=2.7.0",
+    "torch-geometric>=2.8.0",
     "ray[data]>=2.55.1",
 ]
