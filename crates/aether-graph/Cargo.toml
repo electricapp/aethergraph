@@ -14,7 +14,6 @@ bench = false
 
 [dependencies]
 aether-epoch = { path = "../aether-epoch", version = "0.1" }
-crossbeam-utils = "0.8"
 tracing.workspace = true
 # Optional WAL durability — gated behind the `wal` feature so binaries that
 # only want in-memory operation pay no compile / link cost for it.
