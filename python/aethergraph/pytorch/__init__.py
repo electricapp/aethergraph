@@ -16,4 +16,4 @@ Usage:
 from aethergraph.pytorch.hetero_loader import HeteroNeighborLoader
 from aethergraph.pytorch.loader import NeighborLoader
 
-__all__ = ["NeighborLoader", "HeteroNeighborLoader"]
+__all__ = ["HeteroNeighborLoader", "NeighborLoader"]

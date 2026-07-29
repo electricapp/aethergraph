@@ -32,7 +32,7 @@ use aether_stream::umem::Umem;
 use aether_stream::xdp::socket::XdpSocket;
 use aya::Ebpf;
 use aya::maps::XskMap;
-use aya::programs::{Xdp, XdpFlags};
+use aya::programs::{Xdp, XdpMode};
 use crossbeam_channel::bounded;
 use std::ffi::CString;
 use std::sync::Arc;
@@ -192,7 +192,7 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
             .expect("program is not an XDP program");
         program.load().expect("BPF .load()");
         // SKB mode — veth doesn't support DRV mode.
-        if let Err(e) = program.attach(VETH_RX, XdpFlags::SKB_MODE) {
+        if let Err(e) = program.attach(VETH_RX, XdpMode::Skb) {
             eprintln!("skipping: XDP attach to {VETH_RX} failed: {e} (needs CAP_NET_ADMIN)");
             return;
         }

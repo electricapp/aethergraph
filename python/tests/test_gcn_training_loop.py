@@ -56,7 +56,7 @@ def test_2_layer_gcn_loss_decreases_over_5_epochs() -> None:
     _skip_unless_cuda()
 
     import torch
-    import torch.nn.functional as F  # noqa: N812
+    import torch.nn.functional as F
     from torch_geometric.nn import GCNConv
 
     from aethergraph import Graph

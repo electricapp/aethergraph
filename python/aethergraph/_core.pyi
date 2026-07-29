@@ -8,10 +8,9 @@ Path-accepting APIs declare `str | os.PathLike[str]` since PyO3's
 `PathBuf` accepts anything implementing `__fspath__`.
 """
 
-from __future__ import annotations
-
 import os
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
@@ -30,8 +29,8 @@ def _dlpack_capsule_from_cuda_ptr(
     ptr: int, num_nodes: int, feature_dim: int, gpu_id: int
 ) -> Any: ...
 
-SeedArray = npt.NDArray[np.int64] | npt.NDArray[np.uint32]
-PathLike = str | os.PathLike[str]
+SeedArray: TypeAlias = npt.NDArray[np.int64] | npt.NDArray[np.uint32]
+PathLike: TypeAlias = str | os.PathLike[str]
 
 # -- Exceptions --------------------------------------------------------------
 

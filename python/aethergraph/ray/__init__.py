@@ -40,6 +40,6 @@ from aethergraph.ray.datasource import AetherGraphDatasource
 
 __all__ = [
     "AetherGraphDatasource",
-    "create_sampling_dataset",
     "collate_to_pyg",
+    "create_sampling_dataset",
 ]

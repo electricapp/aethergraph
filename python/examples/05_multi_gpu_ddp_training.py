@@ -79,9 +79,9 @@ def setup_distributed() -> tuple[int, int, torch.device]:
     Returns:
         Tuple of (rank, world_size, device) for this process.
     """
-    rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     if world_size > 1:
         dist.init_process_group("nccl")

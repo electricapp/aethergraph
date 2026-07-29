@@ -339,7 +339,7 @@ def _run_neighbor_loader(
         if worker_span:
             worker_span.set_attribute("error", str(e))
         raise RuntimeError(f"Ray worker sampling failed for graph '{graph_path}': {e}") from e
-    except (OSError, IOError) as e:
+    except OSError as e:
         if worker_span:
             worker_span.set_attribute("error", str(e))
         raise RuntimeError(f"Ray worker I/O error for graph '{graph_path}': {e}") from e

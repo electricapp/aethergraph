@@ -556,8 +556,8 @@ def run(
     is included — this measures the pure sampling kernel.
     """
     try:
-        import torch  # noqa: F401
-        import torch_geometric  # noqa: F401
+        import torch
+        import torch_geometric
         import torch_geometric.typing as tgt
     except ImportError:
         console.print("[red]torch and torch_geometric required[/red]")

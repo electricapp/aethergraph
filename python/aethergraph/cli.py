@@ -92,7 +92,7 @@ class Logger:
         if self.verbose >= 2 and not self.quiet:
             console.print(msg)
 
-    def warn(self, msg: str) -> None:
+    def warning(self, msg: str) -> None:
         """Log a warning message.
 
         Args:
@@ -409,7 +409,7 @@ def stats(
     isolated = int(np.sum(degrees_arr == 0))
     if isolated > 0 and num_nodes > 0:
         pct = 100.0 * isolated / num_nodes
-        log.warn(f"Isolated nodes (degree 0): {isolated:,} ({pct:.2f}%)")
+        log.warning(f"Isolated nodes (degree 0): {isolated:,} ({pct:.2f}%)")
 
 
 def main() -> None:

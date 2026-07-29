@@ -43,7 +43,7 @@ from aethergraph.tracing import get_tracer
 if TYPE_CHECKING:
     from aethergraph.graph import Graph
 
-__all__ = ["NeighborLoader", "LoaderMetrics"]
+__all__ = ["LoaderMetrics", "NeighborLoader"]
 
 
 def normalize_input_nodes(

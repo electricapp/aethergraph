@@ -1,7 +1,6 @@
 # scripts/
 
-Operational scripts for spinning up a fresh AWS instance and pushing the repo
-onto it.
+Operational scripts for spinning up a fresh AWS instance.
 
 ## `bootstrap_node.sh`
 
@@ -27,21 +26,6 @@ supports. `--cuda` requires a reboot afterwards for the NVIDIA kernel module to
 load; re-run with `--rxe --nvme` after reboot to restore SoftRoCE + mount (both
 are lost across reboot since rxe is dynamic and `/etc/fstab` stays out of it —
 the xfs survives but needs remount).
-
-## `sync_repo.sh`
-
-Rsyncs the repo to a host, skipping `.git`, `target/`, `node_modules/`, `*.pem`,
-`__pycache__/`. Wrap in a `for IP in …` loop to fan out to a multi-node test
-cluster.
-
-```bash
-scripts/sync_repo.sh ubuntu@13.59.62.42
-```
-
-Environment overrides:
-
-- `KEY=…` — alternate SSH key (default `~/.ssh/phonon-coldstart-test.pem`)
-- `DEST=…` — alternate remote path (default `/home/<user>/aethergraph`)
 
 ## AWS EFA security-group requirements
 

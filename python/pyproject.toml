@@ -14,6 +14,9 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -70,15 +73,21 @@ filterwarnings = [
     "ignore:.*use_polars.*:DeprecationWarning",
 ]
 
-[tool.black]
-line-length = 100
-target-version = ["py310"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint.flake8-bugbear]
+# typer's API is call-in-default by design
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+[tool.ruff.lint.per-file-ignores]
+# benchmark harness keeps going when a competitor library blows up
+"benchmarks/*" = ["BLE001"]
+
 [tool.mypy]
+# 3.12 floor: numpy 2.x stubs use PEP 695 `type` statements, which mypy
+# rejects when analyzing for older versions.
 python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true

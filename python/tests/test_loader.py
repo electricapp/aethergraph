@@ -367,8 +367,8 @@ class TestNeighborLoaderFailureHandling:
         self, monkeypatch: pytest.MonkeyPatch, small_graph: Graph
     ) -> None:
         """Loader should raise if backend stops before producing all batches."""
-        from aethergraph.pytorch import NeighborLoader
         import aethergraph.pytorch.loader as loader_module
+        from aethergraph.pytorch import NeighborLoader
 
         class _FakeSamplingConfig:
             def __init__(self, **_kwargs: object) -> None:
@@ -462,8 +462,8 @@ class TestSamplingConfigValidation:
 
     def test_to_rust_passes_advanced_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Advanced config fields should be forwarded to Rust config."""
-        from aethergraph import SamplingConfig
         import aethergraph.sampler as sampler_module
+        from aethergraph import SamplingConfig
 
         captured: dict[str, object] = {}
 

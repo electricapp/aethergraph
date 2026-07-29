@@ -5,28 +5,37 @@ This module provides Pythonic wrappers around the Rust sampling implementations.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
 from aethergraph._core import (
     NeighborSampler as _NeighborSampler,
+)
+from aethergraph._core import (
     ParallelBatchSampler as _ParallelBatchSampler,
+)
+from aethergraph._core import (
     SampledSubgraph as _SampledSubgraph,
+)
+from aethergraph._core import (
     SamplingConfig as _SamplingConfig,
+)
+from aethergraph._core import (
     SamplingError,
     SamplingTelemetry,
 )
 from aethergraph.graph import Graph
 
 __all__ = [
-    "SamplingConfig",
-    "SampledSubgraph",
-    "Sampler",
     "NeighborSampler",  # PyG-compatible alias
     "ParallelBatchSampler",
+    "SampledSubgraph",
+    "Sampler",
+    "SamplingConfig",
     "SamplingError",
     "SamplingTelemetry",
 ]

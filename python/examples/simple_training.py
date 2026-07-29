@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Simple GNN training with AetherGraph.
 
 Demonstrates the minimal API: Graph + NeighborLoader for iterating over

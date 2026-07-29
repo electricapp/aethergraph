@@ -42,7 +42,7 @@ from aethergraph.tracing import get_tracer
 if TYPE_CHECKING:
     from aethergraph.hetero_graph import HeteroGraph
 
-__all__ = ["HeteroNeighborLoader", "HeteroLoaderMetrics"]
+__all__ = ["HeteroLoaderMetrics", "HeteroNeighborLoader"]
 
 
 @dataclass

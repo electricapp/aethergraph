@@ -29,7 +29,7 @@ except ImportError as e:
 if TYPE_CHECKING:
     from aethergraph.sampler import SampledSubgraph
 
-__all__ = ["to_edge_index", "subgraph_to_pyg", "batch_to_pyg"]
+__all__ = ["batch_to_pyg", "subgraph_to_pyg", "to_edge_index"]
 
 
 def to_edge_index(subgraph: SampledSubgraph) -> torch.Tensor:

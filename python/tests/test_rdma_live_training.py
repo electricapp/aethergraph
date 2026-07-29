@@ -115,7 +115,7 @@ def test_neighbor_loader_trains_against_live_rdma_features() -> None:
         pytest.skip("cargo not on PATH")
 
     import torch
-    import torch.nn.functional as F  # noqa: N812
+    import torch.nn.functional as F
 
     from aethergraph import Graph
     from aethergraph.pytorch import NeighborLoader

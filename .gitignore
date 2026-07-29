@@ -42,14 +42,6 @@ Thumbs.db
 .Spotlight-V100
 .Trashes
 
-# Documentation
-/doc/
-*.html
-*.pdf
-
-# Benchmarks
-/benches/results/
-
 # Test artifacts
 *.profdata
 *.profraw

@@ -92,6 +92,7 @@ from ray.train.torch import TorchTrainer
 from ray.train import ScalingConfig
 from aethergraph.ray import create_sampling_dataset, collate_to_pyg
 
+
 def train_fn():
     import torch
     from torch.nn.parallel import DistributedDataParallel as DDP
@@ -103,6 +104,7 @@ def train_fn():
         data = collate_to_pyg(batch)
         loss = model(data.x, data.edge_index)
         loss.backward()  # DDP syncs gradients here
+
 
 trainer = TorchTrainer(
     train_fn,

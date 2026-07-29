@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
 
-__all__ = ["configure_tracing", "get_tracer", "TracingConfig"]
+__all__ = ["TracingConfig", "configure_tracing", "get_tracer"]
 
 _TRACER_NAME = "aethergraph"
 _tracer: Tracer | None = None

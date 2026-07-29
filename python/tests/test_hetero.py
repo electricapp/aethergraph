@@ -21,7 +21,6 @@ from aethergraph._core import (
     HeteroSamplingConfig,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -365,6 +364,7 @@ class TestHeteroNeighborLoader:
         reddit_hetero_features: dict[str, npt.NDArray[np.float32]],
     ) -> None:
         import torch
+
         from aethergraph.pytorch import HeteroNeighborLoader
 
         loader = HeteroNeighborLoader(
@@ -392,6 +392,7 @@ class TestHeteroNeighborLoader:
 
     def test_batch_size_correct(self, reddit_hetero_graph: HeteroGraph) -> None:
         import torch
+
         from aethergraph.pytorch import HeteroNeighborLoader
 
         loader = HeteroNeighborLoader(
@@ -414,6 +415,7 @@ class TestHeteroNeighborLoader:
 
     def test_shuffle_produces_different_orders(self, reddit_hetero_graph: HeteroGraph) -> None:
         import torch
+
         from aethergraph.pytorch import HeteroNeighborLoader
 
         loader = HeteroNeighborLoader(
@@ -440,6 +442,7 @@ class TestHeteroNeighborLoader:
 
     def test_pin_memory(self, reddit_hetero_graph: HeteroGraph) -> None:
         import torch
+
         from aethergraph.pytorch import HeteroNeighborLoader
 
         if not torch.cuda.is_available():
