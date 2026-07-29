@@ -191,7 +191,7 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
     // Both tables must fit before anything is sliced.
     let tables_len = num_nt
         .checked_mul(NODE_TYPE_ENTRY_SIZE)
-        .and_then(|n| num_et.checked_mul(EDGE_TYPE_ENTRY_SIZE).map(|e| (n, e)))
+        .zip(num_et.checked_mul(EDGE_TYPE_ENTRY_SIZE))
         .and_then(|(n, e)| n.checked_add(e))
         .and_then(|t| t.checked_add(HEADER_SIZE))
         .ok_or_else(|| anyhow::anyhow!("type table size overflows"))?;

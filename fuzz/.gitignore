@@ -1,0 +1,6 @@
+target/
+artifacts/
+coverage/
+corpus/**
+!corpus/*/
+!corpus/*/seed_*
