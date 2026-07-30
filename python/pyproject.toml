@@ -107,7 +107,7 @@ ignore_missing_imports = true
 
 [dependency-groups]
 dev = [
-    "hypothesis>=6.163.0",
+    "hypothesis>=6.164.0",
     "maturin>=1.14.0",
     "mypy>=2.3.0",
     "opentelemetry-api>=1.44.0",
