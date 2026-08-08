@@ -372,9 +372,6 @@ impl PySampledSubgraph {
         // branches; whether LLVM emits a vectorized form (vpmovzxdq on x86_64
         // AVX2 / uxtl on aarch64 NEON) is target- and codegen-flag-dependent
         // and has NOT been audited here.
-        // TODO(perf): pin this in CI with a `cargo asm` snapshot job that
-        // fails the build if the widening lowers to a scalar loop on
-        // either target.
         let nodes_i64: Vec<i64> = subgraph.nodes.iter().map(|&n| n as i64).collect();
         let seeds_i64: Vec<i64> = subgraph.seeds.iter().map(|&s| s as i64).collect();
         let seed_indices_i64: Vec<i64> = seed_indices_local.into_iter().map(|i| i as i64).collect();

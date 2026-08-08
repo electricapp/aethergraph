@@ -9,10 +9,10 @@ use pyo3::ffi as pyffi;
 use pyo3::prelude::*;
 use std::os::raw::c_void;
 
-// DLPack ABI constants (dlpack.h v0.8)
-// TODO: DLPack v1.0 changed the capsule name and added versioned managed
-// tensors (DLManagedTensorVersioned). If PyTorch adopts v1.0, these structs
-// and the capsule creation logic will need updating.
+// DLPack ABI constants (dlpack.h v0.8). These are the legacy structs and
+// "dltensor" capsule name; DLPack v1.0 renamed the capsule and added
+// DLManagedTensorVersioned, but every shipping PyTorch still consumes the
+// legacy form. The v1.0 migration is tracked in ROADMAP.md.
 const KDLCUDA: i32 = 2; // kDLCUDA
 const KDLFLOAT: u8 = 2; // kDLFloat
 

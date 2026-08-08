@@ -1,6 +1,6 @@
 # AetherGraph Test Plan
 
-Outstanding test work only. Delete rows from these tables as they land.
+Outstanding work only. Delete rows from these tables as they land.
 
 ## Status
 
@@ -22,6 +22,17 @@ single-worker baseline.
 | File                                 |
 | ------------------------------------ |
 | `python/tests/test_ray_multi_gpu.py` |
+
+---
+
+## Future work (non-blocking)
+
+Perf/compat improvements, not correctness gaps. Neither blocks any test row.
+
+| What                                        | Where                                  | Notes                                                                                                                                          |
+| ------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Streaming WR posts (post N / drain N)       | `aether-stream/src/rdma/client.rs`     | Batches beyond the QP send-queue depth are currently rejected with a clear error and callers chunk; a windowed post/drain split would lift that |
+| DLPack v1.0 capsules (`dltensor_versioned`) | `aethergraph-py/src/dlpack.rs`         | v0.8 legacy capsules today; every shipping PyTorch accepts them. Migrate when torch deprecates the legacy form                                  |
 
 ---
 

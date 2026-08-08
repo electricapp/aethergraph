@@ -126,12 +126,8 @@ impl RdmaFeatureClient {
         // failure mode is observable, not silent. For batches larger
         // than this cap, the caller should chunk OR construct the
         // client with a deeper QP cap via `RdmaQp::create_with_cqs` and
-        // a custom `IbvQpCap`.
-        //
-        // TODO(perf): support streaming posts — post N, drain N
-        // completions via `signal_every_n`, post next N. Requires
-        // bookkeeping that splits `post_and_wait` into post + drain
-        // primitives and tracks the inflight wr_id window.
+        // a custom `IbvQpCap`. Streaming posts (post/drain in windows)
+        // are tracked as future work in ROADMAP.md.
         const MAX_INFLIGHT_WR: usize = crate::rdma::qp::DEFAULT_QP_CAP.max_send_wr as usize;
         if node_ids.len() > MAX_INFLIGHT_WR {
             return Err(format!(
