@@ -29,6 +29,11 @@ def _to_uint32_ids(arr: npt.NDArray[Any], what: str) -> npt.NDArray[np.uint32]:
         ValueError: If any ID is negative or exceeds ``2**32 - 1``.
     """
     a = np.asarray(arr)
+    # Already-uint32 arrays cannot be out of range: return without scanning.
+    # This is the common case for streaming edge updates, where this helper
+    # runs per insert batch.
+    if a.dtype == np.uint32:
+        return a
     if a.size:
         a_min = int(a.min())
         a_max = int(a.max())

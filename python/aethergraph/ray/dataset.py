@@ -42,9 +42,9 @@ def collate_to_pyg(batch: dict[str, Any]) -> Data:
     ``dataset.iter_batches(batch_size=1)``; passing more than one row stacks
     unrelated subgraphs and is rejected.
 
-    Arrays are copied during conversion because Ray iter_batches may return
-    non-writable numpy arrays, and PyTorch requires writable backing arrays
-    for tensor creation.
+    Arrays are copied only when Ray hands back read-only views (PyTorch
+    requires writable backing arrays); writable arrays are shared with the
+    resulting tensors zero-copy.
 
     Args:
         batch: Dictionary from Ray dataset iteration containing exactly one row.
@@ -77,18 +77,32 @@ def collate_to_pyg(batch: dict[str, Any]) -> Data:
             "rows; iterate with dataset.iter_batches(batch_size=1)."
         )
 
-    edge_src = np.array(batch["edge_index_0"][0], dtype=np.int64, copy=True)
-    edge_dst = np.array(batch["edge_index_1"][0], dtype=np.int64, copy=True)
-    n_id_arr = np.array(batch["n_id"][0], dtype=np.int64, copy=True)
-    e_id_arr = np.array(batch["e_id"][0], dtype=np.int64, copy=True)
+    def _writable(arr: Any, dtype: np.dtype[Any]) -> npt.NDArray[Any]:
+        # Ray may hand back read-only Arrow-backed views; torch needs
+        # writable backing memory. Copy only when the view is read-only or
+        # needs a dtype change — never unconditionally.
+        out = np.asarray(arr, dtype=dtype)
+        if not out.flags.writeable:
+            out = out.copy()
+        return out
 
-    edge_index = torch.stack([torch.from_numpy(edge_src), torch.from_numpy(edge_dst)], dim=0)
-    n_id = torch.from_numpy(n_id_arr)
-    e_id = torch.from_numpy(e_id_arr)
+    edge_src = batch["edge_index_0"][0]
+    edge_dst = batch["edge_index_1"][0]
+    # One fresh (2, E) destination filled row-by-row: a single copy per row
+    # from the (possibly read-only) source, with no torch.stack allocating
+    # and copying a second [2, E] on top.
+    num_edges = len(edge_src)
+    ei = np.empty((2, num_edges), dtype=np.int64)
+    ei[0] = edge_src
+    ei[1] = edge_dst
+    edge_index = torch.from_numpy(ei)
+
+    n_id = torch.from_numpy(_writable(batch["n_id"][0], np.dtype(np.int64)))
+    e_id = torch.from_numpy(_writable(batch["e_id"][0], np.dtype(np.int64)))
 
     x: torch.Tensor | None = None
     if "x" in batch and len(batch["x"][0]) > 0:
-        x_flat = np.array(batch["x"][0], dtype=np.float32, copy=True)
+        x_flat = _writable(batch["x"][0], np.dtype(np.float32))
         shape_0 = int(batch["x_shape_0"][0])
         shape_1 = int(batch["x_shape_1"][0])
         x = torch.from_numpy(x_flat.reshape(shape_0, shape_1))

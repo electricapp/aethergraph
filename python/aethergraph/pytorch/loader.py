@@ -256,12 +256,13 @@ class NeighborLoader(IterableDataset[Data]):
                 into VRAM. Requires Linux, libibverbs, CUDA, and nvidia-peermem.
             gpu_id: CUDA device ordinal for RDMA features (default: 0).
                 Only used when feature_source is set.
-            input_time: Per-seed timestamps as a float64 ndarray for temporal
-                sampling. Must have the same length as input_nodes. Only used
-                when temporal_strategy is set.
-            temporal_strategy: ``"uniform"`` or ``"last"``. When set, only
-                edges with timestamp < seed time are eligible. Requires
-                ``graph.set_timestamps()``.
+            input_time: Not supported — the prefetch pipeline has no channel
+                for per-seed timestamps, so passing this raises
+                ``NotImplementedError``. Use ``aethergraph.Sampler.sample``
+                with ``input_times`` for per-seed temporal sampling.
+            temporal_strategy: ``"uniform"`` or ``"last"``. When set, seeds
+                sample with unbounded time (for ``"last"``, the k most recent
+                edges). Requires ``graph.set_timestamps()``.
             disjoint: If True, each seed gets an isolated subgraph with no
                 node dedup across seeds. Output includes a ``batch`` tensor
                 mapping each node to its seed index.
@@ -380,7 +381,30 @@ class NeighborLoader(IterableDataset[Data]):
                     f"num_nodes={num_nodes}"
                 )
 
+        # The prefetch pipeline submits seeds only — there is no channel for
+        # per-seed timestamps — so accepting `input_time` here would silently
+        # sample as if every seed had unbounded time. Fail loudly and point at
+        # the API that does carry per-seed times. `temporal_strategy` alone is
+        # fine: seeds sample with unbounded time (for "last", the k most
+        # recent edges).
+        if input_time is not None:
+            raise NotImplementedError(
+                "per-seed input_time is not supported by NeighborLoader's prefetch "
+                "pipeline; use aethergraph.Sampler.sample(seeds, input_times=...) "
+                "for temporal sampling with per-seed times"
+            )
         self._input_time = input_time
+
+        # Device availability is immutable for the process lifetime; resolve
+        # the pinning decision once instead of per tensor per batch.
+        self._pin: bool = bool(pin_memory and torch.cuda.is_available())
+
+        # Zero-copy torch view over the in-memory feature matrix, created
+        # once so per-batch gathers are a single `index_select` pass instead
+        # of a numpy fancy-index (alloc + copy) followed by more copies.
+        self._feat_torch: torch.Tensor | None = (
+            torch.from_numpy(self._features) if self._features is not None else None
+        )
 
         # Master generator for seed-node shuffling. An explicit `generator`
         # wins; otherwise seed from `seed` (reproducible) or OS entropy.
@@ -470,8 +494,13 @@ class NeighborLoader(IterableDataset[Data]):
             def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
                 start = batch_idx * batch_size
                 end = min(start + batch_size, num_nodes)
+                # In-place ops on the arange result: one allocation for the
+                # batch instead of four temporaries.
                 idx = np.arange(start, end, dtype=np.int64)
-                return (offset + idx * stride) % num_nodes
+                idx *= stride
+                idx += offset
+                idx %= num_nodes
+                return idx
 
         else:
 
@@ -625,31 +654,38 @@ class NeighborLoader(IterableDataset[Data]):
             PyG Data object with x, edge_index, e_id, n_id, input_id, and
             optionally batch (disjoint mode).
         """
-        nodes_arr: npt.NDArray[np.int64] = np.asarray(subgraph.nodes, dtype=np.int64)
-        n_id = torch.from_numpy(nodes_arr.copy())
+        # The arrays returned by the Rust subgraph are freshly allocated,
+        # Python-owned int64 numpy arrays — `from_numpy` shares them with no
+        # copy and nothing else aliases them.
+        n_id = torch.from_numpy(subgraph.nodes)
         num_nodes = len(n_id)
 
-        local_edge_index: npt.NDArray[np.int64] = subgraph.edge_index_local
-        edge_index = torch.from_numpy(local_edge_index.copy())
+        edge_index = torch.from_numpy(subgraph.edge_index_local)
 
-        e_id = torch.from_numpy(np.asarray(subgraph.edge_ids, dtype=np.int64))
+        e_id = torch.from_numpy(subgraph.edge_ids)
+
+        seed_indices_arr: npt.NDArray[np.int64] = subgraph.seed_indices
+        input_id = torch.from_numpy(seed_indices_arr)
 
         x: torch.Tensor | None = None
         if file_features is not None:
             x = torch.from_numpy(np.asarray(file_features, dtype=np.float32))
-        elif in_memory_features is not None:
-            x = torch.from_numpy(in_memory_features[nodes_arr].copy())
+            if self._pin:
+                x = x.pin_memory()
+        elif self._feat_torch is not None:
+            # One gather pass total: index_select writes straight into the
+            # destination — pinned when requested — instead of a numpy
+            # fancy-index followed by copy and pin passes.
+            feature_dim = self._feat_torch.shape[1]
+            out = torch.empty((num_nodes, feature_dim), dtype=torch.float32, pin_memory=self._pin)
+            torch.index_select(self._feat_torch, 0, n_id, out=out)
+            x = out
 
-        seed_indices_arr: npt.NDArray[np.int64] = np.asarray(subgraph.seed_indices, dtype=np.int64)
-        input_id = torch.from_numpy(seed_indices_arr.copy())
-
-        if self.pin_memory and torch.cuda.is_available():
+        if self._pin:
             edge_index = edge_index.pin_memory()
             e_id = e_id.pin_memory()
             n_id = n_id.pin_memory()
             input_id = input_id.pin_memory()
-            if x is not None:
-                x = x.pin_memory()
 
         data = Data(
             x=x,
@@ -665,8 +701,8 @@ class NeighborLoader(IterableDataset[Data]):
 
         batch_arr = subgraph.batch
         if batch_arr is not None:
-            batch_tensor = torch.from_numpy(np.asarray(batch_arr, dtype=np.int64))
-            if self.pin_memory and torch.cuda.is_available():
+            batch_tensor = torch.from_numpy(batch_arr)
+            if self._pin:
                 batch_tensor = batch_tensor.pin_memory()
             data.batch = batch_tensor
 
@@ -753,9 +789,10 @@ class NeighborLoader(IterableDataset[Data]):
         """Build PyG Data with features already on GPU via RDMA.
 
         Unlike ``_to_pyg_data``, features arrive as a CUDA tensor from
-        GPUDirect RDMA (zero-copy DLPack capsule). All metadata tensors
-        (edge_index, e_id, n_id, input_id) are moved to the same CUDA
-        device with ``non_blocking=True`` for async H2D transfer.
+        GPUDirect RDMA (zero-copy DLPack capsule). The metadata arrays
+        (n_id, edge_index, e_id, input_id) are packed into one pinned
+        staging buffer and moved with a single asynchronous H2D copy;
+        the returned tensors are on-device views into that transfer.
 
         Args:
             subgraph: Rust SampledSubgraph containing nodes, edges, and seeds.
@@ -764,30 +801,50 @@ class NeighborLoader(IterableDataset[Data]):
         Returns:
             PyG Data object with all tensors on the same CUDA device.
         """
-        nodes_arr: npt.NDArray[np.int64] = np.asarray(subgraph.nodes, dtype=np.int64)
-        n_id = torch.from_numpy(nodes_arr.copy())
-        num_nodes = len(n_id)
-
+        # `non_blocking=True` is only honoured from pinned host memory —
+        # pageable tensors silently fall back to synchronous copies. Pack all
+        # four int64 arrays into one pinned staging buffer and issue a single
+        # async H2D transfer, then slice views on-device.
+        nodes_arr: npt.NDArray[np.int64] = subgraph.nodes
         local_edge_index: npt.NDArray[np.int64] = subgraph.edge_index_local
-        edge_index = torch.from_numpy(local_edge_index.copy())
+        edge_ids_arr: npt.NDArray[np.int64] = subgraph.edge_ids
+        seed_indices_arr: npt.NDArray[np.int64] = subgraph.seed_indices
 
-        e_id = torch.from_numpy(np.asarray(subgraph.edge_ids, dtype=np.int64))
+        num_nodes = nodes_arr.shape[0]
+        num_edges = local_edge_index.shape[1]
+        n_eid = edge_ids_arr.shape[0]
+        n_seed = seed_indices_arr.shape[0]
 
-        seed_indices_arr: npt.NDArray[np.int64] = np.asarray(subgraph.seed_indices, dtype=np.int64)
-        input_id = torch.from_numpy(seed_indices_arr.copy())
+        total = num_nodes + 2 * num_edges + n_eid + n_seed
+        stage = torch.empty(total, dtype=torch.int64, pin_memory=True)
+        stage_np = stage.numpy()
+        pos = 0
+        stage_np[pos : pos + num_nodes] = nodes_arr
+        pos += num_nodes
+        stage_np[pos : pos + 2 * num_edges] = local_edge_index.reshape(-1)
+        pos += 2 * num_edges
+        stage_np[pos : pos + n_eid] = edge_ids_arr
+        pos += n_eid
+        stage_np[pos : pos + n_seed] = seed_indices_arr
 
         device = x_gpu.device
-        edge_index = edge_index.to(device, non_blocking=True)
-        e_id = e_id.to(device, non_blocking=True)
-        n_id = n_id.to(device, non_blocking=True)
-        input_id = input_id.to(device, non_blocking=True)
+        packed = stage.to(device, non_blocking=True)
+
+        pos = 0
+        n_id = packed[pos : pos + num_nodes]
+        pos += num_nodes
+        edge_index = packed[pos : pos + 2 * num_edges].view(2, num_edges)
+        pos += 2 * num_edges
+        e_id = packed[pos : pos + n_eid]
+        pos += n_eid
+        input_id = packed[pos : pos + n_seed]
 
         return Data(
             x=x_gpu,
             edge_index=edge_index,
             e_id=e_id,
             n_id=n_id,
-            batch_size=len(seed_indices_arr),
+            batch_size=n_seed,
             input_id=input_id,
             num_nodes=num_nodes,
             num_sampled_nodes=subgraph.num_sampled_nodes_per_hop,

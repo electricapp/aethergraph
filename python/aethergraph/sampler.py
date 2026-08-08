@@ -381,11 +381,14 @@ class ParallelBatchSampler:
             config._to_rust(),
         )
 
-    def sample_batches(self, batches: list[list[int]]) -> list[SampledSubgraph]:
+    def sample_batches(self, batches: list[SeedInput]) -> list[SampledSubgraph]:
         """Sample neighborhoods for multiple batches in parallel.
 
         Args:
-            batches: List of seed node ID lists, one per batch.
+            batches: One seed collection per batch. Prefer numpy ``uint32``
+                or ``int64`` arrays — they cross the FFI boundary as a single
+                bulk slice copy. Python ``list[int]`` also works but pays a
+                per-element unboxing cost.
 
         Returns:
             List of SampledSubgraphs, one per input batch.
