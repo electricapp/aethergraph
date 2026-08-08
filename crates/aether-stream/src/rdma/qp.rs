@@ -37,6 +37,16 @@ pub struct RdmaRead {
     pub length: u32,
 }
 
+/// Reusable SGE/WR arrays for batch posting. An `IbvSendWr` is ~128 bytes,
+/// so building a 1024-read chain allocated ~132 KB per post; the scratch
+/// amortizes that to steady state. Behind a Mutex only for interior
+/// mutability — each QP is posted from one worker at a time, so the lock
+/// is uncontended.
+struct PostScratch {
+    sges: Vec<IbvSge>,
+    wrs: Vec<IbvSendWr>,
+}
+
 /// Owns an RC queue pair. Created via `RdmaQp::create`, connected
 /// via `connect`, then used for RDMA READ operations.
 pub struct RdmaQp {
@@ -45,6 +55,8 @@ pub struct RdmaQp {
     /// so an over-long chain fails fast in Rust instead of overflowing the
     /// queue inside `ibv_post_send`.
     max_send_wr: u32,
+    /// Reusable posting arrays (see [`PostScratch`]).
+    post_scratch: std::sync::Mutex<PostScratch>,
 }
 
 // SAFETY: QP is thread-safe after creation (single-threaded posting assumed).
@@ -110,6 +122,10 @@ impl RdmaQp {
         Ok(Self {
             qp,
             max_send_wr: cap.max_send_wr,
+            post_scratch: std::sync::Mutex::new(PostScratch {
+                sges: Vec::new(),
+                wrs: Vec::new(),
+            }),
         })
     }
 
@@ -187,9 +203,13 @@ impl RdmaQp {
             ));
         }
 
-        // Build SGE and WR arrays
-        let mut sges: Vec<IbvSge> = Vec::with_capacity(reads.len());
-        let mut wrs: Vec<IbvSendWr> = Vec::with_capacity(reads.len());
+        // Build SGE and WR arrays in the QP's reusable scratch.
+        let mut scratch = self.post_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let PostScratch { sges, wrs } = &mut *scratch;
+        sges.clear();
+        wrs.clear();
+        sges.reserve(reads.len());
+        wrs.reserve(reads.len());
 
         for read in reads {
             sges.push(IbvSge {

@@ -29,10 +29,11 @@ const FEATURE_OFFSET: usize = 8;
 ///
 /// Logical slot size = 16 + N + P. There is no inter-field cache-line padding:
 /// the head and tail counters sit directly around the feature payload so a
-/// single one-sided RDMA READ of the slot fetches both version stamps. Note the
-/// stored stride is NOT this compact size — `SharedMemoryRing` rounds each
-/// slot up to a page boundary, so the per-slot stride (`schema.slot_size`) is
-/// page-aligned; the gather reads only the live prefix of each slot (through
+/// single one-sided RDMA READ of the slot fetches both version stamps. The
+/// stored stride (`schema.slot_size`) rounds the compact size up to a
+/// 64-byte cache line — the table registers one MR and addresses slots by
+/// offset, so page-strided slots would only waste DRAM on dead padding.
+/// The gather reads only the live prefix of each slot (through
 /// `tail_offset_in_slot + 8`).
 pub struct FeatureTable {
     ring: SharedMemoryRing,
@@ -98,27 +99,66 @@ fn compute_slot_size(feature_dim: usize) -> usize {
     compute_tail_offset(feature_dim) + 8 // tail_version is 8 bytes
 }
 
-/// Element-wise volatile copy of `len` f32s.
+// The u64-packed volatile copies below assemble two adjacent f32s into one
+// word assuming the first element occupies the low half — little-endian
+// layout, like every other wire structure in this crate.
+#[cfg(target_endian = "big")]
+compile_error!("feature_table's packed seqlock copies assume a little-endian target");
+
+/// Volatile store of an owned f32 slice into a slot payload.
 ///
-/// The seqlock payload is read while a writer may be storing into it (and
-/// vice versa); volatile accesses make each element a real load/store the
-/// compiler cannot elide, fuse, or invent under an exclusive-access
-/// assumption, so the racing copy stays well-defined for race-checking
-/// tools while the version checks arbitrate validity.
+/// Only the slot side of the copy races (readers and the remote HCA pull
+/// it mid-write by design; the version checks arbitrate validity), so only
+/// the slot access is volatile — the source slice is exclusively owned.
+/// Pairs move as single 8-byte volatile stores: the payload starts at
+/// `FEATURE_OFFSET` = 8 inside an aligned slot, so `dst` is 8-aligned, and
+/// halving the volatile-op count roughly halves the copy cost the
+/// element-wise version paid (volatile forbids the compiler from widening
+/// it).
 ///
 /// # Safety
-/// `src` must be valid for `len` reads and `dst` for `len` writes.
+/// `dst` must be valid for `src.len()` f32 writes and 8-byte aligned.
 #[inline]
-unsafe fn volatile_copy_f32s(src: *const f32, dst: *mut f32, len: usize) {
-    for i in 0..len {
-        // SAFETY: `i < len`; the caller guarantees `src` covers `len` reads.
-        let s = unsafe { src.add(i) };
-        // SAFETY: `i < len`; the caller guarantees `dst` covers `len` writes.
-        let d = unsafe { dst.add(i) };
-        // SAFETY: `s` is in-bounds per above.
-        let v = unsafe { s.read_volatile() };
-        // SAFETY: `d` is in-bounds per above.
-        unsafe { d.write_volatile(v) };
+unsafe fn volatile_store_payload(src: &[f32], dst: *mut f32) {
+    let pairs = src.len() / 2;
+    let dst64 = dst as *mut u64;
+    for i in 0..pairs {
+        let lo = src[2 * i].to_bits() as u64;
+        let hi = src[2 * i + 1].to_bits() as u64;
+        // SAFETY: `i < pairs`, so the word lies within the payload; `dst`
+        // is 8-aligned per the contract.
+        unsafe { dst64.add(i).write_volatile(lo | (hi << 32)) };
+    }
+    if src.len() % 2 == 1 {
+        let last = src.len() - 1;
+        // SAFETY: `last < src.len()`, within the payload; 4-byte access
+        // needs only 4-byte alignment.
+        unsafe { (dst.add(last) as *mut u32).write_volatile(src[last].to_bits()) };
+    }
+}
+
+/// Volatile load of a slot payload into an owned f32 slice. Mirror of
+/// [`volatile_store_payload`]: volatile on the racy slot side only, 8 bytes
+/// per operation.
+///
+/// # Safety
+/// `src` must be valid for `dst.len()` f32 reads and 8-byte aligned.
+#[inline]
+unsafe fn volatile_load_payload(src: *const f32, dst: &mut [f32]) {
+    let pairs = dst.len() / 2;
+    let src64 = src as *const u64;
+    for i in 0..pairs {
+        // SAFETY: `i < pairs`, so the word lies within the payload; `src`
+        // is 8-aligned per the contract.
+        let word = unsafe { src64.add(i).read_volatile() };
+        dst[2 * i] = f32::from_bits(word as u32);
+        dst[2 * i + 1] = f32::from_bits((word >> 32) as u32);
+    }
+    if dst.len() % 2 == 1 {
+        let last = dst.len() - 1;
+        // SAFETY: `last < dst.len()`, within the payload.
+        let bits = unsafe { (src.add(last) as *const u32).read_volatile() };
+        dst[last] = f32::from_bits(bits);
     }
 }
 
@@ -146,7 +186,12 @@ impl FeatureTable {
         let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook::new())];
         hooks.extend(extra_hooks);
 
-        let (ring, hook_failures) = SharedMemoryRing::new(slot_count, slot_size, hooks).ok()?;
+        // Slots pack at cache-line stride, not page stride: the table
+        // registers one MR and addresses slots by offset, so per-slot page
+        // alignment would only round a 3088-byte dim-768 slot up to 4096 —
+        // ~25% of table DRAM spent on dead padding.
+        let (ring, hook_failures) =
+            SharedMemoryRing::new_with_slot_align(slot_count, slot_size, 64, hooks).ok()?;
         for failure in &hook_failures {
             tracing::warn!(error = %failure, "feature table memory hook failed");
         }
@@ -233,17 +278,16 @@ impl FeatureTable {
             disarmed: false,
         };
 
-        // Step 2: copy features (volatile, element-wise). Readers and the
-        // remote HCA race this copy by design — the seqlock versions
-        // arbitrate validity — so each element is a volatile store the
-        // compiler cannot elide or widen under an exclusive-access
-        // assumption.
+        // Step 2: copy features (volatile on the slot side, 8 bytes per
+        // op). Readers and the remote HCA race this copy by design — the
+        // seqlock versions arbitrate validity.
         // SAFETY: FEATURE_OFFSET is within the slot.
         let feat_ptr = unsafe { base.add(FEATURE_OFFSET) } as *mut f32;
-        // SAFETY: `feat_ptr` points to `feature_dim` f32 slots inside the slot;
-        // `features` has the same length (asserted above).
+        // SAFETY: `feat_ptr` points to `feature_dim` f32 slots inside the
+        // slot and is 8-aligned (FEATURE_OFFSET = 8 inside an aligned
+        // slot); `features` has the same length (asserted above).
         unsafe {
-            volatile_copy_f32s(features.as_ptr(), feat_ptr, self.feature_dim);
+            volatile_store_payload(features, feat_ptr);
         }
 
         // Step 3: tail → target.
@@ -331,15 +375,16 @@ impl FeatureTable {
                 continue; // writer in progress
             }
 
-            // Read features (volatile, element-wise) — a writer may be
-            // storing into the payload concurrently; the version checks
-            // below arbitrate validity.
+            // Read features (volatile on the slot side, 8 bytes per op) —
+            // a writer may be storing into the payload concurrently; the
+            // version checks below arbitrate validity.
             // SAFETY: FEATURE_OFFSET is within the slot.
             let feat_ptr = unsafe { base.add(FEATURE_OFFSET) } as *const f32;
-            // SAFETY: `feat_ptr` covers `feature_dim` f32s; `out` has
+            // SAFETY: `feat_ptr` covers `feature_dim` f32s and is 8-aligned
+            // (FEATURE_OFFSET = 8 inside an aligned slot); `out` has
             // `>= feature_dim` slots (asserted above).
             unsafe {
-                volatile_copy_f32s(feat_ptr, out.as_mut_ptr(), self.feature_dim);
+                volatile_load_payload(feat_ptr, &mut out[..self.feature_dim]);
             }
 
             // Ensure all feature reads complete before we read tail/head.

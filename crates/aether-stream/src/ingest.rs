@@ -61,12 +61,19 @@ impl Default for IngestConfig {
 pub fn ingest_loop(
     socket: &mut XdpSocket,
     umem: &Arc<Umem>,
-    tx: &Sender<InboundFrame>,
+    tx: &Sender<Vec<InboundFrame>>,
     config: &IngestConfig,
 ) {
+    // Frame size is a power of two (asserted by Umem::new); shift/mask
+    // replace the u64 divide + modulo the loop would otherwise pay per
+    // descriptor.
+    let frame_shift = umem.frame_size().trailing_zeros();
+    let frame_mask = (umem.frame_size() - 1) as u64;
+    let mut completed_scratch: Vec<usize> = Vec::with_capacity(config.fill_batch_size as usize);
+
     loop {
         // 1. Drain completion ring → return frames to UMEM
-        drain_completions(socket, umem);
+        drain_completions(socket, umem, &mut completed_scratch, frame_shift);
 
         // 2. Refill fill ring with free frames
         refill_fill_ring(socket, umem, config.fill_batch_size);
@@ -79,6 +86,10 @@ pub fn ingest_loop(
         }
 
         let batch = available.min(config.rx_batch_size);
+        // One channel operation per RX batch, not per frame: at line rate a
+        // per-packet MPMC send (atomic CAS + possible futex wake each)
+        // becomes the throughput ceiling before the parser does.
+        let mut frames: Vec<InboundFrame> = Vec::with_capacity(batch as usize);
         for i in 0..batch {
             // SAFETY: i < available, so peek is valid
             let desc: RxTxDesc = unsafe { socket.rx.peek(i) };
@@ -89,7 +100,7 @@ pub fn ingest_loop(
             // `frame_ptr` bound is only a debug_assert and would be UB in
             // release). Drop the descriptor on violation; it's not a UMEM frame
             // we own, so we must not release it back to the pool.
-            let frame_idx = (desc.addr / umem.frame_size() as u64) as usize;
+            let frame_idx = (desc.addr >> frame_shift) as usize;
             let end = desc.addr.checked_add(desc.len as u64);
             if end.is_none_or(|e| e > umem.total_size() as u64) || frame_idx >= umem.frame_count() {
                 tracing::warn!(
@@ -104,8 +115,8 @@ pub fn ingest_loop(
             // `desc.addr` points at the packet data itself, which the kernel
             // places at an offset inside the chunk (XDP headroom). Keep that
             // offset — the chunk base holds stale bytes, not the packet.
-            let offset_in_frame = (desc.addr % umem.frame_size() as u64) as usize;
-            let frame = InboundFrame {
+            let offset_in_frame = (desc.addr & frame_mask) as usize;
+            frames.push(InboundFrame {
                 umem_idx: frame_idx,
                 len: desc.len,
                 // SAFETY: [desc.addr, desc.addr + desc.len) is bounds-checked
@@ -113,33 +124,49 @@ pub fn ingest_loop(
                 // (enforced by Umem::new), so base + frame_idx * frame_size
                 // + offset_in_frame == base + desc.addr.
                 data: unsafe { umem.frame_ptr(frame_idx).add(offset_in_frame) },
-            };
-
-            // Bounded channel: `send` BLOCKS when the queue is full — that is
-            // the intended backpressure (this pinned busy-poll thread parks
-            // until a consumer drains). `Err` only means the receiver
-            // disconnected: release the in-hand frame and shut down. Frames
-            // already inside the channel are dropped at shutdown.
-            if tx.send(frame).is_err() {
-                umem.release_frame(frame_idx);
-                return; // receiver gone, shut down
-            }
+            });
         }
 
         // SAFETY: we consumed `batch` entries
         unsafe {
             socket.rx.advance_consumer(batch);
         }
+
+        if frames.is_empty() {
+            continue;
+        }
+
+        // Bounded channel: `send` BLOCKS when the queue is full — that is
+        // the intended backpressure (this pinned busy-poll thread parks
+        // until a consumer drains). `Err` only means the receiver
+        // disconnected: release the in-hand frames and shut down. Batches
+        // already inside the channel are dropped at shutdown.
+        if let Err(returned) = tx.send(frames) {
+            completed_scratch.clear();
+            completed_scratch.extend(returned.0.iter().map(|f| f.umem_idx));
+            umem.release_frames(&completed_scratch);
+            return; // receiver gone, shut down
+        }
     }
 }
 
-/// Drain the completion ring and return frames to the UMEM pool.
-fn drain_completions(socket: &mut XdpSocket, umem: &Umem) {
+/// Drain the completion ring and return frames to the UMEM pool in one
+/// batched free-list splice (one CAS per drain instead of one per frame).
+fn drain_completions(
+    socket: &mut XdpSocket,
+    umem: &Umem,
+    scratch: &mut Vec<usize>,
+    frame_shift: u32,
+) {
     let available = socket.completion.available();
+    if available == 0 {
+        return;
+    }
+    scratch.clear();
     for i in 0..available {
         // SAFETY: i < available
         let addr: u64 = unsafe { socket.completion.peek(i) };
-        let frame_idx = (addr / umem.frame_size() as u64) as usize;
+        let frame_idx = (addr >> frame_shift) as usize;
         // Guard the kernel-supplied completion addr before releasing: a
         // bad index would corrupt the UMEM free list.
         if addr >= umem.total_size() as u64 || frame_idx >= umem.frame_count() {
@@ -150,14 +177,13 @@ fn drain_completions(socket: &mut XdpSocket, umem: &Umem) {
             );
             continue;
         }
-        umem.release_frame(frame_idx);
+        scratch.push(frame_idx);
     }
-    if available > 0 {
-        // SAFETY: we consumed `available` entries
-        unsafe {
-            socket.completion.advance_consumer(available);
-        }
+    // SAFETY: we consumed `available` entries
+    unsafe {
+        socket.completion.advance_consumer(available);
     }
+    umem.release_frames(scratch);
 }
 
 /// Refill the fill ring with free frames from the UMEM pool.
@@ -250,7 +276,7 @@ pub fn spawn_ingest_threads(
     config: IngestConfig,
 ) -> Result<
     (
-        crossbeam_channel::Receiver<InboundFrame>,
+        crossbeam_channel::Receiver<Vec<InboundFrame>>,
         Vec<std::thread::JoinHandle<()>>,
     ),
     SpawnError,

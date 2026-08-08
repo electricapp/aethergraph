@@ -114,6 +114,14 @@ impl Umem {
         self.ring.release_index(index);
     }
 
+    /// Release a batch of frames with one free-list CAS — the completion
+    /// drain returns whole bursts, and a CAS per frame on the shared
+    /// Treiber head is cross-core contention at packet rate.
+    #[inline]
+    pub fn release_frames(&self, indices: &[usize]) {
+        self.ring.release_indices(indices);
+    }
+
     /// Compute the UMEM offset for a frame index (for ring descriptors).
     #[inline]
     pub fn frame_addr(&self, index: usize) -> u64 {

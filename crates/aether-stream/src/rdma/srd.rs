@@ -844,19 +844,19 @@ impl SrdFeatureClient {
             .ok_or_else(|| io::Error::other("remote address overflow"))
     }
 
-    /// Read the `nodes` slots from the server, landing them back-to-back in
-    /// the local destination buffer. Returns once every completion has
-    /// drained.
+    /// Post one RDMA READ per node without draining. Pair with
+    /// [`drain_gather`](Self::drain_gather); [`gather`](Self::gather)
+    /// composes the two. Split out so a sharded pool can post every
+    /// shard's batch before draining any of them — the posts are
+    /// non-blocking, so the shards' DMA runs concurrently from one thread.
     ///
     /// EFA SRD requires each WR to sit in its own `wr_start`/`wr_complete`
     /// bracket and be individually signaled, so N reads produce N CQEs.
-    /// The batched shim (`aether_ibv_post_rdma_reads_srd_batch` +
-    /// `aether_ibv_poll_cq_ex_many`) collapses the post loop and the drain
-    /// burst to one FFI crossing each — Rust makes two boundary crossings
-    /// per gather regardless of batch size.
-    pub fn gather(&self, nodes: &[usize]) -> io::Result<()> {
+    /// The batched shim (`aether_ibv_post_rdma_reads_srd_batch`) collapses
+    /// the post loop to one FFI crossing regardless of batch size.
+    pub fn post_gather(&self, nodes: &[usize]) -> io::Result<usize> {
         if nodes.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let slot = self.adv.schema.slot_size as u32;
         assert!(
@@ -899,13 +899,23 @@ impl SrdFeatureClient {
                 "post_rdma_reads_srd_batch rc={rc}"
             )));
         }
-        // EFA SRD signals every WR — drain N CQEs via the batched poll
-        // shim (one FFI crossing per drain burst instead of N).
-        let mut batch: Vec<AetherCqeSnapshot> = vec![AetherCqeSnapshot::default(); nodes.len()];
+        Ok(nodes.len())
+    }
+
+    /// Drain `posted` completions from this shard's CQ. Every WR posted by
+    /// [`post_gather`](Self::post_gather) is signaled, so the count must
+    /// match — leftover CQEs would be misattributed to the next gather.
+    pub fn drain_gather(&self, posted: usize) -> io::Result<()> {
+        if posted == 0 {
+            return Ok(());
+        }
+        // Drain via the batched poll shim (one FFI crossing per drain
+        // burst instead of one per CQE).
+        let mut batch: Vec<AetherCqeSnapshot> = vec![AetherCqeSnapshot::default(); posted];
         let mut drained = 0usize;
         let start = std::time::Instant::now();
-        while drained < nodes.len() {
-            let want = nodes.len() - drained;
+        while drained < posted {
+            let want = posted - drained;
             // SAFETY: the CQ is live for `self`'s lifetime; `batch` has room
             // for `want` snapshots (`want <= batch.len()`).
             let got = unsafe {
@@ -927,13 +937,21 @@ impl SrdFeatureClient {
                 if start.elapsed() > Duration::from_secs(30) {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        format!("SRD gather drained {drained}/{} after 30s", nodes.len()),
+                        format!("SRD gather drained {drained}/{posted} after 30s"),
                     ));
                 }
                 std::hint::spin_loop();
             }
         }
         Ok(())
+    }
+
+    /// Read the `nodes` slots from the server, landing them back-to-back in
+    /// the local destination buffer. Returns once every completion has
+    /// drained.
+    pub fn gather(&self, nodes: &[usize]) -> io::Result<()> {
+        let posted = self.post_gather(nodes)?;
+        self.drain_gather(posted)
     }
 }
 
@@ -989,9 +1007,12 @@ impl SrdShardedFeatureClient {
         self.shards[shard_idx].dst_slice()
     }
 
-    /// Split `nodes` evenly across shards and run every shard's
-    /// post+drain on its own OS thread. Returns once all shards have
-    /// drained. Panics if any single shard's slice exceeds
+    /// Split `nodes` evenly across shards, post every shard's batch, then
+    /// drain each shard's CQ. Posting is non-blocking, so all shards' DMA
+    /// runs concurrently — the same parallel wire time the old
+    /// thread-per-shard version bought, without paying an OS thread
+    /// spawn/join (tens of microseconds) per gather call that rivaled the
+    /// gather itself. Panics if any single shard's slice exceeds
     /// `max_inflight_per_shard`.
     pub fn gather(&self, nodes: &[usize]) -> io::Result<()> {
         if nodes.is_empty() {
@@ -1004,29 +1025,37 @@ impl SrdShardedFeatureClient {
             "shard slice {chunk} > max_inflight_per_shard {}",
             self.max_inflight_per_shard
         );
-        std::thread::scope(|s| -> io::Result<()> {
-            let handles: Vec<_> = self
-                .shards
-                .iter()
-                .enumerate()
-                .map(|(i, shard)| {
-                    let start = i * chunk;
-                    let end = (start + chunk).min(nodes.len());
-                    let slice = &nodes[start..end];
-                    let shard = Arc::clone(shard);
-                    s.spawn(move || -> io::Result<()> {
-                        if slice.is_empty() {
-                            return Ok(());
-                        }
-                        shard.gather(slice)
-                    })
-                })
-                .collect();
-            for h in handles {
-                h.join()
-                    .map_err(|_| io::Error::other("shard worker panicked"))??;
+
+        // Phase 1: post on every shard.
+        let mut posted: Vec<usize> = Vec::with_capacity(n);
+        let mut post_err: Option<io::Error> = None;
+        for (i, shard) in self.shards.iter().enumerate() {
+            let start = (i * chunk).min(nodes.len());
+            let end = (start + chunk).min(nodes.len());
+            match shard.post_gather(&nodes[start..end]) {
+                Ok(count) => posted.push(count),
+                Err(e) => {
+                    post_err = Some(e);
+                    break;
+                }
             }
-            Ok(())
-        })
+        }
+
+        // Phase 2: drain every shard that posted — even on a post error,
+        // earlier shards' in-flight WRs must be reaped or their CQEs would
+        // corrupt the next gather's accounting.
+        let mut first_err: Option<io::Error> = post_err;
+        for (shard, &count) in self.shards.iter().zip(posted.iter()) {
+            if let Err(e) = shard.drain_gather(count)
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }

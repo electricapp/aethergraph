@@ -229,7 +229,7 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
 
     // ── ingest loop ──────────────────────────────────────────────────────────
     let table = Arc::new(FeatureTable::new(NUM_PACKETS, FEATURE_DIM, vec![]).expect("table alloc"));
-    let (tx, rx_chan) = bounded::<aether_stream::ingest::InboundFrame>(NUM_PACKETS * 2);
+    let (tx, rx_chan) = bounded::<Vec<aether_stream::ingest::InboundFrame>>(NUM_PACKETS * 2);
     let stop = Arc::new(AtomicBool::new(false));
 
     let umem_for_ingest = Arc::clone(&umem);
@@ -277,26 +277,29 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while received < NUM_PACKETS && Instant::now() < deadline {
         match rx_chan.recv_timeout(Duration::from_millis(200)) {
-            Ok(frame) => {
-                if let Some((node, feats)) = parse_payload(frame.data, frame.len) {
-                    if (node as usize) < NUM_PACKETS {
-                        table_for_reader.write_node(node as usize, &feats);
-                        received += 1;
+            Ok(batch) => {
+                for frame in &batch {
+                    if let Some((node, feats)) = parse_payload(frame.data, frame.len) {
+                        if (node as usize) < NUM_PACKETS {
+                            table_for_reader.write_node(node as usize, &feats);
+                            received += 1;
+                            eprintln!(
+                                "[{:>7.3}s] frame node={node} len={} ({received}/{NUM_PACKETS})",
+                                start.elapsed().as_secs_f64(),
+                                frame.len
+                            );
+                        }
+                    } else {
+                        parse_failures += 1;
                         eprintln!(
-                            "[{:>7.3}s] frame node={node} len={} ({received}/{NUM_PACKETS})",
+                            "[{:>7.3}s] parse failure len={} (total {parse_failures})",
                             start.elapsed().as_secs_f64(),
                             frame.len
                         );
                     }
-                } else {
-                    parse_failures += 1;
-                    eprintln!(
-                        "[{:>7.3}s] parse failure len={} (total {parse_failures})",
-                        start.elapsed().as_secs_f64(),
-                        frame.len
-                    );
                 }
-                umem.release_frame(frame.umem_idx);
+                let indices: Vec<usize> = batch.iter().map(|f| f.umem_idx).collect();
+                umem.release_frames(&indices);
             }
             Err(_) => continue,
         }

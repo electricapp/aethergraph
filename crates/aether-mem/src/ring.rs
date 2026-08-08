@@ -372,6 +372,67 @@ impl FreeList {
             backoff.spin();
         }
     }
+
+    /// Release a batch of leased indices with one head CAS.
+    ///
+    /// The indices are linked into a private chain first, then the whole
+    /// chain is spliced onto the stack atomically — a per-packet ingest
+    /// loop releasing a completion batch pays one contended CAS per batch
+    /// instead of one per frame. Out-of-range indices are skipped (with a
+    /// debug assertion), matching [`release`](Self::release).
+    ///
+    /// # Panics
+    /// Panics if any in-range index is not currently leased, or appears
+    /// twice in `indices` — either would corrupt the Treiber stack.
+    pub fn release_many(&self, indices: &[usize]) {
+        // Validate and link indices[i] -> indices[i+1] (skipping invalid
+        // entries). The chain is private until the CAS publishes it, so
+        // these stores are Relaxed.
+        let mut first: Option<usize> = None;
+        let mut prev: Option<usize> = None;
+        for &index in indices {
+            if index >= self.slot_count {
+                debug_assert!(
+                    false,
+                    "release_many: index {index} >= slot_count {}",
+                    self.slot_count
+                );
+                continue;
+            }
+            let slot = &self.next[index];
+            let observed = slot.swap(FREE_LIST_EMPTY, Ordering::Relaxed);
+            assert_eq!(
+                observed, FREE_LIST_LEASED,
+                "release_many: slot {index} is not leased (double release, duplicate, or foreign index)"
+            );
+            if let Some(p) = prev {
+                self.next[p].store(index as u32, Ordering::Relaxed);
+            } else {
+                first = Some(index);
+            }
+            prev = Some(index);
+        }
+        let (Some(first), Some(last)) = (first, prev) else {
+            return;
+        };
+
+        let mut backoff = Backoff::new();
+        loop {
+            let state = self.head.load(Ordering::Acquire);
+            let (head, tag) = unpack_free_head(state);
+            self.next[last].store(head, Ordering::Relaxed);
+            let new_state = pack_free_head(first as u32, tag.wrapping_add(1));
+
+            if self
+                .head
+                .compare_exchange_weak(state, new_state, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            backoff.spin();
+        }
+    }
 }
 
 /// Ring buffer with pre-allocated slots.
@@ -442,6 +503,25 @@ impl SharedMemoryRing {
         slot_size: usize,
         hooks: Vec<Box<dyn MemoryHook>>,
     ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
+        Self::new_with_slot_align(slot_count, slot_size, 0, hooks)
+    }
+
+    /// Create a ring whose slots are packed at `slot_align` stride instead
+    /// of page stride.
+    ///
+    /// Per-slot page alignment matters for DMA descriptors that address
+    /// whole chunks (AF_XDP UMEM); a table that registers the region once
+    /// and addresses slots by offset (the RDMA feature table) only wastes
+    /// memory on it — a 3088-byte slot page-rounds to 4096, ~25% of DRAM
+    /// spent on dead padding. Pass a power-of-two `slot_align` (e.g. 64
+    /// for cache-line slots), or 0 to use the page size. The backing
+    /// allocation base remains page-aligned either way.
+    pub fn new_with_slot_align(
+        slot_count: usize,
+        slot_size: usize,
+        slot_align: usize,
+        hooks: Vec<Box<dyn MemoryHook>>,
+    ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
         if slot_count == 0 {
             return Err(RingBuilderError::InvalidSlotCount("slot_count must be > 0"));
         }
@@ -458,16 +538,28 @@ impl SharedMemoryRing {
         if slot_size == 0 {
             return Err(RingBuilderError::InvalidSlotSize("slot_size must be > 0"));
         }
+        if slot_align != 0 && !slot_align.is_power_of_two() {
+            return Err(RingBuilderError::InvalidSlotSize(
+                "slot_align must be a power of two (or 0 for page alignment)",
+            ));
+        }
 
-        // Resolve the real page size once and align everything to it. Floored
-        // at PAGE_SIZE so DMA alignment is never weaker than 4 KiB.
+        // Resolve the real page size once. The allocation base is always
+        // aligned to it (floored at PAGE_SIZE so DMA alignment is never
+        // weaker than 4 KiB); the per-slot stride uses `slot_align` when
+        // given.
         let page_align = runtime_page_size();
+        let stride_align = if slot_align == 0 {
+            page_align
+        } else {
+            slot_align
+        };
 
-        // Align slot_size to the page boundary using checked arithmetic.
+        // Align slot_size to the stride boundary using checked arithmetic.
         let aligned_slot_size = slot_size
-            .checked_add(page_align - 1)
+            .checked_add(stride_align - 1)
             .ok_or(RingBuilderError::SizeOverflow)?
-            & !(page_align - 1);
+            & !(stride_align - 1);
 
         let addressable_size = slot_count
             .checked_mul(aligned_slot_size)
@@ -705,6 +797,13 @@ impl SharedMemoryRing {
     #[inline]
     pub fn release_index(&self, index: usize) {
         self.free_list.release(index);
+    }
+
+    /// Release a batch of leased slot indices with one free-list CAS.
+    /// See [`FreeList::release_many`].
+    #[inline]
+    pub fn release_indices(&self, indices: &[usize]) {
+        self.free_list.release_many(indices);
     }
 
     /// Get pointer to a specific slot.

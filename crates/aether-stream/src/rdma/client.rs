@@ -211,14 +211,18 @@ impl RdmaFeatureClient {
     /// READ the two sequential snapshots of each row in `indices` into the
     /// buffer's two staging regions.
     ///
-    /// The snapshot-2 batch is posted only after every snapshot-1 completion
-    /// has been observed AND the GPUDirect write flush has run, so per-slot
-    /// visibility in VRAM is monotone between the snapshots — the ordering
-    /// the two-snapshot contract in `feature_table.rs` requires. Each remote
-    /// address is validated against the advertised table bounds (see
-    /// `remote_addr_for`) before it's turned into a one-sided READ — a
-    /// node_id past the table must never be translated into a read outside
-    /// the server's registered region.
+    /// A row's snapshot-2 READ is posted only after its snapshot-1
+    /// completion has been observed AND the GPUDirect write flush has run,
+    /// so per-slot visibility in VRAM is monotone between the snapshots —
+    /// the ordering the two-snapshot contract in `feature_table.rs`
+    /// requires. That constraint is per ROW, not per batch: the batch is
+    /// split into windows and window k's snapshot-2 posts in the same
+    /// chain as window k+1's snapshot-1, keeping the NIC busy through the
+    /// protocol's serialization point instead of draining to idle between
+    /// two full-batch rounds. Each remote address is validated against the
+    /// advertised table bounds (see `remote_addr_for`) before it's turned
+    /// into a one-sided READ — a node_id past the table must never be
+    /// translated into a read outside the server's registered region.
     fn read_snapshots(
         &self,
         node_ids: &[u32],
@@ -229,8 +233,10 @@ impl RdmaFeatureClient {
         // remainder of the slot is dead padding not worth the PCIe traffic.
         let read_len = (self.schema.tail_offset_in_slot + 8) as u32;
 
-        for snapshot in 0..2 {
-            let reads: Vec<RdmaRead> = indices
+        let build = |idx_window: &[usize],
+                     snapshot: usize|
+         -> Result<Vec<RdmaRead>, Box<dyn std::error::Error>> {
+            idx_window
                 .iter()
                 .map(|&i| {
                     Ok(RdmaRead {
@@ -245,9 +251,34 @@ impl RdmaFeatureClient {
                         length: read_len,
                     })
                 })
-                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+                .collect()
+        };
 
-            self.post_and_wait(&reads)?;
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        // Window size: combined S2(k) + S1(k+1) chains must fit the send
+        // queue, and even small batches split in two so the pipeline has
+        // an overlap step.
+        let cap = (crate::rdma::qp::DEFAULT_QP_CAP.max_send_wr as usize) / 2;
+        let window = indices.len().div_ceil(2).clamp(1, cap);
+        let windows: Vec<&[usize]> = indices.chunks(window).collect();
+
+        // Prologue: snapshot 1 of the first window.
+        let first_s1 = build(windows[0], 0)?;
+        self.post_and_wait(&first_s1)?;
+        self.flush_gpudirect_writes()?;
+
+        for k in 0..windows.len() {
+            // Snapshot 2 of window k (its snapshot 1 completed and was
+            // flushed in the previous iteration / prologue), chained with
+            // snapshot 1 of window k+1.
+            let mut combined = build(windows[k], 1)?;
+            if k + 1 < windows.len() {
+                combined.extend(build(windows[k + 1], 0)?);
+            }
+            self.post_and_wait(&combined)?;
             self.flush_gpudirect_writes()?;
         }
         Ok(())
