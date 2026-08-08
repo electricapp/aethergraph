@@ -280,14 +280,19 @@ class PrefetchStats:
     def to_dict(self) -> dict[str, Any]: ...
 
 class NeighborLoader:
-    """Prefetching neighbor loader. Spawns a worker thread; bounded
-    submission and result channels apply backpressure both ways."""
+    """Prefetching neighbor loader. Spawns `sampler_threads` worker
+    threads over an MPMC work queue (plus one feature-loader thread when
+    features are configured); bounded submission and result channels apply
+    backpressure both ways. Results arrive unordered across the pool —
+    each subgraph carries its own seeds, so consumers never rely on
+    arrival order."""
 
     def __init__(
         self,
         graph: CsrGraph,
         config: SamplingConfig,
         prefetch_depth: int = 2,
+        sampler_threads: int = 1,
     ) -> None: ...
     @staticmethod
     def with_features(
@@ -295,6 +300,7 @@ class NeighborLoader:
         config: SamplingConfig,
         feature_path: PathLike,
         prefetch_depth: int = 2,
+        sampler_threads: int = 1,
     ) -> NeighborLoader: ...
     @staticmethod
     def new_nvme(

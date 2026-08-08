@@ -174,19 +174,32 @@ impl PyNeighborLoader {
     ///     graph: Graph to sample from
     ///     config: SamplingConfig for sampling parameters
     ///     prefetch_depth: Number of batches to prefetch ahead (default: 2)
+    ///     sampler_threads: Sampler worker threads pulling from the shared
+    ///         work queue (default: 1). Results arrive unordered across the
+    ///         pool; each carries its identity, so consumers are unaffected.
     #[new]
-    #[pyo3(signature = (graph, config, prefetch_depth=2))]
-    fn new(graph: &PyCsrGraph, config: &PySamplingConfig, prefetch_depth: usize) -> PyResult<Self> {
-        // Share the same graph backing across Python and prefetch thread.
+    #[pyo3(signature = (graph, config, prefetch_depth=2, sampler_threads=1))]
+    fn new(
+        graph: &PyCsrGraph,
+        config: &PySamplingConfig,
+        prefetch_depth: usize,
+        sampler_threads: usize,
+    ) -> PyResult<Self> {
+        // Share the same graph backing across Python and prefetch threads.
         let graph_arc = graph.inner_arc();
 
-        let inner = NeighborLoader::new(graph_arc.clone(), config.inner().clone(), prefetch_depth)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to create NeighborLoader: {}",
-                    e
-                ))
-            })?;
+        let inner = NeighborLoader::new(
+            graph_arc.clone(),
+            config.inner().clone(),
+            prefetch_depth,
+            sampler_threads,
+        )
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to create NeighborLoader: {}",
+                e
+            ))
+        })?;
 
         Ok(Self {
             inner: Some(inner),
@@ -199,24 +212,27 @@ impl PyNeighborLoader {
 
     /// Create a prefetching sampler that also loads features.
     ///
-    /// After sampling the subgraph, the worker thread also loads features
-    /// for all nodes. On Linux, uses io_uring for parallel reads.
+    /// After sampling the subgraph, the pipeline also loads features for
+    /// all nodes. On Linux, uses io_uring for parallel reads.
     ///
     /// Args:
     ///     graph: Graph to sample from
     ///     config: SamplingConfig for sampling parameters
     ///     feature_path: Path to feature file (AETHFEAT format)
     ///     prefetch_depth: Number of batches to prefetch ahead (default: 2)
+    ///     sampler_threads: Sampler worker threads feeding the feature
+    ///         loader (default: 1)
     ///
     /// Returns:
     ///     NeighborLoader configured to load features
     #[staticmethod]
-    #[pyo3(signature = (graph, config, feature_path, prefetch_depth=2))]
+    #[pyo3(signature = (graph, config, feature_path, prefetch_depth=2, sampler_threads=1))]
     fn with_features(
         graph: &PyCsrGraph,
         config: &PySamplingConfig,
         feature_path: PathBuf,
         prefetch_depth: usize,
+        sampler_threads: usize,
     ) -> PyResult<Self> {
         let graph_arc = graph.inner_arc();
 
@@ -225,6 +241,7 @@ impl PyNeighborLoader {
             config.inner().clone(),
             &feature_path,
             prefetch_depth,
+            sampler_threads,
         )
         .map_err(|e| sampling_error(format!("Failed to create prefetcher with features: {}", e)))?;
 
@@ -492,12 +509,13 @@ impl PyNeighborLoader {
     ) -> PyResult<Self> {
         let graph_arc = graph.inner_arc();
 
-        let inner = NeighborLoader::new(graph_arc.clone(), config.inner().clone(), prefetch_depth)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to create NeighborLoader: {e}"
-                ))
-            })?;
+        let inner =
+            NeighborLoader::new(graph_arc.clone(), config.inner().clone(), prefetch_depth, 1)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to create NeighborLoader: {e}"
+                    ))
+                })?;
 
         let rdma = aether_stream::rdma::gather::RdmaFeatureGather::connect(
             server_addr,

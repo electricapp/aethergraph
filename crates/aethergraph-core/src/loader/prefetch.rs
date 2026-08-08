@@ -707,12 +707,16 @@ impl NeighborLoader {
     /// Create a new prefetching sampler for in-memory graphs (no feature loading).
     ///
     /// # Arguments
-    /// * `graph` - Arc to CSR graph (shared with prefetch thread)
+    /// * `graph` - Arc to CSR graph (shared with prefetch threads)
     /// * `config` - Sampling configuration
     /// * `prefetch_depth` - How many batches to keep ready (default: 2-3)
+    /// * `sampler_threads` - Sampler worker count (0 is treated as 1). The
+    ///   work channel is MPMC and results carry their `batch_idx`, so extra
+    ///   workers scale sampling throughput with no ordering machinery —
+    ///   consumers must already match results by content, not arrival order.
     ///
     /// # Errors
-    /// Returns an error if the prefetch thread cannot be spawned.
+    /// Returns an error if a prefetch thread cannot be spawned.
     #[tracing::instrument(
         skip(graph, config),
         fields(num_nodes = graph.num_nodes(), prefetch_depth)
@@ -721,6 +725,7 @@ impl NeighborLoader {
         graph: Arc<Graph>,
         config: SamplingConfig,
         prefetch_depth: usize,
+        sampler_threads: usize,
     ) -> std::io::Result<Self> {
         if prefetch_depth == 0 {
             return Err(std::io::Error::new(
@@ -728,49 +733,57 @@ impl NeighborLoader {
                 "prefetch_depth must be >= 1",
             ));
         }
+        let sampler_threads = sampler_threads.max(1);
 
         // Both channels bounded:
-        //   - work channel  : producer blocks when the worker falls behind
+        //   - work channel  : producer blocks when the workers fall behind
         //                     by more than `prefetch_depth * 8` submitted
         //                     batches. Prevents unbounded RAM growth when a
         //                     producer stages many epochs at once but the
-        //                     worker is slow / stuck.
-        //   - result channel: worker blocks when the consumer falls behind
+        //                     workers are slow / stuck.
+        //   - result channel: workers block when the consumer falls behind
         //                     by `prefetch_depth` produced subgraphs. This is
         //                     the canonical pipeline-stall backpressure.
         let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
         let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
-        let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth);
+        let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth.max(sampler_threads));
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
         let worker_fault = Arc::new(Mutex::new(None));
 
-        let handle = {
+        let mut handles = Vec::with_capacity(sampler_threads);
+        for t in 0..sampler_threads {
             let shutdown = shutdown.clone();
             let fault = worker_fault.clone();
-            thread::Builder::new()
-                .name("aethergraph-prefetch".into())
-                .spawn(move || {
-                    run_worker(&fault, move || {
-                        Self::worker_loop_inmemory(
-                            graph, config, work_rx, result_tx, shutdown, None,
-                        );
-                        Ok(())
-                    });
-                })?
-        };
+            let graph = Arc::clone(&graph);
+            let config = config.clone();
+            let work_rx = work_rx.clone();
+            let result_tx = result_tx.clone();
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("aethergraph-prefetch-{t}"))
+                    .spawn(move || {
+                        run_worker(&fault, move || {
+                            Self::worker_loop_inmemory(
+                                graph, config, work_rx, result_tx, shutdown, None,
+                            );
+                            Ok(())
+                        });
+                    })?,
+            );
+        }
 
         debug!(
             prefetch_depth,
-            "NeighborLoader started (in-memory mode, no features)"
+            sampler_threads, "NeighborLoader started (in-memory mode, no features)"
         );
 
         Ok(Self {
             work_tx: Some(work_tx),
             result_rx: Some(result_rx),
             shutdown,
-            handles: vec![handle],
+            handles,
             stats,
             prefetch_depth,
             feature_dim: None,
@@ -780,54 +793,72 @@ impl NeighborLoader {
 
     /// Create a prefetching sampler that also loads features.
     ///
-    /// After sampling the subgraph, the worker thread also loads features
-    /// for all nodes in the subgraph. On Linux, uses io_uring for parallel reads.
+    /// Sampling and feature loading run as a pipeline: `sampler_threads`
+    /// worker threads pull seed batches from the MPMC work channel, and one
+    /// feature-loader thread (io_uring on Linux) drains their output, so
+    /// sampling overlaps both the feature I/O and the consumer's compute.
     ///
     /// # Arguments
     /// * `graph` - Arc to CSR graph
     /// * `config` - Sampling configuration
     /// * `feature_path` - Path to feature file (AETHFEAT format)
     /// * `prefetch_depth` - How many batches to keep ready
+    /// * `sampler_threads` - Sampler worker count (0 is treated as 1)
     ///
     /// # Errors
-    /// Returns an error if the feature file cannot be loaded or the prefetch thread cannot be spawned.
+    /// Returns an error if the feature file cannot be loaded or a pipeline
+    /// thread cannot be spawned.
     pub fn with_features(
         graph: Arc<Graph>,
         config: SamplingConfig,
         feature_path: impl AsRef<Path>,
         prefetch_depth: usize,
+        sampler_threads: usize,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(prefetch_depth > 0, "prefetch_depth must be >= 1");
+        let sampler_threads = sampler_threads.max(1);
 
         // Load feature store to get metadata
         let feature_store = SyncFeatureStore::load(feature_path.as_ref())?;
         let feature_dim = feature_store.feature_dim();
 
         // Same bounding strategy as the in-memory path: producers see
-        // backpressure rather than silently growing the work queue.
+        // backpressure rather than silently growing the work queue. The
+        // sample channel holds at least one slot per sampler so a burst of
+        // simultaneous completions doesn't immediately block the pool.
         let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
         let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
-        let (sample_tx, sample_rx) = bounded::<SampledWork>(2);
+        let (sample_tx, sample_rx) = bounded::<SampledWork>(sampler_threads.max(2));
         let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
         let worker_fault = Arc::new(Mutex::new(None));
 
-        let sampler_handle = {
+        let mut handles = Vec::with_capacity(sampler_threads + 1);
+        for t in 0..sampler_threads {
             let shutdown = shutdown.clone();
             let stats = stats.clone();
             let fault = worker_fault.clone();
-            thread::Builder::new()
-                .name("aethergraph-sampler".into())
-                .spawn(move || {
-                    run_worker(&fault, move || {
-                        worker_loop_sampler(graph, config, work_rx, sample_tx, shutdown, stats);
-                        Ok(())
-                    });
-                })
-                .map_err(|e| anyhow::anyhow!("failed to spawn sampler thread: {}", e))?
-        };
+            let graph = Arc::clone(&graph);
+            let config = config.clone();
+            let work_rx = work_rx.clone();
+            let sample_tx = sample_tx.clone();
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("aethergraph-sampler-{t}"))
+                    .spawn(move || {
+                        run_worker(&fault, move || {
+                            worker_loop_sampler(graph, config, work_rx, sample_tx, shutdown, stats);
+                            Ok(())
+                        });
+                    })
+                    .map_err(|e| anyhow::anyhow!("failed to spawn sampler thread: {}", e))?,
+            );
+        }
+        // The workers own the only senders after this point, so the loader's
+        // recv disconnects when they all exit.
+        drop(sample_tx);
 
         let loader_handle = {
             let shutdown = shutdown.clone();
@@ -849,17 +880,20 @@ impl NeighborLoader {
                 })
                 .map_err(|e| anyhow::anyhow!("failed to spawn feature loader thread: {}", e))?
         };
+        handles.push(loader_handle);
 
         debug!(
             prefetch_depth,
-            feature_dim, "NeighborLoader started (2-thread pipeline: sampler + feature loader)"
+            sampler_threads,
+            feature_dim,
+            "NeighborLoader started (pipeline: samplers + feature loader)"
         );
 
         Ok(Self {
             work_tx: Some(work_tx),
             result_rx: Some(result_rx),
             shutdown,
-            handles: vec![sampler_handle, loader_handle],
+            handles,
             stats,
             prefetch_depth,
             feature_dim: Some(feature_dim),
@@ -1762,7 +1796,7 @@ mod tests {
             ..Default::default()
         };
 
-        let prefetcher = NeighborLoader::new(graph, config, 2).unwrap();
+        let prefetcher = NeighborLoader::new(graph, config, 2, 1).unwrap();
 
         prefetcher.submit(0, vec![0]).unwrap();
         prefetcher.submit(1, vec![1]).unwrap();
@@ -1779,11 +1813,43 @@ mod tests {
     }
 
     #[test]
+    fn multi_thread_sampler_pool_delivers_every_batch() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            seed: Some(7),
+            ..Default::default()
+        };
+
+        let prefetcher = NeighborLoader::new(graph, config, 4, 4).unwrap();
+        // Stay inside the bounded work channel (prefetch_depth * 8): the
+        // producer here is also the consumer, so overfilling would just be
+        // backpressure deadlocking the test, not a pool property.
+        let n = 24usize;
+        for i in 0..n {
+            prefetcher.submit(i, vec![(i % 5) as u32]).unwrap();
+        }
+
+        // Results may arrive in any order across the pool; every batch
+        // index must arrive exactly once with a valid subgraph.
+        let mut seen = vec![false; n];
+        for _ in 0..n {
+            let r = prefetcher
+                .next_timeout(Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            assert!(!seen[r.batch_idx], "batch {} delivered twice", r.batch_idx);
+            seen[r.batch_idx] = true;
+            assert_eq!(r.subgraph.num_seeds(), 1);
+        }
+        assert!(seen.iter().all(|&s| s), "missing batches: {seen:?}");
+    }
+
+    #[test]
     fn test_prefetch_hit_rate() {
         let graph = create_test_graph();
         let config = SamplingConfig::default();
 
-        let prefetcher = NeighborLoader::new(graph, config, 3).unwrap();
+        let prefetcher = NeighborLoader::new(graph, config, 3, 1).unwrap();
 
         // Submit all upfront
         for i in 0..10 {
@@ -1844,7 +1910,7 @@ mod tests {
 
         // prefetch_depth 1 => result channel capacity 1. Submitting several
         // batches leaves the worker blocked mid-`send` on a full channel.
-        let mut prefetcher = NeighborLoader::new(graph, config, 1).unwrap();
+        let mut prefetcher = NeighborLoader::new(graph, config, 1, 1).unwrap();
         for i in 0..4 {
             prefetcher.submit(i, vec![i as u32 % 5]).unwrap();
         }
@@ -1862,7 +1928,7 @@ mod tests {
     #[test]
     fn test_next_reports_timeout() {
         let graph = create_test_graph();
-        let prefetcher = NeighborLoader::new(graph, SamplingConfig::default(), 2).unwrap();
+        let prefetcher = NeighborLoader::new(graph, SamplingConfig::default(), 2, 1).unwrap();
 
         // Nothing submitted: the worker is alive but has no results.
         let waited = Duration::from_millis(50);
@@ -1930,7 +1996,7 @@ mod tests {
             seed: Some(1),
             ..Default::default()
         };
-        let loader = NeighborLoader::with_features(graph, config, temp_file.path(), 2).unwrap();
+        let loader = NeighborLoader::with_features(graph, config, temp_file.path(), 2, 1).unwrap();
         loader.submit(0, vec![4]).unwrap();
 
         match loader.next_with_features() {

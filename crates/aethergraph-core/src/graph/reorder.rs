@@ -1007,7 +1007,7 @@ mod tests {
             ..Default::default()
         };
         let num_batches = batches.len();
-        let loader = crate::loader::NeighborLoader::new(graph, config, 2).unwrap();
+        let loader = crate::loader::NeighborLoader::new(graph, config, 2, 1).unwrap();
         loader.submit_epoch(batches).unwrap();
 
         // Consume all results

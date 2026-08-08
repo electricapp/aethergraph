@@ -13,6 +13,7 @@ dependencies = [
  "aether-epoch",
  "crc32fast",
  "criterion",
+ "libc",
  "loom",
  "proptest",
  "rand 0.10.2",

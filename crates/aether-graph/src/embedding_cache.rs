@@ -6,39 +6,179 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Rows per storage block. Growing the cache appends one block; earlier
-/// rows never move.
-const BLOCK_ROWS: usize = 4096;
-
 /// Row slot for one computed node.
 #[derive(Debug, Clone, Copy)]
 struct Slot {
-    /// Row index into the block storage.
+    /// Row index into the row store.
     row: u32,
     /// Epoch when the node was last computed. 0 = allocated but never
     /// written through [`EmbeddingCache::update`].
     generation: u64,
 }
 
+/// Contiguous, lazily committed row storage.
+///
+/// On Unix the full `num_nodes × stride` matrix is *reserved* as one
+/// anonymous mapping but committed page-by-page on first touch, so
+/// resident memory tracks touched rows while row addressing is a single
+/// `base + row * stride` — no per-block indirection in the gather loop,
+/// no growth copies, and addresses are stable for the cache's lifetime.
+/// Reserving is free: 118 GB of virtual space for 230M × 128 dims costs
+/// nothing until rows are written. Non-Unix targets fall back to
+/// block-allocated storage with the same interface.
+#[derive(Debug)]
+struct RowStore {
+    #[cfg(unix)]
+    base: std::ptr::NonNull<f32>,
+    #[cfg(unix)]
+    bytes: usize,
+    #[cfg(not(unix))]
+    blocks: Vec<Vec<f32>>,
+    /// Row stride in f32s.
+    stride: usize,
+}
+
+#[cfg(unix)]
+// SAFETY: the mapping is owned by this store; `&self` access hands out
+// disjoint row slices under Rust's usual borrow rules.
+unsafe impl Send for RowStore {}
+#[cfg(unix)]
+// SAFETY: see Send.
+unsafe impl Sync for RowStore {}
+
+#[cfg(not(unix))]
+/// Rows per storage block in the non-Unix fallback.
+const BLOCK_ROWS: usize = 4096;
+
+impl RowStore {
+    #[cfg(unix)]
+    fn new(num_rows: usize, stride: usize) -> Self {
+        let bytes = num_rows
+            .checked_mul(stride)
+            .and_then(|n| n.checked_mul(4))
+            .expect("row store size overflows usize")
+            .max(4096);
+        // SAFETY: anonymous private mapping with no file backing; length is
+        // non-zero. MAP_NORESERVE (Linux) skips commit charging for the
+        // reservation; macOS overcommits anonymous memory by default.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | Self::map_noreserve(),
+                -1,
+                0,
+            )
+        };
+        assert!(
+            raw != libc::MAP_FAILED,
+            "EmbeddingCache: failed to reserve {bytes} bytes of virtual space"
+        );
+        Self {
+            base: std::ptr::NonNull::new(raw as *mut f32).expect("mmap returned null"),
+            bytes,
+            stride,
+        }
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    fn map_noreserve() -> libc::c_int {
+        libc::MAP_NORESERVE
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn map_noreserve() -> libc::c_int {
+        0
+    }
+
+    #[cfg(not(unix))]
+    fn new(_num_rows: usize, stride: usize) -> Self {
+        Self {
+            blocks: Vec::new(),
+            stride,
+        }
+    }
+
+    /// Make row `r` addressable. On Unix the reservation already covers
+    /// every row (the kernel commits the page on first write); the
+    /// fallback appends a block when needed.
+    #[inline]
+    fn ensure_row(&mut self, r: u32) {
+        #[cfg(unix)]
+        {
+            debug_assert!((r as usize + 1) * self.stride * 4 <= self.bytes);
+        }
+        #[cfg(not(unix))]
+        {
+            let r = r as usize;
+            if r / BLOCK_ROWS == self.blocks.len() {
+                self.blocks.push(vec![0.0f32; BLOCK_ROWS * self.stride]);
+            }
+        }
+    }
+
+    #[inline]
+    fn row(&self, r: u32, dim: usize) -> &[f32] {
+        #[cfg(unix)]
+        // SAFETY: `r` was handed out by the cache's allocator, so it is
+        // inside the mapping; anonymous pages read as zero before first
+        // write, so the slice is always initialized memory.
+        unsafe {
+            std::slice::from_raw_parts(self.base.as_ptr().add(r as usize * self.stride), dim)
+        }
+        #[cfg(not(unix))]
+        {
+            let r = r as usize;
+            let start = (r % BLOCK_ROWS) * self.stride;
+            &self.blocks[r / BLOCK_ROWS][start..start + dim]
+        }
+    }
+
+    #[inline]
+    fn row_mut(&mut self, r: u32, dim: usize) -> &mut [f32] {
+        #[cfg(unix)]
+        // SAFETY: as `row`, and `&mut self` guarantees exclusivity.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.base.as_ptr().add(r as usize * self.stride), dim)
+        }
+        #[cfg(not(unix))]
+        {
+            let r = r as usize;
+            let start = (r % BLOCK_ROWS) * self.stride;
+            &mut self.blocks[r / BLOCK_ROWS][start..start + dim]
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RowStore {
+    fn drop(&mut self) {
+        // SAFETY: base/bytes came from the successful mmap in `new`.
+        unsafe {
+            libc::munmap(self.base.as_ptr() as *mut libc::c_void, self.bytes);
+        }
+    }
+}
+
 /// Per-layer embedding cache.
 ///
 /// Stores one embedding vector per *computed* node for a single GNN
-/// layer. Storage is sparse and lazy: memory is allocated per node on
-/// first write, so resident size is `touched_nodes × stride × 4` bytes —
-/// `num_nodes` is only a validity bound, not an allocation. (A dense
+/// layer. Storage is sparse and lazy: the full matrix is reserved as
+/// virtual space but committed per page on first write, so resident size
+/// is `touched_nodes × stride × 4` bytes — `num_nodes` is only a
+/// reservation bound, not an allocation. (An eagerly allocated dense
 /// `num_nodes × dim` matrix would be ~118 GB per layer at 230M nodes ×
-/// 128 dims, allocated up front whether or not a node is ever touched.)
+/// 128 dims whether or not a node is ever touched.)
 ///
 /// The node → row map uses FxHash — this lookup runs once or twice per
 /// node per layer per batch, and SipHash on a 4-byte key cost 3-5x more
-/// than the whole probe needs. Rows live in fixed-size blocks so growth
-/// allocates a fresh block instead of re-copying (and transiently
-/// doubling) the entire table, and the row stride pads `dim` to a
-/// multiple of 16 floats so rows of odd dims don't straddle cache lines.
+/// than the whole probe needs. The row stride pads `dim` to a multiple
+/// of 16 floats so rows of odd dims don't straddle cache lines.
 #[derive(Debug)]
 pub struct EmbeddingCache {
-    /// Row storage blocks, each `BLOCK_ROWS × stride` f32s.
-    blocks: Vec<Vec<f32>>,
+    /// Contiguous reserved row storage.
+    store: RowStore,
     /// Rows allocated so far.
     rows: usize,
     /// node → row slot. Rows are never freed; a training epoch touches a
@@ -46,9 +186,7 @@ pub struct EmbeddingCache {
     slots: FxHashMap<u32, Slot>,
     /// Embedding dimension.
     dim: usize,
-    /// Row stride in f32s (`dim` padded to a multiple of 16).
-    stride: usize,
-    /// Number of addressable nodes (validity bound only).
+    /// Number of addressable nodes (bounds the reservation).
     num_nodes: usize,
     /// Generation counter; nodes with `slot.generation < generation` are stale.
     generation: u64,
@@ -56,45 +194,35 @@ pub struct EmbeddingCache {
 
 impl EmbeddingCache {
     /// Create a cache for up to `num_nodes` nodes with `dim`-dimensional
-    /// embeddings. No per-node memory is allocated until a node is
+    /// embeddings. No per-node memory is committed until a node is
     /// written.
     ///
     /// # Panics
     /// Panics if `dim == 0`.
     pub fn new(num_nodes: usize, dim: usize) -> Self {
         assert!(dim > 0, "embedding dim must be > 0");
+        let stride = dim.next_multiple_of(16);
         // Generation starts at 1 so slot generation 0 is automatically stale.
         Self {
-            blocks: Vec::new(),
+            store: RowStore::new(num_nodes.max(1), stride),
             rows: 0,
             slots: FxHashMap::default(),
             dim,
-            stride: dim.next_multiple_of(16),
             num_nodes,
             generation: 1,
         }
     }
 
-    /// Row slice for an existing slot.
+    /// Allocate the next row. Rows never move; at most one row per node
+    /// can be allocated, so the index stays within the reservation.
     #[inline]
-    fn row(&self, slot: Slot) -> &[f32] {
-        let r = slot.row as usize;
-        let start = (r % BLOCK_ROWS) * self.stride;
-        &self.blocks[r / BLOCK_ROWS][start..start + self.dim]
-    }
-
-    /// Allocate the next row, appending a fresh block when the current one
-    /// is full. Returns the row index. Never moves existing rows.
-    #[inline]
-    fn alloc_row(blocks: &mut Vec<Vec<f32>>, rows: &mut usize, stride: usize) -> u32 {
+    fn alloc_row(store: &mut RowStore, rows: &mut usize) -> u32 {
         assert!(
             *rows <= u32::MAX as usize,
             "EmbeddingCache row index {rows} overflows u32"
         );
-        if rows.is_multiple_of(BLOCK_ROWS) {
-            blocks.push(vec![0.0f32; BLOCK_ROWS * stride]);
-        }
         let row = *rows as u32;
+        store.ensure_row(row);
         *rows += 1;
         row
     }
@@ -110,7 +238,7 @@ impl EmbeddingCache {
             .slots
             .get(&node)
             .unwrap_or_else(|| panic!("EmbeddingCache::get({node}): node never computed"));
-        self.row(*slot)
+        self.store.row(slot.row, self.dim)
     }
 
     /// Return the cached embedding for `node` in one probe, or `None` when
@@ -123,7 +251,7 @@ impl EmbeddingCache {
         if slot.generation == 0 {
             return None;
         }
-        Some(self.row(*slot))
+        Some(self.store.row(slot.row, self.dim))
     }
 
     /// Return mutable embedding slice for `node`, allocating a zeroed row
@@ -142,13 +270,11 @@ impl EmbeddingCache {
         let slot = match self.slots.entry(node) {
             std::collections::hash_map::Entry::Occupied(e) => *e.get(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                let row = Self::alloc_row(&mut self.blocks, &mut self.rows, self.stride);
+                let row = Self::alloc_row(&mut self.store, &mut self.rows);
                 *e.insert(Slot { row, generation: 0 })
             }
         };
-        let r = slot.row as usize;
-        let start = (r % BLOCK_ROWS) * self.stride;
-        &mut self.blocks[r / BLOCK_ROWS][start..start + self.dim]
+        self.store.row_mut(slot.row, self.dim)
     }
 
     /// Write embedding and stamp current generation. One hash probe.
@@ -170,14 +296,12 @@ impl EmbeddingCache {
                 s.row
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let row = Self::alloc_row(&mut self.blocks, &mut self.rows, self.stride);
+                let row = Self::alloc_row(&mut self.store, &mut self.rows);
                 e.insert(Slot { row, generation });
                 row
             }
         };
-        let r = row as usize;
-        let start = (r % BLOCK_ROWS) * self.stride;
-        self.blocks[r / BLOCK_ROWS][start..start + self.dim].copy_from_slice(embedding);
+        self.store.row_mut(row, self.dim).copy_from_slice(embedding);
     }
 
     /// True if node's cached embedding is from a previous generation.

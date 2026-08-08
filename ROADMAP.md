@@ -25,23 +25,14 @@ single-worker baseline.
 
 ---
 
-## Performance structurals (deferred from the roofline pass)
+## Performance structurals
 
-Larger redesigns identified in the performance audit but out of scope for the
-tuning pass. Each is a real architecture change; land with its own tests.
+Remaining larger redesigns; land each with its own tests.
 
-| Area                          | Change                                                                                                                                                                                 |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `aether-graph` arena          | Free-list recycling with epoch-based reclamation so long-running ingest reuses retired chunk memory instead of growing until `compact()`                                               |
-| `aether-graph` arena          | Two-cursor allocation (chunks from one end, interior nodes from the other) so same-kind allocations pack densely per cache line                                                        |
-| `aether-graph` arena          | Lift the 2 GiB capacity limit (u32 offsets) via segmented arenas or u64 offsets for billion-edge single-process ingest                                                                 |
-| `aether-graph` compact        | Parallel compaction: snapshot roots, rebuild per-vertex trees across a thread pool, then swap — compact is single-threaded today                                                       |
-| `embedding_cache` block store | Blocks are `Vec<Vec<f32>>`; a reserved virtual mapping (mmap + commit-on-touch) would make row addresses stable AND contiguous, enabling one-shot bulk gather                          |
-| FeatureCache NVMe tier        | Replace file-per-node with one preallocated file + `O_DIRECT` slot reads/writes (io_uring lane); file-per-node pays open/close + inode churn per miss                                  |
-| FeatureCache tier storage     | Slab-backed rows per tier with a borrow/copy-into API — the owned `Vec<f32>` per entry forces a heap row per node plus a clone on every hit and every promote                          |
-| NeighborLoader                | Multi-sampler pipeline: N Rust sampler threads feeding a bounded queue ahead of H2D, so sampling overlaps transfer AND model compute at scale (hetero loader has the 1-thread version) |
-| Python wheels                 | CI variant building `x86-64-v3` (AVX2/FMA) wheels alongside baseline; runtime dispatch covers F16C but the whole binary gains from `-C target-cpu=x86-64-v3`                           |
-| Deployment docs               | NUMA guidance: pin sampler threads + io_uring SQPOLL thread (`AETHERGRAPH_SQPOLL_CPU`) to the NIC/NVMe socket; interleave feature mmaps across nodes                                   |
+| Area                   | Change                                                                                                                                        |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| FeatureCache NVMe tier | Route the slot file through the io_uring lane with `O_DIRECT` (it uses positional reads on the blocking pool today)                           |
+| HeteroNeighborLoader   | Extend the sampler-pool `num_workers` semantics to the hetero loader (one background thread today; the homogeneous loader has the pooled form) |
 
 ---
 

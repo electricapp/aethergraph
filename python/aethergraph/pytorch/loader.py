@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import math
 import time
-import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -394,8 +393,11 @@ class NeighborLoader(IterableDataset[Data]):
             batch_size: Number of seed nodes per batch.
             shuffle: Whether to shuffle nodes between epochs.
             replace: Whether to sample neighbors with replacement.
-            num_workers: Must be 0. AetherGraph handles parallelism internally
-                via Rust/Rayon. A warning is issued if non-zero.
+            num_workers: Number of Rust sampler threads feeding the
+                prefetch pipeline (PyG-compatible semantics, but threads in
+                the Rust backend instead of DataLoader worker processes).
+                0 and 1 both mean a single sampler thread; higher values
+                scale sampling throughput when sampling is the bottleneck.
             prefetch_factor: Number of batches to prefetch ahead in the
                 sampling pipeline. Higher values reduce GPU stalls but use
                 more memory.
@@ -451,12 +453,13 @@ class NeighborLoader(IterableDataset[Data]):
         """
         super().__init__()
 
-        if num_workers != 0:
-            warnings.warn(
-                "num_workers must be 0 for AetherGraph (Rust handles parallelism)",
-                UserWarning,
-                stacklevel=2,
-            )
+        if num_workers < 0:
+            raise ValueError(f"num_workers must be >= 0, got {num_workers}")
+        # PyG semantics, Rust execution: instead of forking DataLoader
+        # worker processes, num_workers sizes the Rust sampler thread pool
+        # feeding the prefetch pipeline. 0 keeps the single-threaded
+        # pipeline (sampling still overlaps training).
+        self._sampler_threads: int = max(1, num_workers)
 
         # DynamicGraph: snapshot at each epoch for fresh edges.
         # Using match on the union discriminant — mypy narrows the type.
@@ -641,12 +644,14 @@ class NeighborLoader(IterableDataset[Data]):
                 rust_config,
                 feature_path,
                 self.prefetch_factor,
+                self._sampler_threads,
             )
         else:
             sampler = RustNeighborLoader(
                 self.graph,
                 rust_config,
                 self.prefetch_factor,
+                self._sampler_threads,
             )
 
         submitted = 0
