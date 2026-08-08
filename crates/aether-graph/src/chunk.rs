@@ -48,6 +48,21 @@ impl Chunk {
             sorted.len(),
             CHUNK_CAP
         );
+        Self::from_sorted_unchecked(sorted)
+    }
+
+    /// `from_sorted` for internal callers whose lengths are structurally
+    /// bounded (split halves, rebuild leaves) — the length check is a
+    /// debug assertion so per-leaf construction during compaction carries
+    /// no release-mode branch + panic edge.
+    #[inline]
+    pub(crate) fn from_sorted_unchecked(sorted: &[u32]) -> Self {
+        debug_assert!(
+            sorted.len() <= CHUNK_CAP,
+            "chunk: input len {} exceeds CHUNK_CAP {}",
+            sorted.len(),
+            CHUNK_CAP
+        );
         debug_assert!(is_sorted(sorted), "chunk input must be strictly sorted");
         let mut c = Self::empty();
         c.count = sorted.len() as u8;
@@ -77,10 +92,23 @@ impl Chunk {
         self.count as usize == CHUNK_CAP
     }
 
-    /// Binary search for `val`. Returns Ok(index) if found, Err(insert_pos) if not.
+    /// Search for `val`. Returns Ok(index) if found, Err(insert_pos) if not.
+    ///
+    /// Branchless over all 15 lanes: the whole chunk sits in one loaded
+    /// cache line, so counting the smaller lanes vectorizes to a couple of
+    /// packed compares — beating binary search's ~4 serially dependent
+    /// compare/select rounds.
     #[inline]
     pub fn search(&self, val: u32) -> Result<usize, usize> {
-        self.as_slice().binary_search(&val)
+        let n = self.count as usize;
+        let mut pos = 0usize;
+        let mut found = false;
+        for i in 0..CHUNK_CAP {
+            let in_range = i < n;
+            pos += (in_range & (self.data[i] < val)) as usize;
+            found |= in_range & (self.data[i] == val);
+        }
+        if found { Ok(pos) } else { Err(pos) }
     }
 
     /// Does this chunk contain `val`?
@@ -97,13 +125,15 @@ impl Chunk {
             Ok(_) => None, // duplicate
             Err(pos) => {
                 debug_assert!(!self.is_full(), "insert into full chunk");
-                let mut new = *self;
-                let n = new.count as usize;
-                // Shift right to make room
-                let dst = &mut new.data[..n + 1];
-                dst.copy_within(pos..n, pos + 1);
-                dst[pos] = val;
-                new.count += 1;
+                // Build the new chunk in one pass — prefix, value, suffix —
+                // rather than copying all lanes and then shifting the tail
+                // a second time.
+                let n = self.count as usize;
+                let mut new = Self::empty();
+                new.count = self.count + 1;
+                new.data[..pos].copy_from_slice(&self.data[..pos]);
+                new.data[pos] = val;
+                new.data[pos + 1..n + 1].copy_from_slice(&self.data[pos..n]);
                 Some(new)
             }
         }
@@ -115,8 +145,8 @@ impl Chunk {
     pub fn split(&self) -> (Chunk, Chunk) {
         let n = self.count as usize;
         let mid = n / 2;
-        let left = Chunk::from_sorted(&self.data[..mid]);
-        let right = Chunk::from_sorted(&self.data[mid..n]);
+        let left = Chunk::from_sorted_unchecked(&self.data[..mid]);
+        let right = Chunk::from_sorted_unchecked(&self.data[mid..n]);
         (left, right)
     }
 

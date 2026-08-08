@@ -38,9 +38,9 @@ fn round_trip_through_wal_recovers_full_graph() {
     assert_eq!(collect_neighbors(&g2, 1), vec![3]);
     assert_eq!(collect_neighbors(&g2, 2), vec![3]);
     assert_eq!(collect_neighbors(&g2, 3), vec![4]);
-    // current_epoch is bumped once per recovered record so callers can
-    // see how much was replayed.
-    assert_eq!(g2.current_epoch().as_u64(), 5);
+    // Recovery is one logical commit: the epoch advances exactly once for
+    // the whole replay, regardless of the record count.
+    assert_eq!(g2.current_epoch().as_u64(), 1);
 }
 
 #[test]
@@ -232,13 +232,12 @@ fn shared_epoch_clock_is_consistent_after_recovery() {
         assert_eq!(g.current_epoch().as_u64(), 3);
     }
 
-    // Recovery: clock advances once per record applied. (It matches the
-    // original run's epoch here only because each writer guard above
-    // inserted exactly one edge.)
+    // Recovery is one logical commit: the shared clock advances exactly
+    // once for the whole replay.
     let clock = Arc::new(EpochClock::new());
     let g = DynamicGraph::open_with_wal_and_epoch(&path, 16, 1 << 20, Arc::clone(&clock)).unwrap();
     assert_eq!(g.num_edges(), 3);
-    assert_eq!(clock.current().as_u64(), 3);
+    assert_eq!(clock.current().as_u64(), 1);
 }
 
 #[test]

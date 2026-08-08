@@ -14,7 +14,7 @@ use aether_graph::{DynamicGraph, replay_wal};
 // On-disk framing (the `aether_graph::wal` constants are crate-private). The
 // length assertion in `build_wal` fails loudly if the real format drifts.
 const HEADER_LEN: usize = 16;
-const RECORD_LEN: usize = 24;
+const RECORD_LEN: usize = 12;
 
 fn sample_edges() -> Vec<(u32, u32)> {
     (0..16u32).map(|i| (i, i + 1)).collect()

@@ -49,18 +49,32 @@ impl DirtyBitmap {
         }
     }
 
-    /// Mark a vertex as dirty. Lock-free (atomic fetch_or).
-    /// Returns `false` if `vertex` is out of bounds (no bit was set).
-    #[inline]
-    fn mark(&self, vertex: u32) -> bool {
-        let v = vertex as usize;
-        if v >= self.num_vertices {
-            return false;
+    /// Mark a batch of vertices dirty from an ascending, deduplicated
+    /// slice. Vertices sharing a 64-bit word coalesce into one `fetch_or`,
+    /// and the sorted order walks the bitmap sequentially — where a
+    /// per-edge `mark()` costs two random-line atomic RMWs per insert
+    /// (2 likely-DRAM misses each on a multi-hundred-MB bitmap).
+    /// Out-of-range IDs are skipped.
+    fn mark_sorted(&self, sorted: &[u32]) {
+        let mut i = 0;
+        while i < sorted.len() {
+            let v = sorted[i] as usize;
+            if v >= self.num_vertices {
+                // Sorted input: everything after is also out of range.
+                return;
+            }
+            let word = v / 64;
+            let mut mask = 0u64;
+            while i < sorted.len() && (sorted[i] as usize) < self.num_vertices {
+                let v = sorted[i] as usize;
+                if v / 64 != word {
+                    break;
+                }
+                mask |= 1u64 << (v % 64);
+                i += 1;
+            }
+            self.words[word].fetch_or(mask, Ordering::Release);
         }
-        let word = v / 64;
-        let bit = v % 64;
-        self.words[word].fetch_or(1u64 << bit, Ordering::Release);
-        true
     }
 
     /// Check if a vertex is dirty. Returns `false` if `vertex` is out of bounds.
@@ -120,6 +134,16 @@ impl DirtyBitmap {
     }
 }
 
+/// Isolates a writer-updated counter on its own cache line so its stores
+/// don't evict the read-mostly graph fields from reader caches. 128 bytes
+/// covers the adjacent-line prefetcher on x86_64 and Apple Silicon.
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(128)))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    repr(align(64))
+)]
+struct CachePadded<T>(T);
+
 /// Lock-free dynamic graph with O(1) edge insert and O(degree) neighbor access.
 ///
 /// Each vertex's neighbor list is a C-tree (balanced tree of sorted chunks)
@@ -134,9 +158,11 @@ pub struct DynamicGraph {
     /// Number of vertices (fixed at construction).
     num_vertices: usize,
     /// Total edge count (informational, not used for correctness).
-    num_edges: AtomicU64,
+    /// Updated once per committed writer guard, not per edge; padded so
+    /// the update doesn't share a line with fields readers poll.
+    num_edges: CachePadded<AtomicU64>,
     /// Dirty-node bitmap for historical embedding tracking.
-    /// Set on edge insert, cleared at epoch boundary.
+    /// Set on writer commit, cleared at epoch boundary.
     dirty: DirtyBitmap,
     /// Single-writer guard. `true` while a `Writer` exists.
     writer_locked: AtomicBool,
@@ -202,7 +228,7 @@ impl DynamicGraph {
             roots,
             arena: Arena::new(arena_bytes),
             num_vertices,
-            num_edges: AtomicU64::new(0),
+            num_edges: CachePadded(AtomicU64::new(0)),
             dirty: DirtyBitmap::new(num_vertices),
             writer_locked: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
@@ -218,12 +244,10 @@ impl DynamicGraph {
     /// WAL ends in a torn record (mid-write crash), the file is
     /// truncated to the last clean record.
     ///
-    /// After this returns, `current_epoch()` equals the number of
-    /// replayed records — replay advances the clock once per record,
-    /// while a live run advances once per writer-guard drop. The two
-    /// agree only when every guard inserted exactly one edge, so do not
-    /// compare epoch values across a restart; treat the post-recovery
-    /// epoch as a fresh, deterministic starting point.
+    /// Replay runs under one writer guard, so `current_epoch()` advances
+    /// exactly once for the whole recovery — treat the post-recovery
+    /// epoch as a fresh starting point, not as comparable to any epoch
+    /// value from before the restart.
     #[cfg(feature = "wal")]
     pub fn open_with_wal(
         path: impl AsRef<Path>,
@@ -251,11 +275,10 @@ impl DynamicGraph {
         // deliberately leave `graph.wal = None` during replay — we do
         // NOT want to re-log records we're reading from the log.
         //
-        // One writer-guard per record: cheap (a single CAS to acquire,
-        // a single CAS to release, plus an epoch advance). The
-        // per-record advance is exactly what we want — after replay
-        // `current_epoch()` equals the number of records recovered,
-        // giving callers a deterministic "where did we end up" signal.
+        // One writer guard spans the whole replay: recovery is one
+        // logical commit, so it costs one acquire/release/epoch-advance
+        // total instead of five atomics per record across a
+        // potentially-multi-GB log.
         let mut graph = Self::new_with_epoch(num_vertices, arena_bytes, Arc::clone(&epoch));
 
         // The WAL does not record the graph dimensions it was written
@@ -264,28 +287,32 @@ impl DynamicGraph {
         // silently partial replay would present itself as a smaller but
         // valid graph.
         let mut replay_err: Option<WalError> = None;
-        let outcome = crate::wal::replay(path, |rec| {
-            if replay_err.is_some() {
-                return;
-            }
-            let mut w = graph.writer_or_panic();
-            match w.insert_edge(rec.src, rec.dst) {
-                Ok(_) => {}
-                Err(InsertError::VertexOutOfRange { src, dst }) => {
-                    replay_err = Some(WalError::RecordOutOfRange {
-                        src,
-                        dst,
-                        num_vertices: num_vertices as u64,
-                    });
+        let outcome = {
+            // Lazy guard: an empty WAL applies no records and must not
+            // advance the epoch (the guard's drop commits once).
+            let mut writer: Option<Writer<'_>> = None;
+            crate::wal::replay(path, |rec| {
+                if replay_err.is_some() {
+                    return;
                 }
-                Err(InsertError::ArenaFull) => {
-                    replay_err = Some(WalError::ReplayArenaFull);
+                let w = writer.get_or_insert_with(|| graph.writer_or_panic());
+                match w.insert_edge(rec.src, rec.dst) {
+                    Ok(_) => {}
+                    Err(InsertError::VertexOutOfRange { src, dst }) => {
+                        replay_err = Some(WalError::RecordOutOfRange {
+                            src,
+                            dst,
+                            num_vertices: num_vertices as u64,
+                        });
+                    }
+                    Err(InsertError::ArenaFull) => {
+                        replay_err = Some(WalError::ReplayArenaFull);
+                    }
+                    // `graph.wal` is None during replay, so no append happens.
+                    Err(InsertError::WalAppend) => unreachable!("no WAL attached during replay"),
                 }
-                // `graph.wal` is None during replay, so no append happens.
-                Err(InsertError::WalAppend) => unreachable!("no WAL attached during replay"),
-            }
-            let _ = rec.epoch; // reserved for future MVCC pinning
-        })?;
+            })?
+        };
         if let Some(e) = replay_err {
             return Err(e);
         }
@@ -355,6 +382,14 @@ impl DynamicGraph {
         Ok(Writer {
             graph: self,
             rebalance_scratch: Vec::new(),
+            merge_scratch: Vec::new(),
+            pending_edges: 0,
+            dirty_buf: Vec::with_capacity(DIRTY_BUF_FLUSH_THRESHOLD),
+            #[cfg(feature = "wal")]
+            wal_guard: self
+                .wal
+                .as_ref()
+                .map(|m| m.lock().unwrap_or_else(|e| e.into_inner())),
             #[cfg(feature = "wal")]
             wal_failed: false,
         })
@@ -384,18 +419,24 @@ impl DynamicGraph {
         self.num_vertices
     }
 
-    /// Total edge count.
+    /// Total edge count. Reflects committed writer guards: a live guard's
+    /// inserts are folded in when it drops.
     #[inline(always)]
     pub fn num_edges(&self) -> u64 {
-        self.num_edges.load(Ordering::Relaxed)
+        self.num_edges.0.load(Ordering::Relaxed)
     }
 
-    /// Get the C-tree root for a vertex.
+    /// Get the C-tree root for a vertex. Out-of-range vertices read as
+    /// empty rather than panicking — the sampler's inner loops shouldn't
+    /// carry a panic edge for a bounds condition the caller can't hit
+    /// with valid IDs.
     #[inline(always)]
     fn tree_for(&self, vertex: u32) -> CTree {
-        CTree {
-            root: self.roots[vertex as usize].load(Ordering::Acquire),
-        }
+        let root = match self.roots.get(vertex as usize) {
+            Some(r) => r.load(Ordering::Acquire),
+            None => crate::ctree::NULL,
+        };
+        CTree { root }
     }
 
     /// Degree of a vertex.
@@ -575,6 +616,12 @@ impl DynamicGraph {
     }
 }
 
+/// Once the guard's dirty buffer reaches this many entries it is flushed
+/// to the bitmap eagerly, keeping the buffer at a fixed capacity so the
+/// per-edge insert path never grows it (heap-free steady state, enforced
+/// by `tests/zero_alloc.rs`).
+const DIRTY_BUF_FLUSH_THRESHOLD: usize = 8192;
+
 /// Single-writer guard for [`DynamicGraph`].
 ///
 /// Created by [`DynamicGraph::writer`]. Releases the writer slot on drop.
@@ -586,6 +633,23 @@ pub struct Writer<'a> {
     /// elements during a rebalance. Owned by the guard so the write path
     /// allocates at most once per writer instead of once per rebalance.
     rebalance_scratch: Vec<u32>,
+    /// Scratch for the bulk insert path's merged neighbor list.
+    merge_scratch: Vec<u32>,
+    /// Edges inserted by this guard, folded into the shared counter once
+    /// at drop — a per-edge atomic RMW on a shared line bought nothing
+    /// from a provably single writer.
+    pending_edges: u64,
+    /// Vertices touched by this guard's inserts. Sorted, deduplicated, and
+    /// flushed to the dirty bitmap in one sequential pass at commit —
+    /// per-edge marking cost two random-line atomic RMWs per insert
+    /// (each a likely DRAM + TLB miss on a multi-hundred-MB bitmap), and
+    /// consumers only drain dirtiness at epoch boundaries anyway.
+    dirty_buf: Vec<u32>,
+    /// The WAL, locked once for the guard's lifetime. The old per-edge
+    /// `Mutex` lock/unlock was pure tax — the guard already enforces
+    /// single-writer.
+    #[cfg(feature = "wal")]
+    wal_guard: Option<std::sync::MutexGuard<'a, WalWriter>>,
     /// True if any WAL append failed during this writer's lifetime. The
     /// drop path consults this to poison the graph rather than advance the
     /// epoch on data that isn't durable.
@@ -608,7 +672,10 @@ impl<'a> Writer<'a> {
             return Err(InsertError::VertexOutOfRange { src, dst });
         }
 
-        let current_root = self.graph.roots[src as usize].load(Ordering::Acquire);
+        // Relaxed: this thread is the only root-storer (single-writer
+        // guard), so it reads back its own prior store; the initial state
+        // was published by the guard-acquisition synchronization.
+        let current_root = self.graph.roots[src as usize].load(Ordering::Relaxed);
         let tree = CTree { root: current_root };
 
         // SAFETY: Writer existence guarantees single-writer access to the arena.
@@ -623,18 +690,8 @@ impl<'a> Writer<'a> {
                 // exists in neither memory nor the log. The arena bytes
                 // allocated for the failed insert leak until `compact`.
                 #[cfg(feature = "wal")]
-                if let Some(wal_mu) = self.graph.wal.as_ref() {
-                    let rec = EdgeRecord {
-                        epoch: self.graph.epoch.current().as_u64(),
-                        src,
-                        dst,
-                    };
-                    // The Writer guard already enforces single-writer, so
-                    // the mutex is uncontended. Take the guard even if a
-                    // prior holder poisoned it — the buffered writer behind
-                    // the lock is still usable, and panicking here (in a
-                    // path that may run during unwinding) would abort.
-                    let mut w = wal_mu.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(w) = self.wal_guard.as_mut() {
+                    let rec = EdgeRecord { src, dst };
                     if let Err(e) = w.append_edge(rec) {
                         // Record the failure so `Writer::drop` can poison.
                         self.wal_failed = true;
@@ -645,20 +702,169 @@ impl<'a> Writer<'a> {
 
                 // Release ordering ensures all arena writes (new nodes) are
                 // visible before the root pointer becomes visible to
-                // readers. Every published edge is counted and dirty-marked
-                // — publication and bookkeeping never diverge.
+                // readers. Counting and dirty-marking are buffered on the
+                // guard and folded in at commit (or at the buffer's fixed
+                // watermark).
                 self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
-                self.graph.num_edges.fetch_add(1, Ordering::Relaxed);
-                // Out-of-range src/dst are already rejected by the bounds
-                // check at the top of `insert_edge`, so both marks succeed.
-                let _ = self.graph.dirty.mark(src);
-                let _ = self.graph.dirty.mark(dst);
+                self.pending_edges += 1;
+                self.note_dirty(src);
+                self.note_dirty(dst);
 
                 Ok(true)
             }
             InsertResult::Duplicate => Ok(false),
             InsertResult::ArenaFull => Err(InsertError::ArenaFull),
         }
+    }
+
+    /// Insert every edge `(src, dst)` for `dst` in an ascending,
+    /// deduplicated `dsts` slice, rebuilding `src`'s tree once.
+    ///
+    /// Ingest streams are heavily source-clustered; inserting D edges one
+    /// at a time path-copies the root-to-leaf path D times (O(D log D)
+    /// allocations and garbage). This merges the existing neighbors with
+    /// `dsts` and builds the new tree in one pass — O(degree + D) arena
+    /// bytes, one root publish.
+    ///
+    /// Returns the number of edges actually new (duplicates are skipped).
+    ///
+    /// # Panics
+    /// Debug-asserts that `dsts` is strictly ascending.
+    pub fn insert_edges_sorted(&mut self, src: u32, dsts: &[u32]) -> Result<u64, InsertError> {
+        debug_assert!(
+            dsts.windows(2).all(|w| w[0] < w[1]),
+            "insert_edges_sorted requires strictly ascending dsts"
+        );
+        if (src as usize) >= self.graph.num_vertices {
+            return Err(InsertError::VertexOutOfRange { src, dst: 0 });
+        }
+        if let Some(&bad) = dsts
+            .iter()
+            .find(|&&d| (d as usize) >= self.graph.num_vertices)
+        {
+            return Err(InsertError::VertexOutOfRange { src, dst: bad });
+        }
+        if dsts.is_empty() {
+            return Ok(0);
+        }
+
+        // Relaxed: see `insert_edge`.
+        let current_root = self.graph.roots[src as usize].load(Ordering::Relaxed);
+        let tree = CTree { root: current_root };
+
+        // Merge existing (sorted) neighbors with the new sorted dsts. The
+        // genuinely-new dsts are appended to `dirty_buf` as they are
+        // discovered; the tail slice recorded here doubles as the WAL and
+        // bookkeeping list, so no second membership pass is needed. Flush
+        // up front if this batch could cross the watermark — the tail
+        // slice must stay contiguous through the WAL walk below.
+        if self.dirty_buf.len() + dsts.len() + 1 > DIRTY_BUF_FLUSH_THRESHOLD {
+            self.flush_dirty();
+        }
+        let new_dsts_start = self.dirty_buf.len();
+        let existing = &mut self.rebalance_scratch;
+        existing.clear();
+        tree.collect_into(&self.graph.arena, existing);
+        let merged = &mut self.merge_scratch;
+        merged.clear();
+        merged.reserve(existing.len() + dsts.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < existing.len() && j < dsts.len() {
+            match existing[i].cmp(&dsts[j]) {
+                std::cmp::Ordering::Less => {
+                    merged.push(existing[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    merged.push(dsts[j]);
+                    self.dirty_buf.push(dsts[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    merged.push(existing[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        merged.extend_from_slice(&existing[i..]);
+        for &d in &dsts[j..] {
+            merged.push(d);
+            self.dirty_buf.push(d);
+        }
+        let new_count = (self.dirty_buf.len() - new_dsts_start) as u64;
+        if new_count == 0 {
+            return Ok(0);
+        }
+
+        // Build the replacement tree first (invisible to readers), then
+        // log, then publish — a WAL failure leaves readers on the old
+        // root with no record of the unpublished edges.
+        // SAFETY: Writer existence guarantees single-writer access to the arena.
+        let new_tree = match unsafe { CTree::from_sorted(&self.graph.arena, merged) } {
+            Some(t) => t,
+            None => {
+                self.dirty_buf.truncate(new_dsts_start);
+                return Err(InsertError::ArenaFull);
+            }
+        };
+
+        #[cfg(feature = "wal")]
+        if let Some(w) = self.wal_guard.as_mut() {
+            for idx in new_dsts_start..self.dirty_buf.len() {
+                let rec = EdgeRecord {
+                    src,
+                    dst: self.dirty_buf[idx],
+                };
+                if let Err(e) = w.append_edge(rec) {
+                    self.wal_failed = true;
+                    tracing::error!(error = %e, "WAL append failed");
+                    return Err(InsertError::WalAppend);
+                }
+            }
+        }
+
+        self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
+        self.pending_edges += new_count;
+        self.dirty_buf.push(src);
+
+        Ok(new_count)
+    }
+
+    /// Record a vertex as dirtied by this guard, flushing at the fixed
+    /// watermark so the buffer never grows on the insert path.
+    #[inline]
+    fn note_dirty(&mut self, v: u32) {
+        if self.dirty_buf.len() == DIRTY_BUF_FLUSH_THRESHOLD {
+            self.flush_dirty();
+        }
+        self.dirty_buf.push(v);
+    }
+
+    /// Sort, dedup, and fold the buffered dirty vertices into the bitmap
+    /// in one sequential pass, keeping the buffer's capacity.
+    fn flush_dirty(&mut self) {
+        if self.dirty_buf.is_empty() {
+            return;
+        }
+        self.dirty_buf.sort_unstable();
+        self.dirty_buf.dedup();
+        self.graph.dirty.mark_sorted(&self.dirty_buf);
+        self.dirty_buf.clear();
+    }
+
+    /// Fold this guard's buffered bookkeeping into the shared state: one
+    /// atomic add for the edge count, one sorted sequential pass over the
+    /// dirty bitmap.
+    fn flush_bookkeeping(&mut self) {
+        if self.pending_edges > 0 {
+            self.graph
+                .num_edges
+                .0
+                .fetch_add(self.pending_edges, Ordering::Relaxed);
+            self.pending_edges = 0;
+        }
+        self.flush_dirty();
     }
 }
 
@@ -679,42 +885,39 @@ impl Drop for Writer<'_> {
         if panicking {
             self.graph.poisoned.store(true, Ordering::Release);
             #[cfg(feature = "wal")]
-            if let Some(wal_mu) = self.graph.wal.as_ref() {
-                // Take the guard even if poisoned; panicking here (during
-                // unwinding) would abort the process.
-                let mut w = wal_mu.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = w.discard_pending() {
-                    tracing::error!(error = %e, "failed to discard pending WAL records");
-                }
+            if let Some(w) = self.wal_guard.as_mut()
+                && let Err(e) = w.discard_pending()
+            {
+                tracing::error!(error = %e, "failed to discard pending WAL records");
             }
             tracing::warn!("DynamicGraph writer panicked — graph poisoned");
             self.graph.writer_locked.store(false, Ordering::Release);
             return;
         }
 
-        // Clean drop path. The order matters: WAL sync FIRST, then advance
-        // the epoch only if sync succeeded. If sync fails, we've got
-        // in-memory edges that aren't durable — poison instead.
+        // Clean drop path. The order matters: WAL sync FIRST, then fold in
+        // this guard's buffered bookkeeping, then advance the epoch — so
+        // epoch observers (historical-embedding drains) see the committed
+        // dirty set and edge count. If sync fails, we've got in-memory
+        // edges that aren't durable — poison instead, discarding the
+        // buffered bookkeeping (it describes uncommitted state).
         #[cfg(feature = "wal")]
         let mut durable_failure = self.wal_failed;
         #[cfg(not(feature = "wal"))]
         let durable_failure = false;
 
         #[cfg(feature = "wal")]
-        if let Some(wal_mu) = self.graph.wal.as_ref() {
-            // Take the guard even if poisoned — the buffered writer behind
-            // it is still usable, and a panic in `Drop` during unwinding
-            // would abort the process.
-            let mut w = wal_mu.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = w.sync() {
-                tracing::error!(error = %e, "WAL fsync failed; poisoning graph");
-                durable_failure = true;
-            }
+        if let Some(w) = self.wal_guard.as_mut()
+            && let Err(e) = w.sync()
+        {
+            tracing::error!(error = %e, "WAL fsync failed; poisoning graph");
+            durable_failure = true;
         }
 
         if durable_failure {
             self.graph.poisoned.store(true, Ordering::Release);
         } else {
+            self.flush_bookkeeping();
             // Publish a new epoch so readers pinning the clock see this
             // writer's edits. Done before releasing the writer lock so
             // the next writer can't bump the clock first.

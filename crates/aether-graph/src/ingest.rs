@@ -107,6 +107,75 @@ impl std::error::Error for IngestSpawnError {
     }
 }
 
+/// Thread-local counters, folded into the shared [`IngestStats`] at commit
+/// boundaries. Per-edge atomic RMWs on the `Arc`-shared stats line cost
+/// more than the tree insert itself once a monitor thread polls them; two
+/// atomics per commit interval replace two per edge.
+#[derive(Default)]
+struct LocalCounts {
+    received: u64,
+    inserted: u64,
+    duplicates: u64,
+    errors: u64,
+}
+
+impl LocalCounts {
+    fn flush(&mut self, stats: &IngestStats) {
+        if self.received > 0 {
+            stats.received.fetch_add(self.received, Ordering::Relaxed);
+            self.received = 0;
+        }
+        if self.inserted > 0 {
+            stats.inserted.fetch_add(self.inserted, Ordering::Relaxed);
+            self.inserted = 0;
+        }
+        if self.duplicates > 0 {
+            stats
+                .duplicates
+                .fetch_add(self.duplicates, Ordering::Relaxed);
+            self.duplicates = 0;
+        }
+        if self.errors > 0 {
+            stats.errors.fetch_add(self.errors, Ordering::Relaxed);
+            self.errors = 0;
+        }
+    }
+}
+
+/// Insert one edge, updating the local counters. Returns `false` on a
+/// fatal error (arena exhaustion, WAL failure) — the caller must stop.
+/// Every ingest driver funnels through here so the insert/count/commit
+/// logic exists exactly once.
+#[inline]
+fn drive_edge(
+    writer: &mut crate::graph::Writer<'_>,
+    local: &mut LocalCounts,
+    src: u32,
+    dst: u32,
+) -> bool {
+    local.received += 1;
+    match writer.insert_edge(src, dst) {
+        Ok(true) => {
+            local.inserted += 1;
+            true
+        }
+        Ok(false) => {
+            local.duplicates += 1;
+            true
+        }
+        Err(InsertError::VertexOutOfRange { .. }) => {
+            local.errors += 1;
+            true
+        }
+        // Arena exhaustion (and WAL append failure when enabled) cannot be
+        // recovered here: stop ingesting.
+        Err(_) => {
+            local.errors += 1;
+            false
+        }
+    }
+}
+
 /// Ingest edges from a closure into a DynamicGraph.
 ///
 /// Calls `next_edge()` repeatedly until it returns `None`. Single-threaded
@@ -114,7 +183,8 @@ impl std::error::Error for IngestSpawnError {
 ///
 /// Durability cadence: the writer guard is dropped and reacquired every
 /// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
-/// epoch advance) at that interval and again when the run ends.
+/// epoch advance) at that interval and again when the run ends. Stats are
+/// folded into the returned [`IngestStats`] at the same cadence.
 ///
 /// Returns `Err(IngestSpawnError::Writer(_))` if the writer slot is busy
 /// or poisoned (see [`WriterError`]), either at the start or when a
@@ -124,83 +194,59 @@ pub fn run(
     mut next_edge: impl FnMut() -> Option<(u32, u32)>,
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
+    let mut local = LocalCounts::default();
     let mut writer = graph.writer()?;
     let mut guard_edges = 0usize;
     while let Some((src, dst)) = next_edge() {
-        stats.received.fetch_add(1, Ordering::Relaxed);
-        match writer.insert_edge(src, dst) {
-            Ok(true) => {
-                stats.inserted.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(false) => {
-                stats.duplicates.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(InsertError::VertexOutOfRange { .. }) => {
-                stats.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            // Arena exhaustion (and WAL append failure when enabled)
-            // cannot be recovered here: stop ingesting.
-            Err(_) => {
-                stats.errors.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+        let ok = drive_edge(&mut writer, &mut local, src, dst);
+        if !ok {
+            break;
         }
         guard_edges += 1;
         if guard_edges >= COMMIT_INTERVAL_EDGES {
+            local.flush(&stats);
             drop(writer);
             writer = graph.writer()?;
             guard_edges = 0;
         }
     }
+    local.flush(&stats);
     Ok(stats)
 }
 
 /// Ingest edges in batches from an iterator of `(src, dst)` slices.
 ///
-/// Durability cadence: the writer guard is dropped and reacquired at
-/// every batch boundary and every [`COMMIT_INTERVAL_EDGES`] edges within
-/// a batch, committing (WAL sync when attached, epoch advance) at each
-/// cycle. A failed reacquire (slot stolen or graph poisoned) returns
-/// `Err(IngestSpawnError::Writer(_))`.
+/// Durability cadence: the writer guard is dropped and reacquired every
+/// [`COMMIT_INTERVAL_EDGES`] edges — batch boundaries deliberately do NOT
+/// force a commit. A caller feeding 100-edge batches would otherwise pay
+/// an fsync every 100 edges (a 650x amplification over the interval),
+/// capping ingest at the storage's fsync rate. A final commit still runs
+/// when the iterator ends. A failed reacquire (slot stolen or graph
+/// poisoned) returns `Err(IngestSpawnError::Writer(_))`.
 pub fn run_batches(
     graph: &DynamicGraph,
     batches: impl Iterator<Item = Vec<(u32, u32)>>,
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
+    let mut local = LocalCounts::default();
     let mut writer = graph.writer()?;
     let mut guard_edges = 0usize;
     'outer: for batch in batches {
         for &(src, dst) in &batch {
-            stats.received.fetch_add(1, Ordering::Relaxed);
-            match writer.insert_edge(src, dst) {
-                Ok(true) => {
-                    stats.inserted.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(false) => {
-                    stats.duplicates.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(InsertError::VertexOutOfRange { .. }) => {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                }
-                // Arena exhaustion (and WAL append failure when enabled)
-                // cannot be recovered here: stop ingesting.
-                Err(_) => {
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                    break 'outer;
-                }
+            let ok = drive_edge(&mut writer, &mut local, src, dst);
+            if !ok {
+                break 'outer;
             }
             guard_edges += 1;
             if guard_edges >= COMMIT_INTERVAL_EDGES {
+                local.flush(&stats);
                 drop(writer);
                 writer = graph.writer()?;
                 guard_edges = 0;
             }
         }
-        // Commit at the batch boundary.
-        drop(writer);
-        writer = graph.writer()?;
-        guard_edges = 0;
     }
+    local.flush(&stats);
     Ok(stats)
 }
 
@@ -240,30 +286,20 @@ pub fn spawn(
                     return;
                 }
             };
+            let mut local = LocalCounts::default();
             let mut guard_edges = 0usize;
+            let mut idle_spins = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 match next_edge() {
                     Some((src, dst)) => {
-                        stats_clone.received.fetch_add(1, Ordering::Relaxed);
-                        match writer.insert_edge(src, dst) {
-                            Ok(true) => {
-                                stats_clone.inserted.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(false) => {
-                                stats_clone.duplicates.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(InsertError::VertexOutOfRange { .. }) => {
-                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                            // Arena exhaustion (and WAL append failure when
-                            // enabled) cannot be recovered here: stop.
-                            Err(_) => {
-                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
-                                break;
-                            }
+                        idle_spins = 0;
+                        let ok = drive_edge(&mut writer, &mut local, src, dst);
+                        if !ok {
+                            break;
                         }
                         guard_edges += 1;
                         if guard_edges >= COMMIT_INTERVAL_EDGES {
+                            local.flush(&stats_clone);
                             drop(writer);
                             writer = match graph.writer() {
                                 Ok(w) => w,
@@ -280,13 +316,21 @@ pub fn spawn(
                         }
                     }
                     None => {
-                        // Source exhausted. Park briefly with a small sleep
-                        // rather than tight-looping; tests use short timeouts
-                        // so we keep this granularity.
-                        std::thread::park_timeout(Duration::from_millis(1));
+                        // Source momentarily dry. Make buffered stats
+                        // visible, spin briefly for a bursty source, then
+                        // park — jumping straight to a 1 ms sleep adds up
+                        // to 1 ms latency per gap.
+                        local.flush(&stats_clone);
+                        idle_spins += 1;
+                        if idle_spins < 64 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::park_timeout(Duration::from_millis(1));
+                        }
                     }
                 }
             }
+            local.flush(&stats_clone);
         })
         .map_err(IngestSpawnError::Thread)?;
 
@@ -320,40 +364,37 @@ pub fn drain_channel(
     stop: &AtomicBool,
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
+    let mut local = LocalCounts::default();
     let mut writer = graph.writer()?;
     let mut guard_edges = 0usize;
-    while !stop.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok((src, dst)) => {
-                stats.received.fetch_add(1, Ordering::Relaxed);
-                match writer.insert_edge(src, dst) {
-                    Ok(true) => {
-                        stats.inserted.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(false) => {
-                        stats.duplicates.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(InsertError::VertexOutOfRange { .. }) => {
-                        stats.errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    // Arena exhaustion (and WAL append failure when
-                    // enabled) cannot be recovered here: stop ingesting.
-                    Err(_) => {
-                        stats.errors.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                guard_edges += 1;
-                if guard_edges >= COMMIT_INTERVAL_EDGES {
-                    drop(writer);
-                    writer = graph.writer()?;
-                    guard_edges = 0;
-                }
-            }
+    'outer: while !stop.load(Ordering::Relaxed) {
+        // One blocking receive arms the drain; everything already queued
+        // is then pulled with non-blocking try_recv — a timeout-armed recv
+        // per edge (deadline construction + park/unpark) would cap
+        // throughput far below the writer itself.
+        let first = match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(edge) => edge,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let mut next = Some(first);
+        while let Some((src, dst)) = next {
+            let ok = drive_edge(&mut writer, &mut local, src, dst);
+            if !ok {
+                break 'outer;
+            }
+            guard_edges += 1;
+            if guard_edges >= COMMIT_INTERVAL_EDGES {
+                local.flush(&stats);
+                drop(writer);
+                writer = graph.writer()?;
+                guard_edges = 0;
+            }
+            next = rx.try_recv().ok();
         }
+        local.flush(&stats);
     }
+    local.flush(&stats);
     Ok(stats)
 }
 
@@ -437,49 +478,44 @@ pub fn spawn_channel(
                     return;
                 }
             };
+            let mut local = LocalCounts::default();
             let mut guard_edges = 0usize;
-            while !stop.load(Ordering::Relaxed) {
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok((src, dst)) => {
-                        stats_clone.received.fetch_add(1, Ordering::Relaxed);
-                        match writer.insert_edge(src, dst) {
-                            Ok(true) => {
-                                stats_clone.inserted.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(false) => {
-                                stats_clone.duplicates.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(InsertError::VertexOutOfRange { .. }) => {
-                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                            // Arena exhaustion (and WAL append failure when
-                            // enabled) cannot be recovered here: stop.
-                            Err(_) => {
-                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                        guard_edges += 1;
-                        if guard_edges >= COMMIT_INTERVAL_EDGES {
-                            drop(writer);
-                            writer = match graph.writer() {
-                                Ok(w) => w,
-                                Err(e) => {
-                                    stats_clone.errors.fetch_add(1, Ordering::Relaxed);
-                                    tracing::error!(
-                                        error = %e,
-                                        "drainer could not reacquire the writer slot; stopping"
-                                    );
-                                    return;
-                                }
-                            };
-                            guard_edges = 0;
-                        }
-                    }
+            'outer: while !stop.load(Ordering::Relaxed) {
+                // Same drain pattern as `drain_channel`: block once, then
+                // pull everything queued with non-blocking try_recv.
+                let first = match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(edge) => edge,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => break,
+                };
+                let mut next = Some(first);
+                while let Some((src, dst)) = next {
+                    let ok = drive_edge(&mut writer, &mut local, src, dst);
+                    if !ok {
+                        break 'outer;
+                    }
+                    guard_edges += 1;
+                    if guard_edges >= COMMIT_INTERVAL_EDGES {
+                        local.flush(&stats_clone);
+                        drop(writer);
+                        writer = match graph.writer() {
+                            Ok(w) => w,
+                            Err(e) => {
+                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    error = %e,
+                                    "drainer could not reacquire the writer slot; stopping"
+                                );
+                                return;
+                            }
+                        };
+                        guard_edges = 0;
+                    }
+                    next = rx.try_recv().ok();
                 }
+                local.flush(&stats_clone);
             }
+            local.flush(&stats_clone);
         })
         .map_err(IngestSpawnError::Thread)?;
     match ready_rx.recv() {

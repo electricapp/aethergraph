@@ -8,9 +8,21 @@
 //! safe for concurrent reads from previously-allocated nodes.
 
 use std::alloc::Layout;
-use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Pads the writer-side bump cursor onto its own cache line. Every reader
+/// node-dereference loads `Arena::ptr`; without this, the writer's 2-5
+/// `offset` stores per edge insert would keep invalidating the line that
+/// carries `ptr`/`capacity` in every reader's cache — a coherence miss per
+/// node visited instead of an L1 hit. 128 bytes covers the adjacent-line
+/// prefetcher on x86_64 and Apple Silicon's 128-byte granules.
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(128)))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    repr(align(64))
+)]
+struct CachePadded<T>(T);
 
 /// Fixed-capacity bump arena. Pre-allocates all memory upfront.
 ///
@@ -22,14 +34,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// `align_of::<u8>() = 1`, mismatching the 64-byte alignment we need for
 /// cache-line chunks and producing UB at drop.
 pub struct Arena {
-    /// 64-byte aligned backing storage.
-    ptr: UnsafeCell<NonNull<u8>>,
+    /// 64-byte aligned backing storage. Set once in `new` and never
+    /// reassigned — a plain field (not `UnsafeCell`) so the compiler may
+    /// hoist the base-pointer load out of node-walk loops.
+    ptr: NonNull<u8>,
     /// Layout the buffer was allocated with — needed for matched dealloc.
     layout: Layout,
-    /// Next free byte offset. Only the writer advances this.
-    offset: AtomicUsize,
     /// Total capacity in bytes.
     capacity: usize,
+    /// Next free byte offset. Only the writer advances this; isolated on
+    /// its own cache line so writer bumps don't evict the read-mostly
+    /// fields above from reader caches.
+    offset: CachePadded<AtomicUsize>,
 }
 
 // SAFETY: The arena is single-writer (only the graph writer thread allocates).
@@ -71,10 +87,10 @@ impl Arena {
             std::alloc::handle_alloc_error(layout);
         };
         Self {
-            ptr: UnsafeCell::new(ptr),
+            ptr,
             layout,
-            offset: AtomicUsize::new(0),
             capacity,
+            offset: CachePadded(AtomicUsize::new(0)),
         }
     }
 
@@ -95,14 +111,14 @@ impl Arena {
         if size == 0 {
             return None;
         }
-        let current = self.offset.load(Ordering::Relaxed);
+        let current = self.offset.0.load(Ordering::Relaxed);
         // Align up — checked to catch malformed (size, align) inputs.
         let aligned = current.checked_add(align - 1)? & !(align - 1);
         let new_offset = aligned.checked_add(size)?;
         if new_offset > self.capacity {
             return None; // arena full
         }
-        self.offset.store(new_offset, Ordering::Relaxed);
+        self.offset.0.store(new_offset, Ordering::Relaxed);
         // Capacity ≤ MAX_CAPACITY = 2^31 (enforced in `new`), so the cast
         // cannot truncate and bit 31 is never set on a returned offset.
         Some(aligned as u32)
@@ -135,13 +151,9 @@ impl Arena {
     /// Offset must be within bounds and point to a valid, initialized value.
     #[inline(always)]
     pub unsafe fn ptr_at(&self, offset: u32) -> *const u8 {
-        // SAFETY: UnsafeCell deref reads the stable base pointer set in `new`;
-        // single-writer invariant means no &mut alias exists while readers
-        // hold &Arena.
-        let base = unsafe { (*self.ptr.get()).as_ptr() };
         // SAFETY: caller asserts offset is within the allocated capacity, so
         // the resulting pointer stays inside the buffer.
-        unsafe { base.add(offset as usize) as *const u8 }
+        unsafe { self.ptr.as_ptr().add(offset as usize) as *const u8 }
     }
 
     /// Get a typed reference at `offset`.
@@ -159,7 +171,7 @@ impl Arena {
 
     /// Bytes currently allocated.
     pub fn used(&self) -> usize {
-        self.offset.load(Ordering::Relaxed)
+        self.offset.0.load(Ordering::Relaxed)
     }
 
     /// Total capacity.
@@ -170,13 +182,10 @@ impl Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        // SAFETY: read of the NonNull<u8> through UnsafeCell — Drop has &mut self
-        // so no other reference exists.
-        let ptr = unsafe { (*self.ptr.get()).as_ptr() };
-        // SAFETY: `ptr` was returned by `alloc_zeroed(self.layout)` in `new`,
-        // we own it exclusively here, and the layout matches.
+        // SAFETY: `self.ptr` was returned by `alloc_zeroed(self.layout)` in
+        // `new`, we own it exclusively here, and the layout matches.
         unsafe {
-            std::alloc::dealloc(ptr, self.layout);
+            std::alloc::dealloc(self.ptr.as_ptr(), self.layout);
         }
     }
 }

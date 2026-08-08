@@ -28,15 +28,19 @@
 //! [12..16] reserved = 0
 //! ```
 //!
-//! Each record (24 bytes):
+//! Each record (12 bytes):
 //!
 //! ```text
-//! [0..8 ] epoch    u64 LE  — `EpochClock` value at the time of the insert
-//! [8..12] src      u32 LE
-//! [12..16] dst     u32 LE
-//! [16..20] _pad    u32 LE  (0; reserved for record type when we add deletes)
-//! [20..24] crc32   u32 LE  — CRC32 of bytes [0..20] (IEEE polynomial)
+//! [0..4 ] src      u32 LE
+//! [4..8 ] dst      u32 LE
+//! [8..12] crc32    u32 LE  — CRC32 of bytes [0..8] (IEEE polynomial)
 //! ```
+//!
+//! The payload is exactly the edge: an epoch stamp would be identical for
+//! every record in a writer guard and is ignored on replay, so carrying
+//! it per record only inflated log I/O. A future record version can
+//! reintroduce per-record metadata (epoch pinning, deletes) behind the
+//! header's version field.
 //!
 //! Fixed-size records keep replay branchless. Torn writes are detected
 //! two ways: a tail shorter than one record is caught by the fixed
@@ -64,7 +68,12 @@ use std::path::Path;
 pub(crate) const MAGIC: [u8; 8] = *b"AGWAL\0\0\0";
 pub(crate) const VERSION: u32 = 1;
 pub(crate) const HEADER_LEN: u64 = 16;
-pub(crate) const RECORD_LEN: usize = 24;
+pub(crate) const RECORD_LEN: usize = 12;
+
+/// Writer/reader buffer size. Sized so a full commit interval's records
+/// (65,536 edges from the ingest drivers) reach the file in one `write(2)`
+/// and replay pulls the log in 1 MiB reads.
+const BUF_CAPACITY: usize = 1 << 20;
 
 /// Errors surfaced by WAL writes / replay. Corruption is not an error:
 /// a torn or corrupt tail is reported through
@@ -133,7 +142,6 @@ impl From<io::Error> for WalError {
 /// successfully-deserialized record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeRecord {
-    pub epoch: u64,
     pub src: u32,
     pub dst: u32,
 }
@@ -221,7 +229,7 @@ impl WalWriter {
         // Seek to end for append-only writes.
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
-            inner: BufWriter::with_capacity(64 * 1024, file),
+            inner: BufWriter::with_capacity(BUF_CAPACITY, file),
             pending: 0,
         })
     }
@@ -230,12 +238,10 @@ impl WalWriter {
     /// [`sync`](Self::sync) flushes and fsyncs.
     pub fn append_edge(&mut self, rec: EdgeRecord) -> Result<(), WalError> {
         let mut buf = [0u8; RECORD_LEN];
-        buf[0..8].copy_from_slice(&rec.epoch.to_le_bytes());
-        buf[8..12].copy_from_slice(&rec.src.to_le_bytes());
-        buf[12..16].copy_from_slice(&rec.dst.to_le_bytes());
-        // buf[16..20] left zero (record-type tag for future versions).
-        let crc = crc32fast::hash(&buf[..20]);
-        buf[20..24].copy_from_slice(&crc.to_le_bytes());
+        buf[0..4].copy_from_slice(&rec.src.to_le_bytes());
+        buf[4..8].copy_from_slice(&rec.dst.to_le_bytes());
+        let crc = crc32fast::hash(&buf[..8]);
+        buf[8..12].copy_from_slice(&crc.to_le_bytes());
 
         self.inner.write_all(&buf)?;
         self.pending += RECORD_LEN as u64;
@@ -326,7 +332,9 @@ where
             truncate_to: None,
         });
     }
-    let mut reader = BufReader::new(file);
+    // 1 MiB buffer: the default 8 KiB would issue a read(2) every ~680
+    // records on a recovery path that must chew the whole log.
+    let mut reader = BufReader::with_capacity(BUF_CAPACITY, file);
 
     // A header torn by a crash during initial creation (0 < len < HEADER_LEN,
     // since len == 0 returned above) holds no records. Report a truncate-to-0
@@ -373,8 +381,8 @@ where
             }
             Err(e) => return Err(WalError::Io(e)),
         }
-        let crc_recorded = u32::from_le_bytes(buf[20..24].try_into().unwrap());
-        let crc_computed = crc32fast::hash(&buf[..20]);
+        let crc_recorded = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let crc_computed = crc32fast::hash(&buf[..8]);
         if crc_recorded != crc_computed {
             // Partial or torn write detected. Stop replay; callers
             // truncate the file to `offset` to drop the corrupt tail.
@@ -384,9 +392,8 @@ where
             });
         }
         let rec = EdgeRecord {
-            epoch: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            src: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            dst: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            src: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            dst: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
         };
         apply(rec);
         applied += 1;
@@ -436,8 +443,8 @@ mod tests {
     fn append_replay_round_trip() {
         let tmp = tmp_wal();
         let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
-        for (epoch, src, dst) in [(1, 0u32, 1u32), (1, 2, 3), (2, 4, 5)] {
-            w.append_edge(EdgeRecord { epoch, src, dst }).unwrap();
+        for (src, dst) in [(0u32, 1u32), (2, 3), (4, 5)] {
+            w.append_edge(EdgeRecord { src, dst }).unwrap();
         }
         w.sync().unwrap();
         drop(w);
@@ -449,21 +456,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                EdgeRecord {
-                    epoch: 1,
-                    src: 0,
-                    dst: 1
-                },
-                EdgeRecord {
-                    epoch: 1,
-                    src: 2,
-                    dst: 3
-                },
-                EdgeRecord {
-                    epoch: 2,
-                    src: 4,
-                    dst: 5
-                },
+                EdgeRecord { src: 0, dst: 1 },
+                EdgeRecord { src: 2, dst: 3 },
+                EdgeRecord { src: 4, dst: 5 },
             ]
         );
     }
@@ -473,22 +468,12 @@ mod tests {
         let tmp = tmp_wal();
         {
             let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
-            w.append_edge(EdgeRecord {
-                epoch: 1,
-                src: 7,
-                dst: 8,
-            })
-            .unwrap();
+            w.append_edge(EdgeRecord { src: 7, dst: 8 }).unwrap();
             w.sync().unwrap();
         }
         {
             let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
-            w.append_edge(EdgeRecord {
-                epoch: 2,
-                src: 9,
-                dst: 10,
-            })
-            .unwrap();
+            w.append_edge(EdgeRecord { src: 9, dst: 10 }).unwrap();
             w.sync().unwrap();
         }
         let mut got = Vec::new();
@@ -503,12 +488,7 @@ mod tests {
         let tmp = tmp_wal();
         {
             let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
-            w.append_edge(EdgeRecord {
-                epoch: 1,
-                src: 0,
-                dst: 1,
-            })
-            .unwrap();
+            w.append_edge(EdgeRecord { src: 0, dst: 1 }).unwrap();
             w.sync().unwrap();
         }
         // Simulate a torn write: append a "record" with the wrong CRC.
@@ -534,12 +514,7 @@ mod tests {
         let tmp = tmp_wal();
         {
             let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
-            w.append_edge(EdgeRecord {
-                epoch: 1,
-                src: 0,
-                dst: 1,
-            })
-            .unwrap();
+            w.append_edge(EdgeRecord { src: 0, dst: 1 }).unwrap();
             w.sync().unwrap();
         }
         // Simulate a torn write that flushed only part of a record.
@@ -583,12 +558,7 @@ mod tests {
         }
         {
             let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
-            w.append_edge(EdgeRecord {
-                epoch: 1,
-                src: 0,
-                dst: 1,
-            })
-            .unwrap();
+            w.append_edge(EdgeRecord { src: 0, dst: 1 }).unwrap();
             w.sync().unwrap();
         }
         let bytes = std::fs::read(tmp.path()).unwrap();
@@ -635,30 +605,15 @@ mod tests {
     fn discard_pending_drops_unflushed_records() {
         let tmp = tmp_wal();
         let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
-        w.append_edge(EdgeRecord {
-            epoch: 1,
-            src: 0,
-            dst: 1,
-        })
-        .unwrap();
+        w.append_edge(EdgeRecord { src: 0, dst: 1 }).unwrap();
         w.sync().unwrap();
         // Buffered but never synced — must not survive the discard.
-        w.append_edge(EdgeRecord {
-            epoch: 1,
-            src: 2,
-            dst: 3,
-        })
-        .unwrap();
+        w.append_edge(EdgeRecord { src: 2, dst: 3 }).unwrap();
         assert_eq!(w.pending_bytes(), RECORD_LEN as u64);
         w.discard_pending().unwrap();
         assert_eq!(w.pending_bytes(), 0);
         // Appends after a discard land on the last flushed boundary.
-        w.append_edge(EdgeRecord {
-            epoch: 2,
-            src: 4,
-            dst: 5,
-        })
-        .unwrap();
+        w.append_edge(EdgeRecord { src: 4, dst: 5 }).unwrap();
         w.sync().unwrap();
         drop(w);
 

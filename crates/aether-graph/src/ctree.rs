@@ -23,6 +23,30 @@
 
 use crate::arena::Arena;
 use crate::chunk::Chunk;
+use std::mem::MaybeUninit;
+
+/// Hint the CPU to pull the line containing `ptr` toward L1. Prefetch is a
+/// pure hint — any address is architecturally safe — so this wraps the
+/// per-arch instruction without touching memory.
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetch has no memory effects; any address is safe.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: prfm has no memory effects; any address is safe.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) ptr,
+            options(nostack, preserves_flags),
+        )
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
 
 /// Sentinel for null/empty tree.
 pub const NULL: u32 = u32::MAX;
@@ -207,8 +231,12 @@ impl CTree {
         }
 
         // Descend to the target leaf, recording the path of interior nodes.
-        let mut path = [NULL; MAX_DEPTH];
-        let mut went_left = [false; MAX_DEPTH];
+        // The scratch arrays are deliberately uninitialized: only the first
+        // `depth` entries are ever written and read, and zeroing all 576
+        // bytes on every insert costs more than the tree work of the
+        // common single-chunk case.
+        let mut path = [MaybeUninit::<u32>::uninit(); MAX_DEPTH];
+        let mut went_left = [MaybeUninit::<bool>::uninit(); MAX_DEPTH];
         let mut depth = 0usize;
         let mut cur = self.root;
         while !is_leaf(cur) {
@@ -220,12 +248,19 @@ impl CTree {
             }
             // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
             let node: &Interior = unsafe { arena.get(strip_tag(cur)) };
-            path[depth] = cur;
+            path[depth].write(cur);
             let left = val < node.split_key;
-            went_left[depth] = left;
+            went_left[depth].write(left);
             depth += 1;
             cur = if left { node.left } else { node.right };
         }
+
+        // The post-insert element count is known before any copying: the
+        // current root's count plus one (duplicates return before this
+        // matters). Deciding the rebalance up front means the path-copy
+        // loop only records `new_path` when a rebuild will actually
+        // consume it, and no re-read of the fresh root is needed.
+        let total = subtree_size(self.root, arena) + 1;
 
         // Leaf insert (splitting a full chunk adds one level).
         // SAFETY: leaf tag is clear, so cur is a Chunk allocated in this arena.
@@ -268,12 +303,28 @@ impl CTree {
             alloc_or_full!(unsafe { arena.alloc_write(new_chunk) })
         };
 
-        // Path-copy ancestors bottom-up.
-        let mut new_path = [NULL; MAX_DEPTH];
+        // Scapegoat check, decided before the copy loop (see `total`
+        // above). The integer prefilter skips the floating-point log on
+        // the overwhelming majority of inserts: depth_limit(n) is
+        // ~1.71 x log2(n), so any path no deeper than floor(log2(n))
+        // trivially passes the bound.
+        let need_rebalance = {
+            let d = depth + split_levels;
+            d > (total.max(2).ilog2() as usize) && d > depth_limit(total)
+        };
+
+        // Path-copy ancestors bottom-up. `new_path` entries are recorded
+        // only when the rebalance below will read them.
+        let mut new_path = [MaybeUninit::<u32>::uninit(); MAX_DEPTH];
         for i in (0..depth).rev() {
+            // SAFETY: `i < depth`, and every entry below `depth` was
+            // written during the descent.
+            let path_i = unsafe { path[i].assume_init() };
+            // SAFETY: same bound for the direction array.
+            let went_left_i = unsafe { went_left[i].assume_init() };
             // SAFETY: path[i] was recorded as a tagged interior during descent.
-            let old: &Interior = unsafe { arena.get(strip_tag(path[i])) };
-            let (l, r) = if went_left[i] {
+            let old: &Interior = unsafe { arena.get(strip_tag(path_i)) };
+            let (l, r) = if went_left_i {
                 (new_child, old.right)
             } else {
                 (old.left, new_child)
@@ -286,7 +337,9 @@ impl CTree {
             };
             // SAFETY: caller upholds single-writer invariant.
             new_child = tag_interior(alloc_or_full!(unsafe { arena.alloc_write(copied) }));
-            new_path[i] = new_child;
+            if need_rebalance {
+                new_path[i].write(new_child);
+            }
         }
         let new_root = new_child;
 
@@ -297,18 +350,18 @@ impl CTree {
         // way and a later insert retries the rebalance. Repeated failures
         // can only deepen the tree to MAX_DEPTH: the descent above returns
         // `ArenaFull` past that, so depth stays bounded.
-        let total = subtree_size(new_root, arena);
-        if depth + split_levels > depth_limit(total) {
+        if need_rebalance {
+            // SAFETY: every entry below `depth` in `new_path` was written in
+            // the copy loop just above (under the same `need_rebalance`),
+            // and MaybeUninit<u32> shares u32's layout.
+            let new_path_init =
+                unsafe { &*(&new_path[..depth] as *const [MaybeUninit<u32>] as *const [u32]) };
+            // SAFETY: every entry below `depth` in `went_left` was written
+            // during the descent, and MaybeUninit<bool> shares bool's layout.
+            let went_left_init =
+                unsafe { &*(&went_left[..depth] as *const [MaybeUninit<bool>] as *const [bool]) };
             // SAFETY: caller upholds single-writer invariant.
-            match unsafe {
-                rebalance(
-                    arena,
-                    new_root,
-                    &new_path[..depth],
-                    &went_left[..depth],
-                    scratch,
-                )
-            } {
+            match unsafe { rebalance(arena, new_root, new_path_init, went_left_init, scratch) } {
                 Some(balanced_root) => {
                     return InsertResult::Inserted(CTree {
                         root: balanced_root,
@@ -447,8 +500,12 @@ unsafe fn rebalance(
 }
 
 /// Build a perfectly weight-balanced subtree over `vals` (sorted, unique,
-/// non-empty). Splits at the element midpoint, so every interior node is
-/// α-weight-balanced for any α ≥ 1/2 and depth is ceil(log2(len/15)) + 1.
+/// non-empty). Splits on a chunk-capacity boundary at the leaf-count
+/// midpoint, so every leaf except the last is completely full — an
+/// element-midpoint split would leave every leaf 8-15 of 15 full (~25%
+/// wasted capacity, ~25% extra cache lines per scan, forever). Both sides
+/// get within one leaf of half the leaves, so every interior node stays
+/// α-weight-balanced for α = 2/3.
 ///
 /// # Safety
 /// Single-writer invariant on the arena. See [`Arena::alloc`].
@@ -456,9 +513,10 @@ unsafe fn build_balanced(arena: &Arena, vals: &[u32]) -> Option<u32> {
     debug_assert!(!vals.is_empty());
     if vals.len() <= crate::chunk::CHUNK_CAP {
         // SAFETY: caller upholds single-writer invariant.
-        return unsafe { arena.alloc_write(Chunk::from_sorted(vals)) };
+        return unsafe { arena.alloc_write(Chunk::from_sorted_unchecked(vals)) };
     }
-    let mid = vals.len() / 2;
+    let leaves = vals.len().div_ceil(crate::chunk::CHUNK_CAP);
+    let mid = (leaves / 2) * crate::chunk::CHUNK_CAP;
     let (left_vals, right_vals) = vals.split_at(mid);
     // SAFETY: caller upholds single-writer invariant.
     let left = unsafe { build_balanced(arena, left_vals)? };
@@ -480,17 +538,39 @@ unsafe fn build_balanced(arena: &Arena, vals: &[u32]) -> Option<u32> {
 // ---------------------------------------------------------------------------
 
 fn visit_chunks<F: FnMut(&Chunk)>(root: u32, arena: &Arena, f: &mut F) {
-    let mut stack = [NULL; MAX_DEPTH];
+    // Fast path for the majority shape: a degree-≤15 vertex is one chunk,
+    // and setting up the traversal stack would cost more than the visit.
+    if is_leaf(root) {
+        // SAFETY: leaf tag is clear, so root is a Chunk allocated in this arena.
+        let chunk: &Chunk = unsafe { arena.get(root) };
+        f(chunk);
+        return;
+    }
+
+    // Uninitialized stack: entries are written before read (push before
+    // pop), and zeroing 256 bytes per scan would dwarf the traversal work
+    // for small trees. The depth bound is structural (see MAX_DEPTH), so
+    // the release-mode check is a debug_assert.
+    let mut stack = [MaybeUninit::<u32>::uninit(); MAX_DEPTH];
     let mut sp = 0usize;
     let mut cur = root;
     loop {
         while !is_leaf(cur) {
             // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
             let node: &Interior = unsafe { arena.get(strip_tag(cur)) };
-            assert!(sp < MAX_DEPTH, "C-tree exceeded MAX_DEPTH");
-            stack[sp] = node.right;
+            debug_assert!(sp < MAX_DEPTH, "C-tree exceeded MAX_DEPTH");
+            stack[sp].write(node.right);
             sp += 1;
             cur = node.left;
+        }
+        // The pending right subtree is the next dependent miss; hint it
+        // while the callback consumes the current chunk.
+        if sp > 0 {
+            // SAFETY: stack[sp - 1] was written on the way down.
+            let next = unsafe { stack[sp - 1].assume_init() };
+            // SAFETY: prefetch tolerates any address; strip_tag keeps the
+            // offset inside the arena for real nodes.
+            prefetch_read(unsafe { arena.ptr_at(strip_tag(next)) });
         }
         // SAFETY: leaf tag is clear, so cur is a Chunk allocated in this arena.
         let chunk: &Chunk = unsafe { arena.get(cur) };
@@ -499,7 +579,9 @@ fn visit_chunks<F: FnMut(&Chunk)>(root: u32, arena: &Arena, f: &mut F) {
             break;
         }
         sp -= 1;
-        cur = stack[sp];
+        // SAFETY: `sp` was decremented from a pushed position; the entry
+        // was written on the way down.
+        cur = unsafe { stack[sp].assume_init() };
     }
 }
 
