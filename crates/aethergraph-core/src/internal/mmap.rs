@@ -30,7 +30,7 @@ const FULL_VALIDATION_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 /// - num_nodes: 8
 /// - num_edges: 8
 /// - has_weights: 4
-/// - integrity_checksum32: 4 (0 => absent/legacy)
+/// - integrity_checksum32: 4 (0 => absent; checksums are optional by design)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Header {

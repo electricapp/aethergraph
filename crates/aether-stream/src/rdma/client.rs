@@ -119,25 +119,6 @@ impl RdmaFeatureClient {
             )
             .into());
         }
-        // QP send-queue rate limit: a single `post_reads` chain posts one
-        // WR per node and signals only the last one. The QP's
-        // `max_send_wr` is `DEFAULT_QP_CAP.max_send_wr` (4096); posting
-        // more would overflow with `ENOMEM`. Reject upfront so the
-        // failure mode is observable, not silent. For batches larger
-        // than this cap, the caller should chunk OR construct the
-        // client with a deeper QP cap via `RdmaQp::create_with_cqs` and
-        // a custom `IbvQpCap`. Streaming posts (post/drain in windows)
-        // are tracked as future work in ROADMAP.md.
-        const MAX_INFLIGHT_WR: usize = crate::rdma::qp::DEFAULT_QP_CAP.max_send_wr as usize;
-        if node_ids.len() > MAX_INFLIGHT_WR {
-            return Err(format!(
-                "node_ids.len() {} exceeds QP max_send_wr {}; chunk the batch or \
-                 build the QP with a deeper send queue",
-                node_ids.len(),
-                MAX_INFLIGHT_WR,
-            )
-            .into());
-        }
 
         let batch_size = node_ids.len();
 
@@ -300,12 +281,27 @@ impl RdmaFeatureClient {
         &self.validator
     }
 
-    /// Post RDMA READs and busy-poll CQ until the signaled completion arrives.
+    /// Post RDMA READs and busy-poll CQ until every completion arrives.
+    ///
+    /// Batches larger than the QP send-queue depth stream through in
+    /// windows: post one window (one WR per read, only the last signaled),
+    /// drain its signaled completion, post the next. The QP's send queue
+    /// holds `DEFAULT_QP_CAP.max_send_wr` WRs, so any batch size works
+    /// without over-posting `ENOMEM`.
+    fn post_and_wait(&self, reads: &[RdmaRead]) -> Result<(), Box<dyn std::error::Error>> {
+        const WINDOW: usize = crate::rdma::qp::DEFAULT_QP_CAP.max_send_wr as usize;
+        for window in reads.chunks(WINDOW) {
+            self.post_and_wait_window(window)?;
+        }
+        Ok(())
+    }
+
+    /// Post one send-queue-sized window of READs and drain its completion.
     ///
     /// On error from an unsignaled WR, continues polling until the signaled
     /// WR's CQE is also consumed. This prevents stale CQEs from corrupting
     /// subsequent gather calls.
-    fn post_and_wait(&self, reads: &[RdmaRead]) -> Result<(), Box<dyn std::error::Error>> {
+    fn post_and_wait_window(&self, reads: &[RdmaRead]) -> Result<(), Box<dyn std::error::Error>> {
         if reads.is_empty() {
             return Ok(());
         }
@@ -314,7 +310,7 @@ impl RdmaFeatureClient {
 
         let signaled_wr_id = (reads.len() - 1) as u64;
         let mut first_error: Option<(u32, u32)> = None;
-        let mut wc_buf = [unsafe { std::mem::zeroed::<IbvWc>() }; 16];
+        let mut wc_buf = [IbvWc::default(); 16];
 
         // Poll until we see the signaled WR's completion (success or error).
         // Error CQEs from unsignaled WRs are consumed along the way. A deadline
@@ -322,8 +318,7 @@ impl RdmaFeatureClient {
         let deadline = Instant::now() + POLL_DEADLINE;
         loop {
             let n = self.qp.poll_cq(&self.ctx, &mut wc_buf)?;
-            for i in 0..n {
-                let wc = &wc_buf[i];
+            for wc in wc_buf.iter().take(n) {
                 if wc.status != crate::rdma::ffi::IBV_WC_SUCCESS && first_error.is_none() {
                     first_error = Some((wc.status, wc.vendor_err));
                 }

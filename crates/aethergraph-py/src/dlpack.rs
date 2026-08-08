@@ -1,20 +1,28 @@
 //! DLPack tensor export for zero-copy CUDA → PyTorch transfer.
 //!
-//! Creates PyCapsule objects wrapping DLManagedTensor structs that PyTorch
-//! can consume via `torch.from_dlpack()`. This is the standard zero-copy
-//! path for sharing GPU tensors across frameworks.
+//! Creates PyCapsule objects wrapping DLPack v1.0 `DLManagedTensorVersioned`
+//! structs that PyTorch can consume via `torch.from_dlpack()`. This is the
+//! standard zero-copy path for sharing GPU tensors across frameworks.
 
 use aether_stream::rdma::gather::OwnedGpuFeatures;
 use pyo3::ffi as pyffi;
 use pyo3::prelude::*;
 use std::os::raw::c_void;
 
-// DLPack ABI constants (dlpack.h v0.8). These are the legacy structs and
-// "dltensor" capsule name; DLPack v1.0 renamed the capsule and added
-// DLManagedTensorVersioned, but every shipping PyTorch still consumes the
-// legacy form. The v1.0 migration is tracked in ROADMAP.md.
+// DLPack ABI constants (dlpack.h v1.0): versioned managed tensors under the
+// "dltensor_versioned" capsule name.
 const KDLCUDA: i32 = 2; // kDLCUDA
 const KDLFLOAT: u8 = 2; // kDLFloat
+const DLPACK_MAJOR_VERSION: u32 = 1;
+const DLPACK_MINOR_VERSION: u32 = 0;
+
+/// DLPack ABI version stamp, checked by consumers before reading the rest
+/// of the struct.
+#[repr(C)]
+struct DLPackVersion {
+    major: u32,
+    minor: u32,
+}
 
 /// DLPack device descriptor.
 #[repr(C)]
@@ -43,12 +51,19 @@ struct DLTensor {
     byte_offset: u64,
 }
 
-/// DLPack managed tensor with destructor.
+/// DLPack v1.0 managed tensor with version stamp, flags, and destructor.
+///
+/// Field order is ABI: version first (so consumers can check compatibility
+/// before touching anything else), `dl_tensor` last.
 #[repr(C)]
-struct DLManagedTensor {
-    dl_tensor: DLTensor,
+struct DLManagedTensorVersioned {
+    version: DLPackVersion,
     manager_ctx: *mut c_void,
-    deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
+    deleter: Option<unsafe extern "C" fn(*mut DLManagedTensorVersioned)>,
+    /// Bitmask; bit 0 is DLPACK_FLAG_BITMASK_READ_ONLY. Our tensors are
+    /// writable views, so 0.
+    flags: u64,
+    dl_tensor: DLTensor,
 }
 
 /// Context passed to the DLPack deleter.
@@ -67,7 +82,7 @@ struct DlpackContext {
 /// tensor's reference on the CUDA buffer — the VRAM is freed once the last
 /// `Arc` clone goes away. With `owner: None` the caller keeps ownership of
 /// the CUDA memory and only the context/tensor structs are freed.
-unsafe extern "C" fn dlpack_deleter(managed: *mut DLManagedTensor) {
+unsafe extern "C" fn dlpack_deleter(managed: *mut DLManagedTensorVersioned) {
     if managed.is_null() {
         return;
     }
@@ -86,32 +101,36 @@ unsafe extern "C" fn dlpack_deleter(managed: *mut DLManagedTensor) {
 /// consumed.
 ///
 /// `torch.from_dlpack()` takes ownership by renaming the capsule from
-/// "dltensor" to "used_dltensor" and then drives `deleter` itself. If the
-/// capsule is dropped while still named "dltensor" (never consumed), no one
-/// else will ever call `deleter`, so we do it here exactly once. A consumed
-/// capsule fails the "dltensor" validity check and we leave it alone.
+/// "dltensor_versioned" to "used_dltensor_versioned" and then drives
+/// `deleter` itself. If the capsule is dropped while still named
+/// "dltensor_versioned" (never consumed), no one else will ever call
+/// `deleter`, so we do it here exactly once. A consumed capsule fails the
+/// validity check and we leave it alone.
 unsafe extern "C" fn dlpack_capsule_destructor(capsule: *mut pyffi::PyObject) {
     // SAFETY: `capsule` is the PyCapsule being finalized; the GIL is held
-    // during capsule destruction. `c"dltensor"` outlives the call.
-    let valid = unsafe { pyffi::PyCapsule_IsValid(capsule, c"dltensor".as_ptr()) };
+    // during capsule destruction. `c"dltensor_versioned"` outlives the call.
+    let valid = unsafe { pyffi::PyCapsule_IsValid(capsule, c"dltensor_versioned".as_ptr()) };
     if valid == 0 {
         return;
     }
     // SAFETY: the validity check above confirms the capsule still carries a
-    // pointer under the "dltensor" name, so this returns it without error.
-    let ptr = unsafe { pyffi::PyCapsule_GetPointer(capsule, c"dltensor".as_ptr()) };
+    // pointer under the "dltensor_versioned" name, so this returns it
+    // without error.
+    let ptr = unsafe { pyffi::PyCapsule_GetPointer(capsule, c"dltensor_versioned".as_ptr()) };
     if ptr.is_null() {
         return;
     }
-    // SAFETY: the stored pointer is the `*mut DLManagedTensor` produced by
-    // `build_managed_tensor`; the unconsumed capsule is its sole owner, so the
-    // deleter runs exactly once here, freeing the managed tensor and context.
-    unsafe { dlpack_deleter(ptr as *mut DLManagedTensor) };
+    // SAFETY: the stored pointer is the `*mut DLManagedTensorVersioned`
+    // produced by `build_managed_tensor`; the unconsumed capsule is its sole
+    // owner, so the deleter runs exactly once here, freeing the managed
+    // tensor and context.
+    unsafe { dlpack_deleter(ptr as *mut DLManagedTensorVersioned) };
 }
 
-/// Build the raw `DLManagedTensor` Box for a CUDA f32 `(num_nodes, feature_dim)`
-/// view backed by `ptr`. Pure-Rust so we can assert on the struct fields
-/// without going through the Python GIL — see `tests` module below.
+/// Build the raw `DLManagedTensorVersioned` Box for a CUDA f32
+/// `(num_nodes, feature_dim)` view backed by `ptr`. Pure-Rust so we can
+/// assert on the struct fields without going through the Python GIL — see
+/// `tests` module below.
 ///
 /// Layout: row-major `f32` in CUDA memory. Strides are
 /// `[feature_dim, 1]` — i.e. row stride = `feature_dim` elements, column stride
@@ -119,10 +138,10 @@ unsafe extern "C" fn dlpack_capsule_destructor(capsule: *mut pyffi::PyObject) {
 /// matching numpy's `arr.strides // dtype.itemsize`. Consumers that interpret
 /// them in bytes (or that flip row/column major) will silently corrupt reads.
 ///
-/// Ownership: caller takes the returned `*mut DLManagedTensor` and is
-/// responsible for either (a) handing it to `PyCapsule_New` whose consumer
-/// will eventually call `dlpack_deleter`, or (b) calling `dlpack_deleter`
-/// themselves. Leaking is a memory bug.
+/// Ownership: caller takes the returned `*mut DLManagedTensorVersioned` and
+/// is responsible for either (a) handing it to `PyCapsule_New` whose
+/// consumer will eventually call `dlpack_deleter`, or (b) calling
+/// `dlpack_deleter` themselves. Leaking is a memory bug.
 ///
 /// # Safety
 /// `ptr` must reference valid CUDA memory for the lifetime implied by
@@ -135,7 +154,7 @@ fn build_managed_tensor(
     feature_dim: usize,
     gpu_id: i32,
     owner: Option<OwnedGpuFeatures>,
-) -> *mut DLManagedTensor {
+) -> *mut DLManagedTensorVersioned {
     let mut ctx = Box::new(DlpackContext {
         shape: vec![num_nodes as i64, feature_dim as i64],
         // Row-major: stride[0]=feature_dim elements, stride[1]=1 element.
@@ -161,13 +180,18 @@ fn build_managed_tensor(
         byte_offset: 0,
     };
 
-    let managed = Box::new(DLManagedTensor {
-        dl_tensor: tensor,
+    let managed = Box::new(DLManagedTensorVersioned {
+        version: DLPackVersion {
+            major: DLPACK_MAJOR_VERSION,
+            minor: DLPACK_MINOR_VERSION,
+        },
         manager_ctx: Box::into_raw(ctx) as *mut c_void,
         // PyTorch rejects DLPack capsules whose `deleter` is None — even when
         // the capsule itself has its own destructor. We always set this Some
         // so `torch.from_dlpack()` accepts the capsule.
         deleter: Some(dlpack_deleter),
+        flags: 0,
+        dl_tensor: tensor,
     });
 
     Box::into_raw(managed)
@@ -227,7 +251,7 @@ fn capsule_from_parts(
 ) -> PyResult<Py<PyAny>> {
     let managed_ptr = build_managed_tensor(ptr, num_nodes, feature_dim, gpu_id, owner);
 
-    // Create PyCapsule with name "dltensor" (required by DLPack spec).
+    // Create PyCapsule with the DLPack v1.0 name "dltensor_versioned".
     // PyCapsule_New stores the name *pointer*, not a copy, and consumers
     // strcmp it for the capsule's whole lifetime — the name must be 'static.
     // SAFETY: PyCapsule_New requires the GIL, which `Python<'_>` proves.
@@ -237,7 +261,7 @@ fn capsule_from_parts(
     let raw = unsafe {
         pyffi::PyCapsule_New(
             managed_ptr as *mut c_void,
-            c"dltensor".as_ptr(),
+            c"dltensor_versioned".as_ptr(),
             Some(dlpack_capsule_destructor),
         )
     };
@@ -281,6 +305,11 @@ mod tests {
 
         // SAFETY: `managed_ptr` is a valid heap allocation from build_managed_tensor.
         let managed = unsafe { &*managed_ptr };
+
+        assert_eq!(managed.version.major, DLPACK_MAJOR_VERSION);
+        assert_eq!(managed.version.minor, DLPACK_MINOR_VERSION);
+        assert_eq!(managed.flags, 0, "writable tensor: no READ_ONLY flag");
+
         let t = &managed.dl_tensor;
 
         assert_eq!(t.data as u64, PTR, "tensor data pointer");

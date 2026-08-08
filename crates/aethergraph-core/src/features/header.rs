@@ -6,10 +6,10 @@
 //!   [0..8)     magic: b"AETHFEAT"
 //!   [8..16)    num_nodes: u64 le
 //!   [16..24)   feature_dim: u64 le
-//!   [24..32)   features_start_offset: u64 le
-//!              (0 in legacy files means "starts right after the 32-byte header";
-//!              newer writers pick an O_DIRECT-aligned offset)
-//!   [offset..) feature payload: num_nodes × feature_dim × f32 (little-endian)
+//!   [24..32)   features_start_offset: u64 le, > 32 (writers pick an
+//!              O_DIRECT-aligned offset, currently 512)
+//!   [32]       dtype tag (0 = F32, 1 = F16)
+//!   [offset..) feature payload: num_nodes × feature_dim × elements (little-endian)
 //! ```
 
 use anyhow::{Context, Result};
@@ -89,21 +89,18 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         MAX_FEATURE_DIM
     );
 
-    let stored_offset = u64::from_le_bytes(header[24..32].try_into()?);
-    let features_start_offset = if stored_offset == 0 {
-        HEADER_SIZE
-    } else {
-        stored_offset
-    };
+    let features_start_offset = u64::from_le_bytes(header[24..32].try_into()?);
+    // The dtype tag lives at byte 32, so the payload must start past it.
     anyhow::ensure!(
-        features_start_offset >= HEADER_SIZE,
-        "invalid feature payload offset {}",
-        features_start_offset
+        features_start_offset > HEADER_SIZE,
+        "invalid feature payload offset {} (must be > {})",
+        features_start_offset,
+        HEADER_SIZE
     );
     // Mirror FeatureStore::load: the f32 fast path casts the payload to
-    // &[f32], which requires a 4-byte-aligned start. Legitimate files (legacy
-    // offset 32, new offset 512) are always aligned; reject anything else here
-    // so every reader validates it consistently.
+    // &[f32], which requires a 4-byte-aligned start. Written files (offset
+    // 512) are always aligned; reject anything else here so every reader
+    // validates it consistently.
     anyhow::ensure!(
         features_start_offset % std::mem::align_of::<f32>() as u64 == 0,
         "invalid feature payload offset {} (must be {}-byte aligned)",
@@ -111,16 +108,12 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         std::mem::align_of::<f32>()
     );
 
-    // Read dtype tag from byte 32 (first byte of padding region).
-    // Legacy files with offset == HEADER_SIZE have no padding -- default to F32.
-    // New files (offset >= 64) store the tag; byte 32 == 0 is F32 (backward compat).
-    let dtype = if features_start_offset > HEADER_SIZE {
+    // Read the dtype tag at byte 32 (first byte of the padding region).
+    let dtype = {
         let mut tag = [0u8; 1];
         file.read_exact_at(&mut tag, HEADER_SIZE)
             .context("failed to read dtype tag")?;
         FeatureDtype::from_u8(tag[0])?
-    } else {
-        FeatureDtype::F32
     };
 
     // Do the byte-size and file-size validation entirely in u64 first, so a

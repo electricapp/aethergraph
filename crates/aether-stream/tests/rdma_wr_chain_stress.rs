@@ -100,8 +100,7 @@ fn drain_n(
 ) -> Result<(), String> {
     let start = Instant::now();
     let mut seen = 0usize;
-    // SAFETY: zeroed init of POD `IbvWc` is sound.
-    let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 64];
+    let mut wcs = [IbvWc::default(); 64];
     while seen < expected {
         let n = qp
             .poll_cq(ctx, &mut wcs)
@@ -255,8 +254,7 @@ fn empty_post_reads_is_noop() {
     let lb = build_loopback(4, 2, 64);
     lb.client_qp.post_reads(&[]).expect("empty post");
     // There should be no completion.
-    // SAFETY: zeroed init of POD `IbvWc` is sound.
-    let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 4];
+    let mut wcs = [IbvWc::default(); 4];
     let deadline = Instant::now() + Duration::from_millis(100);
     while Instant::now() < deadline {
         let n = lb.client_qp.poll_cq(&lb.client_ctx, &mut wcs).unwrap();
@@ -292,8 +290,7 @@ fn zero_length_read_succeeds() {
     lb.client_qp.post_reads(&[read]).expect("post zero-len");
 
     let start = Instant::now();
-    // SAFETY: zeroed init of POD `IbvWc` is sound.
-    let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 4];
+    let mut wcs = [IbvWc::default(); 4];
     loop {
         let n = lb.client_qp.poll_cq(&lb.client_ctx, &mut wcs).unwrap();
         if n > 0 {

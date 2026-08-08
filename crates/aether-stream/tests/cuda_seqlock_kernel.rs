@@ -79,7 +79,7 @@ fn seqlock_kernel_flags_torn_and_compacts_valid() {
     stream.memcpy_htod(&host, &mut staging).expect("H2D memcpy");
     let staging1_ptr = {
         let (p, _g) = staging.device_ptr_mut(&stream);
-        p as u64
+        p
     };
     let staging2_ptr = staging1_ptr + (SLOT_SIZE * BATCH) as u64;
 

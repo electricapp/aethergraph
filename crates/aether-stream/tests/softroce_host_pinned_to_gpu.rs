@@ -40,7 +40,7 @@ fn drain_one_completion(
     deadline: Duration,
 ) -> Result<IbvWc, String> {
     let start = Instant::now();
-    let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 32];
+    let mut wcs = [IbvWc::default(); 32];
     loop {
         let n = qp
             .poll_cq(ctx, &mut wcs)
@@ -154,7 +154,7 @@ fn rdma_into_host_then_memcpy_into_vram_and_validate() {
         .expect("H2D memcpy");
     let staging1_ptr = {
         let (p, _g) = staging.device_ptr_mut(&stream);
-        p as u64
+        p
     };
     let staging2_ptr = staging1_ptr + snap_len as u64;
 

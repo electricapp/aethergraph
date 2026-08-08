@@ -232,9 +232,10 @@ const _: () = assert!(core::mem::size_of::<IbvSendWrUnion>() == 32);
 // Work completion
 // ---------------------------------------------------------------------------
 
-/// Work completion entry from `ibv_poll_cq`.
+/// Work completion entry from `ibv_poll_cq`. All fields are plain integers,
+/// so the derived `Default` (all-zero) is a valid pre-poll placeholder.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct IbvWc {
     pub wr_id: u64,
     pub status: u32,

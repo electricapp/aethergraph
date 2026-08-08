@@ -13,10 +13,8 @@ import numpy.typing as npt
 import typer
 from rich.console import Console
 from rich.progress import (
-    BarColumn,
     Progress,
     SpinnerColumn,
-    TaskProgressColumn,
     TextColumn,
 )
 
@@ -342,7 +340,6 @@ def stats(
     bytes per node/edge, and isolated node warnings.
     """
     log: Logger = ctx.obj["log"]
-    quiet: bool = ctx.obj["quiet"]
 
     resolved_path = path.resolve()
     if not resolved_path.exists():
@@ -370,29 +367,10 @@ def stats(
     log.info(f"  Has weights: {bool(summary['has_weights'])}")
 
     # Percentiles and the isolated-node count need the full per-node degree
-    # distribution, which `_core` does not expose as a bulk offsets/degrees
-    # array. Build it with a per-node loop; for very large graphs this is the
-    # slow part and would benefit from a degrees accessor on CsrGraph.
+    # distribution; `degrees()` returns it as one numpy array in a single
+    # FFI call.
     log.debug("Analyzing degree distribution")
-
-    degrees: list[int] = []
-
-    with Progress(
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("{task.completed}/{task.total} nodes"),
-        transient=True,
-        disable=quiet,
-    ) as progress:
-        task = progress.add_task("Analyzing", total=num_nodes)
-
-        for node in range(num_nodes):
-            degrees.append(graph.degree(node))
-            if node % 10000 == 0:
-                progress.update(task, completed=node)
-        progress.update(task, completed=num_nodes)
-
-    degrees_arr: npt.NDArray[np.int64] = np.array(degrees, dtype=np.int64)
+    degrees_arr: npt.NDArray[np.uint32] = graph.degrees()
 
     file_size = resolved_path.stat().st_size
     log.info("")

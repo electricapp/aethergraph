@@ -48,7 +48,8 @@ fn generate_synthetic(path: &Path, num_nodes: usize, avg_degree: u32, seed: u64)
     let mut w = BufWriter::with_capacity(16 * 1024 * 1024, file);
 
     // Header: magic, version, num_nodes, num_edges, has_weights=0, checksum=0.
-    // checksum=0 means "absent/legacy" — load_graph accepts this.
+    // checksum=0 means "absent" — checksums are optional and load_graph
+    // accepts files without one.
     let mut header = [0u8; GRAPH_HEADER_SIZE];
     header[0..4].copy_from_slice(&GRAPH_MAGIC.to_le_bytes());
     header[4..8].copy_from_slice(&GRAPH_VERSION.to_le_bytes());

@@ -1788,10 +1788,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_feature_store_legacy_header_offset() {
+    fn test_sync_feature_store_rejects_zero_offset_header() {
         let temp_file = NamedTempFile::new().unwrap();
 
-        // Craft legacy AETHFEAT file where bytes 24..32 are zero and payload starts at 32.
+        // A zero payload offset is invalid — the dtype tag lives at byte 32,
+        // so the payload must start past it.
         let features = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -1801,15 +1802,12 @@ mod tests {
         file.write_all(b"AETHFEAT").unwrap();
         file.write_all(&(2u64).to_le_bytes()).unwrap();
         file.write_all(&(3u64).to_le_bytes()).unwrap();
-        file.write_all(&(0u64).to_le_bytes()).unwrap(); // legacy offset field
+        file.write_all(&(0u64).to_le_bytes()).unwrap();
         let feature_bytes: &[u8] = bytemuck::cast_slice(&features);
         file.write_all(feature_bytes).unwrap();
         file.sync_all().unwrap();
 
-        let mut store = SyncFeatureStore::load(temp_file.path()).unwrap();
-        let batch = store.get_batch(&[0, 1]).unwrap();
-
-        assert_eq!(batch, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(SyncFeatureStore::load(temp_file.path()).is_err());
     }
 
     #[test]
@@ -1902,17 +1900,7 @@ mod tests {
         let graph = create_test_graph();
         let temp_file = NamedTempFile::new().unwrap();
         let features = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(temp_file.path())
-            .unwrap();
-        file.write_all(b"AETHFEAT").unwrap();
-        file.write_all(&(2u64).to_le_bytes()).unwrap();
-        file.write_all(&(3u64).to_le_bytes()).unwrap();
-        file.write_all(&(0u64).to_le_bytes()).unwrap();
-        file.write_all(bytemuck::cast_slice(&features)).unwrap();
-        file.sync_all().unwrap();
+        crate::features::save_features(temp_file.path(), features, 2, 3).unwrap();
 
         let config = SamplingConfig {
             fanout: vec![2],

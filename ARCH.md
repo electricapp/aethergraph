@@ -105,16 +105,23 @@ Linux-only kernel-bypass engine. Compiles to empty crate on macOS/Windows.
 [head_version: u64] [features: f32 × dim] [tail_version: u64]
 ```
 
-Writers: head odd → write features → tail even → head even. RDMA readers: single
-bulk read, GPU kernel validates head == tail.
+Writers claim the head by CAS (even → odd; same-node writers serialize by
+spinning), copy features with volatile ops, then store tail and head to the next
+even value. Local readers re-load head after the copy. RDMA readers issue two
+sequential bulk reads into separate staging regions; a row is accepted only when
+both snapshots carry the same even, nonzero head == tail AND identical payload
+bytes — sound without any PCIe read-ordering assumption.
 
-**ibverbs FFI:** 16 extern C functions, 12 `#[repr(C)]` structs. Non-opaque
+**ibverbs FFI:** 19 extern C functions, 16 `#[repr(C)]` structs. Non-opaque
 `IbvMr` (rkey/lkey fields). `IbvQp` with correct field offsets through `qp_num`.
 `IbvSendWrUnion` as a real union with atomic-variant padding.
 
-**GPU pipeline:** `GpuGatherBuffer` (VRAM via cudarc, registered with NIC via
-nvidia-peermem) → `SeqlockValidator` (CUDA kernel compiled at runtime via nvrtc
-from standalone `.cu` file) → DLPack capsule → `torch.from_dlpack()`.
+**GPU pipeline:** `GpuGatherBuffer` (VRAM via cudarc, registered with the NIC
+via nvidia-peermem, falling back to dma-buf export under IOMMU-mediated VMs) →
+`cuFlushGPUDirectRDMAWrites` after each completion → `SeqlockValidator` (CUDA
+kernel compiled at runtime via nvrtc from standalone `.cu` file) → per-batch
+owned copy of the output (returned tensors survive subsequent gathers) → DLPack
+capsule → `torch.from_dlpack()`.
 
 ## Data Flow — Static Graph Training
 
@@ -174,21 +181,24 @@ Raw Ethernet frames (UDP)
     │
     ▼
 ┌──────────────────────┐
-│   FeatureTable       │  ← seqlock write (head odd → write → tail even → head even)
+│   FeatureTable       │  ← seqlock write (head CAS even→odd → write → tail even → head even)
 │  (HugePage RAM)      │
 └──────────────────────┘
     │                         GPU Node
     ├── TCP Control Plane ──► fetch_advertisement() → base_addr, rkey, schema
     │                         connect_with_qp() → QP endpoint exchange
     │                                │
-    └── RDMA READ ◄──────────────── RdmaFeatureClient::gather(node_ids)
-                                     │
+    └── RDMA READ ×2 ◄───────────── RdmaFeatureClient::gather(node_ids)
+                                     │  (two sequential snapshots per slot,
+                                     │   cuFlushGPUDirectRDMAWrites after each)
                                      ▼
-                              GpuGatherBuffer (VRAM staging, nvidia-peermem)
+                              GpuGatherBuffer (VRAM staging ×2, nvidia-peermem
+                              or dma-buf)
                                      │
                                      ▼
                               SeqlockValidator (CUDA kernel)
-                              if head == tail && even → compact to output
+                              if both snapshots: head == tail, even, nonzero,
+                              and payloads identical → compact to output
                               else → retry
                                      │
                                      ▼
@@ -369,11 +379,11 @@ wrapped in an ergonomic API. Subsystems opt in by accepting an `Arc<EpochClock>`
 and bumping it on commit; readers snapshot `EpochClock::current()` to pin a
 version before issuing a multi-source read.
 
-| Subsystem                        | Role     | Contract                                                                                                                                                                      |
-| -------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DynamicGraph`                   | Producer | Advances the clock once on each clean writer-guard drop. **Panic-poisoned drops do NOT advance** — readers must never observe a version that claims to include partial edits. |
-| Future: versioned `FeatureStore` | Producer | Will advance on each batch commit, sharing the same clock with the graph.                                                                                                     |
-| Reader code (sampler, RDMA path) | Consumer | Pins `current_epoch` before fan-out; passes it to subsystems for range-checked reads.                                                                                         |
+| Subsystem                        | Role     | Contract                                                                                                                                                                                                            |
+| -------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DynamicGraph`                   | Producer | Advances the clock once on each clean writer-guard drop. **Panic-poisoned drops do NOT advance** — readers must never observe a version that claims to include partial edits.                                       |
+| Future: versioned `FeatureStore` | Producer | Will advance on each batch commit, sharing the same clock with the graph.                                                                                                                                           |
+| Reader code (sampler)            | Consumer | Pins `current_epoch` before fan-out; passes it to subsystems for range-checked reads. The RDMA gather path serves latest-value reads only — a seqlock slot holds one version and cannot serve historical snapshots. |
 
 Python: `DynamicGraph.current_epoch` is a `@property` returning `int`.
 
@@ -455,13 +465,23 @@ writes from a kernel that crashed mid-flush.
 
 **Durability contract:**
 
-- `Writer::insert_edge` writes one record to a `BufWriter`. No fsync.
+- `Writer::insert_edge` appends one record to a `BufWriter` **before**
+  publishing the edge; a failed append publishes nothing, poisons the graph, and
+  returns `InsertError::WalAppend`. No fsync per record.
 - `Writer::drop` (clean path) calls `fdatasync(2)` — one syscall per
   writer-guard regardless of edge count. Returns control after the data is
   durable.
 - WAL append failure inside `insert_edge`, or fsync failure on drop, **poisons
   the graph**. Subsequent `writer()` calls return `WriterError::Poisoned`.
   Recovery requires destroying the in-memory graph and re-opening the WAL.
+- A panic-poisoned guard discards its still-buffered records instead of flushing
+  them; bytes the 64 KiB `BufWriter` already spilled to the OS may survive and
+  replay as a valid prefix.
+- The WAL file holds an exclusive advisory lock for its lifetime; a second
+  `open_with_wal` on the same path fails with `WalError::Locked`.
+- Streaming ingest (`aether_graph::ingest`) commits — drops and reacquires the
+  writer guard, fsyncing and advancing the epoch clock — every 65,536 edges and
+  at every batch boundary.
 
 **Recovery:**
 
@@ -471,10 +491,11 @@ per replayed record, so `current_epoch()` after recovery equals the number of
 records replayed. A live run advances the clock once per writer-guard drop, so
 the two agree only when each guard inserted exactly one edge — never compare
 epoch values across a restart. If the file ends in a torn record (CRC mismatch /
-short read), recovery truncates back to the last clean boundary so subsequent
-appends sit on intact data. A record referencing a vertex ≥ the `num_vertices`
-being recovered into, or an arena too small for the log's contents, aborts
-recovery with an error rather than silently dropping records.
+short read), recovery truncates back to the last clean boundary and fsyncs the
+truncation before any new append, so a later crash cannot resurrect the
+discarded bytes. A record referencing a vertex ≥ the `num_vertices` being
+recovered into, or an arena too small for the log's contents, aborts recovery
+with an error rather than silently dropping records.
 
 **What is NOT in scope today:**
 

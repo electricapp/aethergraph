@@ -144,3 +144,96 @@ fn gpudirect_rdma_read_byte_for_byte_match() {
     drop(client);
     drop(server_mr);
 }
+
+#[test]
+fn gather_streams_past_qp_send_queue_depth() {
+    if std::env::var("AETHER_SKIP_RDMA").is_ok() {
+        eprintln!("skipping: AETHER_SKIP_RDMA set");
+        return;
+    }
+    if RdmaContext::open(16, ROCE_V2_GID_INDEX).is_err() {
+        eprintln!("skipping: no RDMA device");
+        return;
+    }
+    if CudaContext::new(0).is_err() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+
+    // A batch beyond the QP send-queue depth (4096 WRs): each snapshot round
+    // must stream through in more than one post/drain window.
+    const NODE_COUNT: usize = 6000;
+    const FEATURE_DIM: usize = 16;
+    const BATCH: usize = NODE_COUNT;
+
+    let server_ctx = RdmaContext::open(256, ROCE_V2_GID_INDEX).expect("server open");
+    let server_table = FeatureTable::new(NODE_COUNT, FEATURE_DIM, vec![]).expect("table alloc");
+
+    let mut expected: Vec<Vec<f32>> = Vec::with_capacity(NODE_COUNT);
+    for node in 0..NODE_COUNT {
+        let feats: Vec<f32> = (0..FEATURE_DIM)
+            .map(|i| (node * 10 + i) as f32 + 0.5)
+            .collect();
+        server_table.write_node(node, &feats);
+        expected.push(feats);
+    }
+
+    // SAFETY: `server_table` owns the registered range and outlives
+    // `server_mr` (dropped explicitly at end of test, before the table).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
+            server_table.base_addr() as *mut u8,
+            server_table.total_size(),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
+        )
+    }
+    .expect("server reg_mr");
+
+    let adv = RdmaAdvertisement {
+        base_addr: server_table.base_addr(),
+        rkey: server_mr.rkey(),
+        schema: server_table.schema(),
+    };
+
+    let port = pick_free_port();
+    let bind_addr = format!("127.0.0.1:{port}");
+    let bind_for_server = bind_addr.clone();
+    let adv_for_server = adv.clone();
+    let server_ctx_addr = &server_ctx as *const RdmaContext as usize;
+    let _server_thread = thread::spawn(move || {
+        // SAFETY: server_ctx outlives the thread — the test joins before
+        // returning, by way of dropping the client/server scope below.
+        let ctx = unsafe { &*(server_ctx_addr as *const RdmaContext) };
+        let _ = serve_control_plane_with_qp(&bind_for_server, &adv_for_server, ctx);
+    });
+    assert!(
+        wait_for_listen(&bind_addr, Duration::from_secs(5)),
+        "server failed to bind {bind_addr}"
+    );
+
+    let mut client = RdmaFeatureClient::connect(&bind_addr, 0, BATCH, ROCE_V2_GID_INDEX)
+        .expect("RdmaFeatureClient::connect");
+
+    let node_ids: Vec<u32> = (0..NODE_COUNT as u32).collect();
+    client.gather(&node_ids).expect("gather");
+
+    let validator = client.validator();
+    let output = validator.output();
+    let mut host_out = vec![0.0f32; BATCH * FEATURE_DIM];
+    validator
+        .stream()
+        .memcpy_dtoh(output, &mut host_out)
+        .expect("D2H output readback");
+
+    for (i, &n) in node_ids.iter().enumerate() {
+        let got = &host_out[i * FEATURE_DIM..(i + 1) * FEATURE_DIM];
+        assert_eq!(
+            got,
+            expected[n as usize].as_slice(),
+            "node {n} (batch index {i}): features mismatch"
+        );
+    }
+
+    drop(client);
+    drop(server_mr);
+}

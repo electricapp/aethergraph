@@ -71,6 +71,9 @@ filterwarnings = [
     # Ray DataContext uses deprecated config names internally
     "ignore:.*use_push_based_shuffle.*:DeprecationWarning",
     "ignore:.*use_polars.*:DeprecationWarning",
+    "ignore:.*use_arrow_tensor_v2.*:DeprecationWarning",
+    # ray.shutdown() leaves worker Popen handles to be GC'd at interpreter exit
+    "ignore:Exception ignored in. .function Popen.__del__:pytest.PytestUnraisableExceptionWarning",
 ]
 
 [tool.ruff]
@@ -98,9 +101,7 @@ namespace_packages = true
 # their public surface as `Any` rather than fail the strict run.
 [[tool.mypy.overrides]]
 module = [
-    "torch_geometric",
     "torch_geometric.*",
-    "wandb",
     "pydantic",
 ]
 ignore_missing_imports = true

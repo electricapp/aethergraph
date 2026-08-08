@@ -93,7 +93,7 @@ impl SeqlockValidator {
 
         // Launch kernel
         let threads_per_block = 256u32;
-        let blocks = ((batch_size as u32) + threads_per_block - 1) / threads_per_block;
+        let blocks = (batch_size as u32).div_ceil(threads_per_block);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads_per_block, 1, 1),
@@ -104,6 +104,10 @@ impl SeqlockValidator {
         let batch_size_i32 = batch_size as i32;
         let slot_size_i32 = slot_size as i32;
 
+        // SAFETY: the argument list matches the kernel's signature (two
+        // staging pointers, output, retry_mask, retry_count, feature_dim,
+        // batch_size, slot_size); all device buffers are sized for
+        // `batch_size` rows (checked against `max_batch_size` above).
         unsafe {
             self.stream
                 .launch_builder(&self.func)

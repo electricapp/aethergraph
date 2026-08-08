@@ -108,96 +108,122 @@ impl SrdContext {
     /// The CQ is sized to `cq_size` CQEs, WITH `IBV_WC_EX_WITH_BYTE_LEN` so
     /// completions carry a byte count.
     pub fn open(cq_size: u32, gid_index: u8) -> io::Result<Self> {
-        unsafe {
-            let mut n: i32 = 0;
-            let list = super::ffi::ibv_get_device_list(&mut n);
-            if list.is_null() || n == 0 {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "no RDMA devices"));
+        let mut n: i32 = 0;
+        // SAFETY: ibverbs FFI; `n` is a valid out-param.
+        let list = unsafe { super::ffi::ibv_get_device_list(&mut n) };
+        if list.is_null() || n == 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no RDMA devices"));
+        }
+        // Pick the first EFA-capable device. `efadv_query_device` returns
+        // non-zero on non-EFA HCAs, so we probe and skip.
+        let mut context: *mut IbvContext = ptr::null_mut();
+        let mut picked_name = String::new();
+        for i in 0..n as isize {
+            // SAFETY: `i < n`; `list` is non-null per the check above.
+            let dev_slot = unsafe { list.offset(i) };
+            // SAFETY: `dev_slot` is in-bounds; the list is non-null.
+            let dev = unsafe { *dev_slot };
+            // SAFETY: `dev` is a valid device pointer from the list.
+            let ctx = unsafe { super::ffi::ibv_open_device(dev) };
+            if ctx.is_null() {
+                continue;
             }
-            // Pick the first EFA-capable device. `efadv_query_device` returns
-            // non-zero on non-EFA HCAs, so we probe and skip.
-            let mut context: *mut IbvContext = ptr::null_mut();
-            let mut picked_name = String::new();
-            for i in 0..n as isize {
-                let dev = *list.offset(i);
-                let ctx = super::ffi::ibv_open_device(dev);
-                if ctx.is_null() {
-                    continue;
-                }
-                let mut efa_attr = EfadvDeviceAttr::default();
-                let rc = efadv_query_device(
+            let mut efa_attr = EfadvDeviceAttr::default();
+            // SAFETY: `ctx` is open; `efa_attr` is a valid out-param of the
+            // size passed.
+            let rc = unsafe {
+                efadv_query_device(
                     ctx,
                     &mut efa_attr,
                     std::mem::size_of::<EfadvDeviceAttr>() as u32,
-                );
-                if rc == 0 && (efa_attr.device_caps & EFADV_DEVICE_ATTR_CAPS_RDMA_READ) != 0 {
-                    context = ctx;
-                    let name_ptr = super::ffi::ibv_get_device_name(dev);
-                    if !name_ptr.is_null() {
-                        picked_name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-                    }
-                    break;
+                )
+            };
+            if rc == 0 && (efa_attr.device_caps & EFADV_DEVICE_ATTR_CAPS_RDMA_READ) != 0 {
+                context = ctx;
+                // SAFETY: `dev` is a valid device pointer from the list.
+                let name_ptr = unsafe { super::ffi::ibv_get_device_name(dev) };
+                if !name_ptr.is_null() {
+                    // SAFETY: `name_ptr` is a NUL-terminated string owned by
+                    // ibverbs, valid for the list's lifetime.
+                    picked_name = unsafe { CStr::from_ptr(name_ptr) }
+                        .to_string_lossy()
+                        .into_owned();
                 }
-                super::ffi::ibv_close_device(ctx);
+                break;
             }
-            super::ffi::ibv_free_device_list(list);
-            if context.is_null() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "no EFA device with RDMA_READ capability",
-                ));
-            }
-            tracing::debug!(device = %picked_name, "opened EFA device");
-
-            let pd = super::ffi::ibv_alloc_pd(context);
-            if pd.is_null() {
-                super::ffi::ibv_close_device(context);
-                return Err(io::Error::other("ibv_alloc_pd"));
-            }
-
-            let mut cq_attr = IbvCqInitAttrEx::zeroed();
-            cq_attr.cqe = cq_size;
-            cq_attr.wc_flags = IBV_WC_EX_WITH_BYTE_LEN;
-            let cq_ex = ibv_create_cq_ex(context, &mut cq_attr);
-            if cq_ex.is_null() {
-                super::ffi::ibv_dealloc_pd(pd);
-                super::ffi::ibv_close_device(context);
-                return Err(io::Error::other("ibv_create_cq_ex"));
-            }
-
-            let mut port_gid: IbvGid = std::mem::zeroed();
-            let rc = super::ffi::ibv_query_gid(context, 1, gid_index as i32, &mut port_gid);
-            if rc != 0 {
-                // Drop CQ + PD before bailing.
-                let cq_plain = aether_ibv_cq_ex_to_cq(cq_ex);
-                super::ffi::ibv_destroy_cq(cq_plain);
-                super::ffi::ibv_dealloc_pd(pd);
-                super::ffi::ibv_close_device(context);
-                return Err(io::Error::other(format!(
-                    "ibv_query_gid({gid_index}) rc={rc}"
-                )));
-            }
-
-            Ok(Self {
-                context,
-                pd,
-                cq_ex,
-                port_gid,
-                gid_index,
-            })
+            // SAFETY: `ctx` was opened above and is not the picked device.
+            unsafe { super::ffi::ibv_close_device(ctx) };
         }
+        // SAFETY: `list` is non-null and not yet freed.
+        unsafe { super::ffi::ibv_free_device_list(list) };
+        if context.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no EFA device with RDMA_READ capability",
+            ));
+        }
+        tracing::debug!(device = %picked_name, "opened EFA device");
+
+        // SAFETY: `context` is the just-opened device context.
+        let pd = unsafe { super::ffi::ibv_alloc_pd(context) };
+        if pd.is_null() {
+            // SAFETY: `context` is non-null and not yet closed.
+            unsafe { super::ffi::ibv_close_device(context) };
+            return Err(io::Error::other("ibv_alloc_pd"));
+        }
+
+        let mut cq_attr = IbvCqInitAttrEx::zeroed();
+        cq_attr.cqe = cq_size;
+        cq_attr.wc_flags = IBV_WC_EX_WITH_BYTE_LEN;
+        // SAFETY: `context` is open; `cq_attr` is initialized above.
+        let cq_ex = unsafe { ibv_create_cq_ex(context, &mut cq_attr) };
+        if cq_ex.is_null() {
+            // SAFETY: `pd` and `context` are live, not yet freed.
+            unsafe { super::ffi::ibv_dealloc_pd(pd) };
+            // SAFETY: see above.
+            unsafe { super::ffi::ibv_close_device(context) };
+            return Err(io::Error::other("ibv_create_cq_ex"));
+        }
+
+        // SAFETY: zeroed init of POD struct is sound.
+        let mut port_gid: IbvGid = unsafe { std::mem::zeroed() };
+        // SAFETY: `context` is open; `port_gid` is a valid out-param.
+        let rc = unsafe { super::ffi::ibv_query_gid(context, 1, gid_index as i32, &mut port_gid) };
+        if rc != 0 {
+            // Drop CQ + PD before bailing.
+            // SAFETY: `cq_ex` is the live extended CQ created above.
+            let cq_plain = unsafe { aether_ibv_cq_ex_to_cq(cq_ex) };
+            // SAFETY: all handles are live, not yet freed.
+            unsafe { super::ffi::ibv_destroy_cq(cq_plain) };
+            // SAFETY: see above.
+            unsafe { super::ffi::ibv_dealloc_pd(pd) };
+            // SAFETY: see above.
+            unsafe { super::ffi::ibv_close_device(context) };
+            return Err(io::Error::other(format!(
+                "ibv_query_gid({gid_index}) rc={rc}"
+            )));
+        }
+
+        Ok(Self {
+            context,
+            pd,
+            cq_ex,
+            port_gid,
+            gid_index,
+        })
     }
 
     /// Register a memory region for local write (SGE destination) or remote
     /// read (peer source). Returns an RAII wrapper; drop before the context.
     pub fn reg_mr(&self, addr: *mut u8, len: usize, access: i32) -> io::Result<RegisteredMr> {
-        unsafe {
-            let mr = super::ffi::ibv_reg_mr(self.pd, addr as *mut libc::c_void, len, access);
-            if mr.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(RegisteredMr::__from_raw_mr(mr))
+        // SAFETY: `self.pd` is alive; `addr/len/access` are the caller's contract.
+        let mr = unsafe { super::ffi::ibv_reg_mr(self.pd, addr as *mut libc::c_void, len, access) };
+        if mr.is_null() {
+            return Err(io::Error::last_os_error());
         }
+        // SAFETY: `mr` is non-null, fresh from `ibv_reg_mr`; the wrapper
+        // takes ownership and deregisters on drop.
+        Ok(unsafe { RegisteredMr::__from_raw_mr(mr) })
     }
 
     /// Raw PD pointer — needed by callers that want to register the MR
@@ -232,6 +258,7 @@ impl SrdContext {
     ///   Err(_) on hard failure.
     pub fn poll_one(&self) -> io::Result<Option<AetherCqeSnapshot>> {
         let mut out = AetherCqeSnapshot::default();
+        // SAFETY: `self.cq_ex` is the live extended CQ; `out` is a valid out-param.
         let rc = unsafe { aether_ibv_poll_cq_ex_one(self.cq_ex, &mut out) };
         match rc {
             0 => Ok(Some(out)),
@@ -243,12 +270,14 @@ impl SrdContext {
 
 impl Drop for SrdContext {
     fn drop(&mut self) {
-        unsafe {
-            let cq_plain = aether_ibv_cq_ex_to_cq(self.cq_ex);
-            super::ffi::ibv_destroy_cq(cq_plain);
-            super::ffi::ibv_dealloc_pd(self.pd);
-            super::ffi::ibv_close_device(self.context);
-        }
+        // SAFETY: `self.cq_ex` was created in `open` and is live until now.
+        let cq_plain = unsafe { aether_ibv_cq_ex_to_cq(self.cq_ex) };
+        // SAFETY: handles were created in `open` and are live until now.
+        unsafe { super::ffi::ibv_destroy_cq(cq_plain) };
+        // SAFETY: see above.
+        unsafe { super::ffi::ibv_dealloc_pd(self.pd) };
+        // SAFETY: see above.
+        unsafe { super::ffi::ibv_close_device(self.context) };
     }
 }
 
@@ -271,29 +300,33 @@ impl SrdAddressHandle {
     /// Create an AH in the context's PD pointing at `remote_gid`, then
     /// extract the AHN via `efadv_query_ah`.
     pub fn create(ctx: &SrdContext, remote_gid: &[u8; 16]) -> io::Result<Self> {
-        unsafe {
-            let mut ah_attr = IbvAhAttr::default();
-            ah_attr.is_global = 1;
-            ah_attr.port_num = 1;
-            ah_attr.grh = IbvGlobalRoute {
+        let mut ah_attr = IbvAhAttr {
+            grh: IbvGlobalRoute {
                 dgid: IbvGid { raw: *remote_gid },
                 flow_label: 0,
                 sgid_index: ctx.gid_index,
                 hop_limit: 64,
                 traffic_class: 0,
-            };
-            let ah = ibv_create_ah(ctx.pd, &mut ah_attr);
-            if ah.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let mut efa = EfadvAhAttr::default();
-            let rc = efadv_query_ah(ah, &mut efa, std::mem::size_of::<EfadvAhAttr>() as u32);
-            if rc != 0 {
-                ibv_destroy_ah(ah);
-                return Err(io::Error::other(format!("efadv_query_ah rc={rc}")));
-            }
-            Ok(Self { ah, ahn: efa.ahn })
+            },
+            is_global: 1,
+            port_num: 1,
+            ..Default::default()
+        };
+        // SAFETY: `ctx.pd` is alive; `ah_attr` is fully initialized above.
+        let ah = unsafe { ibv_create_ah(ctx.pd, &mut ah_attr) };
+        if ah.is_null() {
+            return Err(io::Error::last_os_error());
         }
+        let mut efa = EfadvAhAttr::default();
+        // SAFETY: `ah` is the just-created AH; `efa` is a valid out-param of
+        // the size passed.
+        let rc = unsafe { efadv_query_ah(ah, &mut efa, std::mem::size_of::<EfadvAhAttr>() as u32) };
+        if rc != 0 {
+            // SAFETY: `ah` is live and being abandoned on this error path.
+            unsafe { ibv_destroy_ah(ah) };
+            return Err(io::Error::other(format!("efadv_query_ah rc={rc}")));
+        }
+        Ok(Self { ah, ahn: efa.ahn })
     }
 
     pub fn ahn(&self) -> u16 {
@@ -306,9 +339,8 @@ impl SrdAddressHandle {
 
 impl Drop for SrdAddressHandle {
     fn drop(&mut self) {
-        unsafe {
-            ibv_destroy_ah(self.ah);
-        }
+        // SAFETY: `self.ah` was created in `create` and is live until now.
+        unsafe { ibv_destroy_ah(self.ah) };
     }
 }
 
@@ -337,46 +369,53 @@ impl SrdQp {
     }
 
     pub fn create_with_qkey(ctx: &SrdContext, cap: &IbvQpCap, qkey: u32) -> io::Result<Self> {
-        unsafe {
-            let cq_plain = aether_ibv_cq_ex_to_cq(ctx.cq_ex);
-            let mut attr = IbvQpInitAttrEx::zeroed();
-            attr.send_cq = cq_plain;
-            attr.recv_cq = cq_plain;
-            attr.cap = *cap;
-            attr.qp_type = IBV_QPT_DRIVER;
-            attr.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
-            attr.pd = ctx.pd;
-            attr.send_ops_flags = IBV_QP_EX_WITH_RDMA_READ;
-            let mut efa = EfadvQpInitAttr {
-                comp_mask: 0,
-                driver_qp_type: EFADV_QP_DRIVER_TYPE_SRD,
-                flags: 0,
-                sl: 0,
-                reserved: 0,
-            };
-            let qp = efadv_create_qp_ex(
+        // SAFETY: `ctx.cq_ex` is the live extended CQ.
+        let cq_plain = unsafe { aether_ibv_cq_ex_to_cq(ctx.cq_ex) };
+        let mut attr = IbvQpInitAttrEx::zeroed();
+        attr.send_cq = cq_plain;
+        attr.recv_cq = cq_plain;
+        attr.cap = *cap;
+        attr.qp_type = IBV_QPT_DRIVER;
+        attr.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
+        attr.pd = ctx.pd;
+        attr.send_ops_flags = IBV_QP_EX_WITH_RDMA_READ;
+        let mut efa = EfadvQpInitAttr {
+            comp_mask: 0,
+            driver_qp_type: EFADV_QP_DRIVER_TYPE_SRD,
+            flags: 0,
+            sl: 0,
+            reserved: 0,
+        };
+        // SAFETY: `ctx.context` is open; `attr` and `efa` are fully
+        // initialized with the sizes passed.
+        let qp = unsafe {
+            efadv_create_qp_ex(
                 ctx.context,
                 &mut attr,
                 &mut efa,
                 std::mem::size_of::<EfadvQpInitAttr>() as u32,
-            );
-            if qp.is_null() {
-                return Err(io::Error::other(format!(
-                    "efadv_create_qp_ex failed: {}",
-                    io::Error::last_os_error()
-                )));
-            }
-            let qp_ex = aether_ibv_qp_to_qp_ex(qp);
-            if qp_ex.is_null() {
-                super::ffi::ibv_destroy_qp(qp);
-                return Err(io::Error::other("ibv_qp_to_qp_ex failed"));
-            }
-            Ok(Self { qp, qp_ex, qkey })
+            )
+        };
+        if qp.is_null() {
+            return Err(io::Error::other(format!(
+                "efadv_create_qp_ex failed: {}",
+                io::Error::last_os_error()
+            )));
         }
+        // SAFETY: `qp` is the just-created QP.
+        let qp_ex = unsafe { aether_ibv_qp_to_qp_ex(qp) };
+        if qp_ex.is_null() {
+            // SAFETY: `qp` is live and being abandoned on this error path.
+            unsafe { super::ffi::ibv_destroy_qp(qp) };
+            return Err(io::Error::other("ibv_qp_to_qp_ex failed"));
+        }
+        Ok(Self { qp, qp_ex, qkey })
     }
 
     /// QP number — ship to the peer so they can target us.
     pub fn qpn(&self) -> u32 {
+        // SAFETY: `self.qp` is live for this wrapper's lifetime; `qp_num` is
+        // a plain field of the ibverbs-owned struct.
         unsafe { (*self.qp).qp_num }
     }
 
@@ -404,33 +443,38 @@ impl SrdQp {
     /// Run the full RESET → INIT → RTR → RTS state machine. SRD's RTS needs
     /// only the send-queue PSN; no timeout/retry_cnt knobs exist on SRD.
     pub fn bring_up(&self) -> io::Result<()> {
-        unsafe {
-            // INIT — needs PKEY_INDEX + PORT + QKEY.
-            let mut attr: IbvQpAttr = std::mem::zeroed();
-            attr.qp_state = IBV_QPS_INIT;
-            attr.pkey_index = 0;
-            attr.port_num = 1;
-            attr.qkey = self.qkey;
-            let mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY;
-            let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, mask);
-            if rc != 0 {
-                return Err(io::Error::other(format!("SRD INIT rc={rc}")));
-            }
-            // RTR — bare state transition.
-            let mut attr: IbvQpAttr = std::mem::zeroed();
-            attr.qp_state = IBV_QPS_RTR;
-            let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE);
-            if rc != 0 {
-                return Err(io::Error::other(format!("SRD RTR rc={rc}")));
-            }
-            // RTS — sq_psn only.
-            let mut attr: IbvQpAttr = std::mem::zeroed();
-            attr.qp_state = IBV_QPS_RTS;
-            attr.sq_psn = 0;
-            let rc = super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE | IBV_QP_SQ_PSN);
-            if rc != 0 {
-                return Err(io::Error::other(format!("SRD RTS rc={rc}")));
-            }
+        // INIT — needs PKEY_INDEX + PORT + QKEY.
+        // SAFETY: zeroed init of POD struct is sound.
+        let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
+        attr.qp_state = IBV_QPS_INIT;
+        attr.pkey_index = 0;
+        attr.port_num = 1;
+        attr.qkey = self.qkey;
+        let mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY;
+        // SAFETY: `self.qp` is live; `attr` is initialized for `mask`.
+        let rc = unsafe { super::ffi::ibv_modify_qp(self.qp, &mut attr, mask) };
+        if rc != 0 {
+            return Err(io::Error::other(format!("SRD INIT rc={rc}")));
+        }
+        // RTR — bare state transition.
+        // SAFETY: zeroed init of POD struct is sound.
+        let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
+        attr.qp_state = IBV_QPS_RTR;
+        // SAFETY: `self.qp` is live; `attr` is initialized for the mask.
+        let rc = unsafe { super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE) };
+        if rc != 0 {
+            return Err(io::Error::other(format!("SRD RTR rc={rc}")));
+        }
+        // RTS — sq_psn only.
+        // SAFETY: zeroed init of POD struct is sound.
+        let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
+        attr.qp_state = IBV_QPS_RTS;
+        attr.sq_psn = 0;
+        // SAFETY: `self.qp` is live; `attr` is initialized for the mask.
+        let rc =
+            unsafe { super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE | IBV_QP_SQ_PSN) };
+        if rc != 0 {
+            return Err(io::Error::other(format!("SRD RTS rc={rc}")));
         }
         Ok(())
     }
@@ -445,23 +489,23 @@ impl SrdQp {
         remote_qpn: u32,
         remote_qkey: u32,
         local: &LocalBuf,
-        remote_rkey: u32,
-        remote_addr: u64,
-        length: u32,
+        remote: RemoteBuf,
     ) -> io::Result<()> {
+        // SAFETY: `self.qp_ex` and `ah` are live; the lkey/rkey and address
+        // ranges are the caller's contract with the registered MRs.
         let rc = unsafe {
             aether_ibv_post_rdma_read_srd(
                 self.qp_ex,
                 wr_id,
                 IBV_SEND_SIGNALED,
-                remote_rkey,
-                remote_addr,
+                remote.rkey,
+                remote.addr,
                 ah.as_ptr(),
                 remote_qpn,
                 remote_qkey,
                 local.lkey,
                 local.addr,
-                length,
+                remote.len,
             )
         };
         if rc != 0 {
@@ -473,9 +517,8 @@ impl SrdQp {
 
 impl Drop for SrdQp {
     fn drop(&mut self) {
-        unsafe {
-            super::ffi::ibv_destroy_qp(self.qp);
-        }
+        // SAFETY: `self.qp` was created in `create_with_qkey` and is live until now.
+        unsafe { super::ffi::ibv_destroy_qp(self.qp) };
     }
 }
 
@@ -496,6 +539,15 @@ impl LocalBuf {
             addr: addr as u64,
         }
     }
+}
+
+/// Remote-side counterpart of [`LocalBuf`]: the peer MR's rkey plus the
+/// start address and byte length of the range to READ.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteBuf {
+    pub rkey: u32,
+    pub addr: u64,
+    pub len: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +878,9 @@ impl SrdFeatureClient {
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
+        // SAFETY: the QP and AH are live for `self`'s lifetime; `reads` holds
+        // `reads.len()` initialized entries; lkey/rkey and every address range
+        // come from registered MRs (bounds-checked via `remote_addr_for`).
         let rc = unsafe {
             aether_ibv_post_rdma_reads_srd_batch(
                 self.qp.qp_ex_ptr(),
@@ -851,6 +906,8 @@ impl SrdFeatureClient {
         let start = std::time::Instant::now();
         while drained < nodes.len() {
             let want = nodes.len() - drained;
+            // SAFETY: the CQ is live for `self`'s lifetime; `batch` has room
+            // for `want` snapshots (`want <= batch.len()`).
             let got = unsafe {
                 aether_ibv_poll_cq_ex_many(self.ctx.cq_ex(), batch.as_mut_ptr(), want as u32)
             };

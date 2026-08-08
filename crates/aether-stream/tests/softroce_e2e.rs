@@ -65,8 +65,7 @@ fn drain_one_completion(
     deadline: Duration,
 ) -> Result<IbvWc, String> {
     let start = Instant::now();
-    // SAFETY: zeroed init of POD `IbvWc` is sound.
-    let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 32];
+    let mut wcs = [IbvWc::default(); 32];
     loop {
         let n = qp
             .poll_cq(ctx, &mut wcs)
@@ -387,8 +386,7 @@ fn t1_6_cq_error_recovery() {
     // After one failed WR the RC QP enters the error state; fresh READs will
     // not progress until the QP is rebuilt. Validate that the failure was
     // observed and drained (no stale CQEs linger) by polling a few more times.
-    // SAFETY: zeroed init of POD `IbvWc` is sound.
-    let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 32];
+    let mut wcs = [IbvWc::default(); 32];
     for _ in 0..5 {
         let n = client_qp.poll_cq(&client_ctx, &mut wcs).unwrap();
         assert_eq!(n, 0, "no stale CQEs should linger after drain");

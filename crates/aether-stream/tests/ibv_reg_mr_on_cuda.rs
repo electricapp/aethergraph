@@ -38,7 +38,7 @@ fn ibv_reg_mr_on_cuda_device_pointer() {
     let mut vram: CudaSlice<u8> = stream.alloc_zeros(size).expect("alloc VRAM");
     let vram_ptr = {
         let (p, _g) = vram.device_ptr_mut(&stream);
-        p as u64
+        p
     };
 
     // The critical call: register VRAM with the HCA. Succeeds via

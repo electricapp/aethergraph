@@ -242,8 +242,7 @@ fn post_and_drain(qp: &RdmaQp, cq: *mut IbvCq, reads: &[RdmaRead]) -> io::Result
     }
     qp.post_reads(reads)?;
     let signaled_wr_id = (reads.len() - 1) as u64;
-    // SAFETY: zeroed init of POD `IbvWc` is sound.
-    let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 32];
+    let mut wcs = [IbvWc::default(); 32];
     let mut first_error: Option<(u32, u32)> = None;
     loop {
         // SAFETY: `cq` is the live CQ borrowed for this gather batch.

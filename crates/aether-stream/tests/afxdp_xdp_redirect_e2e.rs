@@ -93,6 +93,7 @@ fn open_raw_sender(iface: &str) -> Option<i32> {
     if fd < 0 {
         return None;
     }
+    // SAFETY: zeroed init of POD `sockaddr_ll` is sound.
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
     addr.sll_protocol = (PAYLOAD_ETHERTYPE).to_be();
@@ -137,6 +138,8 @@ fn parse_payload(data: *const u8, len: u32) -> Option<(u32, [f32; FEATURE_DIM])>
     // SAFETY: `data` points to at least `len` valid bytes per the ingest
     // loop's frame contract; we only read up through `needed`.
     let payload_ptr = unsafe { data.add(header_len) } as *const Payload;
+    // SAFETY: the `Payload` bytes at `payload_ptr` lie within the frame's
+    // validated `needed` length; `read_unaligned` tolerates the packed layout.
     let payload = unsafe { std::ptr::read_unaligned(payload_ptr) };
     Some((payload.node_id, payload.features))
 }
@@ -245,8 +248,8 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
     let mut expected: Vec<[f32; FEATURE_DIM]> = Vec::with_capacity(NUM_PACKETS);
     for n in 0..NUM_PACKETS {
         let mut feats = [0.0f32; FEATURE_DIM];
-        for i in 0..FEATURE_DIM {
-            feats[i] = (n * 1000 + i) as f32 + 0.25;
+        for (i, f) in feats.iter_mut().enumerate() {
+            *f = (n * 1000 + i) as f32 + 0.25;
         }
         let payload = Payload {
             node_id: n as u32,
@@ -309,11 +312,11 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
 
     // ── verify every slot matches what we sent ──────────────────────────────
     let mut readback = [0.0f32; FEATURE_DIM];
-    for n in 0..NUM_PACKETS {
+    for (n, exp) in expected.iter().enumerate() {
         let valid = table.read_node(n, &mut readback);
         assert!(valid, "node {n}: read returned false (uninitialized)");
         assert_eq!(
-            readback, expected[n],
+            readback, *exp,
             "node {n}: features do not match what was sent"
         );
     }

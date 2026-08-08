@@ -140,8 +140,8 @@ fn no_torn_features_under_writer_contention() {
                 // Build the row directly into a stack buffer to keep the
                 // write loop tight.
                 let mut feats = [0.0f32; FEATURE_DIM];
-                for i in 0..FEATURE_DIM {
-                    feats[i] = base + i as f32;
+                for (i, f) in feats.iter_mut().enumerate() {
+                    *f = base + i as f32;
                 }
                 table_for_writer.write_node(node, &feats);
             }

@@ -87,8 +87,7 @@ fn build_loopback() -> Loopback {
 fn post_and_wait(qp: &RdmaQp, reads: &[RdmaRead], cq: *mut IbvCq) -> Result<(), String> {
     qp.post_reads(reads)
         .map_err(|e| format!("post_reads: {e}"))?;
-    // SAFETY: zeroed init of POD `IbvWc` is sound.
-    let mut wcs = [unsafe { std::mem::zeroed::<IbvWc>() }; 8];
+    let mut wcs = [IbvWc::default(); 8];
     let wc = loop {
         // SAFETY: `cq` is the live CQ for this test harness.
         let n = unsafe { RdmaQp::poll_cq_on(cq, &mut wcs) }.map_err(|e| format!("poll_cq: {e}"))?;

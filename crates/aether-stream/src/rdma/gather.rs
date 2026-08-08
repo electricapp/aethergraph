@@ -34,7 +34,7 @@ impl OwnedGpuFeatures {
     /// on the buffer's own allocation stream.
     pub fn device_ptr(&self) -> u64 {
         let (ptr, _sync) = self.buf.device_ptr(self.buf.stream());
-        ptr as u64
+        ptr
     }
 }
 

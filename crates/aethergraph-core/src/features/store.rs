@@ -8,7 +8,7 @@
 //! [8 bytes] Magic: "AETHFEAT"
 //! [8 bytes] num_nodes (u64 little-endian)
 //! [8 bytes] feature_dim (u64 little-endian)
-//! [8 bytes] data_offset (u64 little-endian, 0 for legacy 32-byte header)
+//! [8 bytes] data_offset (u64 little-endian, > 32; written files use 512)
 //! [N bytes] Raw f32 feature data (num_nodes * feature_dim * 4)
 //! ```
 //!
@@ -43,16 +43,6 @@ const MAGIC: &[u8; 8] = b"AETHFEAT";
 const HEADER_SIZE: usize = 32;
 /// Aligned start for feature payload in newly written files.
 const ALIGNED_DATA_OFFSET: u64 = 512;
-
-#[inline]
-fn decode_data_offset(stored: u64) -> u64 {
-    // Legacy files wrote this field as 0; payload starts immediately after the header.
-    if stored == 0 {
-        HEADER_SIZE as u64
-    } else {
-        stored
-    }
-}
 
 /// Feature data builder for incremental construction.
 ///
@@ -345,8 +335,7 @@ impl FeatureStore {
         // Read metadata
         let num_nodes_u64 = u64::from_le_bytes(mmap[8..16].try_into()?);
         let feature_dim_u64 = u64::from_le_bytes(mmap[16..24].try_into()?);
-        let stored_data_offset = u64::from_le_bytes(mmap[24..32].try_into()?);
-        let data_offset_u64 = decode_data_offset(stored_data_offset);
+        let data_offset_u64 = u64::from_le_bytes(mmap[24..32].try_into()?);
 
         // Sanity check: prevent OOM from malicious headers
         const MAX_NODES: u64 = 10_000_000_000; // 10B nodes max
@@ -363,9 +352,10 @@ impl FeatureStore {
             feature_dim_u64,
             MAX_DIM
         );
+        // The dtype tag lives at byte 32, so the payload must start past it.
         anyhow::ensure!(
-            data_offset_u64 >= HEADER_SIZE as u64,
-            "invalid data_offset {} (must be >= {})",
+            data_offset_u64 > HEADER_SIZE as u64,
+            "invalid data_offset {} (must be > {})",
             data_offset_u64,
             HEADER_SIZE
         );
@@ -384,12 +374,9 @@ impl FeatureStore {
             std::mem::align_of::<f32>()
         );
 
-        // Read dtype tag from byte 32 (first byte of padding region).
-        let dtype = if data_offset_u64 > HEADER_SIZE as u64 && mmap.len() > HEADER_SIZE {
-            FeatureDtype::from_u8(mmap[HEADER_SIZE])?
-        } else {
-            FeatureDtype::F32
-        };
+        // Read the dtype tag at byte 32 (first byte of the padding region).
+        // In bounds: data_offset > HEADER_SIZE and data_offset <= mmap.len().
+        let dtype = FeatureDtype::from_u8(mmap[HEADER_SIZE])?;
 
         // Validate data size entirely in u64 first, so a 32-bit usize can't
         // truncate the product before it's range-checked. Cast to usize only
@@ -1135,7 +1122,9 @@ mod tests {
     }
 
     #[test]
-    fn test_load_legacy_zero_offset_header() {
+    fn test_reject_zero_data_offset() {
+        // The payload offset must clear the dtype tag at byte 32; a zero
+        // offset is not a valid file.
         let temp_file = NamedTempFile::new().unwrap();
         let features = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut file = OpenOptions::new()
@@ -1147,14 +1136,19 @@ mod tests {
         file.write_all(MAGIC).unwrap();
         file.write_all(&(2u64).to_le_bytes()).unwrap();
         file.write_all(&(3u64).to_le_bytes()).unwrap();
-        file.write_all(&0u64.to_le_bytes()).unwrap(); // legacy payload offset
+        file.write_all(&0u64.to_le_bytes()).unwrap();
         let feature_bytes: &[u8] = bytemuck::cast_slice(&features);
         file.write_all(feature_bytes).unwrap();
         file.sync_all().unwrap();
 
-        let store = FeatureStore::load(temp_file.path()).unwrap();
-        assert_eq!(store.get(0).unwrap(), &[1.0, 2.0, 3.0]);
-        assert_eq!(store.get(1).unwrap(), &[4.0, 5.0, 6.0]);
+        let err = match FeatureStore::load(temp_file.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("zero data_offset must be rejected"),
+        };
+        assert!(
+            err.to_string().contains("invalid data_offset"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1177,10 +1171,12 @@ mod tests {
     #[test]
     fn test_truncated_file() {
         // Create a valid header but truncated data
-        let mut bytes = vec![0u8; HEADER_SIZE + 10]; // Only 10 bytes of data
+        let mut bytes = vec![0u8; 64 + 10]; // payload region holds only 10 bytes
         bytes[0..8].copy_from_slice(b"AETHFEAT");
         bytes[8..16].copy_from_slice(&100u64.to_le_bytes()); // 100 nodes
         bytes[16..24].copy_from_slice(&64u64.to_le_bytes()); // 64 dims (needs 25600 bytes)
+        bytes[24..32].copy_from_slice(&64u64.to_le_bytes()); // payload starts at 64
+        // byte 32 stays 0 → dtype F32
 
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), &bytes).unwrap();
@@ -1333,8 +1329,8 @@ mod tests {
     }
 
     #[test]
-    fn test_f16_backward_compat() {
-        // Existing f32 files with new save_features (writes dtype tag 0) still load
+    fn test_f32_dtype_tag_loads() {
+        // save_features writes dtype tag 0 (F32); load must honor it.
         let num_nodes = 50;
         let feature_dim = 16;
         let features = vec![42.0f32; num_nodes * feature_dim];
@@ -1348,25 +1344,5 @@ mod tests {
         let node_features = store.get(0).unwrap();
         assert_eq!(node_features.len(), feature_dim);
         assert!(node_features.iter().all(|&x| x == 42.0));
-
-        // Legacy zero-offset files also still work
-        let temp_legacy = NamedTempFile::new().unwrap();
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(temp_legacy.path())
-            .unwrap();
-        file.write_all(MAGIC).unwrap();
-        file.write_all(&(2u64).to_le_bytes()).unwrap();
-        file.write_all(&(3u64).to_le_bytes()).unwrap();
-        file.write_all(&0u64.to_le_bytes()).unwrap();
-        let raw: &[u8] = bytemuck::cast_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        file.write_all(raw).unwrap();
-        file.sync_all().unwrap();
-
-        let legacy = FeatureStore::load(temp_legacy.path()).unwrap();
-        assert_eq!(legacy.dtype(), crate::FeatureDtype::F32);
-        assert_eq!(legacy.get(0).unwrap(), &[1.0, 2.0, 3.0]);
-        assert_eq!(legacy.get(1).unwrap(), &[4.0, 5.0, 6.0]);
     }
 }

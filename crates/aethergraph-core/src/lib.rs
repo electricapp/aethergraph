@@ -45,7 +45,8 @@ pub use features::{
     create_features, save_feature_data, save_features, save_features_f16, save_features_ndarray,
 };
 
-// Internal utilities (re-exported for backward compatibility, will be removed)
+// Graph (de)serialization entry points — public API surface; the `internal`
+// module path is an implementation detail.
 pub use internal::mmap::{
     load_graph, load_graph_mmap, load_graph_owned, load_graph_with_validation, save_graph,
 };

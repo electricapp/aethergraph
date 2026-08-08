@@ -17,7 +17,7 @@
 
 use aether_stream::rdma::ffi::{IBV_ACCESS_LOCAL_WRITE, IBV_ACCESS_REMOTE_READ, IBV_WC_SUCCESS};
 use aether_stream::rdma::srd::{
-    DEFAULT_SRD_QKEY, DEFAULT_SRD_QP_CAP, LocalBuf, SrdAddressHandle, SrdContext, SrdQp,
+    DEFAULT_SRD_QKEY, DEFAULT_SRD_QP_CAP, LocalBuf, RemoteBuf, SrdAddressHandle, SrdContext, SrdQp,
 };
 use std::time::{Duration, Instant};
 
@@ -82,9 +82,11 @@ fn srd_rdma_read_loopback_bytes_match() {
         qp.qpn(),
         DEFAULT_SRD_QKEY,
         &local,
-        src_mr.rkey(),
-        src_ptr as u64,
-        LEN as u32,
+        RemoteBuf {
+            rkey: src_mr.rkey(),
+            addr: src_ptr as u64,
+            len: LEN as u32,
+        },
     )
     .expect("post_rdma_read");
 
@@ -183,9 +185,11 @@ fn srd_four_reads_in_order() {
                 lkey: dst_mr.lkey(),
                 addr: (dst_ptr as u64) + (i * LEN) as u64,
             },
-            src_mr.rkey(),
-            (src_ptr as u64) + (i * LEN) as u64,
-            LEN as u32,
+            RemoteBuf {
+                rkey: src_mr.rkey(),
+                addr: (src_ptr as u64) + (i * LEN) as u64,
+                len: LEN as u32,
+            },
         )
         .expect("post");
     }
@@ -421,9 +425,11 @@ fn bench_srd_rdma_read_latency() {
                 qp.qpn(),
                 DEFAULT_SRD_QKEY,
                 &local,
-                src_mr.rkey(),
-                src.as_ptr() as u64,
-                sz,
+                RemoteBuf {
+                    rkey: src_mr.rkey(),
+                    addr: src.as_ptr() as u64,
+                    len: sz,
+                },
             )
             .expect("post");
             loop {

@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 /// Register a CUDA VA range with the HCA.
 ///
-/// Tries the legacy nvidia-peermem path (`ibv_reg_mr` on the device VA)
-/// first — the fast path on bare metal. Where that fails (hypervisors
+/// Tries the peer-memory path (`ibv_reg_mr` on the device VA via
+/// nvidia-peermem) first — the fast path on bare metal. Where that fails (hypervisors
 /// block the p2p page path; the registration EFAULTs even with
 /// `nvidia_peermem` loaded), falls back to exporting the range as a
 /// dma-buf via `cuMemGetHandleForAddressRange` and registering with
@@ -158,7 +158,7 @@ impl GpuGatherBuffer {
         // before we move `allocation` into Self.
         let device_ptr = {
             let (ptr, _guard) = allocation.device_ptr(stream);
-            ptr as u64
+            ptr
         };
 
         // IBV_ACCESS_LOCAL_WRITE is required for RDMA READ target buffers.
