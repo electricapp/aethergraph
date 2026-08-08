@@ -34,6 +34,8 @@ except ImportError as e:
         "Ray Data integration requires pyarrow. Install with: pip install pyarrow"
     ) from e
 
+from aethergraph.ray import _schema
+
 if TYPE_CHECKING:
     from torch_geometric.data import Data
 
@@ -122,11 +124,8 @@ class AetherGraphDatasource(Datasource):
             graph = Graph.load(self.graph_path, storage="mmap", validation="header_only")
             self._input_nodes = None
             self._num_input_nodes = graph.num_nodes
-        elif isinstance(input_nodes, np.ndarray):
-            self._input_nodes = input_nodes.astype(np.int64)
-            self._num_input_nodes = len(self._input_nodes)
         else:
-            self._input_nodes = np.array(input_nodes, dtype=np.int64)
+            self._input_nodes = np.asarray(input_nodes, dtype=np.int64)
             self._num_input_nodes = len(self._input_nodes)
 
     def get_read_tasks(
@@ -406,17 +405,17 @@ def _pyg_data_to_arrow(data: Data) -> pa.Table:
         e_id = np.array([], dtype=np.int64)
 
     columns: dict[str, pa.Array] = {
-        "edge_index_0": _numpy_to_list_array(edge_src, pa.int64()),
-        "edge_index_1": _numpy_to_list_array(edge_dst, pa.int64()),
-        "n_id": _numpy_to_list_array(n_id, pa.int64()),
-        "e_id": _numpy_to_list_array(e_id, pa.int64()),
-        "batch_size": pa.array([data.batch_size], type=pa.int32()),
+        _schema.EDGE_SRC: _numpy_to_list_array(edge_src, pa.int64()),
+        _schema.EDGE_DST: _numpy_to_list_array(edge_dst, pa.int64()),
+        _schema.N_ID: _numpy_to_list_array(n_id, pa.int64()),
+        _schema.E_ID: _numpy_to_list_array(e_id, pa.int64()),
+        _schema.BATCH_SIZE: pa.array([data.batch_size], type=pa.int32()),
     }
 
     if data.x is not None:
         x_np: npt.NDArray[np.float32] = data.x.numpy().ravel()
-        columns["x"] = _numpy_to_list_array(x_np, pa.float32())
-        columns["x_shape_0"] = pa.array([data.x.shape[0]], type=pa.int32())
-        columns["x_shape_1"] = pa.array([data.x.shape[1]], type=pa.int32())
+        columns[_schema.X] = _numpy_to_list_array(x_np, pa.float32())
+        columns[_schema.X_ROWS] = pa.array([data.x.shape[0]], type=pa.int32())
+        columns[_schema.X_COLS] = pa.array([data.x.shape[1]], type=pa.int32())
 
     return pa.table(columns)

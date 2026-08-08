@@ -7,7 +7,6 @@ sampling backend.
 
 from __future__ import annotations
 
-import math
 import queue
 import threading
 import time
@@ -38,13 +37,30 @@ except ImportError as e:
 from aethergraph._core import HeteroNeighborSampler as RustHeteroSampler
 from aethergraph._core import HeteroSampledSubgraph as RustHeteroSubgraph
 from aethergraph._core import HeteroSamplingConfig as RustHeteroSamplingConfig
-from aethergraph.pytorch.loader import normalize_input_nodes
+from aethergraph.pytorch.loader import make_batch_getter, normalize_input_nodes
 from aethergraph.tracing import get_tracer
 
 if TYPE_CHECKING:
     from aethergraph.hetero_graph import HeteroGraph
 
 __all__ = ["HeteroLoaderMetrics", "HeteroNeighborLoader"]
+
+
+@dataclass(frozen=True)
+class _WorkerDone:
+    """The sampling thread produced every batch it was asked for."""
+
+
+@dataclass(frozen=True)
+class _WorkerError:
+    """The sampling thread died; the consumer re-raises its exception."""
+
+    exc: Exception
+
+
+_WorkerMessage = RustHeteroSubgraph | _WorkerDone | _WorkerError
+"""One message on the prefetch queue, discriminated by type — the consumer
+dispatches with ``match``, so a malformed message cannot be expressed."""
 
 
 @dataclass
@@ -184,11 +200,13 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                 "Pass a (node_type, node_ids) tuple."
             )
 
-        if not isinstance(input_nodes, tuple) or len(input_nodes) != 2:
+        try:
+            seed_type, node_ids = input_nodes
+        except (TypeError, ValueError) as e:
             raise ValueError(
                 "input_nodes must be a (node_type, node_ids) tuple, "
                 f"got {type(input_nodes).__name__}"
-            )
+            ) from e
 
         self.graph = data
         self.num_neighbors = num_neighbors
@@ -201,18 +219,16 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         self._seed = seed
         self._max_degree = max_degree
 
-        # Normalize features once: contiguous float32, wrapped in zero-copy
-        # torch views so the per-batch gather is a single index_select pass.
-        # Without this, a float64 input would silently pay a full astype on
-        # every batch for every node type.
-        self._features: dict[str, npt.NDArray[np.float32]] | None = (
-            {k: np.ascontiguousarray(v, dtype=np.float32) for k, v in features.items()}
-            if features is not None
-            else None
-        )
+        # Parse features once into their canonical form: zero-copy torch
+        # views over contiguous float32 arrays — the one representation the
+        # per-batch gather consumes. Without this, a float64 input would
+        # silently pay a full astype on every batch for every node type.
         self._feat_torch: dict[str, torch.Tensor] | None = (
-            {k: torch.from_numpy(v) for k, v in self._features.items()}
-            if self._features is not None
+            {
+                k: torch.from_numpy(np.ascontiguousarray(v, dtype=np.float32))
+                for k, v in features.items()
+            }
+            if features is not None
             else None
         )
 
@@ -220,34 +236,23 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         # pinning decision once instead of per tensor per type per batch.
         self._pin: bool = bool(pin_memory and torch.cuda.is_available())
 
-        # Type lists are graph-wide and immutable; cached on first batch so
-        # each subsequent batch skips the per-call Rust string rebuild.
-        self._cached_node_types: list[str] | None = None
-        self._cached_edge_types: list[tuple[str, str, str]] | None = None
+        # Type lists are graph-wide and immutable: resolved here once, so
+        # batch conversion never asks Rust to rebuild the string lists.
+        self._node_types: list[str] = data.node_types
+        self._edge_types: list[tuple[str, str, str]] = data.edge_types
 
-        seed_type, node_ids = input_nodes
         self._seed_type = seed_type
 
         if node_ids is None:
             self._input_nodes = None
             self._num_input_nodes = data.num_nodes(seed_type)
         else:
-            self._input_nodes = normalize_input_nodes(node_ids)
+            self._input_nodes = normalize_input_nodes(
+                node_ids,
+                num_nodes=data.num_nodes(seed_type),
+                what=f"input_nodes for node type '{seed_type}'",
+            )
             self._num_input_nodes = len(self._input_nodes)
-
-        if self._input_nodes is not None:
-            if self._input_nodes.ndim != 1:
-                raise ValueError(
-                    f"input_nodes must be a 1D array-like, got shape {self._input_nodes.shape}"
-                )
-            if np.any(self._input_nodes < 0):
-                raise ValueError("input_nodes must contain non-negative node IDs")
-            max_node = data.num_nodes(seed_type)
-            if self._input_nodes.size > 0 and int(self._input_nodes.max()) >= max_node:
-                raise ValueError(
-                    f"input_nodes contains out-of-range node IDs for node type "
-                    f"'{seed_type}' with num_nodes={max_node}"
-                )
 
         # Seed the shuffle generator from `seed` so epochs are reproducible;
         # `__iter__` spawns a fresh child per epoch so concurrent iterators
@@ -283,39 +288,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         # Fresh child generator per epoch: concurrent iterators don't share
         # mutable RNG state, and the sequence is reproducible when seeded.
         rng = self._rng.spawn(1)[0]
-
-        # Build batch getter (same lazy/shuffle pattern as NeighborLoader)
-        if self._input_nodes is not None:
-            epoch_nodes = self._input_nodes.copy()
-            if self.shuffle:
-                rng.shuffle(epoch_nodes)
-
-            def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
-                start = batch_idx * batch_size
-                end = min(start + batch_size, num_nodes)
-                return epoch_nodes[start:end]
-
-        elif self.shuffle and num_nodes > 0:
-            offset = int(rng.integers(0, num_nodes))
-            stride = self._random_coprime_stride(num_nodes, rng)
-
-            def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
-                start = batch_idx * batch_size
-                end = min(start + batch_size, num_nodes)
-                # In-place ops on the arange result: one allocation for the
-                # batch instead of four temporaries.
-                idx = np.arange(start, end, dtype=np.int64)
-                idx *= stride
-                idx += offset
-                idx %= num_nodes
-                return idx
-
-        else:
-
-            def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
-                start = batch_idx * batch_size
-                end = min(start + batch_size, num_nodes)
-                return np.arange(start, end, dtype=np.int64)
+        get_batch = make_batch_getter(self._input_nodes, num_nodes, batch_size, self.shuffle, rng)
 
         # Build Rust config and sampler
         rust_config = RustHeteroSamplingConfig(
@@ -341,40 +314,28 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         # Background sampling: bounded queue keeps prefetch_factor batches
         # in flight. The worker thread spends its time inside the GIL-free
         # Rust sample call, so it genuinely overlaps the consumer.
-        results: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=self.prefetch_factor)
+        results: queue.Queue[_WorkerMessage] = queue.Queue(maxsize=self.prefetch_factor)
         stop = threading.Event()
+
+        def put_message(msg: _WorkerMessage) -> None:
+            while not stop.is_set():
+                try:
+                    results.put(msg, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
 
         def sample_worker() -> None:
             try:
                 for batch_idx in range(num_batches):
                     if stop.is_set():
                         return
-                    seeds = get_batch(batch_idx)
-                    # Pass int64 seeds straight through: the Rust sampler
-                    # accepts int64 (range-checked at the FFI boundary).
-                    # Narrowing to uint32 here would wrap node IDs >= 2**32.
-                    subgraph = sampler.sample(self._seed_type, seeds)
-                    while not stop.is_set():
-                        try:
-                            results.put(("ok", subgraph), timeout=0.1)
-                            break
-                        except queue.Full:
-                            continue
-                while not stop.is_set():
-                    try:
-                        results.put(("done", None), timeout=0.1)
-                        return
-                    except queue.Full:
-                        continue
+                    put_message(sampler.sample(self._seed_type, get_batch(batch_idx)))
+                put_message(_WorkerDone())
             # Any worker failure must reach the consumer as the raised
             # exception rather than dying silently on this thread.
             except Exception as exc:  # noqa: BLE001
-                while not stop.is_set():
-                    try:
-                        results.put(("err", exc), timeout=0.1)
-                        return
-                    except queue.Full:
-                        continue
+                put_message(_WorkerError(exc))
 
         worker = threading.Thread(
             target=sample_worker, name="aethergraph-hetero-prefetch", daemon=True
@@ -383,20 +344,20 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
 
         try:
             while received < num_batches:
-                kind, payload = results.get()
-                if kind == "err":
-                    raise payload
-                if kind == "done":
-                    raise RuntimeError(
-                        f"hetero sampler stopped early: received {received} "
-                        f"of {num_batches} batches"
-                    )
-                received += 1
-
-                data = self._to_pyg_hetero_data(payload, in_memory_features)
-                if self.transform is not None:
-                    data = self.transform(data)
-                yield data
+                match results.get():
+                    case _WorkerError(exc=exc):
+                        raise exc
+                    case _WorkerDone():
+                        raise RuntimeError(
+                            f"hetero sampler stopped early: received {received} "
+                            f"of {num_batches} batches"
+                        )
+                    case subgraph:
+                        received += 1
+                        data = self._to_pyg_hetero_data(subgraph, in_memory_features)
+                        if self.transform is not None:
+                            data = self.transform(data)
+                        yield data
         finally:
             stop.set()
             worker.join()
@@ -420,10 +381,8 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
     ) -> HeteroData:
         """Convert a heterogeneous sampled subgraph to a PyG HeteroData object.
 
-        The numpy arrays returned by the Rust subgraph are freshly allocated
-        and Python-owned, so tensors share them without copies. Feature rows
-        gather in a single ``index_select`` pass straight into the final
-        (optionally pinned) buffer.
+        Feature rows gather in a single ``index_select`` pass straight into
+        the final (optionally pinned) buffer.
 
         Args:
             subgraph: Rust HeteroSampledSubgraph.
@@ -435,15 +394,8 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         """
         data = HeteroData()
         pin = self._pin
-
-        # Type lists are graph-wide and immutable: fetch them from Rust once
-        # per loader, not once per batch.
-        if self._cached_node_types is None:
-            self._cached_node_types = list(subgraph.node_types)
-            self._cached_edge_types = list(subgraph.edge_types)
-        node_types = self._cached_node_types
-        edge_types = self._cached_edge_types
-        assert edge_types is not None
+        node_types = self._node_types
+        edge_types = self._edge_types
 
         for nt in node_types:
             nodes = subgraph.nodes(nt)
@@ -480,15 +432,6 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         seed_store.input_id = input_id
 
         return data
-
-    def _random_coprime_stride(self, modulus: int, rng: np.random.Generator) -> int:
-        """Pick a random stride in [1, modulus) coprime with modulus."""
-        if modulus <= 1:
-            return 1
-        while True:
-            stride = int(rng.integers(1, modulus))
-            if math.gcd(stride, modulus) == 1:
-                return stride
 
     def __len__(self) -> int:
         """Return the number of batches per epoch."""

@@ -20,6 +20,7 @@ except ImportError as e:
         "Ray Data integration requires ray[data]>=2.9. Install with: pip install aethergraph[ray]"
     ) from e
 
+from aethergraph.ray import _schema
 from aethergraph.ray.datasource import AetherGraphDatasource
 
 if TYPE_CHECKING:
@@ -47,9 +48,8 @@ def collate_to_pyg(batch: dict[str, Any]) -> Data:
     resulting tensors zero-copy.
 
     Args:
-        batch: Dictionary from Ray dataset iteration containing exactly one row.
-            Expected keys: edge_index_0, edge_index_1, n_id, e_id, batch_size.
-            Optional: x, x_shape_0, x_shape_1.
+        batch: Dictionary from Ray dataset iteration containing exactly one
+            row, with the columns defined in :mod:`aethergraph.ray._schema`.
 
     Returns:
         torch_geometric.data.Data object ready for model.forward().
@@ -69,7 +69,7 @@ def collate_to_pyg(batch: dict[str, Any]) -> Data:
     except ImportError as e:
         raise ImportError("collate_to_pyg requires torch and torch_geometric") from e
 
-    num_rows = len(batch["batch_size"])
+    num_rows = len(batch[_schema.BATCH_SIZE])
     if num_rows != 1:
         raise ValueError(
             "collate_to_pyg expects exactly one row: the datasource packs one "
@@ -86,8 +86,8 @@ def collate_to_pyg(batch: dict[str, Any]) -> Data:
             out = out.copy()
         return out
 
-    edge_src = batch["edge_index_0"][0]
-    edge_dst = batch["edge_index_1"][0]
+    edge_src = batch[_schema.EDGE_SRC][0]
+    edge_dst = batch[_schema.EDGE_DST][0]
     # One fresh (2, E) destination filled row-by-row: a single copy per row
     # from the (possibly read-only) source, with no torch.stack allocating
     # and copying a second [2, E] on top.
@@ -97,22 +97,22 @@ def collate_to_pyg(batch: dict[str, Any]) -> Data:
     ei[1] = edge_dst
     edge_index = torch.from_numpy(ei)
 
-    n_id = torch.from_numpy(_writable(batch["n_id"][0], np.dtype(np.int64)))
-    e_id = torch.from_numpy(_writable(batch["e_id"][0], np.dtype(np.int64)))
+    n_id = torch.from_numpy(_writable(batch[_schema.N_ID][0], np.dtype(np.int64)))
+    e_id = torch.from_numpy(_writable(batch[_schema.E_ID][0], np.dtype(np.int64)))
 
     x: torch.Tensor | None = None
-    if "x" in batch and len(batch["x"][0]) > 0:
-        x_flat = _writable(batch["x"][0], np.dtype(np.float32))
-        shape_0 = int(batch["x_shape_0"][0])
-        shape_1 = int(batch["x_shape_1"][0])
-        x = torch.from_numpy(x_flat.reshape(shape_0, shape_1))
+    if _schema.X in batch:
+        x_flat = _writable(batch[_schema.X][0], np.dtype(np.float32))
+        rows = int(batch[_schema.X_ROWS][0])
+        cols = int(batch[_schema.X_COLS][0])
+        x = torch.from_numpy(x_flat.reshape(rows, cols))
 
     return Data(
         x=x,
         edge_index=edge_index,
         n_id=n_id,
         e_id=e_id,
-        batch_size=int(batch["batch_size"][0]),
+        batch_size=int(batch[_schema.BATCH_SIZE][0]),
     )
 
 

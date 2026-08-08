@@ -28,6 +28,7 @@ from aethergraph._core import (
     SamplingError,
     SamplingTelemetry,
 )
+from aethergraph._types import SubgraphType, TemporalStrategy
 from aethergraph.graph import Graph
 
 __all__ = [
@@ -87,9 +88,9 @@ class SamplingConfig:
     max_degree: int | None = None
     cumulative: bool = True
     weighted: bool = False
-    subgraph_type: str = "directional"
+    subgraph_type: SubgraphType = "directional"
     track_edge_ids: bool = True
-    temporal_strategy: str | None = None
+    temporal_strategy: TemporalStrategy | None = None
     disjoint: bool = False
     deterministic: bool = False
     telemetry: SamplingTelemetry | None = None

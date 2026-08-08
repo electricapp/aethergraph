@@ -10,7 +10,7 @@ Path-accepting APIs declare `str | os.PathLike[str]` since PyO3's
 
 import os
 from collections.abc import Sequence
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
@@ -31,6 +31,8 @@ def _dlpack_capsule_from_cuda_ptr(
 
 SeedArray: TypeAlias = npt.NDArray[np.int64] | npt.NDArray[np.uint32]
 PathLike: TypeAlias = str | os.PathLike[str]
+SubgraphType: TypeAlias = Literal["directional", "induced", "bidirectional"]
+TemporalStrategy: TypeAlias = Literal["uniform", "last"]
 
 # -- Exceptions --------------------------------------------------------------
 
@@ -113,9 +115,9 @@ class SamplingConfig:
         max_degree: int | None = None,
         cumulative: bool = True,
         weighted: bool = False,
-        subgraph_type: str = "directional",
+        subgraph_type: SubgraphType = "directional",
         track_edge_ids: bool = True,
-        temporal_strategy: str | None = None,
+        temporal_strategy: TemporalStrategy | None = None,
         disjoint: bool = False,
         deterministic: bool = False,
         telemetry: SamplingTelemetry | None = None,
@@ -133,11 +135,11 @@ class SamplingConfig:
     @property
     def weighted(self) -> bool: ...
     @property
-    def subgraph_type(self) -> str: ...
+    def subgraph_type(self) -> SubgraphType: ...
     @property
     def track_edge_ids(self) -> bool: ...
     @property
-    def temporal_strategy(self) -> str | None: ...
+    def temporal_strategy(self) -> TemporalStrategy | None: ...
     @property
     def disjoint(self) -> bool: ...
     @property
@@ -153,7 +155,12 @@ class SamplingTelemetry:
 class SampledSubgraph:
     """One sampled subgraph. All array accessors are `@property` — no parens.
 
-    The arrays are `int64` because PyTorch's index dtype is `int64`."""
+    The arrays are `int64` because PyTorch's index dtype is `int64`.
+
+    Ownership contract: every array accessor allocates a fresh, Python-owned
+    numpy array on each access. Nothing aliases Rust memory, so callers may
+    mutate the result or wrap it zero-copy (``torch.from_numpy``) without a
+    defensive copy."""
 
     # Counts.
     @property
@@ -426,7 +433,12 @@ class HeteroSamplingConfig:
     def num_hops(self) -> int: ...
 
 class HeteroSampledSubgraph:
-    """One sampled subgraph from `HeteroNeighborSampler`."""
+    """One sampled subgraph from `HeteroNeighborSampler`.
+
+    Same ownership contract as `SampledSubgraph`: array accessors return
+    fresh, Python-owned arrays that never alias Rust memory. `sample` accepts
+    int64 seed arrays directly — IDs are range-checked at this boundary, so
+    callers never pre-narrow to uint32."""
 
     @property
     def node_types(self) -> list[str]: ...

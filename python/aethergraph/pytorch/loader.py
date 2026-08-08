@@ -12,7 +12,7 @@ import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -37,6 +37,7 @@ from aethergraph._core import HAS_GPUDIRECT
 from aethergraph._core import NeighborLoader as RustNeighborLoader
 from aethergraph._core import SampledSubgraph as RustSampledSubgraph
 from aethergraph._core import SamplingConfig as RustSamplingConfig
+from aethergraph._types import SubgraphType, TemporalStrategy
 from aethergraph.dynamic_graph import DynamicGraph
 from aethergraph.tracing import get_tracer
 
@@ -48,20 +49,32 @@ __all__ = ["LoaderMetrics", "NeighborLoader"]
 
 def normalize_input_nodes(
     input_nodes: torch.Tensor | npt.NDArray[Any] | list[int],
+    *,
+    num_nodes: int,
+    what: str = "input_nodes",
 ) -> npt.NDArray[np.int64]:
-    """Normalize ``input_nodes`` to a contiguous 1D int64 index array.
+    """Parse ``input_nodes`` into a validated, contiguous 1D int64 array.
 
-    Accepts a torch tensor, numpy array, or Python sequence. A boolean
-    tensor/array is treated as a PyG-style mask and converted to the indices
-    of its ``True`` entries via ``np.nonzero``; everything else is taken as
-    explicit node IDs. The result is always a contiguous ``int64`` array so it
-    can be passed to the Rust sampler without further copying or narrowing.
+    This is the single choke point for seed-node input: it accepts a torch
+    tensor, numpy array, or Python sequence, and returns an array whose type
+    carries the full contract — 1D, contiguous, ``int64``, every ID in
+    ``[0, num_nodes)``. Callers use the result without further checks.
+
+    A boolean tensor/array is treated as a PyG-style mask and converted to the
+    indices of its ``True`` entries via ``np.nonzero``; everything else is
+    taken as explicit node IDs.
 
     Args:
         input_nodes: Mask or explicit node IDs.
+        num_nodes: Exclusive upper bound for valid node IDs.
+        what: Description of the array for error messages.
 
     Returns:
-        Contiguous ``int64`` array of node IDs.
+        Contiguous 1D ``int64`` array of in-range node IDs.
+
+    Raises:
+        ValueError: If the input is not 1D after mask conversion, or contains
+            IDs outside ``[0, num_nodes)``.
     """
     if isinstance(input_nodes, torch.Tensor):
         if input_nodes.dtype == torch.bool:
@@ -74,7 +87,146 @@ def normalize_input_nodes(
             arr = np.nonzero(a)[0].astype(np.int64)
         else:
             arr = a.astype(np.int64)
+    if arr.ndim != 1:
+        raise ValueError(f"{what} must be a 1D array-like, got shape {arr.shape}")
+    if arr.size > 0:
+        lo = int(arr.min())
+        hi = int(arr.max())
+        if lo < 0:
+            raise ValueError(f"{what} must contain non-negative node IDs (min {lo})")
+        if hi >= num_nodes:
+            raise ValueError(
+                f"{what} contains out-of-range node IDs (max {hi} >= num_nodes={num_nodes})"
+            )
     return np.ascontiguousarray(arr)
+
+
+def _random_coprime_stride(modulus: int, rng: np.random.Generator) -> int:
+    """Pick a random stride in ``[1, modulus)`` coprime with ``modulus``.
+
+    Used to walk a full permutation of ``[0, modulus)`` in O(1) memory:
+    ``node = (offset + pos * stride) % modulus`` visits every index exactly
+    once when ``gcd(stride, modulus) == 1``.
+    """
+    if modulus <= 1:
+        return 1
+    while True:
+        stride = int(rng.integers(1, modulus))
+        if math.gcd(stride, modulus) == 1:
+            return stride
+
+
+def make_batch_getter(
+    input_nodes: npt.NDArray[np.int64] | None,
+    num_nodes: int,
+    batch_size: int,
+    shuffle: bool,
+    rng: np.random.Generator,
+) -> Callable[[int], npt.NDArray[np.int64]]:
+    """Build the per-epoch ``batch_idx -> seed IDs`` function.
+
+    With explicit ``input_nodes``, batches slice a (shuffled) copy. With all
+    nodes and ``shuffle``, an O(1)-memory coprime-stride permutation replaces
+    the full shuffle array — for billion-node graphs that saves ~8 GB per
+    epoch. Otherwise batches are plain ``arange`` ranges.
+    """
+    if input_nodes is not None:
+        epoch_nodes = input_nodes.copy()
+        if shuffle:
+            rng.shuffle(epoch_nodes)
+
+        def get_batch_sliced(batch_idx: int) -> npt.NDArray[np.int64]:
+            start = batch_idx * batch_size
+            end = min(start + batch_size, num_nodes)
+            return epoch_nodes[start:end]
+
+        return get_batch_sliced
+
+    if shuffle and num_nodes > 0:
+        offset = int(rng.integers(0, num_nodes))
+        stride = _random_coprime_stride(num_nodes, rng)
+
+        def get_batch_strided(batch_idx: int) -> npt.NDArray[np.int64]:
+            start = batch_idx * batch_size
+            end = min(start + batch_size, num_nodes)
+            # In-place ops on the arange result: one allocation for the
+            # batch instead of four temporaries.
+            idx = np.arange(start, end, dtype=np.int64)
+            idx *= stride
+            idx += offset
+            idx %= num_nodes
+            return idx
+
+        return get_batch_strided
+
+    def get_batch_range(batch_idx: int) -> npt.NDArray[np.int64]:
+        start = batch_idx * batch_size
+        end = min(start + batch_size, num_nodes)
+        return np.arange(start, end, dtype=np.int64)
+
+    return get_batch_range
+
+
+@dataclass(frozen=True)
+class _RdmaFeatureSource:
+    """Parsed ``feature_source`` URI.
+
+    Constructed once by :func:`_parse_feature_source`; past the constructor
+    no code inspects the URI string again.
+    """
+
+    server_addr: str
+
+
+def _parse_features(features: npt.NDArray[Any], num_nodes: int) -> torch.Tensor:
+    """Parse an in-memory feature matrix into its canonical torch view.
+
+    Returns a zero-copy torch view over a contiguous ``float32`` array of
+    shape ``[num_nodes, dim]`` — the one representation the per-batch gather
+    consumes, so no batch ever re-converts dtype or layout.
+
+    Raises:
+        ValueError: If the array is not 2D or its row count does not match
+            the graph.
+    """
+    arr = np.ascontiguousarray(features, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"features must be 2D, got shape {arr.shape}")
+    if arr.shape[0] != num_nodes:
+        raise ValueError(
+            f"features.shape[0]={arr.shape[0]} does not match graph num_nodes={num_nodes}"
+        )
+    return torch.from_numpy(arr)
+
+
+_RDMA_SCHEME = "rdma://"
+
+
+def _parse_feature_source(feature_source: str | None) -> _RdmaFeatureSource | None:
+    """Parse the ``feature_source`` URI into its typed form.
+
+    Raises:
+        ValueError: If the string does not use a recognized scheme — an
+            unrecognized source must fail here rather than be silently
+            ignored by the sampling path.
+        RuntimeError: If RDMA is requested but the extension was built
+            without the ``gpudirect`` Cargo feature.
+    """
+    if feature_source is None:
+        return None
+    if not feature_source.startswith(_RDMA_SCHEME):
+        raise ValueError(
+            f"unrecognized feature_source {feature_source!r}: expected 'rdma://host:port'"
+        )
+    if not HAS_GPUDIRECT:
+        raise RuntimeError(
+            "feature_source='rdma://' requires a wheel built with the "
+            "`gpudirect` Cargo feature (maturin develop --features gpudirect)."
+        )
+    addr = feature_source[len(_RDMA_SCHEME) :]
+    if not addr:
+        raise ValueError("feature_source 'rdma://' is missing the host:port address")
+    return _RdmaFeatureSource(server_addr=addr)
 
 
 @dataclass
@@ -188,13 +340,13 @@ class NeighborLoader(IterableDataset[Data]):
     _rng: np.random.Generator
     _max_degree: int | None
     _cumulative: bool
-    _subgraph_type: str
+    _subgraph_type: SubgraphType
     _track_edge_ids: bool
     _metrics: LoaderMetrics
-    _input_time: npt.NDArray[np.float64] | None
-    _temporal_strategy: Literal["uniform", "last"] | None
+    _temporal_strategy: TemporalStrategy | None
     _disjoint: bool
     _neighbor_sampler: Callable[..., Data] | None
+    _rdma: _RdmaFeatureSource | None
 
     def __init__(
         self,
@@ -212,16 +364,16 @@ class NeighborLoader(IterableDataset[Data]):
         feature_source: str | None = None,
         gpu_id: int = 0,
         input_time: npt.NDArray[np.float64] | None = None,
-        temporal_strategy: Literal["uniform", "last"] | None = None,
+        temporal_strategy: TemporalStrategy | None = None,
         disjoint: bool = False,
         seed: int | None = None,
         generator: np.random.Generator | None = None,
         max_degree: int | None = None,
         cumulative: bool = True,
-        subgraph_type: str = "directional",
+        subgraph_type: SubgraphType = "directional",
         track_edge_ids: bool = True,
         neighbor_sampler: Callable[..., Data] | None = None,
-        features: npt.NDArray[np.float32] | None = None,
+        features: npt.NDArray[Any] | None = None,
         feature_path: str | Path | None = None,
     ) -> None:
         """Initialize the neighbor loader.
@@ -326,15 +478,7 @@ class NeighborLoader(IterableDataset[Data]):
         self.transform = transform
         self.feature_source = feature_source
         self.gpu_id = gpu_id
-        if (
-            feature_source is not None
-            and feature_source.startswith("rdma://")
-            and not HAS_GPUDIRECT
-        ):
-            raise RuntimeError(
-                "feature_source='rdma://' requires a wheel built with the "
-                "`gpudirect` Cargo feature (maturin develop --features gpudirect)."
-            )
+        self._rdma = _parse_feature_source(feature_source)
         self._temporal_strategy = temporal_strategy
         self._disjoint = disjoint
         self._seed = seed
@@ -346,40 +490,19 @@ class NeighborLoader(IterableDataset[Data]):
 
         if features is not None and feature_path is not None:
             raise ValueError("pass either `features` or `feature_path`, not both")
-        self._features: npt.NDArray[np.float32] | None = (
-            np.asarray(features, dtype=np.float32) if features is not None else None
-        )
         self._feature_path: Path | None = Path(feature_path) if feature_path is not None else None
-        if self._features is not None and self._features.ndim != 2:
-            raise ValueError(f"features must be 2D, got shape {self._features.shape}")
 
         num_nodes = self.graph.num_nodes
-
-        if self._features is not None and self._features.shape[0] != num_nodes:
-            raise ValueError(
-                f"features.shape[0]={self._features.shape[0]} does not match graph "
-                f"num_nodes={num_nodes}"
-            )
+        self._feat_torch: torch.Tensor | None = (
+            _parse_features(features, num_nodes) if features is not None else None
+        )
 
         if input_nodes is None:
             self._input_nodes = None
             self._num_input_nodes = num_nodes
         else:
-            self._input_nodes = normalize_input_nodes(input_nodes)
+            self._input_nodes = normalize_input_nodes(input_nodes, num_nodes=num_nodes)
             self._num_input_nodes = len(self._input_nodes)
-
-        if self._input_nodes is not None:
-            if self._input_nodes.ndim != 1:
-                raise ValueError(
-                    f"input_nodes must be a 1D array-like, got shape {self._input_nodes.shape}"
-                )
-            if np.any(self._input_nodes < 0):
-                raise ValueError("input_nodes must contain non-negative node IDs")
-            if self._input_nodes.size > 0 and int(self._input_nodes.max()) >= num_nodes:
-                raise ValueError(
-                    f"input_nodes contains out-of-range node IDs for graph with "
-                    f"num_nodes={num_nodes}"
-                )
 
         # The prefetch pipeline submits seeds only — there is no channel for
         # per-seed timestamps — so accepting `input_time` here would silently
@@ -393,18 +516,10 @@ class NeighborLoader(IterableDataset[Data]):
                 "pipeline; use aethergraph.Sampler.sample(seeds, input_times=...) "
                 "for temporal sampling with per-seed times"
             )
-        self._input_time = input_time
 
         # Device availability is immutable for the process lifetime; resolve
         # the pinning decision once instead of per tensor per batch.
         self._pin: bool = bool(pin_memory and torch.cuda.is_available())
-
-        # Zero-copy torch view over the in-memory feature matrix, created
-        # once so per-batch gathers are a single `index_select` pass instead
-        # of a numpy fancy-index (alloc + copy) followed by more copies.
-        self._feat_torch: torch.Tensor | None = (
-            torch.from_numpy(self._features) if self._features is not None else None
-        )
 
         # Master generator for seed-node shuffling. An explicit `generator`
         # wins; otherwise seed from `seed` (reproducible) or OS entropy.
@@ -476,38 +591,7 @@ class NeighborLoader(IterableDataset[Data]):
         # mutable RNG state, and the sequence is reproducible when the loader
         # was seeded.
         rng = self._rng.spawn(1)[0]
-
-        if self._input_nodes is not None:
-            epoch_nodes = self._input_nodes.copy()
-            if self.shuffle:
-                rng.shuffle(epoch_nodes)
-
-            def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
-                start = batch_idx * batch_size
-                end = min(start + batch_size, num_nodes)
-                return epoch_nodes[start:end]
-
-        elif self.shuffle and num_nodes > 0:
-            offset = int(rng.integers(0, num_nodes))
-            stride = self._random_coprime_stride(num_nodes, rng)
-
-            def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
-                start = batch_idx * batch_size
-                end = min(start + batch_size, num_nodes)
-                # In-place ops on the arange result: one allocation for the
-                # batch instead of four temporaries.
-                idx = np.arange(start, end, dtype=np.int64)
-                idx *= stride
-                idx += offset
-                idx %= num_nodes
-                return idx
-
-        else:
-
-            def get_batch(batch_idx: int) -> npt.NDArray[np.int64]:
-                start = batch_idx * batch_size
-                end = min(start + batch_size, num_nodes)
-                return np.arange(start, end, dtype=np.int64)
+        get_batch = make_batch_getter(self._input_nodes, num_nodes, batch_size, self.shuffle, rng)
 
         if self._neighbor_sampler is not None:
             for batch_idx in range(num_batches):
@@ -531,8 +615,7 @@ class NeighborLoader(IterableDataset[Data]):
             disjoint=self._disjoint,
         )
 
-        if self.feature_source and self.feature_source.startswith("rdma://"):
-            server_addr = self.feature_source[len("rdma://") :]
+        if self._rdma is not None:
             # Upper bound on nodes per batch: batch_size * product of the
             # per-hop fanout, doubled for slack. `math.prod` is arbitrary
             # precision so it can't overflow into a negative int64, and the
@@ -542,7 +625,7 @@ class NeighborLoader(IterableDataset[Data]):
             sampler = RustNeighborLoader.with_rdma_features(
                 self.graph,
                 rust_config,
-                server_addr,
+                self._rdma.server_addr,
                 self.gpu_id,
                 max_batch_nodes=max_batch_nodes,
                 prefetch_depth=self.prefetch_factor,
@@ -551,7 +634,6 @@ class NeighborLoader(IterableDataset[Data]):
             return
 
         feature_path = self._feature_path
-        in_memory_features = self._features
 
         if feature_path is not None:
             sampler = RustNeighborLoader.with_features(
@@ -599,7 +681,7 @@ class NeighborLoader(IterableDataset[Data]):
                     sampler.submit(submitted, get_batch(submitted))
                     submitted += 1
 
-                data = self._to_pyg_data(subgraph, features, in_memory_features)
+                data = self._to_pyg_data(subgraph, features)
                 if self.transform is not None:
                     data = self.transform(data)
                 yield data
@@ -627,19 +709,18 @@ class NeighborLoader(IterableDataset[Data]):
         self,
         subgraph: RustSampledSubgraph,
         file_features: npt.NDArray[np.float32] | None,
-        in_memory_features: npt.NDArray[np.float32] | None,
     ) -> Data:
         """Convert a sampled subgraph to a PyG Data object.
 
         Feature sources are checked in priority order:
             1. File-based features (loaded by Rust sampler via io_uring/mmap)
-            2. In-memory features (``graph.features`` numpy array)
+            2. In-memory features (the loader's ``features`` matrix)
             3. No features (``x`` will be ``None``)
 
         Edge indices use pre-computed local IDs from Rust's
-        ``edge_index_local()``, which is O(1) HashMap lookup per edge.
-        Seeds are extracted from the subgraph itself, eliminating any FIFO
-        ordering dependency between batch submission and result retrieval.
+        ``edge_index_local()``. Seeds are extracted from the subgraph itself,
+        eliminating any FIFO ordering dependency between batch submission and
+        result retrieval.
 
         In disjoint mode, a ``batch`` tensor is attached mapping each node
         to its seed index. All tensors are optionally pinned to page-locked
@@ -647,16 +728,12 @@ class NeighborLoader(IterableDataset[Data]):
 
         Args:
             subgraph: Rust SampledSubgraph containing nodes, edges, and seeds.
-            file_features: Features loaded from file by Rust sampler, or None.
-            in_memory_features: Features set directly on Graph, or None.
+            file_features: Features gathered by the Rust sampler, or None.
 
         Returns:
             PyG Data object with x, edge_index, e_id, n_id, input_id, and
             optionally batch (disjoint mode).
         """
-        # The arrays returned by the Rust subgraph are freshly allocated,
-        # Python-owned int64 numpy arrays — `from_numpy` shares them with no
-        # copy and nothing else aliases them.
         n_id = torch.from_numpy(subgraph.nodes)
         num_nodes = len(n_id)
 
@@ -669,7 +746,7 @@ class NeighborLoader(IterableDataset[Data]):
 
         x: torch.Tensor | None = None
         if file_features is not None:
-            x = torch.from_numpy(np.asarray(file_features, dtype=np.float32))
+            x = torch.from_numpy(file_features)
             if self._pin:
                 x = x.pin_memory()
         elif self._feat_torch is not None:
@@ -755,7 +832,7 @@ class NeighborLoader(IterableDataset[Data]):
                     sampler.submit(submitted, get_batch(submitted))
                     submitted += 1
 
-                x = torch.from_dlpack(dlpack_capsule)  # type: ignore[attr-defined]
+                x = torch.from_dlpack(dlpack_capsule)
 
                 data = self._to_pyg_data_gpu(subgraph, x)
                 if self.transform is not None:
@@ -850,27 +927,6 @@ class NeighborLoader(IterableDataset[Data]):
             num_sampled_nodes=subgraph.num_sampled_nodes_per_hop,
             num_sampled_edges=subgraph.num_sampled_edges_per_hop,
         )
-
-    def _random_coprime_stride(self, modulus: int, rng: np.random.Generator) -> int:
-        """Pick a random stride coprime with modulus for O(1)-memory shuffling.
-
-        Used to generate a full permutation of ``[0, modulus)`` without
-        allocating an array: ``node = (offset + pos * stride) % modulus``
-        visits every index exactly once when ``gcd(stride, modulus) == 1``.
-
-        Args:
-            modulus: The range size (number of input nodes).
-            rng: Generator to draw the stride from.
-
-        Returns:
-            A random integer in ``[1, modulus)`` coprime with modulus.
-        """
-        if modulus <= 1:
-            return 1
-        while True:
-            stride = int(rng.integers(1, modulus))
-            if math.gcd(stride, modulus) == 1:
-                return stride
 
     def __len__(self) -> int:
         """Return the number of batches per epoch.

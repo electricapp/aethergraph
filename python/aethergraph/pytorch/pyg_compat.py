@@ -73,11 +73,12 @@ def subgraph_to_pyg(
 
     Args:
         subgraph: Sampled subgraph from AetherGraph containing nodes and edges.
-        features: Optional node features. Can be a torch.Tensor or numpy array.
-            If shape[0] matches num_nodes, used directly. Otherwise, indexed
-            by global node IDs from the subgraph.
-        labels: Optional node labels. Can be a torch.Tensor or numpy array.
-            Handled the same as features for shape matching.
+        features: Optional node features for **all nodes in the original
+            graph**, as a torch.Tensor or numpy array. Rows are gathered by
+            the subgraph's global node IDs. Callers holding features already
+            gathered for this subgraph should assign ``data.x`` directly.
+        labels: Optional node labels for all nodes in the original graph,
+            gathered the same way as ``features``.
         remap_nodes: Whether to use local node IDs [0, num_nodes) in edge_index.
             When True, uses pre-computed local indices from Rust. When False,
             uses global node IDs.
@@ -115,28 +116,14 @@ def subgraph_to_pyg(
     )
 
     if features is not None:
-        features_tensor: torch.Tensor
-        if isinstance(features, np.ndarray):
-            features_tensor = torch.from_numpy(features)
-        else:
-            features_tensor = features
-
-        if features_tensor.shape[0] == num_nodes:
-            data.x = features_tensor
-        else:
-            data.x = torch.index_select(features_tensor, 0, node_ids)
+        features_tensor = (
+            torch.from_numpy(features) if isinstance(features, np.ndarray) else features
+        )
+        data.x = torch.index_select(features_tensor, 0, node_ids)
 
     if labels is not None:
-        labels_tensor: torch.Tensor
-        if isinstance(labels, np.ndarray):
-            labels_tensor = torch.from_numpy(labels)
-        else:
-            labels_tensor = labels
-
-        if labels_tensor.shape[0] == num_nodes:
-            data.y = labels_tensor
-        else:
-            data.y = torch.index_select(labels_tensor, 0, node_ids)
+        labels_tensor = torch.from_numpy(labels) if isinstance(labels, np.ndarray) else labels
+        data.y = torch.index_select(labels_tensor, 0, node_ids)
 
     return data
 
