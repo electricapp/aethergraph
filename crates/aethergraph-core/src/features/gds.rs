@@ -469,15 +469,20 @@ impl GdsFeatureStore {
             );
         }
 
-        // Sort by node ID for sequential file access. Track original index
-        // so output lands in the caller's expected order.
-        let mut sorted: Vec<(NodeId, usize)> = nodes
+        // Sort by node ID for sequential file access, tracking the original
+        // index so output lands in the caller's expected order. Node and
+        // index pack into one u64 (node in the high half) — half the
+        // footprint of a (u32, usize) tuple and a plain integer sort.
+        let mut sorted: Vec<u64> = nodes
             .iter()
-            .copied()
             .enumerate()
-            .map(|(i, n)| (n, i))
+            .map(|(i, &n)| ((n as u64) << 32) | i as u64)
             .collect();
-        sorted.sort_unstable_by_key(|&(n, _)| n);
+        sorted.sort_unstable();
+        let sorted: Vec<(NodeId, usize)> = sorted
+            .into_iter()
+            .map(|packed| ((packed >> 32) as NodeId, packed as u32 as usize))
+            .collect();
 
         // Small batches: skip batch API overhead.
         if sorted.len() < BATCH_API_THRESHOLD {
@@ -577,17 +582,23 @@ impl GdsFeatureStore {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while completed < num_entries as usize {
             let mut nr: std::os::raw::c_uint = num_entries;
+            let remaining = (num_entries as usize - completed) as std::os::raw::c_uint;
             let mut timeout = libc::timespec {
                 tv_sec: 0,
                 tv_nsec: 10_000_000, // 10ms per wait slice
             };
+            // min_nr = remaining: block once for the rest of the batch
+            // instead of returning after a single completion — min_nr = 1
+            // makes the worst case one driver round-trip per completed
+            // read. The timeout still bounds each wait slice so the
+            // deadline check below runs.
             // SAFETY: `batch_handle` is still valid (not destroyed yet);
             // `events` has capacity for `nr` entries; `nr` and `timeout`
             // are exclusive stack locals.
             let err = unsafe {
                 ffi::cuFileBatchIOGetStatus(
                     batch_handle,
-                    1,
+                    remaining,
                     &raw mut nr,
                     events.as_mut_ptr(),
                     &raw mut timeout,

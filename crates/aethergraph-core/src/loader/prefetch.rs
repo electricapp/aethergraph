@@ -200,9 +200,10 @@ pub struct SyncFeatureStore {
     features_start_offset: u64,
     /// Element data type (F32 or F16).
     dtype: FeatureDtype,
-    /// io_uring handle with SQPOLL-aware submission (Linux only)
+    /// io_uring lane (ring + reusable landing buffers) with SQPOLL-aware
+    /// submission (Linux only)
     #[cfg(target_os = "linux")]
-    uring: Option<crate::internal::uring::UringHandle>,
+    uring: Option<crate::internal::uring::UringLane>,
     /// Whether O_DIRECT is enabled (required for IOPOLL)
     #[cfg(target_os = "linux")]
     direct_io: bool,
@@ -294,12 +295,12 @@ impl SyncFeatureStore {
     }
 
     #[cfg(target_os = "linux")]
-    fn setup_uring(file: &File, direct_io: bool) -> Option<crate::internal::uring::UringHandle> {
+    fn setup_uring(file: &File, direct_io: bool) -> Option<crate::internal::uring::UringLane> {
         let mut handle = crate::internal::uring::create_feature_uring(direct_io)?;
         if let Err(e) = handle.register_fd(file) {
             warn!("Failed to register FD: {}", e);
         }
-        Some(handle)
+        Some(crate::internal::uring::UringLane::new(handle))
     }
 
     /// Get feature dimension
@@ -348,19 +349,20 @@ impl SyncFeatureStore {
         #[cfg(target_os = "linux")]
         {
             if self.uring.is_some() {
-                // Take io_uring handle out temporarily to avoid borrow conflict
-                let mut handle = self.uring.take().unwrap();
+                // Take the io_uring lane out temporarily to avoid borrow conflict
+                let mut lane = self.uring.take().unwrap();
                 let result = Self::batch_read_uring_aligned(
                     &self.file,
                     nodes,
                     feature_size,
                     self.num_nodes,
                     self.features_start_offset,
-                    &mut handle,
+                    &mut lane,
                     self.direct_io,
                     self.dtype,
+                    self.feature_dim,
                 );
-                self.uring = Some(handle);
+                self.uring = Some(lane);
                 return result;
             }
         }
@@ -379,7 +381,10 @@ impl SyncFeatureStore {
         self.batch_read_sync(nodes, feature_size)
     }
 
-    /// Batch read using io_uring with proper SQPOLL and aligned buffers.
+    /// Batch read using io_uring with proper SQPOLL and the lane's
+    /// persistent aligned buffers — no per-batch aligned allocation, one
+    /// pipelined submission for the whole batch, rows decoded straight into
+    /// the output vector.
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     fn batch_read_uring_aligned(
@@ -388,11 +393,12 @@ impl SyncFeatureStore {
         feature_size: usize,
         num_nodes: usize,
         features_start_offset: u64,
-        handle: &mut crate::internal::uring::UringHandle,
+        lane: &mut crate::internal::uring::UringLane,
         direct_io: bool,
         dtype: FeatureDtype,
+        feature_dim: usize,
     ) -> anyhow::Result<Vec<f32>> {
-        use crate::internal::uring::{AlignedBufferPool, batch_read};
+        use crate::internal::uring::batch_read;
 
         if nodes.is_empty() {
             return Ok(Vec::new());
@@ -406,16 +412,37 @@ impl SyncFeatureStore {
         }
 
         let fd = file.as_raw_fd();
-
-        // Allocate aligned buffers for O_DIRECT, or regular buffers otherwise
-        let mut aligned_pool: Option<AlignedBufferPool> = None;
-        let mut regular_buffer: Vec<u8> = Vec::new();
+        let mut features = vec![0f32; nodes.len() * feature_dim];
 
         if direct_io {
-            // O_DIRECT requires aligned buffers
-            aligned_pool = Some(AlignedBufferPool::try_new(nodes.len(), feature_size)?)
+            let total_slots = nodes.len();
+            let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(total_slots);
+            {
+                let pool = lane.direct_pool(total_slots, feature_size)?;
+                for (i, &node) in nodes.iter().enumerate() {
+                    let file_offset = features_start_offset + (node as u64 * feature_size as u64);
+                    reads.push((file_offset, pool.slot_ptr(i), feature_size));
+                }
+            }
+            // SAFETY: each ptr points into the lane's pool, which outlives
+            // this call; batch_read reaps every submitted completion before
+            // returning — on success AND on error.
+            batch_read(&mut lane.handle, fd, &reads)?;
+
+            let pool = lane.direct_pool(total_slots, feature_size)?;
+            for i in 0..total_slots {
+                let row = pool.slot_slice(i, feature_size);
+                let dst = &mut features[i * feature_dim..(i + 1) * feature_dim];
+                match dtype {
+                    FeatureDtype::F32 => {
+                        dst.copy_from_slice(bytemuck::cast_slice::<u8, f32>(row));
+                    }
+                    FeatureDtype::F16 => {
+                        crate::internal::simd::f16_le_to_f32(row, dst);
+                    }
+                }
+            }
         } else {
-            // Regular I/O can use any buffer
             let total_size = nodes.len().checked_mul(feature_size).ok_or_else(|| {
                 anyhow::anyhow!(
                     "buffer size overflow: {} nodes * {} bytes",
@@ -423,48 +450,34 @@ impl SyncFeatureStore {
                     feature_size
                 )
             })?;
-            regular_buffer = vec![0u8; total_size];
-        }
-
-        // Build list of reads: (file_offset, buffer_ptr, length)
-        let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
-        for (i, &node) in nodes.iter().enumerate() {
-            let file_offset = features_start_offset + (node as u64 * feature_size as u64);
-            let buf_ptr = if direct_io {
-                aligned_pool.as_mut().unwrap().slot_ptr(i)
-            } else {
-                // SAFETY: regular_buffer is `nodes.len() * feature_size` bytes; `i < nodes.len()`.
-                unsafe { regular_buffer.as_mut_ptr().add(i * feature_size) }
-            };
-            reads.push((file_offset, buf_ptr, feature_size));
-        }
-
-        // SAFETY: each buf_ptr is valid for `feature_size` bytes (allocated above);
-        // they outlive this call.
-        batch_read(handle, fd, &reads)?;
-
-        // Convert buffer data to f32
-        let decode = |bytes: &[u8]| -> Vec<f32> {
-            match dtype {
-                FeatureDtype::F32 => bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                FeatureDtype::F16 => bytes
-                    .chunks_exact(2)
-                    .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-                    .collect(),
+            let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
+            {
+                let scratch = lane.scratch(total_size);
+                let base = scratch.as_mut_ptr();
+                for (i, &node) in nodes.iter().enumerate() {
+                    let file_offset = features_start_offset + (node as u64 * feature_size as u64);
+                    // SAFETY: `i < nodes.len()` and the scratch spans
+                    // `nodes.len() * feature_size` bytes.
+                    let buf_ptr = unsafe { base.add(i * feature_size) };
+                    reads.push((file_offset, buf_ptr, feature_size));
+                }
             }
-        };
+            // SAFETY: every ptr points into the lane's scratch, which
+            // outlives this call; batch_read reaps every submitted
+            // completion before returning.
+            batch_read(&mut lane.handle, fd, &reads)?;
 
-        let features: Vec<f32> = if direct_io {
-            let pool = aligned_pool.as_ref().unwrap();
-            (0..nodes.len())
-                .flat_map(|i| decode(pool.slot_slice(i, feature_size)))
-                .collect()
-        } else {
-            decode(&regular_buffer)
-        };
+            let scratch = lane.scratch(total_size);
+            match dtype {
+                FeatureDtype::F32 => {
+                    bytemuck::cast_slice_mut::<f32, u8>(&mut features)
+                        .copy_from_slice(&scratch[..total_size]);
+                }
+                FeatureDtype::F16 => {
+                    crate::internal::simd::f16_le_to_f32(&scratch[..total_size], &mut features);
+                }
+            }
+        }
 
         Ok(features)
     }
@@ -1512,16 +1525,19 @@ fn sample_with_uring(
 
         let edges_before = edge_src.len();
 
-        // Batch read all frontier neighbors via io_uring
-        let neighbors_batch =
+        // Batch read all frontier neighbors via io_uring into one flat
+        // arena; `spans` locates each node's slice.
+        let (flat_neighbors, spans) =
             batch_read_neighbors_uring(handle, fd, offsets, edges_start, num_nodes, &frontier)?;
 
         let mut next_frontier = Vec::new();
 
-        for (&node, neighbors) in frontier.iter().zip(neighbors_batch.iter()) {
-            if neighbors.is_empty() {
+        for (&node, &(span_start, span_len)) in frontier.iter().zip(spans.iter()) {
+            if span_len == 0 {
                 continue;
             }
+            let neighbors =
+                &flat_neighbors[span_start as usize..span_start as usize + span_len as usize];
 
             let node_idx = node as usize;
             // Frontier nodes are valid IDs, so this index is always in range.
@@ -1550,11 +1566,13 @@ fn sample_with_uring(
         num_sampled_nodes.push(next_frontier.len());
         num_sampled_edges.push(edge_src.len() - edges_before);
 
-        frontier = if config.cumulative {
-            frontier.into_iter().chain(next_frontier).collect()
+        if config.cumulative {
+            // Reuse the frontier allocation instead of reallocating the
+            // whole accumulated list every hop.
+            frontier.append(&mut next_frontier);
         } else {
-            next_frontier
-        };
+            frontier = next_frontier;
+        }
     }
 
     let nodes: Vec<NodeId> = all_nodes.into_iter().collect();
@@ -1572,7 +1590,12 @@ fn sample_with_uring(
 
 /// Batch read neighbors for multiple nodes using io_uring.
 ///
-/// Uses SQPOLL-aware submission and registered file descriptors.
+/// Uses SQPOLL-aware submission and registered file descriptors. All
+/// neighbor lists land back-to-back in one flat `Vec<NodeId>` — a single
+/// allocation whose typed backing io_uring writes into directly, so on
+/// little-endian targets there is no per-node buffer, no second decode
+/// pass, and no copy. `spans[i]` is `(start, len)` into the flat array for
+/// input node `i` (zero-length for invalid/zero-degree nodes).
 #[cfg(target_os = "linux")]
 fn batch_read_neighbors_uring(
     handle: &mut crate::internal::uring::UringHandle,
@@ -1581,50 +1604,49 @@ fn batch_read_neighbors_uring(
     edges_start: u64,
     num_nodes: usize,
     nodes: &[NodeId],
-) -> anyhow::Result<Vec<Vec<NodeId>>> {
+) -> anyhow::Result<(Vec<NodeId>, Vec<(u32, u32)>)> {
     use crate::internal::uring::batch_read;
 
-    // `buffers[i]` is empty for invalid/zero-degree nodes; `reads` carries
-    // (file_offset, ptr, len) for the non-empty subset.
-    let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
-    let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
-
+    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(nodes.len());
+    let mut total: usize = 0;
     for &node in nodes {
         let idx = node as usize;
         if idx >= num_nodes {
-            buffers.push(Vec::new());
+            spans.push((total as u32, 0));
             continue;
         }
         let start = offsets[idx] as usize;
         let end = offsets[idx + 1] as usize;
-        let num_neighbors = end - start;
-        if num_neighbors == 0 {
-            buffers.push(Vec::new());
-            continue;
-        }
-        let byte_offset = edges_start + (start * 4) as u64;
-        let byte_size = num_neighbors * 4;
-        let mut buf = vec![0u8; byte_size];
-        let ptr = buf.as_mut_ptr();
-        buffers.push(buf);
-        reads.push((byte_offset, ptr, byte_size));
+        spans.push((total as u32, (end - start) as u32));
+        total += end - start;
     }
 
-    if !reads.is_empty() {
-        // SAFETY: every ptr in `reads` points into `buffers[i]` which lives until
-        // this function returns; batch_read writes synchronously and returns
-        // before we touch the buffers again.
+    let mut flat: Vec<NodeId> = vec![0; total];
+    if total > 0 {
+        let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
+        {
+            let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut flat);
+            let base = bytes.as_mut_ptr();
+            for (&node, &(span_start, span_len)) in nodes.iter().zip(spans.iter()) {
+                if span_len == 0 {
+                    continue;
+                }
+                let start = offsets[node as usize] as usize;
+                let byte_offset = edges_start + (start * 4) as u64;
+                // SAFETY: span offsets were accumulated to fit exactly in
+                // `flat`, so `span_start * 4 .. span_start * 4 + span_len * 4`
+                // is in bounds.
+                let ptr = unsafe { base.add(span_start as usize * 4) };
+                reads.push((byte_offset, ptr, span_len as usize * 4));
+            }
+        }
+        // SAFETY: every ptr in `reads` points into `flat`'s backing, which
+        // lives until this function returns; batch_read reaps every
+        // submitted completion before returning.
         batch_read(handle, fd, &reads)?;
     }
 
-    Ok(buffers
-        .into_iter()
-        .map(|buf| {
-            buf.chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
-        })
-        .collect())
+    Ok((flat, spans))
 }
 
 /// Fast PRNG (same as in sampler.rs)

@@ -16,7 +16,8 @@ use tracing::{debug, trace};
 /// Magic number to identify AetherGraph files: "AETH" in ASCII
 const MAGIC: u32 = 0x4145_5448;
 
-/// Current file format version
+/// Current file format version. The integrity checksum is CRC32 (IEEE) —
+/// SIMD-accelerated with runtime dispatch, ~10-30 GB/s over the body.
 const VERSION: u32 = 1;
 
 /// Use full validation below this threshold; offsets-only above it.
@@ -162,7 +163,7 @@ pub fn save_graph(graph: &Graph, path: impl AsRef<Path>) -> Result<()> {
 
     let offsets_bytes = cast_slice::<EdgeOffset, u8>(graph.offsets());
     let edges_bytes = cast_slice::<NodeId, u8>(graph.edges());
-    let checksum32 = Some(checksum32_parts(&[offsets_bytes, edges_bytes]));
+    let checksum32 = Some(crc32_parts(&[offsets_bytes, edges_bytes]));
 
     let header = Header::new(
         graph.num_nodes(),
@@ -225,11 +226,27 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
 
     let layout = parse_layout(&mmap)?;
 
-    // Tell the kernel we will read the offsets+edges body so it can fault
-    // those pages in ahead of the access pattern that follows — the Full
-    // validation checksum and structural checks both stream the whole body.
-    let body = &mmap[layout.offsets_range.start..layout.edges_range.end];
-    crate::internal::hint::prefetch_mmap_range(body.as_ptr(), body.len());
+    // Readahead is gated on what will actually be read. Full validation
+    // streams the whole offsets+edges body (checksum + destination checks),
+    // so WILLNEED the body. OffsetsOnly/HeaderOnly never touch the edge
+    // pages at load — an unconditional body-wide WILLNEED would turn the
+    // O(1)-startup mmap of a multi-GB graph into a full sequential read.
+    // The edges array is then hinted MADV_RANDOM: sampling faults one page
+    // per useful neighbor list, and default readahead would drag in 128 KiB
+    // per fault. The offsets array gets MADV_HUGEPAGE (best-effort): random
+    // per-node lookups over a multi-GB offsets array are dTLB-bound at
+    // 4 KiB pages.
+    let offsets_bytes = &mmap[layout.offsets_range.start..layout.offsets_range.end];
+    let edges_bytes = &mmap[layout.edges_range.start..layout.edges_range.end];
+    if validation == GraphValidationMode::Full {
+        let body = &mmap[layout.offsets_range.start..layout.edges_range.end];
+        crate::internal::hint::prefetch_mmap_range(body.as_ptr(), body.len());
+    } else {
+        crate::internal::hint::prefetch_mmap_range(offsets_bytes.as_ptr(), offsets_bytes.len());
+        crate::internal::hint::advise_mmap_random(edges_bytes.as_ptr(), edges_bytes.len());
+    }
+    crate::internal::hint::advise_mmap_hugepage(offsets_bytes.as_ptr(), offsets_bytes.len());
+    crate::internal::hint::advise_mmap_hugepage(edges_bytes.as_ptr(), edges_bytes.len());
 
     validate_checksum_if_present(&mmap, &layout, validation)?;
 
@@ -288,42 +305,23 @@ pub fn load_graph_from_mmap_with_validation(
     let offsets_bytes = &mmap[layout.offsets_range.start..layout.offsets_range.end];
     let edges_bytes = &mmap[layout.edges_range.start..layout.edges_range.end];
 
-    let offsets: Vec<EdgeOffset> = offsets_bytes
-        .chunks_exact(std::mem::size_of::<EdgeOffset>())
-        .map(|chunk| {
-            EdgeOffset::from_le_bytes(
-                chunk
-                    .try_into()
-                    .expect("chunks_exact guarantees EdgeOffset-sized chunks"),
-            )
-        })
-        .collect();
+    // Bulk memcpy decode: allocate the typed destination and view it as
+    // bytes for the copy. On little-endian targets the on-disk bytes are
+    // already native order, and unlike a per-element `from_le_bytes` map
+    // this is a guaranteed single memcpy with no alignment requirement on
+    // the source.
+    let mut offsets: Vec<EdgeOffset> =
+        vec![0; offsets_bytes.len() / std::mem::size_of::<EdgeOffset>()];
+    bytemuck::cast_slice_mut::<EdgeOffset, u8>(&mut offsets).copy_from_slice(offsets_bytes);
 
-    let edges: Vec<NodeId> = edges_bytes
-        .chunks_exact(std::mem::size_of::<NodeId>())
-        .map(|chunk| {
-            NodeId::from_le_bytes(
-                chunk
-                    .try_into()
-                    .expect("chunks_exact guarantees NodeId-sized chunks"),
-            )
-        })
-        .collect();
+    let mut edges: Vec<NodeId> = vec![0; edges_bytes.len() / std::mem::size_of::<NodeId>()];
+    bytemuck::cast_slice_mut::<NodeId, u8>(&mut edges).copy_from_slice(edges_bytes);
 
     let weights = if let Some(range) = &layout.weights_range {
         let weights_bytes = &mmap[range.start..range.end];
-        Some(
-            weights_bytes
-                .chunks_exact(std::mem::size_of::<f32>())
-                .map(|chunk| {
-                    f32::from_le_bytes(
-                        chunk
-                            .try_into()
-                            .expect("chunks_exact guarantees f32-sized chunks"),
-                    )
-                })
-                .collect(),
-        )
+        let mut w: Vec<f32> = vec![0.0; weights_bytes.len() / std::mem::size_of::<f32>()];
+        bytemuck::cast_slice_mut::<f32, u8>(&mut w).copy_from_slice(weights_bytes);
+        Some(w)
     } else {
         None
     };
@@ -457,7 +455,7 @@ fn validate_checksum_if_present(
 
     let offsets = &bytes[layout.offsets_range.start..layout.offsets_range.end];
     let edges = &bytes[layout.edges_range.start..layout.edges_range.end];
-    let actual = checksum32_parts(&[offsets, edges]);
+    let actual = crc32_parts(&[offsets, edges]);
 
     anyhow::ensure!(
         actual == expected,
@@ -476,18 +474,16 @@ fn default_validation_mode(file_size: u64) -> GraphValidationMode {
     }
 }
 
-fn checksum32_parts(parts: &[&[u8]]) -> u32 {
-    const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
-    const FNV_PRIME: u32 = 0x0100_0193;
-
-    let mut hash = FNV_OFFSET_BASIS;
+/// CRC32 (IEEE) over the concatenated parts. crc32fast dispatches to the
+/// SIMD carryless-multiply path at runtime, so this runs at memory speed
+/// rather than the cycles-per-byte a serial byte hash costs over multi-GB
+/// bodies.
+fn crc32_parts(parts: &[&[u8]]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
     for part in parts {
-        for &b in *part {
-            hash ^= b as u32;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
+        hasher.update(part);
     }
-    hash
+    hasher.finalize()
 }
 
 #[cfg(test)]

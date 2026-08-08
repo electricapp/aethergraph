@@ -307,16 +307,76 @@ impl AlignedBufferPool {
     }
 
     /// Get the slot size (may be larger than requested due to alignment).
-    #[cfg(test)]
     pub fn slot_size(&self) -> usize {
         self.slot_size
     }
 
     /// Get number of slots.
-    #[cfg(test)]
     pub fn num_slots(&self) -> usize {
         self.num_slots
     }
+}
+
+/// One ring plus its reusable landing buffers.
+///
+/// Batch readers previously allocated a fresh `AlignedBufferPool` (an
+/// aligned heap allocation) or a zeroed `Vec` per batch; keeping them with
+/// the ring under one lock amortizes that to steady state — buffers only
+/// grow when a larger batch arrives.
+pub struct UringLane {
+    pub handle: UringHandle,
+    /// Reusable O_DIRECT landing slots.
+    pool: Option<AlignedBufferPool>,
+    /// Reusable buffered-I/O landing bytes.
+    scratch: Vec<u8>,
+}
+
+impl UringLane {
+    pub fn new(handle: UringHandle) -> Self {
+        Self {
+            handle,
+            pool: None,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// The aligned pool, rebuilt only when the requested geometry outgrows
+    /// the cached one.
+    pub fn direct_pool(
+        &mut self,
+        num_slots: usize,
+        slot_size: usize,
+    ) -> Result<&mut AlignedBufferPool> {
+        let rebuild = match &self.pool {
+            Some(p) => p.num_slots() < num_slots || p.slot_size() < slot_size,
+            None => true,
+        };
+        if rebuild {
+            self.pool = Some(AlignedBufferPool::try_new(num_slots, slot_size)?);
+        }
+        Ok(self.pool.as_mut().expect("pool populated above"))
+    }
+
+    /// The buffered-I/O scratch, grown (never shrunk) to `len` bytes.
+    pub fn scratch(&mut self, len: usize) -> &mut [u8] {
+        if self.scratch.len() < len {
+            self.scratch.resize(len, 0);
+        }
+        &mut self.scratch[..len]
+    }
+}
+
+/// Optional CPU to pin SQPOLL kernel threads to, read once from
+/// `AETHERGRAPH_SQPOLL_CPU`. Unpinned SQPOLL threads migrate freely and can
+/// land on the cores running samplers; deployments that pin their compute
+/// threads should park the poller on a housekeeping core.
+fn sqpoll_cpu() -> Option<u32> {
+    static CPU: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CPU.get_or_init(|| {
+        std::env::var("AETHERGRAPH_SQPOLL_CPU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
 }
 
 /// SQPOLL-aware io_uring wrapper.
@@ -327,6 +387,8 @@ impl AlignedBufferPool {
 /// - Manages IOPOLL completion polling
 pub struct UringHandle {
     ring: io_uring::IoUring,
+    /// SQ/CQ depth the ring was built with.
+    entries: u32,
     /// Whether SQPOLL is enabled
     sqpoll_enabled: bool,
     /// Whether IOPOLL is enabled
@@ -346,15 +408,17 @@ impl UringHandle {
     /// * `sqpoll_idle_ms` - Kernel thread idle timeout in ms (typically 1000)
     pub fn new(entries: u32, sqpoll_idle_ms: u32) -> Result<Self> {
         // Try full SQPOLL + IOPOLL first
-        match io_uring::IoUring::builder()
-            .setup_sqpoll(sqpoll_idle_ms)
-            .setup_iopoll()
-            .build(entries)
-        {
+        let mut builder = io_uring::IoUring::builder();
+        builder.setup_sqpoll(sqpoll_idle_ms).setup_iopoll();
+        if let Some(cpu) = sqpoll_cpu() {
+            builder.setup_sqpoll_cpu(cpu);
+        }
+        match builder.build(entries) {
             Ok(ring) => {
                 debug!("io_uring initialized with SQPOLL + IOPOLL");
                 Ok(Self {
                     ring,
+                    entries,
                     sqpoll_enabled: true,
                     iopoll_enabled: true,
                     registered_fd: None,
@@ -378,14 +442,17 @@ impl UringHandle {
     /// * `sqpoll_idle_ms` - Kernel thread idle timeout in ms (typically 1000)
     pub fn new_sqpoll_only(entries: u32, sqpoll_idle_ms: u32) -> Result<Self> {
         // Try SQPOLL without IOPOLL
-        match io_uring::IoUring::builder()
-            .setup_sqpoll(sqpoll_idle_ms)
-            .build(entries)
-        {
+        let mut builder = io_uring::IoUring::builder();
+        builder.setup_sqpoll(sqpoll_idle_ms);
+        if let Some(cpu) = sqpoll_cpu() {
+            builder.setup_sqpoll_cpu(cpu);
+        }
+        match builder.build(entries) {
             Ok(ring) => {
                 debug!("io_uring initialized with SQPOLL (no IOPOLL)");
                 Ok(Self {
                     ring,
+                    entries,
                     sqpoll_enabled: true,
                     iopoll_enabled: false,
                     registered_fd: None,
@@ -397,12 +464,18 @@ impl UringHandle {
                 let ring = io_uring::IoUring::new(entries).context("failed to create io_uring")?;
                 Ok(Self {
                     ring,
+                    entries,
                     sqpoll_enabled: false,
                     iopoll_enabled: false,
                     registered_fd: None,
                 })
             }
         }
+    }
+
+    /// SQ/CQ depth this ring was built with.
+    pub fn entries(&self) -> u32 {
+        self.entries
     }
 
     /// Register a file descriptor for fast access.
@@ -642,14 +715,56 @@ pub fn batch_read(
     // per-call fd override once a fd is registered on the handle.
     let registered_idx = handle.registered_fd_index();
     let is_sqpoll = handle.is_sqpoll();
+    // During the push phase, hand accumulated SQEs to the kernel and reap
+    // available completions at this cadence — the device starts working
+    // while later SQEs are still being built, the queue depth stays high
+    // instead of sawtoothing submit-everything → drain-everything, and a
+    // batch larger than the CQ can never overflow it.
+    let pipeline_stride = (handle.entries() as usize / 4).max(1);
+
+    // Records one CQE against the batch. Every submitted SQE produces
+    // exactly one CQE, all of which must be reaped before returning.
+    let process_cqe = |cqe: io_uring::cqueue::Entry, first_err: &mut Option<anyhow::Error>| {
+        let result = cqe.result();
+        let idx = cqe.user_data() as usize;
+        let Some(&(offset, _, expected_len)) = reads.get(idx) else {
+            if first_err.is_none() {
+                *first_err = Some(anyhow::anyhow!(
+                    "io_uring completion with unknown user_data {idx}"
+                ));
+            }
+            return;
+        };
+        if result < 0 {
+            if first_err.is_none() {
+                *first_err = Some(anyhow::anyhow!(
+                    "io_uring read at offset {} failed with error {}",
+                    offset,
+                    -result
+                ));
+            }
+            return;
+        }
+        // Short reads on local files mean truncation/corruption.
+        if ((result as usize) < expected_len) && first_err.is_none() {
+            *first_err = Some(anyhow::anyhow!(
+                "io_uring short read at offset {}: got {} bytes, expected {} \
+                 (file may be truncated or corrupted)",
+                offset,
+                result,
+                expected_len
+            ));
+        }
+    };
 
     // Push all reads, counting how many SQEs the kernel will see. Each
-    // of them produces exactly one CQE that the drain loop below must
-    // reap before we return.
+    // of them produces exactly one CQE that must be reaped — inline during
+    // the push phase or by the drain loop below — before we return.
     let mut first_err: Option<anyhow::Error> = None;
     let mut submitted = 0usize;
+    let mut completed = 0usize;
     {
-        let (submitter, mut sq, _cq) = handle.split();
+        let (submitter, mut sq, mut cq) = handle.split();
 
         'push: for (i, &(offset, buf_ptr, len)) in reads.iter().enumerate() {
             let entry = match registered_idx {
@@ -685,6 +800,30 @@ pub fn batch_read(
                 }
             }
             submitted += 1;
+
+            // Pipeline: kick submission and reap whatever has already
+            // finished, without blocking.
+            if submitted.is_multiple_of(pipeline_stride) {
+                sq.sync();
+                let res = if is_sqpoll {
+                    if sq.need_wakeup() {
+                        submitter.submit().map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    submitter.submit().map(|_| ())
+                };
+                if let Err(e) = res {
+                    first_err = Some(anyhow::Error::from(e).context("io_uring submit failed"));
+                    break 'push;
+                }
+                cq.sync();
+                for cqe in &mut cq {
+                    completed += 1;
+                    process_cqe(cqe, &mut first_err);
+                }
+            }
         }
 
         sq.sync();
@@ -700,45 +839,15 @@ pub fn batch_read(
         first_err = Some(e);
     }
 
-    // Drain exactly `submitted` completions, recording (not returning)
-    // errors so the kernel is provably done with every buffer first.
-    let mut completed = 0usize;
+    // Drain the remaining completions, recording (not returning) errors so
+    // the kernel is provably done with every buffer first.
     let mut wait_failures = 0u32;
     while completed < submitted {
         handle.cq_sync();
 
         for cqe in handle.completion() {
             completed += 1;
-            let result = cqe.result();
-            let idx = cqe.user_data() as usize;
-            let Some(&(offset, _, expected_len)) = reads.get(idx) else {
-                if first_err.is_none() {
-                    first_err = Some(anyhow::anyhow!(
-                        "io_uring completion with unknown user_data {idx}"
-                    ));
-                }
-                continue;
-            };
-            if result < 0 {
-                if first_err.is_none() {
-                    first_err = Some(anyhow::anyhow!(
-                        "io_uring read at offset {} failed with error {}",
-                        offset,
-                        -result
-                    ));
-                }
-                continue;
-            }
-            // Short reads on local files mean truncation/corruption.
-            if ((result as usize) < expected_len) && first_err.is_none() {
-                first_err = Some(anyhow::anyhow!(
-                    "io_uring short read at offset {}: got {} bytes, expected {} \
-                     (file may be truncated or corrupted)",
-                    offset,
-                    result,
-                    expected_len
-                ));
-            }
+            process_cqe(cqe, &mut first_err);
         }
 
         if completed < submitted {

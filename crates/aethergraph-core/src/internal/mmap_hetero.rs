@@ -163,9 +163,19 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
     let mmap = Arc::new(unsafe { MmapOptions::new().map(&file)? });
     let file_len = mmap.len();
 
-    // Hint the kernel to fault in the mapping ahead of the section-by-section
-    // structural validation that streams the offsets/edges pages below.
-    crate::internal::hint::prefetch_mmap_range(mmap.as_ptr(), file_len);
+    // The load below reads only the header, the type tables, and the first/
+    // last 8 bytes of each offsets array — deliberately O(1) page faults.
+    // WILLNEED therefore covers just a small prefix (header + tables live at
+    // the front); the CSR body is hinted MADV_RANDOM instead, since sampling
+    // faults one page per useful neighbor list and default readahead would
+    // drag in 128 KiB per fault.
+    let prefix = file_len.min(1 << 20);
+    crate::internal::hint::prefetch_mmap_range(mmap.as_ptr(), prefix);
+    if file_len > prefix {
+        // SAFETY: `prefix <= file_len`, so the offset stays in the mapping.
+        let body = unsafe { mmap.as_ptr().add(prefix) };
+        crate::internal::hint::advise_mmap_random(body, file_len - prefix);
+    }
 
     if file_len < HEADER_SIZE {
         bail!("file too small for header: {file_len} bytes");

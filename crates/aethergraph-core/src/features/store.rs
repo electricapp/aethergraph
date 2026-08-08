@@ -425,6 +425,13 @@ impl FeatureStore {
             mmap.len() as f64 / 1e9
         );
 
+        // Batch gathers touch rows at random: readahead would fault 128 KiB
+        // per useful row, and 4 KiB pages make TB-scale gathers dTLB-bound.
+        // Both hints are best-effort.
+        let payload = &mmap[data_offset..data_offset + expected_data_size];
+        crate::internal::hint::advise_mmap_random(payload.as_ptr(), payload.len());
+        crate::internal::hint::advise_mmap_hugepage(payload.as_ptr(), payload.len());
+
         Ok(Self {
             mmap,
             num_nodes,
@@ -434,6 +441,25 @@ impl FeatureStore {
             dtype,
             telemetry: None,
         })
+    }
+
+    /// How many rows ahead the batch gathers prefetch. Random rows on a
+    /// large store miss LLC (and often dTLB); a handful of rows in flight
+    /// overlaps those misses with the copy of the current row.
+    const GATHER_PREFETCH_ROWS: usize = 4;
+
+    /// Prefetch every cache line of one feature row.
+    #[inline(always)]
+    fn prefetch_row(row: &[u8]) {
+        let mut p = row.as_ptr();
+        // SAFETY: `end` is one-past-the-slice; `p` only advances in 64-byte
+        // steps while strictly below it, and prefetch tolerates any address.
+        let end = unsafe { p.add(row.len()) };
+        while p < end {
+            crate::internal::prefetch::prefetch_read(p);
+            // SAFETY: advancing past `end` terminates the loop before use.
+            p = unsafe { p.add(64) };
+        }
     }
 
     /// Raw bytes of the feature payload.
@@ -580,25 +606,12 @@ impl FeatureStore {
         );
 
         let raw = self.feature_data_raw();
-        let elem_size = self.dtype.element_size();
-        let row_bytes = self.feature_dim * elem_size;
-        let start = node_idx.checked_mul(row_bytes).ok_or_else(|| {
-            anyhow::anyhow!(
-                "index overflow: node {} * row_bytes {}",
-                node_idx,
-                row_bytes
-            )
-        })?;
-        let end = start
-            .checked_add(row_bytes)
-            .ok_or_else(|| anyhow::anyhow!("index overflow: {} + {}", start, row_bytes))?;
-        anyhow::ensure!(
-            end <= raw.len(),
-            "feature data bounds error: end {} > len {}",
-            end,
-            raw.len()
-        );
-        let row = &raw[start..end];
+        let row_bytes = self.feature_dim * self.dtype.element_size();
+        // `node_idx < num_nodes` was checked above and the payload length is
+        // exactly `num_nodes * row_bytes` (validated at load), so the row
+        // arithmetic cannot overflow or escape the slice.
+        let start = node_idx * row_bytes;
+        let row = &raw[start..start + row_bytes];
 
         match self.dtype {
             FeatureDtype::F32 => {
@@ -606,9 +619,7 @@ impl FeatureStore {
                 out[..self.feature_dim].copy_from_slice(src);
             }
             FeatureDtype::F16 => {
-                for (i, chunk) in row.chunks_exact(2).enumerate() {
-                    out[i] = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
-                }
+                crate::internal::simd::f16_le_to_f32(row, &mut out[..self.feature_dim]);
             }
         }
         Ok(())
@@ -628,46 +639,44 @@ impl FeatureStore {
         let start = self.telemetry.is_some().then(Instant::now);
         trace!("Batch loading {} node features", nodes.len());
 
-        let mut result = Vec::with_capacity(nodes.len() * self.feature_dim);
+        // Validate and convert IDs to row byte offsets first — the gather
+        // loop below then runs branch-light with rows prefetched ahead of
+        // the copy, overlapping the random-access miss latency instead of
+        // serializing one miss per row.
         let raw = self.feature_data_raw();
-        let elem_size = self.dtype.element_size();
-        let row_bytes = self.feature_dim * elem_size;
-
-        // Hot path: inline loop
+        let row_bytes = self.feature_dim * self.dtype.element_size();
+        let mut row_starts: Vec<usize> = Vec::with_capacity(nodes.len());
         for &node in nodes {
             let node_id: NodeId = node
                 .try_into()
                 .map_err(|e| anyhow::anyhow!("invalid node id: {:?}", e))?;
             let node_idx = node_id as usize;
-
             anyhow::ensure!(node_idx < self.num_nodes, "node {} out of bounds", node_id);
+            // Payload length is exactly num_nodes * row_bytes (validated at
+            // load), so this offset cannot overflow or escape the slice.
+            row_starts.push(node_idx * row_bytes);
+        }
 
-            let byte_start = node_idx.checked_mul(row_bytes).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "index overflow in batch: node {} * row_bytes {}",
-                    node_idx,
-                    row_bytes
-                )
-            })?;
-            let byte_end = byte_start.checked_add(row_bytes).ok_or_else(|| {
-                anyhow::anyhow!("index overflow in batch: {} + {}", byte_start, row_bytes)
-            })?;
-            anyhow::ensure!(
-                byte_end <= raw.len(),
-                "batch bounds error: end {} > len {}",
-                byte_end,
-                raw.len()
-            );
-            let row = &raw[byte_start..byte_end];
-
-            match self.dtype {
-                FeatureDtype::F32 => {
-                    result.extend_from_slice(bytemuck::cast_slice(row));
-                }
-                FeatureDtype::F16 => {
-                    for chunk in row.chunks_exact(2) {
-                        result.push(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+        let mut result = Vec::with_capacity(nodes.len() * self.feature_dim);
+        match self.dtype {
+            FeatureDtype::F32 => {
+                for (i, &byte_start) in row_starts.iter().enumerate() {
+                    if let Some(&ahead) = row_starts.get(i + Self::GATHER_PREFETCH_ROWS) {
+                        Self::prefetch_row(&raw[ahead..ahead + row_bytes]);
                     }
+                    let row = &raw[byte_start..byte_start + row_bytes];
+                    result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(row));
+                }
+            }
+            FeatureDtype::F16 => {
+                result.resize(nodes.len() * self.feature_dim, 0.0);
+                for (i, &byte_start) in row_starts.iter().enumerate() {
+                    if let Some(&ahead) = row_starts.get(i + Self::GATHER_PREFETCH_ROWS) {
+                        Self::prefetch_row(&raw[ahead..ahead + row_bytes]);
+                    }
+                    let row = &raw[byte_start..byte_start + row_bytes];
+                    let out = &mut result[i * self.feature_dim..(i + 1) * self.feature_dim];
+                    crate::internal::simd::f16_le_to_f32(row, out);
                 }
             }
         }
@@ -713,10 +722,35 @@ impl FeatureStore {
 
         let start = self.telemetry.is_some().then(Instant::now);
 
+        // Same prefetched gather as `get_batch`, writing into the caller's
+        // buffer. Bounds are validated up front so the copy loop stays
+        // branch-light.
+        let raw = self.feature_data_raw();
+        let row_bytes = self.feature_dim * self.dtype.element_size();
+        for &node in nodes {
+            anyhow::ensure!(
+                (node as usize) < self.num_nodes,
+                "node {} out of bounds (num_nodes={})",
+                node,
+                self.num_nodes
+            );
+        }
         for (i, &node) in nodes.iter().enumerate() {
-            // i * feature_dim is bounded by `total`, already checked above.
-            let row_start = i * self.feature_dim;
-            self.get_into(node, &mut out[row_start..row_start + self.feature_dim])?;
+            if let Some(&ahead) = nodes.get(i + Self::GATHER_PREFETCH_ROWS) {
+                let ahead_start = ahead as usize * row_bytes;
+                Self::prefetch_row(&raw[ahead_start..ahead_start + row_bytes]);
+            }
+            let byte_start = node as usize * row_bytes;
+            let row = &raw[byte_start..byte_start + row_bytes];
+            let dst = &mut out[i * self.feature_dim..(i + 1) * self.feature_dim];
+            match self.dtype {
+                FeatureDtype::F32 => {
+                    dst.copy_from_slice(bytemuck::cast_slice::<u8, f32>(row));
+                }
+                FeatureDtype::F16 => {
+                    crate::internal::simd::f16_le_to_f32(row, dst);
+                }
+            }
         }
 
         if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {

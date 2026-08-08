@@ -424,14 +424,18 @@ impl AsyncCsrGraph {
         let results = tokio::task::spawn_blocking(move || {
             let fd = file.as_raw_fd();
 
-            // Pre-allocate buffers for all reads
-            let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
-            let mut read_info: Vec<(usize, u64, usize)> = Vec::with_capacity(nodes.len());
+            // io_uring DMAs straight into each result Vec's typed backing —
+            // no byte-buffer temporaries and, on little-endian targets, no
+            // decode pass or second copy per node. The heap allocations
+            // behind the inner Vecs are address-stable even as the outer
+            // Vec grows, so the read pointers stay valid.
+            let mut results: Vec<Vec<NodeId>> = Vec::with_capacity(nodes.len());
+            let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
 
-            for (i, &node) in nodes.iter().enumerate() {
+            for &node in nodes.iter() {
                 let idx = node as usize;
                 if idx >= num_nodes {
-                    buffers.push(Vec::new());
+                    results.push(Vec::new());
                     continue;
                 }
 
@@ -440,50 +444,35 @@ impl AsyncCsrGraph {
                 let num_neighbors = end_edge.saturating_sub(start_edge);
 
                 if num_neighbors == 0 {
-                    buffers.push(Vec::new());
+                    results.push(Vec::new());
                     continue;
                 }
 
                 let byte_offset = edges_start + (start_edge * std::mem::size_of::<NodeId>()) as u64;
                 let byte_size = num_neighbors * std::mem::size_of::<NodeId>();
 
-                buffers.push(vec![0u8; byte_size]);
-                read_info.push((i, byte_offset, byte_size));
+                results.push(vec![0 as NodeId; num_neighbors]);
+                let slot = results
+                    .last_mut()
+                    .expect("results is non-empty after the push above");
+                let bytes: &mut [u8] = bytemuck::cast_slice_mut(slot.as_mut_slice());
+                reads.push((byte_offset, bytes.as_mut_ptr(), byte_size));
             }
 
-            if read_info.is_empty() {
-                return Ok(vec![Vec::new(); nodes.len()]);
+            if reads.is_empty() {
+                return Ok(results);
             }
-
-            // Convert to (offset, ptr, len) tuples for batch_read.
-            let reads: Vec<(u64, *mut u8, usize)> = read_info
-                .iter()
-                .map(|&(buf_idx, byte_offset, byte_size)| {
-                    (byte_offset, buffers[buf_idx].as_mut_ptr(), byte_size)
-                })
-                .collect();
 
             // Hold the ring lock only for SQ/CQ interaction.
             {
                 let mut handle = uring.lock();
-                // SAFETY: each ptr in `reads` points into buffers[i] which lives
-                // until this closure returns; batch_read completes synchronously.
+                // SAFETY: each ptr in `reads` points into a result Vec's
+                // heap allocation, which lives until this closure returns;
+                // batch_read reaps every submitted completion before
+                // returning — on success AND on error.
                 crate::internal::uring::batch_read(&mut handle, fd, &reads)?;
-                trace!("Submitted {} reads via io_uring", read_info.len());
+                trace!("Completed {} reads via io_uring", reads.len());
             }
-
-            // Convert buffers to NodeId vectors
-            let mut results = vec![Vec::new(); nodes.len()];
-            for &(buf_idx, _, _) in &read_info {
-                let buffer = &buffers[buf_idx];
-                let neighbors: Vec<NodeId> = buffer
-                    .chunks_exact(4)
-                    .map(|chunk| NodeId::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect();
-                results[buf_idx] = neighbors;
-            }
-
-            trace!("Completed batch read of {} nodes via io_uring", nodes.len());
 
             Ok::<_, anyhow::Error>(results)
         })
@@ -493,57 +482,76 @@ impl AsyncCsrGraph {
         Ok(results)
     }
 
-    /// Tokio fallback implementation - still async but not io_uring
+    /// Tokio fallback implementation - still async but not io_uring.
+    ///
+    /// One blocking task per core-sized chunk of nodes, each running a
+    /// pread loop — one task and one syscall per node would put a
+    /// blocking-pool dispatch in front of every read, and for a 1000-node
+    /// batch that overhead dominates whenever pages are cached.
     async fn batch_neighbors_tokio(&self, nodes: &[NodeId]) -> Result<Vec<Vec<NodeId>>> {
         use tokio::task;
 
         trace!("Using tokio fallback for batch read (not io_uring)");
 
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(nodes.len());
+        let chunk_len = nodes.len().div_ceil(parallelism);
+
         let tasks: Vec<_> = nodes
-            .iter()
-            .map(|&node| {
+            .chunks(chunk_len)
+            .map(|chunk| {
+                let chunk: Vec<NodeId> = chunk.to_vec();
                 let file = Arc::clone(&self.file);
                 let offsets = Arc::clone(&self.offsets);
                 let edges_start = self.edges_start;
                 let num_nodes = self.num_nodes;
 
                 task::spawn_blocking(move || {
-                    let idx = node as usize;
-                    if idx >= num_nodes {
-                        return Ok(Vec::new());
-                    }
+                    let mut out: Vec<Vec<NodeId>> = Vec::with_capacity(chunk.len());
+                    for &node in &chunk {
+                        let idx = node as usize;
+                        if idx >= num_nodes {
+                            out.push(Vec::new());
+                            continue;
+                        }
 
-                    let start_edge = offsets[idx] as usize;
-                    let end_edge = offsets[idx + 1] as usize;
-                    let num_neighbors = end_edge.saturating_sub(start_edge);
+                        let start_edge = offsets[idx] as usize;
+                        let end_edge = offsets[idx + 1] as usize;
+                        let num_neighbors = end_edge.saturating_sub(start_edge);
 
-                    if num_neighbors == 0 {
-                        return Ok(Vec::new());
-                    }
+                        if num_neighbors == 0 {
+                            out.push(Vec::new());
+                            continue;
+                        }
 
-                    let byte_offset =
-                        edges_start + (start_edge * std::mem::size_of::<NodeId>()) as u64;
-                    let byte_size = num_neighbors * std::mem::size_of::<NodeId>();
+                        let byte_offset =
+                            edges_start + (start_edge * std::mem::size_of::<NodeId>()) as u64;
 
-                    let mut buffer = vec![0u8; byte_size];
-                    file.read_exact_at(&mut buffer, byte_offset)
+                        // pread straight into the typed buffer: on
+                        // little-endian targets the bytes are already
+                        // native order, so no decode pass or copy.
+                        let mut neighbors = vec![0 as NodeId; num_neighbors];
+                        file.read_exact_at(
+                            bytemuck::cast_slice_mut(neighbors.as_mut_slice()),
+                            byte_offset,
+                        )
                         .context("failed to read from file")?;
-
-                    let neighbors: Vec<NodeId> = buffer
-                        .chunks_exact(4)
-                        .map(|chunk| {
-                            NodeId::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                        })
-                        .collect();
-
-                    Ok::<_, anyhow::Error>(neighbors)
+                        out.push(neighbors);
+                    }
+                    Ok::<_, anyhow::Error>(out)
                 })
             })
             .collect();
 
         let mut results = Vec::with_capacity(nodes.len());
         for task in tasks {
-            results.push(task.await.context("blocking task failed")??);
+            results.extend(task.await.context("blocking task failed")??);
         }
 
         Ok(results)
@@ -551,23 +559,18 @@ impl AsyncCsrGraph {
 
     /// Helper: Read edges from file at given offset
     async fn read_edges_at(&self, offset: u64, size: usize) -> Result<Vec<NodeId>> {
-        // Use blocking task since FileExt::read_exact_at is sync
+        // Use blocking task since FileExt::read_exact_at is sync. The read
+        // lands straight in the typed buffer — no byte temp, no decode.
         let file = Arc::clone(&self.file);
-        let buffer = tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; size];
-            file.read_exact_at(&mut buf, offset)
+        let neighbors = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0 as NodeId; size / std::mem::size_of::<NodeId>()];
+            file.read_exact_at(bytemuck::cast_slice_mut(buf.as_mut_slice()), offset)
                 .context("failed to read from file")?;
             Ok::<_, anyhow::Error>(buf)
         })
         .await
         .context("blocking task panicked")?
         .context("read failed")?;
-
-        // Convert bytes to NodeIds
-        let neighbors: Vec<NodeId> = buffer
-            .chunks_exact(4)
-            .map(|chunk| NodeId::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
 
         Ok(neighbors)
     }

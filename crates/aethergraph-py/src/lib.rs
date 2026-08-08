@@ -5,6 +5,13 @@
 
 #![allow(non_local_definitions)] // PyO3 macros generate non-local definitions
 
+// The batch loop allocates steadily (per-batch subgraph buffers, i64
+// widenings, feature vectors); mimalloc's sharded thread-local heaps beat
+// the system allocator on exactly that churn, and as the Rust-side
+// `#[global_allocator]` it never touches Python's own allocation paths.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod arrow_utils;
 mod async_feature_store;
 #[cfg(feature = "gpudirect")]

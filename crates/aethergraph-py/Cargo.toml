@@ -53,6 +53,10 @@ numpy = "0.29"
 # Error handling
 anyhow = "1.0"
 
+# Rust-side global allocator: the batch loop is allocation-heavy and
+# mimalloc's thread-local heaps outperform system malloc on that churn.
+mimalloc = { version = "0.1", default-features = false }
+
 # Other utilities
 parking_lot = "0.12"
 
