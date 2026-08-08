@@ -52,24 +52,39 @@ impl HistoricalSampler {
     /// the graph itself is not consulted, so callers should ensure
     /// `advance_epoch` has been invoked at least once for accurate results.
     pub fn prepare_batch(&self, nodes: &[u32]) -> HistoricalBatch {
+        let mut batch = HistoricalBatch {
+            recompute_nodes: Vec::new(),
+            cached_nodes: Vec::new(),
+            cached_embeddings: Vec::new(),
+        };
+        self.prepare_batch_into(nodes, &mut batch);
+        batch
+    }
+
+    /// Like [`prepare_batch`](Self::prepare_batch), but reusing the
+    /// caller's buffers — the eager variant allocates three fresh vectors
+    /// per batch, the largest being `nodes x dim x 4` bytes of embeddings
+    /// (tens of MB per batch at realistic sizes) whose malloc and
+    /// first-touch faulting alone are milliseconds of pure overhead.
+    pub fn prepare_batch_into(&self, nodes: &[u32], batch: &mut HistoricalBatch) {
         let dim = self.cache.dim();
-        let mut recompute_nodes = Vec::with_capacity(nodes.len());
-        let mut cached_nodes = Vec::with_capacity(nodes.len());
-        let mut cached_embeddings = Vec::with_capacity(nodes.len() * dim);
+        batch.recompute_nodes.clear();
+        batch.cached_nodes.clear();
+        batch.cached_embeddings.clear();
+        batch.recompute_nodes.reserve(nodes.len());
+        batch.cached_nodes.reserve(nodes.len());
+        batch.cached_embeddings.reserve(nodes.len() * dim);
 
         for &node in nodes {
-            if self.cache.is_uninitialized(node) {
-                recompute_nodes.push(node);
-            } else {
-                cached_nodes.push(node);
-                cached_embeddings.extend_from_slice(self.cache.get(node));
+            // One hash probe per node: the classify-then-fetch pair paid
+            // two on the hottest per-node loop of the training path.
+            match self.cache.get_if_computed(node) {
+                Some(row) => {
+                    batch.cached_nodes.push(node);
+                    batch.cached_embeddings.extend_from_slice(row);
+                }
+                None => batch.recompute_nodes.push(node),
             }
-        }
-
-        HistoricalBatch {
-            recompute_nodes,
-            cached_nodes,
-            cached_embeddings,
         }
     }
 

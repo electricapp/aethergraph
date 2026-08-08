@@ -4,12 +4,16 @@
 //! only nodes in the dirty set are recomputed -- the rest use cached values.
 //! This turns a 230M-node problem into a ~100K-node problem per batch.
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+/// Rows per storage block. Growing the cache appends one block; earlier
+/// rows never move.
+const BLOCK_ROWS: usize = 4096;
 
 /// Row slot for one computed node.
 #[derive(Debug, Clone, Copy)]
 struct Slot {
-    /// Row index into the flat storage (byte offset = row * dim * 4).
+    /// Row index into the block storage.
     row: u32,
     /// Epoch when the node was last computed. 0 = allocated but never
     /// written through [`EmbeddingCache::update`].
@@ -20,19 +24,30 @@ struct Slot {
 ///
 /// Stores one embedding vector per *computed* node for a single GNN
 /// layer. Storage is sparse and lazy: memory is allocated per node on
-/// first write, so resident size is `touched_nodes × dim × 4` bytes —
+/// first write, so resident size is `touched_nodes × stride × 4` bytes —
 /// `num_nodes` is only a validity bound, not an allocation. (A dense
 /// `num_nodes × dim` matrix would be ~118 GB per layer at 230M nodes ×
 /// 128 dims, allocated up front whether or not a node is ever touched.)
+///
+/// The node → row map uses FxHash — this lookup runs once or twice per
+/// node per layer per batch, and SipHash on a 4-byte key cost 3-5x more
+/// than the whole probe needs. Rows live in fixed-size blocks so growth
+/// allocates a fresh block instead of re-copying (and transiently
+/// doubling) the entire table, and the row stride pads `dim` to a
+/// multiple of 16 floats so rows of odd dims don't straddle cache lines.
 #[derive(Debug)]
 pub struct EmbeddingCache {
-    /// Flat row storage for computed nodes: `computed × dim` f32 values.
-    data: Vec<f32>,
+    /// Row storage blocks, each `BLOCK_ROWS × stride` f32s.
+    blocks: Vec<Vec<f32>>,
+    /// Rows allocated so far.
+    rows: usize,
     /// node → row slot. Rows are never freed; a training epoch touches a
     /// bounded working set, so the map tracks distinct touched nodes.
-    slots: HashMap<u32, Slot>,
+    slots: FxHashMap<u32, Slot>,
     /// Embedding dimension.
     dim: usize,
+    /// Row stride in f32s (`dim` padded to a multiple of 16).
+    stride: usize,
     /// Number of addressable nodes (validity bound only).
     num_nodes: usize,
     /// Generation counter; nodes with `slot.generation < generation` are stale.
@@ -50,9 +65,11 @@ impl EmbeddingCache {
         assert!(dim > 0, "embedding dim must be > 0");
         // Generation starts at 1 so slot generation 0 is automatically stale.
         Self {
-            data: Vec::new(),
-            slots: HashMap::new(),
+            blocks: Vec::new(),
+            rows: 0,
+            slots: FxHashMap::default(),
             dim,
+            stride: dim.next_multiple_of(16),
             num_nodes,
             generation: 1,
         }
@@ -61,31 +78,25 @@ impl EmbeddingCache {
     /// Row slice for an existing slot.
     #[inline]
     fn row(&self, slot: Slot) -> &[f32] {
-        let start = slot.row as usize * self.dim;
-        &self.data[start..start + self.dim]
+        let r = slot.row as usize;
+        let start = (r % BLOCK_ROWS) * self.stride;
+        &self.blocks[r / BLOCK_ROWS][start..start + self.dim]
     }
 
-    /// Allocate (or find) the row for `node`. The new row is zeroed and
-    /// carries generation 0 until written via [`update`](Self::update).
-    fn slot_or_insert(&mut self, node: u32) -> Slot {
+    /// Allocate the next row, appending a fresh block when the current one
+    /// is full. Returns the row index. Never moves existing rows.
+    #[inline]
+    fn alloc_row(blocks: &mut Vec<Vec<f32>>, rows: &mut usize, stride: usize) -> u32 {
         assert!(
-            (node as usize) < self.num_nodes,
-            "EmbeddingCache: node {node} out of range (num_nodes {})",
-            self.num_nodes
+            *rows <= u32::MAX as usize,
+            "EmbeddingCache row index {rows} overflows u32"
         );
-        if let Some(&s) = self.slots.get(&node) {
-            return s;
+        if rows.is_multiple_of(BLOCK_ROWS) {
+            blocks.push(vec![0.0f32; BLOCK_ROWS * stride]);
         }
-        let next_row = self.data.len() / self.dim;
-        assert!(
-            next_row <= u32::MAX as usize,
-            "EmbeddingCache row index {next_row} overflows u32"
-        );
-        let row = next_row as u32;
-        self.data.resize(self.data.len() + self.dim, 0.0);
-        let s = Slot { row, generation: 0 };
-        self.slots.insert(node, s);
-        s
+        let row = *rows as u32;
+        *rows += 1;
+        row
     }
 
     /// Return cached embedding slice for `node`.
@@ -102,6 +113,19 @@ impl EmbeddingCache {
         self.row(*slot)
     }
 
+    /// Return the cached embedding for `node` in one probe, or `None` when
+    /// the node was never computed (or was invalidated). Replaces the
+    /// `is_uninitialized` + `get` pair, which paid two hash probes per
+    /// node on the hottest per-node loop of the training path.
+    #[inline]
+    pub fn get_if_computed(&self, node: u32) -> Option<&[f32]> {
+        let slot = self.slots.get(&node)?;
+        if slot.generation == 0 {
+            return None;
+        }
+        Some(self.row(*slot))
+    }
+
     /// Return mutable embedding slice for `node`, allocating a zeroed row
     /// on first access (caller writes the new embedding). Does not stamp
     /// the generation — use [`update`](Self::update) for that.
@@ -110,24 +134,50 @@ impl EmbeddingCache {
     /// Panics if `node >= num_nodes`.
     #[inline]
     pub fn get_mut(&mut self, node: u32) -> &mut [f32] {
-        let slot = self.slot_or_insert(node);
-        let start = slot.row as usize * self.dim;
-        &mut self.data[start..start + self.dim]
+        assert!(
+            (node as usize) < self.num_nodes,
+            "EmbeddingCache: node {node} out of range (num_nodes {})",
+            self.num_nodes
+        );
+        let slot = match self.slots.entry(node) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let row = Self::alloc_row(&mut self.blocks, &mut self.rows, self.stride);
+                *e.insert(Slot { row, generation: 0 })
+            }
+        };
+        let r = slot.row as usize;
+        let start = (r % BLOCK_ROWS) * self.stride;
+        &mut self.blocks[r / BLOCK_ROWS][start..start + self.dim]
     }
 
-    /// Write embedding and stamp current generation.
+    /// Write embedding and stamp current generation. One hash probe.
     ///
     /// # Panics
     /// Panics if `node >= num_nodes`.
     pub fn update(&mut self, node: u32, embedding: &[f32]) {
         debug_assert_eq!(embedding.len(), self.dim);
-        let slot = self.slot_or_insert(node);
-        let start = slot.row as usize * self.dim;
-        self.data[start..start + self.dim].copy_from_slice(embedding);
-        self.slots
-            .get_mut(&node)
-            .expect("slot just inserted")
-            .generation = self.generation;
+        assert!(
+            (node as usize) < self.num_nodes,
+            "EmbeddingCache: node {node} out of range (num_nodes {})",
+            self.num_nodes
+        );
+        let generation = self.generation;
+        let row = match self.slots.entry(node) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let s = e.get_mut();
+                s.generation = generation;
+                s.row
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let row = Self::alloc_row(&mut self.blocks, &mut self.rows, self.stride);
+                e.insert(Slot { row, generation });
+                row
+            }
+        };
+        let r = row as usize;
+        let start = (r % BLOCK_ROWS) * self.stride;
+        self.blocks[r / BLOCK_ROWS][start..start + self.dim].copy_from_slice(embedding);
     }
 
     /// True if node's cached embedding is from a previous generation.
@@ -171,21 +221,19 @@ impl EmbeddingCache {
 
     /// Nodes from `candidates` that are dirty OR stale (gen < current).
     ///
-    /// `dirty_sorted` MUST be sorted ascending; this is required for the
-    /// O(n+m) merge-style scan below. The result preserves `candidates`
+    /// The dirty list is loaded into a hash set once, so the scan is a
+    /// genuine O(n + m) — per-candidate binary search over the dirty list
+    /// was O(n log m) of random probes. The result preserves `candidates`
     /// order; out-of-range candidates are dropped silently.
-    pub fn stale_nodes(&self, candidates: &[u32], dirty_sorted: &[u32]) -> Vec<u32> {
-        debug_assert!(
-            dirty_sorted.windows(2).all(|w| w[0] <= w[1]),
-            "dirty_sorted must be sorted ascending"
-        );
+    pub fn stale_nodes(&self, candidates: &[u32], dirty: &[u32]) -> Vec<u32> {
+        let dirty_set: FxHashSet<u32> = dirty.iter().copied().collect();
         let mut out = Vec::with_capacity(candidates.len());
         for &n in candidates {
             if (n as usize) >= self.num_nodes {
                 continue;
             }
-            // Stale checks are O(1); avoid the binary search if possible.
-            if self.is_stale(n) || dirty_sorted.binary_search(&n).is_ok() {
+            // Stale checks are O(1); consult the set only when needed.
+            if self.is_stale(n) || dirty_set.contains(&n) {
                 out.push(n);
             }
         }

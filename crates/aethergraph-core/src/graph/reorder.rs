@@ -176,9 +176,12 @@ impl Graph {
             })
             .collect();
 
-        let mut merges = Vec::with_capacity(merges_pass1.len() + merges_pass2.len());
-        merges.extend_from_slice(&merges_pass1);
+        // Append pass 2 into pass 1's allocation — a third full copy of the
+        // merge log (8n bytes, 2x peak memory at billion-node scale) buys
+        // nothing.
+        let mut merges = merges_pass1;
         merges.extend_from_slice(&merges_pass2);
+        drop(merges_pass2);
 
         Some(RabbitMergeLog { merges })
     }
@@ -337,25 +340,11 @@ impl Graph {
             return ((0..n as NodeId).collect(), (0..n as u32).collect());
         };
 
-        // Build partition assignments from the merge log.
-        let mut part_uf = SequentialUnionFind::new(n);
-        for &(winner, loser) in &merge_log.merges {
-            let rw = part_uf.find(winner);
-            let rl = part_uf.find(loser);
-            if rw != rl {
-                part_uf.union(rw, rl);
-            }
-        }
-        let mut root_to_id: FxHashMap<u32, u32> = FxHashMap::default();
-        let mut partitions = Vec::with_capacity(n);
-        for i in 0..n as u32 {
-            let root = part_uf.find(i);
-            let next_id = root_to_id.len() as u32;
-            let id = *root_to_id.entry(root).or_insert(next_id);
-            partitions.push(id);
-        }
-
-        // Build the dendrogram permutation (same as reorder_rabbit).
+        // Build the dendrogram permutation (same as reorder_rabbit). The
+        // same sequential union-find drives the partition assignment below
+        // — replaying the identical merge sequence into a second UF (two
+        // more O(n) arrays and a full second replay of the sequential
+        // phase) produced byte-identical roots.
         debug_assert!(
             (n as u64 + merge_log.merges.len() as u64) <= u32::MAX as u64,
             "dendrogram index space exceeds u32"
@@ -376,6 +365,16 @@ impl Graph {
             });
             let new_root = seq_uf.union(rw, rl);
             community_dendro[new_root as usize] = internal_idx;
+        }
+
+        // Partition assignments from the same union-find.
+        let mut root_to_id: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut partitions = Vec::with_capacity(n);
+        for i in 0..n as u32 {
+            let root = seq_uf.find(i);
+            let next_id = root_to_id.len() as u32;
+            let id = *root_to_id.entry(root).or_insert(next_id);
+            partitions.push(id);
         }
 
         let mut perm = Vec::with_capacity(n);
@@ -429,24 +428,37 @@ impl Graph {
             return Graph::from_edges(0, &[], None);
         }
 
-        let mut seen = vec![false; n];
-        for &old_id in perm {
-            anyhow::ensure!((old_id as usize) < n, "out-of-range node {}", old_id);
-            anyhow::ensure!(!seen[old_id as usize], "duplicate node {}", old_id);
-            seen[old_id as usize] = true;
-        }
-        drop(seen);
-
-        let mut inv_perm = vec![0u32; n];
+        // The duplicate/range check folds into the inverse-permutation
+        // build: u32::MAX marks unassigned slots (new_id < n <= u32::MAX,
+        // so it can't collide), replacing a separate bool array and a
+        // second O(n) pass.
+        let mut inv_perm = vec![u32::MAX; n];
         for (new_id, &old_id) in perm.iter().enumerate() {
+            anyhow::ensure!((old_id as usize) < n, "out-of-range node {}", old_id);
+            anyhow::ensure!(
+                inv_perm[old_id as usize] == u32::MAX,
+                "duplicate node {}",
+                old_id
+            );
             inv_perm[old_id as usize] = new_id as u32;
         }
 
+        // The per-node degree lookup is a random access into the offsets
+        // array — serial and latency-bound at billion-node scale. Gather
+        // degrees in parallel, then run the cheap sequential prefix sum
+        // over the dense result.
+        let degrees: Vec<u64> = (0..n)
+            .into_par_iter()
+            .map(|new_id| self.degree(perm[new_id]) as u64)
+            .collect();
         let mut new_offsets: Vec<EdgeOffset> = Vec::with_capacity(n + 1);
         new_offsets.push(0);
-        for new_id in 0..n {
-            new_offsets.push(new_offsets[new_id] + self.degree(perm[new_id]) as u64);
+        let mut acc = 0u64;
+        for &d in &degrees {
+            acc += d;
+            new_offsets.push(acc);
         }
+        drop(degrees);
 
         let num_edges = self.num_edges();
         let has_weights = self.weights().is_some();
@@ -482,24 +494,20 @@ impl Graph {
                 }
             }
             if has_weights && let Some(w) = self.neighbor_weights(old_id) {
-                for (j, &val) in w.iter().enumerate() {
-                    // SAFETY: dst+j is in-bounds of `new_weights` (parallel to edges); unique writer per slot.
-                    let p = unsafe { (wp as *mut f32).add(dst + j) };
-                    // SAFETY: p is in-bounds and uniquely owned by this task.
-                    unsafe {
-                        *p = val;
-                    }
-                }
+                // SAFETY: dst..dst+w.len() is in-bounds of `new_weights`
+                // (parallel to edges) and uniquely owned by this task, so a
+                // temporary exclusive slice is sound — and unlike an
+                // element-at-a-time raw-pointer loop, `copy_from_slice`
+                // lowers to one memcpy.
+                let out =
+                    unsafe { std::slice::from_raw_parts_mut((wp as *mut f32).add(dst), w.len()) };
+                out.copy_from_slice(w);
             }
             if has_timestamps && let Some(ts) = self.neighbor_timestamps(old_id) {
-                for (j, &val) in ts.iter().enumerate() {
-                    // SAFETY: dst+j is in-bounds of `new_timestamps` (parallel to edges); unique writer per slot.
-                    let p = unsafe { (tp as *mut f64).add(dst + j) };
-                    // SAFETY: p is in-bounds and uniquely owned by this task.
-                    unsafe {
-                        *p = val;
-                    }
-                }
+                // SAFETY: same ownership argument as the weights slice.
+                let out =
+                    unsafe { std::slice::from_raw_parts_mut((tp as *mut f64).add(dst), ts.len()) };
+                out.copy_from_slice(ts);
             }
         });
 
@@ -593,32 +601,47 @@ pub fn partition_aligned_batches(
 ) -> Vec<Vec<NodeId>> {
     assert!(batch_size > 0, "batch_size must be >= 1");
 
-    // Group seeds by partition. A seed id must index into `partitions`
-    // (length == num_nodes); otherwise it would silently fall into
-    // partition 0 and be mis-grouped.
-    let mut by_partition: FxHashMap<u32, Vec<NodeId>> = FxHashMap::default();
-    for &s in seeds {
-        debug_assert!(
-            (s as usize) < partitions.len(),
-            "seed {s} is out of range for partitions of length {}",
-            partitions.len()
-        );
-        let p = partitions.get(s as usize).copied().unwrap_or(0);
-        by_partition.entry(p).or_default().push(s);
+    // Group seeds by partition with one u64 sort — (partition << 32 |
+    // original index) keys group by partition and stay stable within it.
+    // The old per-partition Vec map allocated one heap Vec per distinct
+    // community (Rabbit produces many small ones), approaching one
+    // allocation per seed each epoch. A seed id must index into
+    // `partitions` (length == num_nodes); otherwise it would silently fall
+    // into partition 0 and be mis-grouped.
+    let mut keyed: Vec<u64> = seeds
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            debug_assert!(
+                (s as usize) < partitions.len(),
+                "seed {s} is out of range for partitions of length {}",
+                partitions.len()
+            );
+            let p = partitions.get(s as usize).copied().unwrap_or(0);
+            ((p as u64) << 32) | i as u64
+        })
+        .collect();
+    keyed.sort_unstable();
+
+    // Contiguous runs of one partition in the sorted keys.
+    let mut runs: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
+    let mut run_start = 0usize;
+    for i in 1..=keyed.len() {
+        if i == keyed.len() || (keyed[i] >> 32) != (keyed[run_start] >> 32) {
+            runs.push(((keyed[run_start] >> 32) as u32, run_start..i));
+            run_start = i;
+        }
     }
 
-    // Collect partition keys and optionally shuffle.
-    let mut part_keys: Vec<u32> = by_partition.keys().copied().collect();
+    // Optionally shuffle the partition visit order.
     if shuffle_partitions {
         // Fisher-Yates with a simple LCG seeded by `seed`.
         let mut rng = seed.wrapping_mul(0x517c_c1b7_2722_0a95).wrapping_add(1);
-        for i in (1..part_keys.len()).rev() {
+        for i in (1..runs.len()).rev() {
             rng = rng.wrapping_mul(0x517c_c1b7_2722_0a95).wrapping_add(1);
             let j = (rng >> 33) as usize % (i + 1);
-            part_keys.swap(i, j);
+            runs.swap(i, j);
         }
-    } else {
-        part_keys.sort_unstable();
     }
 
     // Build batches: fill each batch from one partition at a time.
@@ -627,10 +650,9 @@ pub fn partition_aligned_batches(
     let mut batches = Vec::new();
     let mut current_batch: Vec<NodeId> = Vec::with_capacity(batch_size);
 
-    for key in part_keys {
-        let group = by_partition.remove(&key).unwrap_or_default();
-        for s in group {
-            current_batch.push(s);
+    for (_, range) in runs {
+        for &key in &keyed[range] {
+            current_batch.push(seeds[key as u32 as usize]);
             if current_batch.len() == batch_size {
                 batches.push(std::mem::replace(
                     &mut current_batch,

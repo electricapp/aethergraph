@@ -462,8 +462,9 @@ class TestWalDurability:
         assert g2.has_edge(0, 2)
         assert g2.has_edge(3, 7)
         assert not g2.has_edge(1, 0)
-        # Three writer-guard commits during replay → epoch advances three times.
-        assert g2.current_epoch == 3
+        # Replay applies the whole log under one writer guard → the epoch
+        # advances exactly once per recovery, regardless of record count.
+        assert g2.current_epoch == 1
 
     def test_current_epoch_advances_on_commit(self, tmp_path: Path) -> None:
         """Each writer-guard close (one per `insert_edge`) bumps the epoch."""

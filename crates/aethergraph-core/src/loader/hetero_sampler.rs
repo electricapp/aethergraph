@@ -12,6 +12,25 @@ use crate::graph::NodeId;
 use crate::graph::hetero::{EdgeTypeId, HeteroGraph, NodeTypeId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+/// Per-node-type dedup structure. Node types small enough for a dense
+/// array use generation-stamped slots — one random array load per probe,
+/// where the hash map pays hash + bucket walk (~3-5x slower and the
+/// dominant per-edge cost of the sampler). The generation tag (high 32
+/// bits) makes cross-call reuse a counter bump instead of a clear; the low
+/// 32 bits hold the local index.
+enum TypeDedup {
+    Dense(Vec<u64>),
+    Map(FxHashMap<NodeId, u32>),
+}
+
+/// Node types with at most this many nodes get the dense dedup array
+/// (8 bytes per node, so at most 8 MB per type).
+const DENSE_DEDUP_MAX_NODES: usize = 1 << 20;
+
+/// How many frontier entries ahead the hop loop prefetches the first
+/// source edge type's CSR offset word.
+const FRONTIER_PREFETCH_DIST: usize = 4;
+
 /// Ultra-fast wyrand PRNG.
 #[derive(Clone)]
 struct WyRand {
@@ -72,22 +91,29 @@ pub struct HeteroNeighborSampler<'a> {
     graph: &'a HeteroGraph,
     config: HeteroSamplingConfig,
     rng: WyRand,
-    /// Per-type: global_id → local_index. Cleared between calls.
-    local_index: Vec<FxHashMap<NodeId, u32>>,
-    /// Per-type: nodes in discovery order (parallel to local_index).
+    /// Per-type dedup: dense generation-stamped array for small types,
+    /// hash map for large ones.
+    dedup: Vec<TypeDedup>,
+    /// Current generation for the dense dedup arrays.
+    current_gen: u32,
+    /// Per-type: nodes in discovery order (parallel to the dedup state).
     node_vecs: Vec<Vec<NodeId>>,
     /// Per-edge-type edge buffers (local indices).
     edge_src_buf: Vec<Vec<u32>>,
     edge_dst_buf: Vec<Vec<u32>>,
-    /// Double-buffered frontiers.
-    frontier: Vec<(NodeTypeId, NodeId)>,
-    next_frontier: Vec<(NodeTypeId, NodeId)>,
+    /// Double-buffered frontiers carrying (type, global id, local index) —
+    /// the local index was assigned at discovery, so re-deriving it per
+    /// hop with a dedup probe would be pure waste.
+    frontier: Vec<(NodeTypeId, NodeId, u32)>,
+    next_frontier: Vec<(NodeTypeId, NodeId, u32)>,
     /// Precomputed: src edge types per node type (stack-copied in hot loop).
     src_edge_types: Vec<Vec<EdgeTypeId>>,
     /// Precomputed: dst type per edge type.
     dst_types: Vec<NodeTypeId>,
-    /// Reusable Floyd bitmap (small degree ≤256).
-    floyd_bitmap: [bool; 256],
+    /// Reusable Floyd scratch (small degree ≤256): generation stamps, so
+    /// per-node reuse is a counter bump instead of an O(n) clear.
+    floyd_stamp: [u32; 256],
+    floyd_gen: u32,
     /// Reusable Floyd set (large degree).
     floyd_set: FxHashSet<usize>,
 }
@@ -106,8 +132,15 @@ impl<'a> HeteroNeighborSampler<'a> {
             .copied()
             .unwrap_or(25);
 
-        let local_index: Vec<FxHashMap<NodeId, u32>> = (0..num_nt)
-            .map(|_| FxHashMap::with_capacity_and_hasher(256, Default::default()))
+        let dedup: Vec<TypeDedup> = (0..num_nt)
+            .map(|nt| {
+                let n = graph.num_nodes(nt as NodeTypeId);
+                if n <= DENSE_DEDUP_MAX_NODES {
+                    TypeDedup::Dense(vec![0u64; n])
+                } else {
+                    TypeDedup::Map(FxHashMap::with_capacity_and_hasher(256, Default::default()))
+                }
+            })
             .collect();
         let node_vecs: Vec<Vec<NodeId>> = (0..num_nt).map(|_| Vec::with_capacity(256)).collect();
         let edge_src_buf: Vec<Vec<u32>> = (0..num_et).map(|_| Vec::with_capacity(1024)).collect();
@@ -126,7 +159,8 @@ impl<'a> HeteroNeighborSampler<'a> {
             graph,
             config,
             rng: WyRand::new(seed),
-            local_index,
+            dedup,
+            current_gen: 0,
             node_vecs,
             edge_src_buf,
             edge_dst_buf,
@@ -134,7 +168,8 @@ impl<'a> HeteroNeighborSampler<'a> {
             next_frontier: Vec::with_capacity(4096),
             src_edge_types,
             dst_types,
-            floyd_bitmap: [false; 256],
+            floyd_stamp: [0u32; 256],
+            floyd_gen: 0,
             floyd_set: FxHashSet::with_capacity_and_hasher(max_fanout * 2, Default::default()),
         }
     }
@@ -144,9 +179,21 @@ impl<'a> HeteroNeighborSampler<'a> {
         seed_type: NodeTypeId,
         seeds: &[NodeId],
     ) -> HeteroSampledSubgraph {
-        // Clear all reusable buffers (preserves capacity)
-        for m in &mut self.local_index {
-            m.clear();
+        // Reset reusable state. Dense dedup arrays reset with a generation
+        // bump (a fill only on the u32 wrap); maps clear normally.
+        self.current_gen = self.current_gen.wrapping_add(1);
+        if self.current_gen == 0 {
+            for d in &mut self.dedup {
+                if let TypeDedup::Dense(slots) = d {
+                    slots.fill(0);
+                }
+            }
+            self.current_gen = 1;
+        }
+        for d in &mut self.dedup {
+            if let TypeDedup::Map(m) = d {
+                m.clear();
+            }
         }
         for v in &mut self.node_vecs {
             v.clear();
@@ -160,15 +207,21 @@ impl<'a> HeteroNeighborSampler<'a> {
         self.frontier.clear();
 
         // Register seeds with local indices
-        let st = seed_type as usize;
         for &seed in seeds {
-            let idx = self.node_vecs[st].len() as u32;
-            if let std::collections::hash_map::Entry::Vacant(e) = self.local_index[st].entry(seed) {
-                e.insert(idx);
-                self.node_vecs[st].push(seed);
-            }
-            self.frontier.push((seed_type, seed));
+            let (idx, _) = self.insert_node(seed, seed_type);
+            self.frontier.push((seed_type, seed, idx));
         }
+
+        // Hoist every edge type's CSR slices once per call: the inner loop
+        // then slices raw arrays instead of re-deriving storage per
+        // (node, edge type), and the offsets arrays double as prefetch
+        // targets.
+        let csrs: Vec<(&[crate::graph::EdgeOffset], &[NodeId])> = (0..self.dst_types.len())
+            .map(|et| {
+                let g = self.graph.csr(et as EdgeTypeId);
+                (g.offsets(), g.edges())
+            })
+            .collect();
 
         // Hop-by-hop sampling
         for hop in 0..self.config.num_hops {
@@ -176,7 +229,20 @@ impl<'a> HeteroNeighborSampler<'a> {
             let frontier_len = self.frontier.len();
 
             for fi in 0..frontier_len {
-                let (node_type, local_id) = self.frontier[fi];
+                // Prefetch the first source edge type's offset word for an
+                // upcoming frontier entry — the probes are random-access
+                // and serially dependent without the hint.
+                if fi + FRONTIER_PREFETCH_DIST < frontier_len {
+                    let (nt_ahead, id_ahead, _) = self.frontier[fi + FRONTIER_PREFETCH_DIST];
+                    if let Some(&et0) = self.src_edge_types[nt_ahead as usize].first() {
+                        let offsets = csrs[et0 as usize].0;
+                        if (id_ahead as usize) < offsets.len() {
+                            crate::internal::prefetch::prefetch_read(&offsets[id_ahead as usize]);
+                        }
+                    }
+                }
+
+                let (node_type, local_id, src_local_idx) = self.frontier[fi];
 
                 // Copy the source node type's edge-type IDs out so the inner
                 // loop can call &mut self sampling methods without holding a
@@ -195,19 +261,23 @@ impl<'a> HeteroNeighborSampler<'a> {
                     &et_heap[..]
                 };
 
-                // Look up the local index of the source node
-                let src_local_idx = self.local_index[node_type as usize][&local_id];
-
                 for &et_id in et_slice {
                     let fanout = self.config.fanout[et_id as usize][hop];
                     if fanout == 0 {
                         continue;
                     }
 
-                    let neighbors = self.graph.csr(et_id).neighbors(local_id);
-                    if neighbors.is_empty() {
+                    let (offsets, edges) = csrs[et_id as usize];
+                    let i = local_id as usize;
+                    if i + 1 >= offsets.len() {
                         continue;
                     }
+                    let start = offsets[i] as usize;
+                    let end = offsets[i + 1] as usize;
+                    if start >= end || end > edges.len() {
+                        continue;
+                    }
+                    let neighbors = &edges[start..end];
 
                     let effective = if let Some(max_deg) = self.config.max_degree {
                         if neighbors.len() > max_deg {
@@ -235,15 +305,21 @@ impl<'a> HeteroNeighborSampler<'a> {
             std::mem::swap(&mut self.frontier, &mut self.next_frontier);
         }
 
-        // Build output: hand the filled per-type buffers to the caller and swap
-        // fresh ones back in. The returned buffers are therefore allocated per
-        // call; only the dedup maps and frontiers are reset and reused.
+        // Build output: hand the filled per-type buffers to the caller and
+        // swap fresh ones back in — but only where something was actually
+        // produced. An empty buffer swaps for `Vec::new()` (no allocation),
+        // so wide schemas don't pay an allocation per untouched type per
+        // batch.
         let num_nt = self.node_vecs.len();
         let num_et = self.edge_src_buf.len();
 
         let mut nodes = Vec::with_capacity(num_nt);
         for i in 0..num_nt {
-            let mut swap = Vec::with_capacity(256);
+            let mut swap = if self.node_vecs[i].is_empty() {
+                Vec::new()
+            } else {
+                Vec::with_capacity(256)
+            };
             std::mem::swap(&mut self.node_vecs[i], &mut swap);
             nodes.push(swap);
         }
@@ -251,8 +327,11 @@ impl<'a> HeteroNeighborSampler<'a> {
         let mut edge_src = Vec::with_capacity(num_et);
         let mut edge_dst = Vec::with_capacity(num_et);
         for i in 0..num_et {
-            let mut s = Vec::with_capacity(1024);
-            let mut d = Vec::with_capacity(1024);
+            let (mut s, mut d) = if self.edge_src_buf[i].is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                (Vec::with_capacity(1024), Vec::with_capacity(1024))
+            };
             std::mem::swap(&mut self.edge_src_buf[i], &mut s);
             std::mem::swap(&mut self.edge_dst_buf[i], &mut d);
             edge_src.push(s);
@@ -268,21 +347,53 @@ impl<'a> HeteroNeighborSampler<'a> {
         }
     }
 
+    /// Pack a generation tag and local index into one dense dedup slot.
+    #[inline(always)]
+    const fn pack_slot(generation: u32, idx: u32) -> u64 {
+        ((generation as u64) << 32) | idx as u64
+    }
+
+    /// Insert a node of `node_type`, assigning a local index if new.
+    /// Returns `(local index, is_new)`.
+    #[inline(always)]
+    fn insert_node(&mut self, id: NodeId, node_type: NodeTypeId) -> (u32, bool) {
+        let nt = node_type as usize;
+        match &mut self.dedup[nt] {
+            TypeDedup::Dense(slots) => {
+                let i = id as usize;
+                let slot = slots[i];
+                if (slot >> 32) as u32 == self.current_gen {
+                    (slot as u32, false)
+                } else {
+                    let idx = self.node_vecs[nt].len() as u32;
+                    slots[i] = Self::pack_slot(self.current_gen, idx);
+                    self.node_vecs[nt].push(id);
+                    (idx, true)
+                }
+            }
+            TypeDedup::Map(map) => {
+                let next_idx = self.node_vecs[nt].len() as u32;
+                match map.entry(id) {
+                    std::collections::hash_map::Entry::Occupied(e) => (*e.get(), false),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(next_idx);
+                        self.node_vecs[nt].push(id);
+                        (next_idx, true)
+                    }
+                }
+            }
+        }
+    }
+
     /// Insert a destination node, assigning a local index if new.
     /// Returns the local index. Pushes to next_frontier if newly discovered.
     #[inline(always)]
     fn insert_dst(&mut self, dst_id: NodeId, dst_type: NodeTypeId) -> u32 {
-        let dt = dst_type as usize;
-        let next_idx = self.node_vecs[dt].len() as u32;
-        match self.local_index[dt].entry(dst_id) {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(next_idx);
-                self.node_vecs[dt].push(dst_id);
-                self.next_frontier.push((dst_type, dst_id));
-                next_idx
-            }
+        let (idx, is_new) = self.insert_node(dst_id, dst_type);
+        if is_new {
+            self.next_frontier.push((dst_type, dst_id, idx));
         }
+        idx
     }
 
     #[inline]
@@ -324,44 +435,30 @@ impl<'a> HeteroNeighborSampler<'a> {
     ) {
         let n = neighbors.len();
 
-        // Macro-like inline to avoid &mut self borrow conflicts with bitmap/set.
-        // insert_dst logic is duplicated here because we can't call &mut self
-        // methods while borrowing self.floyd_bitmap or self.floyd_set.
-        macro_rules! emit_edge {
-            ($dst_id:expr) => {{
-                let dt = dst_type as usize;
-                let next_idx = self.node_vecs[dt].len() as u32;
-                let dst_local = match self.local_index[dt].entry($dst_id) {
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(next_idx);
-                        self.node_vecs[dt].push($dst_id);
-                        self.next_frontier.push((dst_type, $dst_id));
-                        next_idx
-                    }
-                };
-                self.edge_src_buf[et].push(src_local);
-                self.edge_dst_buf[et].push(dst_local);
-            }};
-        }
-
         if n <= 256 {
-            let bitmap = &mut self.floyd_bitmap[..n];
-            for b in bitmap.iter_mut() {
-                *b = false;
+            // Stamp reuse is a counter bump, not an O(n) clear per node;
+            // direct indexing (no held slice borrow) also lets this loop
+            // call insert_dst instead of duplicating it.
+            self.floyd_gen = self.floyd_gen.wrapping_add(1);
+            if self.floyd_gen == 0 {
+                self.floyd_stamp.fill(0);
+                self.floyd_gen = 1;
             }
+            let stamp = self.floyd_gen;
             for i in (n - k)..n {
                 let s = (i + 1) as u64;
                 let x = self.rng.next_u32();
                 let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
-                let pick = if !bitmap[j] {
-                    bitmap[j] = true;
+                let pick = if self.floyd_stamp[j] != stamp {
+                    self.floyd_stamp[j] = stamp;
                     j
                 } else {
-                    bitmap[i] = true;
+                    self.floyd_stamp[i] = stamp;
                     i
                 };
-                emit_edge!(neighbors[pick]);
+                let dst_local = self.insert_dst(neighbors[pick], dst_type);
+                self.edge_src_buf[et].push(src_local);
+                self.edge_dst_buf[et].push(dst_local);
             }
         } else {
             self.floyd_set.clear();
@@ -375,7 +472,9 @@ impl<'a> HeteroNeighborSampler<'a> {
                     self.floyd_set.insert(i);
                     i
                 };
-                emit_edge!(neighbors[pick]);
+                let dst_local = self.insert_dst(neighbors[pick], dst_type);
+                self.edge_src_buf[et].push(src_local);
+                self.edge_dst_buf[et].push(dst_local);
             }
         }
     }

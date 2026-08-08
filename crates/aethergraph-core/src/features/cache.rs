@@ -19,7 +19,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, trace, warn};
@@ -71,18 +71,25 @@ impl Default for FeatureCacheConfig {
     }
 }
 
+/// One cached row plus its runtime hit counter. The counter is atomic so
+/// cache hits bump it under a read lock — a hit taking the tier's WRITE
+/// lock serialized every concurrent loader on one lock.
+struct CacheEntry {
+    features: FeatureVector,
+    hits: AtomicU32,
+}
+
 /// Frequency-weighted cache for a single tier.
 ///
-/// Replaces the old LRU cache. `get()` is O(1) instead of O(n).
-/// Eviction pops the lowest-frequency unpinned node from a min-heap.
-/// The heap uses lazy deletion -- stale entries are skipped on pop.
+/// Replaces the old LRU cache. `get()` is O(1), takes `&self`, and is
+/// called under a read lock. Eviction pops the lowest-frequency unpinned
+/// node from a min-heap. The heap uses lazy deletion -- stale entries are
+/// skipped on pop.
 struct FreqCache {
     capacity: usize,
-    cache: AHashMap<NodeId, FeatureVector>,
+    cache: AHashMap<NodeId, CacheEntry>,
     /// Static frequencies from warmup (set once, never mutated after init)
     warmup_freq: AHashMap<NodeId, u32>,
-    /// Runtime access counts
-    access_counts: AHashMap<NodeId, u32>,
     /// Pinned nodes (never evicted)
     pinned: FxHashSet<NodeId>,
     /// Min-heap: (frequency, node_id). Lazy deletion on pop.
@@ -95,35 +102,34 @@ impl FreqCache {
             capacity,
             cache: AHashMap::with_capacity(capacity),
             warmup_freq,
-            access_counts: AHashMap::with_capacity(capacity),
             pinned: FxHashSet::default(),
             eviction_heap: BinaryHeap::with_capacity(capacity),
         }
     }
 
     fn freq(&self, node: NodeId) -> u32 {
-        self.warmup_freq.get(&node).copied().unwrap_or(0)
-            + self.access_counts.get(&node).copied().unwrap_or(0)
+        let hits = self
+            .cache
+            .get(&node)
+            .map(|e| e.hits.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        self.warmup_freq.get(&node).copied().unwrap_or(0) + hits
     }
 
-    fn get(&mut self, node: NodeId) -> Option<&FeatureVector> {
-        if self.cache.contains_key(&node) {
-            // O(1) on a hit: only bump the access count. The heap is NOT
-            // touched here — a hit's raised frequency only makes a node less
-            // likely to be evicted, and `evict_one` reconciles stale heap
-            // values lazily, so the heap never needs the per-hit push that
-            // would otherwise grow it unboundedly.
-            *self.access_counts.entry(node).or_insert(0) += 1;
-            self.cache.get(&node)
-        } else {
-            None
-        }
+    /// Shared-access hit path: one map probe, one relaxed counter bump.
+    /// The heap is NOT touched here — a hit's raised frequency only makes
+    /// a node less likely to be evicted, and `evict_one` reconciles stale
+    /// heap values lazily.
+    fn get(&self, node: NodeId) -> Option<&FeatureVector> {
+        let entry = self.cache.get(&node)?;
+        entry.hits.fetch_add(1, Ordering::Relaxed);
+        Some(&entry.features)
     }
 
     fn insert(&mut self, node: NodeId, features: FeatureVector) -> Option<(NodeId, FeatureVector)> {
-        if self.cache.contains_key(&node) {
-            *self.access_counts.entry(node).or_insert(0) += 1;
-            self.cache.insert(node, features);
+        if let Some(entry) = self.cache.get_mut(&node) {
+            entry.hits.fetch_add(1, Ordering::Relaxed);
+            entry.features = features;
             return None;
         }
 
@@ -141,7 +147,13 @@ impl FreqCache {
         };
 
         // Insert new entry
-        self.cache.insert(node, features);
+        self.cache.insert(
+            node,
+            CacheEntry {
+                features,
+                hits: AtomicU32::new(0),
+            },
+        );
         let freq = self.freq(node);
         self.eviction_heap.push(Reverse((freq, node)));
 
@@ -180,9 +192,8 @@ impl FreqCache {
                 continue;
             }
             // Evict this node
-            let features = self.cache.remove(&node)?;
-            self.access_counts.remove(&node);
-            return Some((node, features));
+            let entry = self.cache.remove(&node)?;
+            return Some((node, entry.features));
         }
         None
     }
@@ -325,9 +336,12 @@ impl FeatureCache {
 
     /// Get features for a node, loading from slower tiers if needed
     pub async fn get(&self, node: NodeId) -> Result<FeatureVector> {
-        // Try GPU cache first (hot tier)
+        // Try GPU cache first (hot tier). Hits take only the READ lock —
+        // the frequency bump is an atomic inside the entry — so concurrent
+        // loaders hitting the hot tier no longer serialize on one writer
+        // lock.
         {
-            let mut gpu = self.gpu_cache.write();
+            let gpu = self.gpu_cache.read();
             if let Some(features) = gpu.get(node) {
                 let features = features.clone();
                 let pinned = gpu.is_pinned(node);
@@ -343,7 +357,7 @@ impl FeatureCache {
 
         // Try CPU cache (warm tier)
         let cpu_features = {
-            let mut cpu = self.cpu_cache.write();
+            let cpu = self.cpu_cache.read();
             cpu.get(node).cloned()
         };
 
@@ -389,9 +403,9 @@ impl FeatureCache {
         let mut missing: Vec<NodeId> = Vec::new();
         let mut missing_set: FxHashSet<NodeId> = FxHashSet::default();
 
-        // GPU tier: one lock for the whole batch.
+        // GPU tier: one READ lock for the whole batch (hits don't mutate).
         {
-            let mut gpu = self.gpu_cache.write();
+            let gpu = self.gpu_cache.read();
             let mut gpu_hits = 0u64;
             let mut pinned_hits = 0u64;
             for &node in nodes {
@@ -422,7 +436,7 @@ impl FeatureCache {
         // CPU tier for the remainder.
         let mut cpu_found: Vec<(NodeId, FeatureVector)> = Vec::new();
         if !missing.is_empty() {
-            let mut cpu = self.cpu_cache.write();
+            let cpu = self.cpu_cache.read();
             missing.retain(|&node| match cpu.get(node) {
                 Some(features) => {
                     cpu_found.push((node, features.clone()));
@@ -441,30 +455,44 @@ impl FeatureCache {
             }
         }
 
-        // NVMe for the distinct cold misses, fetched concurrently.
+        // NVMe for the distinct cold misses, fetched concurrently. A bounded
+        // set of chunked tasks rather than one spawn per node: NVME_FANOUT
+        // tasks keep the device at a healthy queue depth while the
+        // spawn/JoinHandle overhead stays constant instead of scaling with
+        // the miss count.
         if !missing.is_empty() {
+            const NVME_FANOUT: usize = 64;
+            let n_tasks = missing.len().min(NVME_FANOUT);
+            let per_task = missing.len().div_ceil(n_tasks);
             let fetches: Vec<_> = missing
-                .iter()
-                .map(|&node| {
+                .chunks(per_task)
+                .map(|chunk| {
                     let cache = self.clone_arc();
+                    let chunk = chunk.to_vec();
                     tokio::spawn(async move {
-                        let result = cache.load_from_nvme(node).await;
-                        (node, result)
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for node in chunk {
+                            let result = cache.load_from_nvme(node).await;
+                            out.push((node, result));
+                        }
+                        out
                     })
                 })
                 .collect();
             for fetch in fetches {
-                let (node, result) = fetch.await.context("task panicked")?;
-                match result {
-                    Ok(features) => {
-                        self.stats.nvme_hits.fetch_add(1, Ordering::Relaxed);
-                        self.promote_to_cpu(node, features.clone()).await;
-                        resolved.insert(node, features);
-                    }
-                    Err(e) => {
-                        self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                        return Err(e)
-                            .with_context(|| format!("failed to load features for node {}", node));
+                for (node, result) in fetch.await.context("task panicked")? {
+                    match result {
+                        Ok(features) => {
+                            self.stats.nvme_hits.fetch_add(1, Ordering::Relaxed);
+                            self.promote_to_cpu(node, features.clone()).await;
+                            resolved.insert(node, features);
+                        }
+                        Err(e) => {
+                            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                            return Err(e).with_context(|| {
+                                format!("failed to load features for node {}", node)
+                            });
+                        }
                     }
                 }
             }
@@ -484,8 +512,10 @@ impl FeatureCache {
 
     /// Insert features for a node into the cache
     pub async fn insert(&self, node: NodeId, features: FeatureVector) -> Result<()> {
-        self.promote_to_gpu(node, features.clone()).await;
+        // Persist first, then promote by move — the old order needed a
+        // full clone of the row just to keep a copy for the NVMe write.
         self.save_to_nvme(node, &features).await?;
+        self.promote_to_gpu(node, features).await;
         Ok(())
     }
 

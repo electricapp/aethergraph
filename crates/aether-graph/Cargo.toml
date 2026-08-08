@@ -15,6 +15,7 @@ bench = false
 [dependencies]
 aether-epoch = { path = "../aether-epoch", version = "0.1" }
 tracing.workspace = true
+rustc-hash.workspace = true
 # Optional WAL durability — gated behind the `wal` feature so binaries that
 # only want in-memory operation pay no compile / link cost for it.
 crc32fast = { version = "1.5", optional = true }

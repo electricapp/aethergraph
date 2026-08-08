@@ -237,22 +237,33 @@ impl PyDynamicGraph {
             )));
         }
 
-        let src_vec: Vec<u32> = src_slice.to_vec();
-        let dst_vec: Vec<u32> = dst_slice.to_vec();
+        // Pack (src, dst) into one u64 per edge: a single sort groups the
+        // batch by source so each source's destinations go through the bulk
+        // merge path (one tree walk per source) instead of one path-copying
+        // insert per edge.
+        let mut packed: Vec<u64> = src_slice
+            .iter()
+            .zip(dst_slice)
+            .map(|(&s, &d)| ((s as u64) << 32) | d as u64)
+            .collect();
         let inner = Arc::clone(&self.inner);
 
         py.detach(move || {
             let _guard = self.write_lock.lock();
             let mut writer = inner.writer().map_err(Self::map_writer_err)?;
-            let mut count = 0usize;
-            for (&s, &d) in src_vec.iter().zip(dst_vec.iter()) {
-                match writer.insert_edge(s, d) {
-                    Ok(true) => count += 1,
-                    Ok(false) => {}
-                    Err(e) => return Err(Self::map_insert_err(e)),
-                }
+            packed.sort_unstable();
+            packed.dedup();
+            let mut count = 0u64;
+            let mut dsts: Vec<u32> = Vec::new();
+            for run in packed.chunk_by(|a, b| (a >> 32) == (b >> 32)) {
+                let s = (run[0] >> 32) as u32;
+                dsts.clear();
+                dsts.extend(run.iter().map(|&p| p as u32));
+                count += writer
+                    .insert_edges_sorted(s, &dsts)
+                    .map_err(Self::map_insert_err)?;
             }
-            Ok(count)
+            Ok(count as usize)
         })
     }
 

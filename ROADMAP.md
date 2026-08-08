@@ -25,6 +25,25 @@ single-worker baseline.
 
 ---
 
+## Performance structurals (deferred from the roofline pass)
+
+Larger redesigns identified in the performance audit but out of scope for the
+tuning pass. Each is a real architecture change; land with its own tests.
+
+| Area                          | Change                                                                                                                                                                                 |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `aether-graph` arena          | Free-list recycling with epoch-based reclamation so long-running ingest reuses retired chunk memory instead of growing until `compact()`                                               |
+| `aether-graph` arena          | Two-cursor allocation (chunks from one end, interior nodes from the other) so same-kind allocations pack densely per cache line                                                        |
+| `aether-graph` arena          | Lift the 2 GiB capacity limit (u32 offsets) via segmented arenas or u64 offsets for billion-edge single-process ingest                                                                 |
+| `aether-graph` compact        | Parallel compaction: snapshot roots, rebuild per-vertex trees across a thread pool, then swap — compact is single-threaded today                                                       |
+| `embedding_cache` block store | Blocks are `Vec<Vec<f32>>`; a reserved virtual mapping (mmap + commit-on-touch) would make row addresses stable AND contiguous, enabling one-shot bulk gather                          |
+| FeatureCache NVMe tier        | Replace file-per-node with one preallocated file + `O_DIRECT` slot reads/writes (io_uring lane); file-per-node pays open/close + inode churn per miss                                  |
+| NeighborLoader                | Multi-sampler pipeline: N Rust sampler threads feeding a bounded queue ahead of H2D, so sampling overlaps transfer AND model compute at scale (hetero loader has the 1-thread version) |
+| Python wheels                 | CI variant building `x86-64-v3` (AVX2/FMA) wheels alongside baseline; runtime dispatch covers F16C but the whole binary gains from `-C target-cpu=x86-64-v3`                           |
+| Deployment docs               | NUMA guidance: pin sampler threads + io_uring SQPOLL thread (`AETHERGRAPH_SQPOLL_CPU`) to the NIC/NVMe socket; interleave feature mmaps across nodes                                   |
+
+---
+
 ## CI surrogates (catch drift without hardware)
 
 | Job                      | What it does                                                                                                                   |
@@ -37,18 +56,18 @@ single-worker baseline.
 
 ## Environment gotchas
 
-| Pitfall                                           | What to do                                                                                                                  |
-| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| AL2023 kernel 6.18 does not ship `rdma_rxe`       | Use Ubuntu 22.04/24.04, or AL2023 kernel 6.1 + `kernel-modules-extra`                                                       |
-| SoftRoCE on `lo` does not work                    | Bind `rxe` to a real ethernet device — loopback has no MAC for ARP/GID resolution                                           |
-| GID 0 is link-local IPv6 on RoCE                  | Pick the IPv4-mapped GID (typically index 1; confirm via `show_gids`). `RdmaContext::open` requires an explicit `gid_index` |
-| `ulimit -l unlimited` required                    | Otherwise `ibv_reg_mr` / `mlock` fail                                                                                       |
-| EFA needs SG self-reference on ingress AND egress | A generic egress `0.0.0.0/0` silently drops EFA                                                                             |
-| `cargo test -p ... -p ...` shares compile         | One crate's build failure cancels sibling test runs mid-build                                                               |
-| `xdp_bpf` feature needs `clang` + `libbpf-dev`    | `build.rs` invokes clang with `--target=bpf` to compile the redirect program                                                |
+| Pitfall                                           | What to do                                                                                                                      |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| AL2023 kernel 6.18 does not ship `rdma_rxe`       | Use Ubuntu 22.04/24.04, or AL2023 kernel 6.1 + `kernel-modules-extra`                                                           |
+| SoftRoCE on `lo` does not work                    | Bind `rxe` to a real ethernet device — loopback has no MAC for ARP/GID resolution                                               |
+| GID 0 is link-local IPv6 on RoCE                  | Pick the IPv4-mapped GID (typically index 1; confirm via `show_gids`). `RdmaContext::open` requires an explicit `gid_index`     |
+| `ulimit -l unlimited` required                    | Otherwise `ibv_reg_mr` / `mlock` fail                                                                                           |
+| EFA needs SG self-reference on ingress AND egress | A generic egress `0.0.0.0/0` silently drops EFA                                                                                 |
+| `cargo test -p ... -p ...` shares compile         | One crate's build failure cancels sibling test runs mid-build                                                                   |
+| `xdp_bpf` feature needs `clang` + `libbpf-dev`    | `build.rs` invokes clang with `--target=bpf` to compile the redirect program                                                    |
 | `ibv_reg_mr` on CUDA VAs EFAULTs in VMs           | nvidia-peermem needs bare metal; `reg_mr_cuda` falls back to dma-buf (`ibv_reg_dmabuf_mr`, needs rdma-core ≥ v34, driver ≥ 515) |
-| auditwheel-bundled libibverbs sees 0 devices      | Bundled lib can't load the mlx5 provider plugin — build the extension with `maturin develop` so it links system libibverbs  |
-| torch wheel CUDA flavor must match the driver     | e.g. driver 570 = CUDA 12.8 → install `+cu128` wheels from `download.pytorch.org/whl/cu128`                                 |
+| auditwheel-bundled libibverbs sees 0 devices      | Bundled lib can't load the mlx5 provider plugin — build the extension with `maturin develop` so it links system libibverbs      |
+| torch wheel CUDA flavor must match the driver     | e.g. driver 570 = CUDA 12.8 → install `+cu128` wheels from `download.pytorch.org/whl/cu128`                                     |
 
 ---
 
