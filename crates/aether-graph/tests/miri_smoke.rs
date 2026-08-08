@@ -15,24 +15,25 @@ use aether_graph::{Arena, CTree, Chunk, DynamicGraph, InsertResult};
 #[test]
 fn arena_alloc_write_read_roundtrip() {
     let arena = Arena::new(4096);
+    let chunk = Chunk::from_sorted(&[7, 8, 9]);
     // SAFETY: single-threaded test.
-    let off = unsafe { arena.alloc_write::<u64>(0x1234_5678_9abc_def0) }.unwrap();
-    // SAFETY: single-threaded test; `off` was just returned by `alloc_write`.
-    let read: &u64 = unsafe { arena.get(off) };
-    assert_eq!(*read, 0x1234_5678_9abc_def0);
+    let idx = unsafe { arena.alloc_write_chunk(chunk) }.unwrap();
+    // SAFETY: single-threaded test; `idx` was just written as a Chunk.
+    let read: &Chunk = unsafe { arena.chunk(idx) };
+    assert_eq!(read.as_slice(), &[7, 8, 9]);
 }
 
 #[test]
-fn arena_alignment_holds_across_allocations() {
+fn arena_regions_are_disjoint_and_aligned() {
     let arena = Arena::new(8192);
-    // SAFETY: single-threaded test; alignment is a power of two.
-    let _ = unsafe { arena.alloc(1, 1) }.unwrap();
-    // SAFETY: single-threaded test; alignment is a power of two.
-    let off = unsafe { arena.alloc(64, 64) }.unwrap();
-    assert_eq!(off % 64, 0);
-    // SAFETY: single-threaded test; alignment is a power of two.
-    let off2 = unsafe { arena.alloc(128, 128) }.unwrap();
-    assert_eq!(off2 % 128, 0);
+    // SAFETY: single-threaded test.
+    unsafe {
+        let c = arena.alloc_chunk().unwrap();
+        let i = arena.alloc_interior().unwrap();
+        assert_eq!(arena.chunk_ptr(c).addr() % 64, 0);
+        assert_eq!(arena.interior_ptr(i).addr() % 16, 0);
+        assert!(arena.chunk_ptr(c) < arena.interior_ptr(i));
+    }
 }
 
 #[test]

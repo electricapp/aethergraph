@@ -11,7 +11,7 @@
 //! The single-writer invariant is enforced at runtime by [`Writer`] —
 //! `DynamicGraph::writer()` returns `None` if a writer already exists.
 
-use crate::arena::Arena;
+use crate::arena::{Arena, RecycleStats, RetireLog};
 use crate::chunk::Chunk;
 use crate::ctree::{CTree, InsertResult};
 use std::sync::Arc;
@@ -195,12 +195,13 @@ impl DynamicGraph {
     /// Create a graph with `num_vertices` vertices and no edges.
     ///
     /// `arena_bytes` controls the arena capacity, at most
-    /// [`Arena::MAX_CAPACITY`] (2 GiB — offsets are u32 with a tag bit).
-    /// Each insert path-copies its tree path (~100–250 bytes including
-    /// superseded nodes), so arena consumption tracks total inserts, not
-    /// live edges. Long-running ingest should call [`compact`] when
-    /// usage approaches capacity; compacted storage is ~6–10 bytes per
-    /// live edge.
+    /// [`Arena::MAX_CAPACITY`] (32 GiB — offsets are u32 slot indices
+    /// with a tag bit). Each insert path-copies its tree path, but the
+    /// superseded nodes are recycled once no concurrent reader can still
+    /// observe them, so steady-state consumption tracks live edges plus a
+    /// bounded recycling lag rather than total inserts. [`compact`]
+    /// remains the escape hatch that repacks everything perfectly
+    /// (~6–10 bytes per live edge) and clears any leaked slots.
     ///
     /// [`compact`]: Self::compact
     ///
@@ -385,6 +386,7 @@ impl DynamicGraph {
             merge_scratch: Vec::new(),
             pending_edges: 0,
             dirty_buf: Vec::with_capacity(DIRTY_BUF_FLUSH_THRESHOLD),
+            retire_log: RetireLog::new(),
             #[cfg(feature = "wal")]
             wal_guard: self
                 .wal
@@ -442,6 +444,7 @@ impl DynamicGraph {
     /// Degree of a vertex.
     #[inline]
     pub fn degree(&self, vertex: u32) -> usize {
+        let _gate = self.arena.read_guard();
         self.tree_for(vertex).count(&self.arena)
     }
 
@@ -449,9 +452,13 @@ impl DynamicGraph {
     ///
     /// Zero allocations. The chunks are read directly from the arena.
     /// Safe to call concurrently with edge inserts — readers see a
-    /// consistent snapshot (the tree that was current when they read the root).
+    /// consistent snapshot (the tree that was current when they read the
+    /// root), and the traversal holds the arena's reader gate so recycled
+    /// slots can never be rewritten underneath it. Keep the callback
+    /// short: gate time delays slot reuse for the writer.
     #[inline]
     pub fn for_each_chunk(&self, vertex: u32, f: impl FnMut(&Chunk)) {
+        let _gate = self.arena.read_guard();
         self.tree_for(vertex).for_each_chunk(&self.arena, f);
     }
 
@@ -462,12 +469,14 @@ impl DynamicGraph {
     #[inline]
     pub fn neighbors_into(&self, vertex: u32, buf: &mut Vec<u32>) {
         buf.clear();
+        let _gate = self.arena.read_guard();
         self.tree_for(vertex).collect_into(&self.arena, buf);
     }
 
     /// Check if edge (src → dst) exists.
     #[inline]
     pub fn has_edge(&self, src: u32, dst: u32) -> bool {
+        let _gate = self.arena.read_guard();
         self.tree_for(src).contains(&self.arena, dst)
     }
 
@@ -506,6 +515,14 @@ impl DynamicGraph {
     /// from [`ArenaFull`]: compact into a larger arena and keep
     /// ingesting.
     ///
+    /// The rebuild is parallel: a prepass computes each vertex's exact
+    /// slot cost (`ceil(deg/15)` chunks, one fewer interiors — perfectly
+    /// balanced trees are deterministic), vertices are partitioned into
+    /// contiguous ranges of roughly equal edge count, and each thread
+    /// builds its range into a privately reserved, disjoint slot region
+    /// of the new arena — no atomics, no allocation races, and the
+    /// capacity check happens up front instead of failing mid-rebuild.
+    ///
     /// # Panics
     /// Panics if `new_capacity` is 0 or exceeds [`Arena::MAX_CAPACITY`]
     /// (the [`Arena::new`] contract).
@@ -515,22 +532,104 @@ impl DynamicGraph {
         }
 
         let (offsets, edges) = self.snapshot_csr();
-        let new_arena = Arena::new(new_capacity);
+        let nv = self.num_vertices;
 
-        let mut new_roots = Vec::with_capacity(self.num_vertices);
-        for v in 0..self.num_vertices {
-            let start = offsets[v] as usize;
-            let end = offsets[v + 1] as usize;
-            // SAFETY: `&mut self` makes this thread the only one touching
-            // the new arena.
-            let tree = unsafe { CTree::from_sorted(&new_arena, &edges[start..end]) }
-                .ok_or(CompactError::ArenaFull)?;
-            new_roots.push(AtomicU32::new(tree.root));
+        // Exact slot cost of the fully compacted graph, and the per-thread
+        // partition. Ranges split on edge count so one hub-heavy stretch
+        // doesn't serialize the rebuild.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16)
+            .max(1);
+        let threads = if edges.len() < (1 << 20) { 1 } else { threads };
+
+        let mut bounds = Vec::with_capacity(threads + 1);
+        bounds.push(0usize);
+        for t in 1..threads {
+            let target = (edges.len() as u64) * (t as u64) / (threads as u64);
+            let v = offsets.partition_point(|&o| o < target).min(nv);
+            bounds.push((*bounds.last().expect("non-empty")).max(v));
         }
+        bounds.push(nv);
+
+        // Per-range slot totals from the deterministic cost formula.
+        let mut range_chunks = vec![0usize; threads];
+        let mut range_interiors = vec![0usize; threads];
+        for t in 0..threads {
+            let (mut c, mut i) = (0usize, 0usize);
+            for v in bounds[t]..bounds[t + 1] {
+                let deg = (offsets[v + 1] - offsets[v]) as usize;
+                let (dc, di) = crate::ctree::compact_slot_cost(deg);
+                c += dc;
+                i += di;
+            }
+            range_chunks[t] = c;
+            range_interiors[t] = i;
+        }
+        let total_chunks: usize = range_chunks.iter().sum();
+        let total_interiors: usize = range_interiors.iter().sum();
+        if total_chunks * crate::arena::CHUNK_SLOT + total_interiors * crate::arena::INTERIOR_SLOT
+            > new_capacity
+        {
+            return Err(CompactError::ArenaFull);
+        }
+
+        let new_arena = Arena::new(new_capacity);
+        let mut new_roots: Vec<u32> = vec![crate::ctree::NULL; nv];
+
+        {
+            let mut root_slices: Vec<&mut [u32]> = Vec::with_capacity(threads);
+            let mut rest: &mut [u32] = &mut new_roots;
+            for t in 0..threads {
+                let (head, tail) = rest.split_at_mut(bounds[t + 1] - bounds[t]);
+                root_slices.push(head);
+                rest = tail;
+            }
+
+            let arena_ref = &new_arena;
+            let offsets_ref = &offsets;
+            let edges_ref = &edges;
+            let bounds_ref = &bounds;
+            std::thread::scope(|s| {
+                let mut chunk_base = 0u32;
+                let mut interior_base = 0u32;
+                for (t, roots_out) in root_slices.into_iter().enumerate() {
+                    let cb = chunk_base;
+                    let ib = interior_base;
+                    let cc = range_chunks[t] as u32;
+                    let ic = range_interiors[t] as u32;
+                    chunk_base += cc;
+                    interior_base += ic;
+                    s.spawn(move || {
+                        // SAFETY: the ranges handed out here are disjoint
+                        // by construction (prefix sums over exact costs)
+                        // and committed below after every thread joins.
+                        let mut region = unsafe { arena_ref.region(cb, cc, ib, ic) };
+                        for (i, v) in (bounds_ref[t]..bounds_ref[t + 1]).enumerate() {
+                            let start = offsets_ref[v] as usize;
+                            let end = offsets_ref[v + 1] as usize;
+                            roots_out[i] = if start == end {
+                                crate::ctree::NULL
+                            } else {
+                                crate::ctree::build_balanced_region(
+                                    &mut region,
+                                    &edges_ref[start..end],
+                                )
+                            };
+                        }
+                    });
+                }
+            });
+        }
+
+        // SAFETY: all region writers joined; their reservations tile the
+        // committed extents exactly.
+        unsafe { new_arena.commit_regions(total_chunks, total_interiors) };
 
         // Rebuild succeeded in full — only now replace the live state.
         self.arena = new_arena;
-        self.roots = new_roots;
+        self.roots = new_roots.into_iter().map(AtomicU32::new).collect();
         Ok(())
     }
 
@@ -555,8 +654,12 @@ impl DynamicGraph {
         offsets.push(0);
         // Iterate via usize to avoid u32 truncation when num_vertices is large.
         // Each vertex's neighbors are appended straight onto `edges`; the
-        // running length after each append is the next CSR offset.
+        // running length after each append is the next CSR offset. The
+        // reader gate is entered per vertex, not for the whole O(V + E)
+        // snapshot, so the writer's slot recycling keeps making progress
+        // while the snapshot runs.
         for v in 0..self.num_vertices {
+            let _gate = self.arena.read_guard();
             self.tree_for(v as u32)
                 .collect_into(&self.arena, &mut edges);
             offsets.push(edges.len() as u64);
@@ -645,6 +748,12 @@ pub struct Writer<'a> {
     /// (each a likely DRAM + TLB miss on a multi-hundred-MB bitmap), and
     /// consumers only drain dirtiness at epoch boundaries anyway.
     dirty_buf: Vec<u32>,
+    /// Slots superseded by this guard's inserts, awaiting their gate
+    /// stamp. Stamped (handed to the arena's grace ring) at the fixed
+    /// watermark and at commit — always after the root stores that made
+    /// the slots unreachable, which is what makes the stamp's grace
+    /// reasoning sound.
+    retire_log: RetireLog,
     /// The WAL, locked once for the guard's lifetime. The old per-edge
     /// `Mutex` lock/unlock was pure tax — the guard already enforces
     /// single-writer.
@@ -671,16 +780,42 @@ impl<'a> Writer<'a> {
         if (src as usize) >= self.graph.num_vertices || (dst as usize) >= self.graph.num_vertices {
             return Err(InsertError::VertexOutOfRange { src, dst });
         }
+        match self.insert_edge_inner(src, dst) {
+            Err(InsertError::ArenaFull) => {
+                // Both cursors are spent, but slots superseded by earlier
+                // (already published) inserts may be waiting in the log.
+                // Stamp them so the exhausted allocator can reclaim any
+                // grace-cleared batch, then retry once.
+                // SAFETY: single-writer guard held; everything in the log
+                // was unpublished by a prior root store.
+                unsafe { self.graph.arena.retire_log(&mut self.retire_log) };
+                self.insert_edge_inner(src, dst)
+            }
+            other => other,
+        }
+    }
 
+    fn insert_edge_inner(&mut self, src: u32, dst: u32) -> Result<bool, InsertError> {
         // Relaxed: this thread is the only root-storer (single-writer
         // guard), so it reads back its own prior store; the initial state
         // was published by the guard-acquisition synchronization.
         let current_root = self.graph.roots[src as usize].load(Ordering::Relaxed);
         let tree = CTree { root: current_root };
 
+        // Marks for rolling back retire entries if the WAL append fails
+        // below: a failed append leaves the old tree live, so its nodes
+        // must not stay logged for reuse.
+        let chunks_mark = self.retire_log.chunks.len();
+        let interiors_mark = self.retire_log.interiors.len();
+
         // SAFETY: Writer existence guarantees single-writer access to the arena.
         match unsafe {
-            tree.insert_with_scratch(&self.graph.arena, dst, &mut self.rebalance_scratch)
+            tree.insert_with_scratch(
+                &self.graph.arena,
+                dst,
+                &mut self.rebalance_scratch,
+                &mut self.retire_log,
+            )
         } {
             InsertResult::Inserted(new_tree) => {
                 // WAL append first (buffered; fsync happens in
@@ -693,12 +828,17 @@ impl<'a> Writer<'a> {
                 if let Some(w) = self.wal_guard.as_mut() {
                     let rec = EdgeRecord { src, dst };
                     if let Err(e) = w.append_edge(rec) {
-                        // Record the failure so `Writer::drop` can poison.
+                        // Record the failure so `Writer::drop` can poison,
+                        // and un-log the still-live old nodes.
+                        self.retire_log.chunks.truncate(chunks_mark);
+                        self.retire_log.interiors.truncate(interiors_mark);
                         self.wal_failed = true;
                         tracing::error!(error = %e, "WAL append failed");
                         return Err(InsertError::WalAppend);
                     }
                 }
+                #[cfg(not(feature = "wal"))]
+                let _ = (chunks_mark, interiors_mark);
 
                 // Release ordering ensures all arena writes (new nodes) are
                 // visible before the root pointer becomes visible to
@@ -709,11 +849,22 @@ impl<'a> Writer<'a> {
                 self.pending_edges += 1;
                 self.note_dirty(src);
                 self.note_dirty(dst);
+                self.maybe_stamp_retired();
 
                 Ok(true)
             }
             InsertResult::Duplicate => Ok(false),
             InsertResult::ArenaFull => Err(InsertError::ArenaFull),
+        }
+    }
+
+    /// Stamp the retire log at its fixed watermark. Called only after a
+    /// root store, so every logged slot is already unreachable.
+    #[inline]
+    fn maybe_stamp_retired(&mut self) {
+        if self.retire_log.wants_flush() {
+            // SAFETY: single-writer guard held; logged slots unpublished.
+            unsafe { self.graph.arena.retire_log(&mut self.retire_log) };
         }
     }
 
@@ -801,12 +952,19 @@ impl<'a> Writer<'a> {
         // log, then publish — a WAL failure leaves readers on the old
         // root with no record of the unpublished edges.
         // SAFETY: Writer existence guarantees single-writer access to the arena.
-        let new_tree = match unsafe { CTree::from_sorted(&self.graph.arena, merged) } {
-            Some(t) => t,
-            None => {
-                self.dirty_buf.truncate(new_dsts_start);
-                return Err(InsertError::ArenaFull);
-            }
+        let mut built = unsafe { CTree::from_sorted(&self.graph.arena, merged) };
+        if built.is_none() {
+            // Stamp already-unpublished retirements so the exhausted
+            // allocator can reclaim grace-cleared slots, then retry once
+            // (see `insert_edge`).
+            // SAFETY: single-writer guard held.
+            unsafe { self.graph.arena.retire_log(&mut self.retire_log) };
+            // SAFETY: as above.
+            built = unsafe { CTree::from_sorted(&self.graph.arena, merged) };
+        }
+        let Some(new_tree) = built else {
+            self.dirty_buf.truncate(new_dsts_start);
+            return Err(InsertError::ArenaFull);
         };
 
         #[cfg(feature = "wal")]
@@ -825,8 +983,18 @@ impl<'a> Writer<'a> {
         }
 
         self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
+        // The old tree is superseded in full now that the merged rebuild
+        // is published; log every one of its nodes for recycling.
+        if current_root != crate::ctree::NULL {
+            // SAFETY: single-writer guard; the old tree is unreachable
+            // from the just-published root.
+            unsafe {
+                crate::ctree::retire_subtree(&self.graph.arena, current_root, &mut self.retire_log)
+            };
+        }
         self.pending_edges += new_count;
         self.dirty_buf.push(src);
+        self.maybe_stamp_retired();
 
         Ok(new_count)
     }
@@ -865,6 +1033,14 @@ impl<'a> Writer<'a> {
             self.pending_edges = 0;
         }
         self.flush_dirty();
+    }
+
+    /// Arena recycling counters. Slots this guard has logged but not yet
+    /// stamped count as neither free nor pending.
+    pub fn recycle_stats(&self) -> RecycleStats {
+        // SAFETY: holding the `Writer` proves this thread is the single
+        // writer, which is the recycler's access contract.
+        unsafe { self.graph.arena.recycle_stats() }
     }
 }
 
@@ -915,9 +1091,21 @@ impl Drop for Writer<'_> {
         }
 
         if durable_failure {
+            // The un-stamped retire log dies with the guard: its slots are
+            // never reused, which is exactly right — some of them may
+            // belong to trees that are still the published state.
             self.graph.poisoned.store(true, Ordering::Release);
         } else {
             self.flush_bookkeeping();
+            // Stamp this guard's remaining retirements (all root stores
+            // are done) and fold in any batches whose grace has passed,
+            // so a subsequent guard starts with a warm free list.
+            // SAFETY: single-writer guard still held; logged slots are
+            // unpublished.
+            unsafe {
+                self.graph.arena.retire_log(&mut self.retire_log);
+                self.graph.arena.reclaim();
+            }
             // Publish a new epoch so readers pinning the clock see this
             // writer's edits. Done before releasing the writer lock so
             // the next writer can't bump the clock first.
