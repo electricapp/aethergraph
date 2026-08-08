@@ -257,11 +257,14 @@ fn save_features(path: std::path::PathBuf, features: numpy::PyReadonlyArray2<f32
     let num_nodes = shape[0];
     let feature_dim = shape[1];
 
-    // `is_standard_layout()` returns true for some non-contiguous views
-    // (e.g. transposed strides that still match the shape), so we cannot
-    // use it to gate a zero-copy fast path. Materialize unconditionally via
-    // `.iter()`, which yields elements in C order regardless of layout.
-    let features_vec: Vec<f32> = features_array.iter().copied().collect();
+    // C-contiguous input (the overwhelmingly common case) materializes with
+    // one bulk memcpy via `as_slice`; only genuinely non-contiguous views
+    // fall back to element iteration, which yields C order regardless of
+    // the source layout.
+    let features_vec: Vec<f32> = match features_array.as_slice() {
+        Some(s) => s.to_vec(),
+        None => features_array.iter().copied().collect(),
+    };
 
     core_save_features(&path, features_vec, num_nodes, feature_dim).map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("Failed to save features: {}", e))

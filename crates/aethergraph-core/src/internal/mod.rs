@@ -7,6 +7,7 @@ pub mod mmap;
 pub mod mmap_hetero;
 #[cfg(feature = "parquet")]
 pub mod parquet_import;
+pub mod prefetch;
 pub mod telemetry;
 
 #[cfg(target_os = "linux")]

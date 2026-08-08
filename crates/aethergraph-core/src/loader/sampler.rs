@@ -221,9 +221,11 @@ pub struct NeighborSampler<'a> {
     config: SamplingConfig,
     rng: WyRand,
     /// Direct array path (selected by `use_direct`: <= 100K nodes, or a
-    /// sample estimated to touch > 1% of the graph).
-    node_gen: Vec<u32>,
-    node_local_idx: Vec<u32>,
+    /// sample estimated to touch > 1% of the graph). Each entry packs the
+    /// generation tag in the high 32 bits and the local index in the low 32,
+    /// so a dedup probe touches exactly one cache line instead of two
+    /// parallel arrays.
+    node_slot: Vec<u64>,
     current_gen: u32,
     /// HashMap path (large graphs).
     local_index: FxHashMap<NodeId, u32>,
@@ -237,13 +239,22 @@ pub struct NeighborSampler<'a> {
     edge_dst_buf: Vec<NodeId>,
     /// Global edge IDs (position in CSR edges array).
     edge_ids_buf: Vec<u64>,
-    /// Double-buffered frontiers.
-    frontier: Vec<NodeId>,
-    next_frontier: Vec<NodeId>,
+    /// Local (remapped) endpoint indices, filled at emit time — the local
+    /// index of every endpoint is already known when the edge is pushed, so
+    /// no post-pass hashmap lookup is ever needed.
+    src_local_buf: Vec<u32>,
+    dst_local_buf: Vec<u32>,
+    /// Local indices of the seeds, captured at registration.
+    seed_locals_buf: Vec<u32>,
+    /// Double-buffered frontiers carrying (global id, local index).
+    frontier: Vec<(NodeId, u32)>,
+    next_frontier: Vec<(NodeId, u32)>,
     /// Reusable buffer for weighted sampling results.
     sample_buf: Vec<(NodeId, usize)>,
-    /// Reusable Floyd bitmap (small degree <= 256).
-    floyd_bitmap: [bool; 256],
+    /// Reusable Floyd scratch (small degree <= 256): generation stamps, so
+    /// per-node reuse is a counter bump instead of an O(n) clear.
+    floyd_stamp: [u32; 256],
+    floyd_gen: u32,
     /// Reusable Floyd set (large degree > 256).
     seen_set: FxHashSet<usize>,
     /// Temporal: per-node time constraints (parallel to node_vec).
@@ -255,6 +266,12 @@ pub struct NeighborSampler<'a> {
     /// Weighted with-replace: reusable cumulative-distribution buffer.
     cumsum_buf: Vec<f64>,
 }
+
+/// How many frontier entries ahead the hop loop prefetches the CSR offsets
+/// (and, at half this distance, the first edge line). The dedup probes and
+/// neighbor-list reads are random-access and serially dependent without
+/// these hints.
+const FRONTIER_PREFETCH_DIST: usize = 4;
 
 impl<'a> NeighborSampler<'a> {
     /// Creates a new neighbor sampler.
@@ -286,13 +303,8 @@ impl<'a> NeighborSampler<'a> {
             graph,
             config,
             rng,
-            node_gen: if use_direct {
-                vec![0u32; num_nodes]
-            } else {
-                Vec::new()
-            },
-            node_local_idx: if use_direct {
-                vec![0u32; num_nodes]
+            node_slot: if use_direct {
+                vec![0u64; num_nodes]
             } else {
                 Vec::new()
             },
@@ -303,10 +315,14 @@ impl<'a> NeighborSampler<'a> {
             edge_src_buf: Vec::with_capacity(2048),
             edge_dst_buf: Vec::with_capacity(2048),
             edge_ids_buf: Vec::with_capacity(2048),
+            src_local_buf: Vec::with_capacity(2048),
+            dst_local_buf: Vec::with_capacity(2048),
+            seed_locals_buf: Vec::with_capacity(512),
             frontier: Vec::with_capacity(512),
             next_frontier: Vec::with_capacity(4096),
             sample_buf: Vec::with_capacity(max_fanout),
-            floyd_bitmap: [false; 256],
+            floyd_stamp: [0u32; 256],
+            floyd_gen: 0,
             seen_set: FxHashSet::with_capacity_and_hasher(max_fanout * 2, Default::default()),
             node_times: Vec::new(),
             temporal_filtered: Vec::with_capacity(max_fanout),
@@ -315,16 +331,22 @@ impl<'a> NeighborSampler<'a> {
         }
     }
 
+    /// Pack a generation tag and local index into one dedup-slot word.
+    #[inline(always)]
+    const fn pack_slot(generation: u32, idx: u32) -> u64 {
+        ((generation as u64) << 32) | idx as u64
+    }
+
     #[inline(always)]
     fn insert_node(&mut self, id: NodeId) -> u32 {
         if self.use_direct {
             let i = id as usize;
-            if self.node_gen[i] == self.current_gen {
-                self.node_local_idx[i]
+            let slot = self.node_slot[i];
+            if (slot >> 32) as u32 == self.current_gen {
+                slot as u32
             } else {
                 let idx = self.node_vec.len() as u32;
-                self.node_gen[i] = self.current_gen;
-                self.node_local_idx[i] = idx;
+                self.node_slot[i] = Self::pack_slot(self.current_gen, idx);
                 self.node_vec.push(id);
                 idx
             }
@@ -341,28 +363,31 @@ impl<'a> NeighborSampler<'a> {
         }
     }
 
+    /// Register `id`, pushing it onto the next frontier when new. Returns
+    /// its local index either way — the caller records it for the edge's
+    /// endpoint without any later lookup.
     #[inline(always)]
-    fn insert_node_frontier(&mut self, id: NodeId) -> bool {
+    fn insert_node_frontier(&mut self, id: NodeId) -> (u32, bool) {
         if self.use_direct {
             let i = id as usize;
-            if self.node_gen[i] == self.current_gen {
-                return false;
+            let slot = self.node_slot[i];
+            if (slot >> 32) as u32 == self.current_gen {
+                return (slot as u32, false);
             }
             let idx = self.node_vec.len() as u32;
-            self.node_gen[i] = self.current_gen;
-            self.node_local_idx[i] = idx;
+            self.node_slot[i] = Self::pack_slot(self.current_gen, idx);
             self.node_vec.push(id);
-            self.next_frontier.push(id);
-            true
+            self.next_frontier.push((id, idx));
+            (idx, true)
         } else {
             let next_idx = self.node_vec.len() as u32;
             match self.local_index.entry(id) {
-                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Occupied(e) => (*e.get(), false),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(next_idx);
                     self.node_vec.push(id);
-                    self.next_frontier.push(id);
-                    true
+                    self.next_frontier.push((id, next_idx));
+                    (next_idx, true)
                 }
             }
         }
@@ -440,7 +465,7 @@ impl<'a> NeighborSampler<'a> {
             if self.use_direct {
                 self.current_gen = self.current_gen.wrapping_add(1);
                 if self.current_gen == 0 {
-                    self.node_gen.fill(0);
+                    self.node_slot.fill(0);
                     self.current_gen = 1;
                 }
             } else {
@@ -450,69 +475,31 @@ impl<'a> NeighborSampler<'a> {
             self.edge_src_buf.clear();
             self.edge_dst_buf.clear();
             self.edge_ids_buf.clear();
+            self.src_local_buf.clear();
+            self.dst_local_buf.clear();
             self.frontier.clear();
             self.next_frontier.clear();
             self.node_times.clear();
 
             // Register single seed
-            self.insert_node(seed);
-            self.frontier.push(seed);
+            let seed_local = self.insert_node(seed);
+            self.frontier.push((seed, seed_local));
             if let Some(times) = input_times {
                 self.node_times.push(times[seed_idx]);
             }
 
             // Run hop loop inline (same logic as sample_neighbors_inner)
-            for hop in 0..num_hops {
-                let edges_before = self.edge_src_buf.len();
-                let sample_size = self.config.fanout[hop];
-                self.next_frontier.clear();
-
-                let frontier_len = self.frontier.len();
-                for fi in 0..frontier_len {
-                    let node = self.frontier[fi];
-                    let neighbors = self.graph.neighbors(node);
-                    if neighbors.is_empty() {
-                        continue;
-                    }
-                    if is_temporal {
-                        self.sample_temporal(node, neighbors, sample_size);
-                    } else {
-                        self.sample_normal(node, neighbors, sample_size);
-                    }
-                }
-
+            self.run_hops(num_hops, is_temporal, |hop, new_nodes, new_edges| {
                 // Accumulate this seed's per-hop counts into the combined totals.
-                num_sampled_nodes[hop] += self.next_frontier.len();
-                num_sampled_edges[hop] += self.edge_src_buf.len() - edges_before;
+                num_sampled_nodes[hop] += new_nodes;
+                num_sampled_edges[hop] += new_edges;
+            });
 
-                if self.config.cumulative {
-                    self.frontier.extend_from_slice(&self.next_frontier);
-                } else {
-                    std::mem::swap(&mut self.frontier, &mut self.next_frontier);
-                }
-            }
-
-            // Compute local edge indices and offset into combined output.
-            // The dedup structure already maps each global id to its local index
-            // within this seed's subgraph (node_local_idx for the direct array,
-            // local_index for the HashMap), so no per-seed map needs rebuilding.
+            // Endpoint locals were recorded at emit time; only the per-seed
+            // block offset needs applying while concatenating.
             let node_offset = all_nodes.len() as u32;
-
-            if self.use_direct {
-                for &src in &self.edge_src_buf {
-                    all_src_local.push(self.node_local_idx[src as usize] + node_offset);
-                }
-                for &dst in &self.edge_dst_buf {
-                    all_dst_local.push(self.node_local_idx[dst as usize] + node_offset);
-                }
-            } else {
-                for &src in &self.edge_src_buf {
-                    all_src_local.push(self.local_index[&src] + node_offset);
-                }
-                for &dst in &self.edge_dst_buf {
-                    all_dst_local.push(self.local_index[&dst] + node_offset);
-                }
-            }
+            all_src_local.extend(self.src_local_buf.iter().map(|&l| l + node_offset));
+            all_dst_local.extend(self.dst_local_buf.iter().map(|&l| l + node_offset));
 
             all_nodes.extend_from_slice(&self.node_vec);
             all_edge_src.extend_from_slice(&self.edge_src_buf);
@@ -534,6 +521,108 @@ impl<'a> NeighborSampler<'a> {
             local_index: FxHashMap::default(),
             batch: Some(batch),
             precomputed_local: Some((all_src_local, all_dst_local)),
+            seed_locals: None,
+        }
+    }
+
+    /// Run the hop loop over the current frontier, invoking `record` with
+    /// `(hop, new_frontier_nodes, new_edges)` after each hop.
+    ///
+    /// CSR slices are hoisted once per call so the inner loop indexes raw
+    /// arrays (no per-node storage dispatch), and upcoming frontier entries'
+    /// offset words and first edge lines are prefetched ahead of use — the
+    /// probes are random-access and otherwise serially dependent.
+    fn run_hops(
+        &mut self,
+        num_hops: usize,
+        is_temporal: bool,
+        mut record: impl FnMut(usize, usize, usize),
+    ) {
+        use crate::internal::prefetch::prefetch_read;
+
+        let offsets = self.graph.offsets();
+        let edges = self.graph.edges();
+        let num_nodes = self.graph.num_nodes();
+        let num_edges = edges.len();
+        let weights = if self.config.weighted {
+            self.graph.weights()
+        } else {
+            None
+        };
+        let timestamps = if is_temporal {
+            self.graph.timestamps()
+        } else {
+            None
+        };
+
+        for hop in 0..num_hops {
+            let edges_before = self.edge_src_buf.len();
+            let sample_size = self.config.fanout[hop];
+            self.next_frontier.clear();
+
+            let frontier_len = self.frontier.len();
+            for fi in 0..frontier_len {
+                if fi + FRONTIER_PREFETCH_DIST < frontier_len {
+                    let ahead = self.frontier[fi + FRONTIER_PREFETCH_DIST].0 as usize;
+                    if ahead < num_nodes {
+                        prefetch_read(&offsets[ahead]);
+                    }
+                }
+                if fi + FRONTIER_PREFETCH_DIST / 2 < frontier_len {
+                    let ahead = self.frontier[fi + FRONTIER_PREFETCH_DIST / 2].0 as usize;
+                    if ahead < num_nodes {
+                        let s = offsets[ahead] as usize;
+                        if s < num_edges {
+                            prefetch_read(&edges[s]);
+                        }
+                    }
+                }
+
+                let (node, node_local) = self.frontier[fi];
+                let i = node as usize;
+                if i >= num_nodes {
+                    continue;
+                }
+                let start = offsets[i] as usize;
+                let end = offsets[i + 1] as usize;
+                if start >= end || end > num_edges {
+                    continue;
+                }
+                let neighbors = &edges[start..end];
+                let edge_offset = start as u64;
+
+                if is_temporal {
+                    let Some(ts_all) = timestamps else { continue };
+                    self.sample_temporal(
+                        node,
+                        node_local,
+                        neighbors,
+                        &ts_all[start..end],
+                        edge_offset,
+                        sample_size,
+                    );
+                } else {
+                    let w = weights.map(|w| &w[start..end]);
+                    self.sample_normal(node, node_local, neighbors, w, edge_offset, sample_size);
+                }
+            }
+
+            record(
+                hop,
+                self.next_frontier.len(),
+                self.edge_src_buf.len() - edges_before,
+            );
+
+            // Update frontier based on sampling mode (double-buffer swap)
+            if self.config.cumulative {
+                // PyG-style: accumulate all nodes for next hop. By design this
+                // re-processes the whole accumulated frontier each hop, so the
+                // total work is O(Σ frontier sizes) rather than O(new nodes).
+                self.frontier.extend_from_slice(&self.next_frontier);
+            } else {
+                // Pure GraphSAGE: only use new frontier
+                std::mem::swap(&mut self.frontier, &mut self.next_frontier);
+            }
         }
     }
 
@@ -556,7 +645,7 @@ impl<'a> NeighborSampler<'a> {
         if self.use_direct {
             self.current_gen = self.current_gen.wrapping_add(1);
             if self.current_gen == 0 {
-                self.node_gen.fill(0);
+                self.node_slot.fill(0);
                 self.current_gen = 1;
             }
         } else {
@@ -566,14 +655,18 @@ impl<'a> NeighborSampler<'a> {
         self.edge_src_buf.clear();
         self.edge_dst_buf.clear();
         self.edge_ids_buf.clear();
+        self.src_local_buf.clear();
+        self.dst_local_buf.clear();
+        self.seed_locals_buf.clear();
         self.frontier.clear();
         self.next_frontier.clear();
         self.node_times.clear();
 
         // Register seeds with local indices
         for &seed in seeds {
-            self.insert_node(seed);
-            self.frontier.push(seed);
+            let local = self.insert_node(seed);
+            self.seed_locals_buf.push(local);
+            self.frontier.push((seed, local));
         }
 
         // Initialize seed times for temporal sampling
@@ -585,47 +678,16 @@ impl<'a> NeighborSampler<'a> {
         let mut num_sampled_nodes = Vec::with_capacity(num_hops);
         let mut num_sampled_edges = Vec::with_capacity(num_hops);
 
-        // Sample neighbors hop by hop
-        for hop in 0..num_hops {
-            let edges_before = self.edge_src_buf.len();
-            let sample_size = self.config.fanout[hop];
-            self.next_frontier.clear();
-
-            let frontier_len = self.frontier.len();
-            for fi in 0..frontier_len {
-                let node = self.frontier[fi];
-                let neighbors = self.graph.neighbors(node);
-                if neighbors.is_empty() {
-                    continue;
-                }
-
-                if is_temporal {
-                    self.sample_temporal(node, neighbors, sample_size);
-                } else {
-                    self.sample_normal(node, neighbors, sample_size);
-                }
-            }
-
-            // Record per-hop stats (for PyG compatibility)
-            num_sampled_nodes.push(self.next_frontier.len());
-            num_sampled_edges.push(self.edge_src_buf.len() - edges_before);
-
-            // Update frontier based on sampling mode (double-buffer swap)
-            if self.config.cumulative {
-                // PyG-style: accumulate all nodes for next hop. By design this
-                // re-processes the whole accumulated frontier each hop, so the
-                // total work is O(Σ frontier sizes) rather than O(new nodes).
-                self.frontier.extend_from_slice(&self.next_frontier);
-            } else {
-                // Pure GraphSAGE: only use new frontier
-                std::mem::swap(&mut self.frontier, &mut self.next_frontier);
-            }
-        }
+        self.run_hops(num_hops, is_temporal, |_hop, new_nodes, new_edges| {
+            num_sampled_nodes.push(new_nodes);
+            num_sampled_edges.push(new_edges);
+        });
 
         // Hand the filled buffers to the caller and swap fresh ones back in.
-        // The four returned buffers (nodes + the three edge arrays) are
-        // therefore freshly allocated on every call; only the internal scratch
-        // (frontiers, dedup arrays, sample buffers) is reset and reused.
+        // The returned buffers (nodes, the three edge arrays, and the local
+        // endpoint indices) are therefore freshly allocated on every call;
+        // only the internal scratch (frontiers, dedup arrays, sample buffers)
+        // is reset and reused.
         let mut node_vec = Vec::with_capacity(512);
         std::mem::swap(&mut self.node_vec, &mut node_vec);
 
@@ -638,72 +700,111 @@ impl<'a> NeighborSampler<'a> {
         let mut edge_ids = Vec::with_capacity(if self.config.track_edge_ids { 2048 } else { 0 });
         std::mem::swap(&mut self.edge_ids_buf, &mut edge_ids);
 
-        // Build local_index map for the subgraph from the generation arrays.
-        // This is O(N) where N = sampled nodes (~12K), not graph nodes.
-        let local_index: FxHashMap<NodeId, u32> = node_vec
-            .iter()
-            .enumerate()
-            .map(|(idx, &id)| (id, idx as u32))
-            .collect();
+        let mut src_local = Vec::with_capacity(2048);
+        std::mem::swap(&mut self.src_local_buf, &mut src_local);
 
-        // Apply subgraph_type post-processing
-        let (edge_src, edge_dst, edge_ids) = match self.config.subgraph_type {
-            SubgraphType::Directional => {
-                // Default: return edges as-is
-                (edge_src, edge_dst, edge_ids)
-            }
-            SubgraphType::Induced => {
-                // Filter to only edges where both endpoints are in the node set.
-                // local_index serves as the node set — O(1) lookup.
-                let mut new_src = Vec::with_capacity(edge_src.len());
-                let mut new_dst = Vec::with_capacity(edge_dst.len());
-                let mut new_ids = if self.config.track_edge_ids {
-                    Vec::with_capacity(edge_ids.len())
-                } else {
-                    Vec::new()
-                };
+        let mut dst_local = Vec::with_capacity(2048);
+        std::mem::swap(&mut self.dst_local_buf, &mut dst_local);
 
-                for i in 0..edge_src.len() {
-                    if local_index.contains_key(&edge_src[i])
-                        && local_index.contains_key(&edge_dst[i])
-                    {
-                        new_src.push(edge_src[i]);
-                        new_dst.push(edge_dst[i]);
-                        if self.config.track_edge_ids {
-                            new_ids.push(edge_ids[i]);
+        let mut seed_locals = Vec::with_capacity(512);
+        std::mem::swap(&mut self.seed_locals_buf, &mut seed_locals);
+
+        // Apply subgraph_type post-processing. Local endpoint indices were
+        // recorded at emit time, so no per-edge map lookup happens on any
+        // path; the Induced filter builds its membership map alone.
+        let (edge_src, edge_dst, edge_ids, src_local, dst_local, local_index) =
+            match self.config.subgraph_type {
+                SubgraphType::Directional => (
+                    edge_src,
+                    edge_dst,
+                    edge_ids,
+                    src_local,
+                    dst_local,
+                    FxHashMap::default(),
+                ),
+                SubgraphType::Induced => {
+                    // Filter to only edges where both endpoints are in the
+                    // node set. local_index serves as the node set — O(1)
+                    // lookup. The local arrays are filtered in lockstep.
+                    let local_index: FxHashMap<NodeId, u32> = node_vec
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &id)| (id, idx as u32))
+                        .collect();
+
+                    let mut new_src = Vec::with_capacity(edge_src.len());
+                    let mut new_dst = Vec::with_capacity(edge_dst.len());
+                    let mut new_ids = if self.config.track_edge_ids {
+                        Vec::with_capacity(edge_ids.len())
+                    } else {
+                        Vec::new()
+                    };
+                    let mut new_src_local = Vec::with_capacity(src_local.len());
+                    let mut new_dst_local = Vec::with_capacity(dst_local.len());
+
+                    for i in 0..edge_src.len() {
+                        if local_index.contains_key(&edge_src[i])
+                            && local_index.contains_key(&edge_dst[i])
+                        {
+                            new_src.push(edge_src[i]);
+                            new_dst.push(edge_dst[i]);
+                            if self.config.track_edge_ids {
+                                new_ids.push(edge_ids[i]);
+                            }
+                            new_src_local.push(src_local[i]);
+                            new_dst_local.push(dst_local[i]);
                         }
                     }
+
+                    (
+                        new_src,
+                        new_dst,
+                        new_ids,
+                        new_src_local,
+                        new_dst_local,
+                        local_index,
+                    )
                 }
+                SubgraphType::Bidirectional => {
+                    // Add reverse edges
+                    let mut new_src = Vec::with_capacity(edge_src.len() * 2);
+                    let mut new_dst = Vec::with_capacity(edge_dst.len() * 2);
+                    let mut new_ids = if self.config.track_edge_ids {
+                        Vec::with_capacity(edge_ids.len() * 2)
+                    } else {
+                        Vec::new()
+                    };
+                    let mut new_src_local = Vec::with_capacity(src_local.len() * 2);
+                    let mut new_dst_local = Vec::with_capacity(dst_local.len() * 2);
 
-                (new_src, new_dst, new_ids)
-            }
-            SubgraphType::Bidirectional => {
-                // Add reverse edges
-                let mut new_src = Vec::with_capacity(edge_src.len() * 2);
-                let mut new_dst = Vec::with_capacity(edge_dst.len() * 2);
-                let mut new_ids = if self.config.track_edge_ids {
-                    Vec::with_capacity(edge_ids.len() * 2)
-                } else {
-                    Vec::new()
-                };
+                    // Original edges
+                    new_src.extend_from_slice(&edge_src);
+                    new_dst.extend_from_slice(&edge_dst);
+                    if self.config.track_edge_ids {
+                        new_ids.extend_from_slice(&edge_ids);
+                    }
+                    new_src_local.extend_from_slice(&src_local);
+                    new_dst_local.extend_from_slice(&dst_local);
 
-                // Original edges
-                new_src.extend_from_slice(&edge_src);
-                new_dst.extend_from_slice(&edge_dst);
-                if self.config.track_edge_ids {
-                    new_ids.extend_from_slice(&edge_ids);
+                    // Reverse edges (edge_id for reverse is same as forward)
+                    new_src.extend_from_slice(&edge_dst);
+                    new_dst.extend_from_slice(&edge_src);
+                    if self.config.track_edge_ids {
+                        new_ids.extend_from_slice(&edge_ids);
+                    }
+                    new_src_local.extend_from_slice(&dst_local);
+                    new_dst_local.extend_from_slice(&src_local);
+
+                    (
+                        new_src,
+                        new_dst,
+                        new_ids,
+                        new_src_local,
+                        new_dst_local,
+                        FxHashMap::default(),
+                    )
                 }
-
-                // Reverse edges (edge_id for reverse is same as forward)
-                new_src.extend_from_slice(&edge_dst);
-                new_dst.extend_from_slice(&edge_src);
-                if self.config.track_edge_ids {
-                    new_ids.extend_from_slice(&edge_ids);
-                }
-
-                (new_src, new_dst, new_ids)
-            }
-        };
+            };
 
         let subgraph = SampledSubgraph {
             nodes: node_vec,
@@ -715,7 +816,8 @@ impl<'a> NeighborSampler<'a> {
             num_sampled_edges,
             local_index,
             batch: None,
-            precomputed_local: None,
+            precomputed_local: Some((src_local, dst_local)),
+            seed_locals: Some(seed_locals),
         };
 
         // Record telemetry if enabled (opt-in, zero overhead if None)
@@ -733,18 +835,17 @@ impl<'a> NeighborSampler<'a> {
     /// Temporal sampling for a single node: filter by timestamp, sample, emit.
     /// Uses sample_buf and temporal_filtered as scratch (pre-allocated on sampler).
     #[inline]
-    fn sample_temporal(&mut self, node: NodeId, neighbors: &[NodeId], sample_size: usize) {
-        let ts = match self.graph.neighbor_timestamps(node) {
-            Some(ts) => ts,
-            None => return,
-        };
+    fn sample_temporal(
+        &mut self,
+        node: NodeId,
+        node_local: u32,
+        neighbors: &[NodeId],
+        ts: &[f64],
+        edge_offset: u64,
+        sample_size: usize,
+    ) {
         let node_time = if !self.node_times.is_empty() {
-            let local_idx = if self.use_direct {
-                self.node_local_idx[node as usize]
-            } else {
-                self.local_index[&node]
-            };
-            self.node_times[local_idx as usize]
+            self.node_times[node_local as usize]
         } else {
             f64::INFINITY
         };
@@ -822,15 +923,16 @@ impl<'a> NeighborSampler<'a> {
         }
 
         // Emit from sample_buf with time recording — single pass, no redundant lookups
-        let edge_offset = self.graph.edge_offset(node);
         for j in 0..self.sample_buf.len() {
             let (neighbor, csr_idx) = self.sample_buf[j];
             self.edge_src_buf.push(node);
             self.edge_dst_buf.push(neighbor);
+            self.src_local_buf.push(node_local);
             if self.config.track_edge_ids {
                 self.edge_ids_buf.push(edge_offset + csr_idx as u64);
             }
-            let is_new = self.insert_node_frontier(neighbor);
+            let (dst_local, is_new) = self.insert_node_frontier(neighbor);
+            self.dst_local_buf.push(dst_local);
             if is_new {
                 // Use ts directly (already borrowed above, same lifetime)
                 self.node_times.push(ts[csr_idx]);
@@ -840,13 +942,15 @@ impl<'a> NeighborSampler<'a> {
 
     /// Normal (non-temporal) sampling for a single node: weighted or unweighted.
     #[inline]
-    fn sample_normal(&mut self, node: NodeId, neighbors: &[NodeId], sample_size: usize) {
-        let weights = if self.config.weighted {
-            self.graph.neighbor_weights(node)
-        } else {
-            None
-        };
-
+    fn sample_normal(
+        &mut self,
+        node: NodeId,
+        node_local: u32,
+        neighbors: &[NodeId],
+        weights: Option<&[f32]>,
+        edge_offset: u64,
+        sample_size: usize,
+    ) {
         if let Some(w) = weights {
             self.sample_buf.clear();
             if self.config.replace {
@@ -854,22 +958,17 @@ impl<'a> NeighborSampler<'a> {
             } else {
                 self.weighted_sample_without_replacement_into(neighbors, w, sample_size);
             }
-            if self.config.track_edge_ids {
-                let edge_offset = self.graph.edge_offset(node);
-                for i in 0..self.sample_buf.len() {
-                    let (neighbor, local_idx) = self.sample_buf[i];
-                    self.edge_src_buf.push(node);
-                    self.edge_dst_buf.push(neighbor);
+            let track = self.config.track_edge_ids;
+            for i in 0..self.sample_buf.len() {
+                let (neighbor, local_idx) = self.sample_buf[i];
+                self.edge_src_buf.push(node);
+                self.edge_dst_buf.push(neighbor);
+                self.src_local_buf.push(node_local);
+                if track {
                     self.edge_ids_buf.push(edge_offset + local_idx as u64);
-                    self.insert_node_frontier(neighbor);
                 }
-            } else {
-                for i in 0..self.sample_buf.len() {
-                    let (neighbor, _) = self.sample_buf[i];
-                    self.edge_src_buf.push(node);
-                    self.edge_dst_buf.push(neighbor);
-                    self.insert_node_frontier(neighbor);
-                }
+                let (dst_local, _) = self.insert_node_frontier(neighbor);
+                self.dst_local_buf.push(dst_local);
             }
         } else {
             let effective = if let Some(max_deg) = self.config.max_degree {
@@ -887,191 +986,118 @@ impl<'a> NeighborSampler<'a> {
 
             let n = effective.len();
             if self.config.replace {
-                self.emit_sample_replace(node, effective, sample_size);
+                self.emit_sample_replace(node, node_local, effective, edge_offset, sample_size);
             } else if sample_size >= n {
-                self.emit_take_all(node, effective);
+                self.emit_take_all(node, node_local, effective, edge_offset);
             } else {
-                self.emit_sample_floyd(node, effective, sample_size);
+                self.emit_sample_floyd(node, node_local, effective, edge_offset, sample_size);
             }
         }
     }
 
+    /// Push one sampled edge (with its emit-time local endpoint indices) to
+    /// the output buffers.
+    #[inline(always)]
+    fn emit_edge(
+        &mut self,
+        src: NodeId,
+        src_local: u32,
+        neighbor: NodeId,
+        edge_offset: u64,
+        idx: usize,
+        track: bool,
+    ) {
+        self.edge_src_buf.push(src);
+        self.edge_dst_buf.push(neighbor);
+        self.src_local_buf.push(src_local);
+        if track {
+            self.edge_ids_buf.push(edge_offset + idx as u64);
+        }
+        let (dst_local, _) = self.insert_node_frontier(neighbor);
+        self.dst_local_buf.push(dst_local);
+    }
+
     /// Emit edges for sampling with replacement — pushes directly to edge buffers.
     #[inline]
-    fn emit_sample_replace(&mut self, src: NodeId, neighbors: &[NodeId], k: usize) {
+    fn emit_sample_replace(
+        &mut self,
+        src: NodeId,
+        src_local: u32,
+        neighbors: &[NodeId],
+        edge_offset: u64,
+        k: usize,
+    ) {
         let n = neighbors.len() as u64;
-        if self.config.track_edge_ids {
-            let edge_offset = self.graph.edge_offset(src);
-            for _ in 0..k {
-                let x = self.rng.next_u32();
-                let idx = ((x as u64).wrapping_mul(n) >> 32) as usize;
-                let neighbor = neighbors[idx];
-                self.edge_src_buf.push(src);
-                self.edge_dst_buf.push(neighbor);
-                self.edge_ids_buf.push(edge_offset + idx as u64);
-                self.insert_node_frontier(neighbor);
-            }
-        } else {
-            for _ in 0..k {
-                let x = self.rng.next_u32();
-                let idx = ((x as u64).wrapping_mul(n) >> 32) as usize;
-                let neighbor = neighbors[idx];
-                self.edge_src_buf.push(src);
-                self.edge_dst_buf.push(neighbor);
-                self.insert_node_frontier(neighbor);
-            }
+        let track = self.config.track_edge_ids;
+        for _ in 0..k {
+            let x = self.rng.next_u32();
+            let idx = ((x as u64).wrapping_mul(n) >> 32) as usize;
+            self.emit_edge(src, src_local, neighbors[idx], edge_offset, idx, track);
         }
     }
 
     /// Emit edges for take-all (fanout >= degree) — pushes directly to edge buffers.
     #[inline]
-    fn emit_take_all(&mut self, src: NodeId, neighbors: &[NodeId]) {
-        if self.config.track_edge_ids {
-            let edge_offset = self.graph.edge_offset(src);
-            for (idx, &neighbor) in neighbors.iter().enumerate() {
-                self.edge_src_buf.push(src);
-                self.edge_dst_buf.push(neighbor);
-                self.edge_ids_buf.push(edge_offset + idx as u64);
-                self.insert_node_frontier(neighbor);
-            }
-        } else {
-            for &neighbor in neighbors {
-                self.edge_src_buf.push(src);
-                self.edge_dst_buf.push(neighbor);
-                self.insert_node_frontier(neighbor);
-            }
+    fn emit_take_all(
+        &mut self,
+        src: NodeId,
+        src_local: u32,
+        neighbors: &[NodeId],
+        edge_offset: u64,
+    ) {
+        let track = self.config.track_edge_ids;
+        for (idx, &neighbor) in neighbors.iter().enumerate() {
+            self.emit_edge(src, src_local, neighbor, edge_offset, idx, track);
         }
     }
 
     /// Floyd's O(k) sampling without replacement — pushes directly to edge buffers.
-    /// Uses stack bitmap for n <= 256, reusable HashSet otherwise.
-    fn emit_sample_floyd(&mut self, src: NodeId, neighbors: &[NodeId], k: usize) {
+    /// Uses generation-stamped scratch for n <= 256, reusable HashSet otherwise.
+    fn emit_sample_floyd(
+        &mut self,
+        src: NodeId,
+        src_local: u32,
+        neighbors: &[NodeId],
+        edge_offset: u64,
+        k: usize,
+    ) {
         let n = neighbors.len();
+        let track = self.config.track_edge_ids;
 
-        // Macro to emit an edge, avoiding borrow conflicts with floyd_bitmap/seen_set.
-        macro_rules! emit {
-            ($idx:expr) => {{
-                let neighbor = neighbors[$idx];
-                self.edge_src_buf.push(src);
-                self.edge_dst_buf.push(neighbor);
-                if self.use_direct {
-                    let ni = neighbor as usize;
-                    if self.node_gen[ni] != self.current_gen {
-                        let local = self.node_vec.len() as u32;
-                        self.node_gen[ni] = self.current_gen;
-                        self.node_local_idx[ni] = local;
-                        self.node_vec.push(neighbor);
-                        self.next_frontier.push(neighbor);
-                    }
-                } else {
-                    let next_idx = self.node_vec.len() as u32;
-                    match self.local_index.entry(neighbor) {
-                        std::collections::hash_map::Entry::Occupied(_) => {}
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert(next_idx);
-                            self.node_vec.push(neighbor);
-                            self.next_frontier.push(neighbor);
-                        }
-                    }
-                }
-            }};
-        }
-
-        if self.config.track_edge_ids {
-            let edge_offset = self.graph.edge_offset(src);
-
-            macro_rules! emit_with_eid {
-                ($idx:expr) => {{
-                    let neighbor = neighbors[$idx];
-                    self.edge_src_buf.push(src);
-                    self.edge_dst_buf.push(neighbor);
-                    self.edge_ids_buf.push(edge_offset + $idx as u64);
-                    if self.use_direct {
-                        let ni = neighbor as usize;
-                        if self.node_gen[ni] != self.current_gen {
-                            let local = self.node_vec.len() as u32;
-                            self.node_gen[ni] = self.current_gen;
-                            self.node_local_idx[ni] = local;
-                            self.node_vec.push(neighbor);
-                            self.next_frontier.push(neighbor);
-                        }
-                    } else {
-                        let next_idx = self.node_vec.len() as u32;
-                        match self.local_index.entry(neighbor) {
-                            std::collections::hash_map::Entry::Occupied(_) => {}
-                            std::collections::hash_map::Entry::Vacant(e) => {
-                                e.insert(next_idx);
-                                self.node_vec.push(neighbor);
-                                self.next_frontier.push(neighbor);
-                            }
-                        }
-                    }
-                }};
+        if n <= 256 {
+            // Stamp reuse is a counter bump, not an O(n) clear per node.
+            self.floyd_gen = self.floyd_gen.wrapping_add(1);
+            if self.floyd_gen == 0 {
+                self.floyd_stamp.fill(0);
+                self.floyd_gen = 1;
             }
-
-            if n <= 256 {
-                let bitmap = &mut self.floyd_bitmap[..n];
-                for b in bitmap.iter_mut() {
-                    *b = false;
-                }
-                for i in (n - k)..n {
-                    let s = (i + 1) as u64;
-                    let x = self.rng.next_u32();
-                    let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
-                    if !bitmap[j] {
-                        bitmap[j] = true;
-                        emit_with_eid!(j);
-                    } else {
-                        bitmap[i] = true;
-                        emit_with_eid!(i);
-                    }
-                }
-            } else {
-                self.seen_set.clear();
-                for i in (n - k)..n {
-                    let s = (i + 1) as u64;
-                    let x = self.rng.next_u32();
-                    let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
-                    if self.seen_set.insert(j) {
-                        emit_with_eid!(j);
-                    } else {
-                        self.seen_set.insert(i);
-                        emit_with_eid!(i);
-                    }
-                }
+            let stamp = self.floyd_gen;
+            for i in (n - k)..n {
+                let s = (i + 1) as u64;
+                let x = self.rng.next_u32();
+                let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
+                let pick = if self.floyd_stamp[j] != stamp {
+                    self.floyd_stamp[j] = stamp;
+                    j
+                } else {
+                    self.floyd_stamp[i] = stamp;
+                    i
+                };
+                self.emit_edge(src, src_local, neighbors[pick], edge_offset, pick, track);
             }
         } else {
-            // No edge ID tracking — faster path
-            if n <= 256 {
-                let bitmap = &mut self.floyd_bitmap[..n];
-                for b in bitmap.iter_mut() {
-                    *b = false;
-                }
-                for i in (n - k)..n {
-                    let s = (i + 1) as u64;
-                    let x = self.rng.next_u32();
-                    let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
-                    if !bitmap[j] {
-                        bitmap[j] = true;
-                        emit!(j);
-                    } else {
-                        bitmap[i] = true;
-                        emit!(i);
-                    }
-                }
-            } else {
-                self.seen_set.clear();
-                for i in (n - k)..n {
-                    let s = (i + 1) as u64;
-                    let x = self.rng.next_u32();
-                    let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
-                    if self.seen_set.insert(j) {
-                        emit!(j);
-                    } else {
-                        self.seen_set.insert(i);
-                        emit!(i);
-                    }
-                }
+            self.seen_set.clear();
+            for i in (n - k)..n {
+                let s = (i + 1) as u64;
+                let x = self.rng.next_u32();
+                let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
+                let pick = if self.seen_set.insert(j) {
+                    j
+                } else {
+                    self.seen_set.insert(i);
+                    i
+                };
+                self.emit_edge(src, src_local, neighbors[pick], edge_offset, pick, track);
             }
         }
     }
@@ -1126,8 +1152,7 @@ impl<'a> NeighborSampler<'a> {
 
         // Reuse pre-allocated buffer
         self.weighted_keys.clear();
-        self.weighted_keys
-            .reserve(n.saturating_sub(self.weighted_keys.capacity()));
+        self.weighted_keys.reserve(n);
 
         // Compute keys: key[i] = -ln(u) / w[i], u ~ Uniform(0,1).
         // fast_neg_ln_u64 computes -ln(u) exactly, so the keys are unbiased.
@@ -1187,14 +1212,22 @@ pub struct SampledSubgraph {
     /// Number of edges sampled at each hop (for PyG compatibility)
     pub num_sampled_edges: Vec<usize>,
 
-    /// Local index map: global NodeId → position in `nodes` vec. O(1) lookup.
+    /// Local index map: global NodeId → position in `nodes` vec. Only
+    /// populated for subgraphs built via [`SampledSubgraph::from_parts`]
+    /// (external reconstruction) — sampler-produced subgraphs carry
+    /// pre-computed local indices instead.
     local_index: FxHashMap<NodeId, u32>,
 
     /// Per-node batch assignment (disjoint mode only). Maps each node to its seed index.
     pub batch: Option<Vec<u32>>,
 
-    /// Pre-computed local edge indices (disjoint mode, where local_index has duplicates).
+    /// Pre-computed local edge indices, recorded at emit time during
+    /// sampling. Always present on sampler-produced subgraphs.
     precomputed_local: Option<(Vec<u32>, Vec<u32>)>,
+
+    /// Local indices of the seeds, captured at registration. Present on
+    /// non-disjoint sampler-produced subgraphs.
+    seed_locals: Option<Vec<u32>>,
 }
 
 impl SampledSubgraph {
@@ -1226,6 +1259,7 @@ impl SampledSubgraph {
             local_index,
             batch: None,
             precomputed_local: None,
+            seed_locals: None,
         }
     }
 
@@ -1255,13 +1289,16 @@ impl SampledSubgraph {
 
     /// Compute edge indices with local (remapped) node IDs in [0, num_nodes).
     ///
-    /// Uses O(1) HashMap lookup per edge. No sorting required.
+    /// Sampler-produced subgraphs carry local indices recorded at emit time,
+    /// so this is a zero-copy move; the per-edge HashMap fallback only runs
+    /// for subgraphs reconstructed via [`SampledSubgraph::from_parts`].
     ///
     /// # Errors
     /// Returns an error if any edge endpoint is not found in the local index,
     /// which indicates a bug in the sampling algorithm.
     pub fn edge_index_local(&mut self) -> Result<(Vec<u32>, Vec<u32>), String> {
-        // Fast path: disjoint mode has precomputed local indices — take them (zero-copy move).
+        // Fast path: local indices were recorded during sampling — take them
+        // (zero-copy move).
         if let Some(precomputed) = self.precomputed_local.take() {
             return Ok(precomputed);
         }
@@ -1288,9 +1325,16 @@ impl SampledSubgraph {
     /// Compute local seed indices (position of each seed in the nodes array).
     /// Useful for identifying which nodes in the subgraph were the original seeds.
     ///
+    /// Sampler-produced subgraphs return the indices captured at seed
+    /// registration; the HashMap fallback only runs for subgraphs built via
+    /// [`SampledSubgraph::from_parts`].
+    ///
     /// # Errors
     /// Returns an error if any seed is not found in the local index.
     pub fn seed_indices_local(&self) -> Result<Vec<u32>, String> {
+        if let Some(ref locals) = self.seed_locals {
+            return Ok(locals.clone());
+        }
         self.seeds
             .iter()
             .map(|id| {
@@ -1338,16 +1382,24 @@ impl<'a> ParallelBatchSampler<'a> {
                 .map(|seeds| sampler.sample_neighbors(seeds))
                 .collect()
         } else {
-            // One sampler per Rayon worker (built lazily via map_init), reused
-            // across the batches that thread handles — avoids reallocating the
-            // num_nodes-sized dedup arrays per batch.
-            batches
-                .par_iter()
-                .map_init(
-                    || NeighborSampler::new(self.graph, self.config.clone()),
-                    |sampler, seeds| sampler.sample_neighbors(seeds),
-                )
-                .collect()
+            // One sampler per chunk, processed serially within the chunk.
+            // `map_init` runs its init once per rayon *split* (which
+            // work-stealing multiplies), and each construction allocates and
+            // zeroes the num_nodes-sized dedup array in direct mode; chunking
+            // caps constructions at the thread count while keeping order.
+            let threads = rayon::current_num_threads().max(1);
+            let chunk = batches.len().div_ceil(threads).max(1);
+            let grouped: Vec<Vec<SampledSubgraph>> = batches
+                .par_chunks(chunk)
+                .map(|group| {
+                    let mut sampler = NeighborSampler::new(self.graph, self.config.clone());
+                    group
+                        .iter()
+                        .map(|seeds| sampler.sample_neighbors(seeds))
+                        .collect()
+                })
+                .collect();
+            grouped.into_iter().flatten().collect()
         }
     }
 }

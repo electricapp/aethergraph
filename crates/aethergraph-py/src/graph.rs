@@ -132,17 +132,13 @@ impl PyCsrGraph {
                 dst_slice.len()
             )));
         }
-        let edges: Vec<(u32, u32)> = src_slice
-            .iter()
-            .zip(dst_slice.iter())
-            .map(|(&s, &d)| (s, d))
-            .collect();
         let w = weights.as_ref().map(|w| w.as_slice()).transpose()?;
-        // The O(E) CSR build touches only owned edges plus the numpy-backed
-        // weight slice (kept alive by the readonly guard above); release the
-        // GIL across it.
+        // The O(E) CSR build reads the numpy-backed src/dst/weight slices
+        // directly (kept alive by the readonly guards above) — no
+        // interleaved (src, dst) tuple copy of the edge list is
+        // materialized. Release the GIL across the build.
         let graph = py
-            .detach(|| Graph::from_edges(num_nodes, &edges, w))
+            .detach(|| Graph::from_src_dst(num_nodes, src_slice, dst_slice, w))
             .map_err(|e| graph_load_error(format!("Failed to create graph: {}", e)))?;
         Ok(Self {
             inner: Arc::new(graph),

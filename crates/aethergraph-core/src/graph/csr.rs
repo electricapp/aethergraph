@@ -7,7 +7,6 @@
 //! This layout provides O(1) access to any node's neighbor list and excellent cache locality.
 
 use anyhow::Result;
-use bytemuck::try_cast_slice;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::ops::Range;
@@ -191,7 +190,10 @@ impl Graph {
 
     /// Creates a graph view directly from mmap-backed CSR bytes.
     ///
-    /// Caller must ensure ranges are valid and correctly typed.
+    /// Caller must ensure ranges are valid and correctly typed. Alignment
+    /// and length divisibility are asserted here, once, so the per-call
+    /// slice accessors can reconstruct typed slices without re-validating
+    /// on every `neighbors()` in the sampling hot loop.
     pub(crate) fn from_mapped_parts(
         num_nodes: usize,
         num_edges: usize,
@@ -200,6 +202,28 @@ impl Graph {
         edges_range: Range<usize>,
         weights_range: Option<Range<usize>>,
     ) -> Self {
+        let base = mmap.as_ptr() as usize;
+        assert!(
+            (base + offsets_range.start).is_multiple_of(std::mem::align_of::<EdgeOffset>())
+                && offsets_range
+                    .len()
+                    .is_multiple_of(std::mem::size_of::<EdgeOffset>()),
+            "mmap offsets range misaligned for u64"
+        );
+        assert!(
+            (base + edges_range.start).is_multiple_of(std::mem::align_of::<NodeId>())
+                && edges_range
+                    .len()
+                    .is_multiple_of(std::mem::size_of::<NodeId>()),
+            "mmap edges range misaligned for u32"
+        );
+        if let Some(ref w) = weights_range {
+            assert!(
+                (base + w.start).is_multiple_of(std::mem::align_of::<f32>())
+                    && w.len().is_multiple_of(std::mem::size_of::<f32>()),
+                "mmap weights range misaligned for f32"
+            );
+        }
         Self {
             num_nodes,
             num_edges,
@@ -228,68 +252,100 @@ impl Graph {
         edges: &[(NodeId, NodeId)],
         weights: Option<&[f32]>,
     ) -> Result<Self> {
+        Self::build_csr(
+            num_nodes,
+            edges.len(),
+            |i| edges[i].0,
+            |i| edges[i].1,
+            weights,
+        )
+    }
+
+    /// Creates a new CSR graph from separate source and destination arrays.
+    ///
+    /// Structure-of-arrays entry point for callers that already hold `src`
+    /// and `dst` as parallel arrays (numpy bindings, columnar imports) — it
+    /// avoids materializing an interleaved `(src, dst)` tuple copy of the
+    /// whole edge list before the build.
+    pub fn from_src_dst(
+        num_nodes: usize,
+        src: &[NodeId],
+        dst: &[NodeId],
+        weights: Option<&[f32]>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            src.len() == dst.len(),
+            "src length {} doesn't match dst length {}",
+            src.len(),
+            dst.len()
+        );
+        Self::build_csr(num_nodes, src.len(), |i| src[i], |i| dst[i], weights)
+    }
+
+    /// Shared counting-sort CSR builder over an indexed edge accessor.
+    ///
+    /// Degree counting uses one shared array of relaxed atomic counters:
+    /// O(V) memory total, where per-chunk local counts would be
+    /// O(V x threads) (1.28 GB of temporaries for a 10M-node graph on 16
+    /// threads) plus an O(V x threads) reduce.
+    fn build_csr(
+        num_nodes: usize,
+        num_edges: usize,
+        src_at: impl Fn(usize) -> NodeId + Sync,
+        dst_at: impl Fn(usize) -> NodeId + Sync,
+        weights: Option<&[f32]>,
+    ) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
         trace!(
             "Building CSR graph: {} nodes, {} edges",
-            num_nodes,
-            edges.len()
+            num_nodes, num_edges
         );
 
         if let Some(w) = weights {
             anyhow::ensure!(
-                w.len() == edges.len(),
+                w.len() == num_edges,
                 "weights length {} doesn't match edges length {}",
                 w.len(),
-                edges.len()
+                num_edges
             );
         }
 
-        let num_edges = edges.len();
-
-        // Count outgoing edges per node (parallel for large graphs)
-        let degree = if num_edges > 100_000 {
-            // Parallel degree counting for HPC workloads
-            let chunk_size = (num_edges / rayon::current_num_threads()).max(10_000);
-
-            edges
-                .par_chunks(chunk_size)
-                .map(|chunk| {
-                    let mut local_degree = vec![0u64; num_nodes];
-                    for &(src, _) in chunk {
-                        if (src as usize) < num_nodes {
-                            local_degree[src as usize] += 1;
-                        }
-                    }
-                    local_degree
-                })
-                .reduce(
-                    || vec![0u64; num_nodes],
-                    |mut a, b| {
-                        for (i, &count) in b.iter().enumerate() {
-                            a[i] += count;
-                        }
-                        a
-                    },
-                )
+        // Validate all source nodes up front so the counting pass is
+        // branch-free on the bounds.
+        let parallel = num_edges > 100_000;
+        let all_src_valid = if parallel {
+            (0..num_edges)
+                .into_par_iter()
+                .all(|i| (src_at(i) as usize) < num_nodes)
         } else {
-            // Sequential for small graphs (less overhead)
-            let mut degree = vec![0u64; num_nodes];
-            for &(src, _) in edges {
-                if (src as usize) < num_nodes {
-                    degree[src as usize] += 1;
-                }
-            }
-            degree
+            (0..num_edges).all(|i| (src_at(i) as usize) < num_nodes)
         };
-
-        // Validate all source nodes
-        for &(src, _) in edges {
-            anyhow::ensure!(
-                (src as usize) < num_nodes,
+        if !all_src_valid {
+            let bad = (0..num_edges)
+                .find(|&i| (src_at(i) as usize) >= num_nodes)
+                .expect("a source failed validation");
+            anyhow::bail!(
                 "source node {} exceeds num_nodes {}",
-                src,
+                src_at(bad),
                 num_nodes
             );
         }
+
+        // Count outgoing edges per node.
+        let degree: Vec<u64> = if parallel {
+            let counters: Vec<AtomicU64> = (0..num_nodes).map(|_| AtomicU64::new(0)).collect();
+            (0..num_edges).into_par_iter().for_each(|i| {
+                counters[src_at(i) as usize].fetch_add(1, Ordering::Relaxed);
+            });
+            counters.into_iter().map(AtomicU64::into_inner).collect()
+        } else {
+            let mut degree = vec![0u64; num_nodes];
+            for i in 0..num_edges {
+                degree[src_at(i) as usize] += 1;
+            }
+            degree
+        };
 
         // Build offsets using prefix sum
         let mut offsets: Vec<EdgeOffset> = Vec::with_capacity(num_nodes + 1);
@@ -306,9 +362,12 @@ impl Graph {
         let mut csr_edges = vec![0; num_edges];
         let mut csr_weights = weights.map(|_| vec![0.0; num_edges]);
 
-        // Fill edges using offsets as insertion cursors
+        // Fill edges using offsets as insertion cursors. Serial: per-source
+        // arrival order of neighbors is part of the observable layout.
         let mut cursors = offsets[..num_nodes].to_vec();
-        for (edge_idx, &(src, dst)) in edges.iter().enumerate() {
+        for edge_idx in 0..num_edges {
+            let src = src_at(edge_idx);
+            let dst = dst_at(edge_idx);
             anyhow::ensure!(
                 (dst as usize) < num_nodes,
                 "destination node {} exceeds num_nodes {}",
@@ -669,8 +728,17 @@ impl Graph {
                 ..
             } => {
                 let bytes = &mmap[offsets_range.start..offsets_range.end];
-                try_cast_slice::<u8, EdgeOffset>(bytes)
-                    .expect("internal invariant: validated mmap offsets alignment")
+                // SAFETY: alignment and length divisibility were asserted
+                // once in `from_mapped_parts`; the mmap is immutable and
+                // outlives `self` via the Arc. Re-checking per call would
+                // put an alignment test and division in the sampler's
+                // per-node path.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        bytes.as_ptr() as *const EdgeOffset,
+                        bytes.len() / std::mem::size_of::<EdgeOffset>(),
+                    )
+                }
             }
         }
     }
@@ -683,8 +751,13 @@ impl Graph {
                 mmap, edges_range, ..
             } => {
                 let bytes = &mmap[edges_range.start..edges_range.end];
-                try_cast_slice::<u8, NodeId>(bytes)
-                    .expect("internal invariant: validated mmap edges alignment")
+                // SAFETY: see `offsets_slice` — validated at construction.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        bytes.as_ptr() as *const NodeId,
+                        bytes.len() / std::mem::size_of::<NodeId>(),
+                    )
+                }
             }
         }
     }
@@ -699,8 +772,13 @@ impl Graph {
                 ..
             } => weights_range.as_ref().map(|range| {
                 let bytes = &mmap[range.start..range.end];
-                try_cast_slice::<u8, f32>(bytes)
-                    .expect("internal invariant: validated mmap weights alignment")
+                // SAFETY: see `offsets_slice` — validated at construction.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        bytes.as_ptr() as *const f32,
+                        bytes.len() / std::mem::size_of::<f32>(),
+                    )
+                }
             }),
         }
     }
