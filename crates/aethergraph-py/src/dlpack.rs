@@ -6,7 +6,6 @@
 
 use pyo3::ffi as pyffi;
 use pyo3::prelude::*;
-use std::ffi::CString;
 use std::os::raw::c_void;
 
 // DLPack ABI constants (dlpack.h v0.8)
@@ -203,16 +202,17 @@ pub fn create_dlpack_capsule(
 ) -> PyResult<Py<PyAny>> {
     let managed_ptr = build_managed_tensor(ptr, num_nodes, feature_dim, gpu_id);
 
-    // Create PyCapsule with name "dltensor" (required by DLPack spec)
-    let name = CString::new("dltensor").unwrap();
+    // Create PyCapsule with name "dltensor" (required by DLPack spec).
+    // PyCapsule_New stores the name *pointer*, not a copy, and consumers
+    // strcmp it for the capsule's whole lifetime — the name must be 'static.
     // SAFETY: PyCapsule_New requires the GIL, which `Python<'_>` proves.
-    // `name` outlives the call. The destructor frees the managed tensor if the
-    // capsule is dropped without being consumed; a consumer (torch.from_dlpack)
-    // renames the capsule and takes over the DLPack `deleter` itself.
+    // The destructor frees the managed tensor if the capsule is dropped
+    // without being consumed; a consumer (torch.from_dlpack) renames the
+    // capsule and takes over the DLPack `deleter` itself.
     let raw = unsafe {
         pyffi::PyCapsule_New(
             managed_ptr as *mut c_void,
-            name.as_ptr(),
+            c"dltensor".as_ptr(),
             Some(dlpack_capsule_destructor),
         )
     };

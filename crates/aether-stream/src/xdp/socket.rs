@@ -255,16 +255,16 @@ fn getsockopt_mmap_offsets(fd: i32) -> std::io::Result<XdpMmapOffsets> {
 
 /// mmap a single ring region.
 ///
-/// Ring size in bytes = offsets.desc + ring_size * sizeof(descriptor) + padding.
-/// We over-allocate to be safe — the kernel will only map what's needed.
+/// Ring size in bytes = offsets.desc + ring_size * sizeof(descriptor). The
+/// kernel rejects (EINVAL) any request larger than the ring's page-aligned
+/// allocation, so the size must be exact — no defensive padding.
 unsafe fn mmap_ring<T>(
     fd: i32,
     offsets: &super::rings::XdpRingOffset,
     ring_size: u32,
     pgoff: u64,
 ) -> std::io::Result<MmapRegion> {
-    // Conservative size: desc offset + ring entries + some extra for producer/consumer/flags
-    let mmap_size = offsets.desc as usize + (ring_size as usize) * std::mem::size_of::<T>() + 4096;
+    let mmap_size = offsets.desc as usize + (ring_size as usize) * std::mem::size_of::<T>();
 
     // SAFETY: `fd` is the AF_XDP socket; `pgoff` selects a kernel-known ring
     // region whose size is at most `mmap_size`.

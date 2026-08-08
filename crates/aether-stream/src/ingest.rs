@@ -99,10 +99,15 @@ pub fn ingest_loop(
                 continue;
             }
 
+            // `desc.addr` points at the packet data itself, which the kernel
+            // places at an offset inside the chunk (XDP headroom). Keep that
+            // offset — the chunk base holds stale bytes, not the packet.
+            let offset_in_frame = (desc.addr % umem.frame_size() as u64) as usize;
             let frame = InboundFrame {
                 umem_idx: frame_idx,
                 len: desc.len,
-                data: umem.frame_ptr(frame_idx),
+                // SAFETY: bounds-checked above; offset_in_frame < frame_size.
+                data: unsafe { umem.frame_ptr(frame_idx).add(offset_in_frame) },
             };
 
             // If channel is full/disconnected, release frame back

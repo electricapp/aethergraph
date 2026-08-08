@@ -237,6 +237,9 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
         // after the test body to trigger that.
         ingest_loop(&mut socket, &umem_for_ingest, &tx_for_ingest, &config);
     });
+    // Let the ingest thread run its initial FILL-ring pass before frames
+    // start arriving; anything redirected before that is silently dropped.
+    std::thread::sleep(Duration::from_millis(50));
 
     // ── inject 100 frames from veth-tx ──────────────────────────────────────
     let mut expected: Vec<[f32; FEATURE_DIM]> = Vec::with_capacity(NUM_PACKETS);
@@ -258,11 +261,16 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
         };
         send_frame(raw_fd, rx_mac, tx_mac, bytes).expect("send_frame");
         expected.push(feats);
+        // Copy-mode AF_XDP has no backpressure: a full-rate burst overruns
+        // the FILL ring and drops frames. Pace to what the ring absorbs.
+        std::thread::sleep(Duration::from_micros(500));
     }
 
     // ── drain the ingest channel and populate the FeatureTable ──────────────
     let table_for_reader = Arc::clone(&table);
     let mut received = 0usize;
+    let mut parse_failures = 0usize;
+    let start = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(5);
     while received < NUM_PACKETS && Instant::now() < deadline {
         match rx_chan.recv_timeout(Duration::from_millis(200)) {
@@ -271,7 +279,19 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
                     if (node as usize) < NUM_PACKETS {
                         table_for_reader.write_node(node as usize, &feats);
                         received += 1;
+                        eprintln!(
+                            "[{:>7.3}s] frame node={node} len={} ({received}/{NUM_PACKETS})",
+                            start.elapsed().as_secs_f64(),
+                            frame.len
+                        );
                     }
+                } else {
+                    parse_failures += 1;
+                    eprintln!(
+                        "[{:>7.3}s] parse failure len={} (total {parse_failures})",
+                        start.elapsed().as_secs_f64(),
+                        frame.len
+                    );
                 }
                 umem.release_frame(frame.umem_idx);
             }
