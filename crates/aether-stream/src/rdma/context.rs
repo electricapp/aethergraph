@@ -187,9 +187,46 @@ impl RdmaContext {
     /// fails with EBUSY at context drop). Storing it in the same struct as the
     /// context, declared *before* the context field, gives the right Drop order
     /// (Rust drops fields in declaration order).
-    pub fn reg_mr(&self, addr: *mut u8, len: usize, access: i32) -> io::Result<RegisteredMr> {
+    ///
+    /// # Safety
+    /// `[addr, addr + len)` must be a valid, registerable memory range, and it
+    /// must remain valid — not freed, unmapped, or repurposed — until the
+    /// returned `RegisteredMr` is dropped AND every in-flight work request
+    /// referencing its lkey/rkey has completed. The MR holds no lifetime tie
+    /// to the buffer; once the region is advertised, remote peers can DMA
+    /// into/out of it, so violating this contract is remote reads/writes of
+    /// freed memory.
+    pub unsafe fn reg_mr(
+        &self,
+        addr: *mut u8,
+        len: usize,
+        access: i32,
+    ) -> io::Result<RegisteredMr> {
         // SAFETY: `self.pd` is alive; `addr/len/access` are the caller's contract.
         let mr = unsafe { ibv_reg_mr(self.pd, addr as *mut libc::c_void, len, access) };
+        if mr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(RegisteredMr { mr })
+    }
+
+    /// Register a dma-buf region for RDMA access.
+    ///
+    /// `offset`/`len` locate the region inside the dma-buf identified by
+    /// `fd`; `iova` is the address the MR's range starts at for work
+    /// requests (pass the CUDA device VA so existing address arithmetic
+    /// keeps working). The fd may be closed after this returns — the MR
+    /// holds its own reference. Same Drop-order contract as [`Self::reg_mr`].
+    pub fn reg_mr_dmabuf(
+        &self,
+        fd: i32,
+        offset: u64,
+        len: usize,
+        iova: u64,
+        access: i32,
+    ) -> io::Result<RegisteredMr> {
+        // SAFETY: `self.pd` is alive; `fd/offset/len` are the caller's contract.
+        let mr = unsafe { super::ffi::ibv_reg_dmabuf_mr(self.pd, offset, len, iova, fd, access) };
         if mr.is_null() {
             return Err(io::Error::last_os_error());
         }

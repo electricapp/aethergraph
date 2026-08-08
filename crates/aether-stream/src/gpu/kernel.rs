@@ -1,10 +1,11 @@
 //! CUDA seqlock validation and feature compaction kernel.
 //!
-//! After RDMA READs land in the VRAM staging buffer, this kernel
-//! runs on the GPU to:
-//! 1. Validate head == tail && head % 2 == 0 (consistent read)
-//! 2. Compact valid features into a contiguous output tensor
-//! 3. Mark torn reads for CPU-initiated retry
+//! After both snapshot READ rounds land in the VRAM staging regions, this
+//! kernel runs on the GPU to:
+//! 1. Cross-validate the two snapshots of each slot: versions must all
+//!    match (even, nonzero) and the payload bytes must be identical
+//! 2. Compact valid features (from snapshot 1) into a contiguous output tensor
+//! 3. Mark inconsistent rows for CPU-initiated retry of both snapshots
 //!
 //! The CUDA source lives in `validate_and_compact.cu` alongside this file.
 
@@ -63,23 +64,20 @@ impl SeqlockValidator {
         })
     }
 
-    /// Launch validation kernel against a raw VRAM staging pointer. Returns
-    /// the number of slots the kernel flagged for retry.
+    /// Launch validation kernel against two raw VRAM staging pointers.
+    /// Returns the number of slots the kernel flagged for retry.
     ///
-    /// `staging_ptr` points to `batch_size` consecutive slots of `slot_size`
-    /// bytes each. Caller owns the buffer's lifetime. This intentionally does
-    /// not take a `GpuGatherBuffer` so that CUDA-only tests can exercise the
-    /// kernel without an RDMA-registered MR.
-    ///
-    /// `epoch_version`: MVCC epoch pin. Pass 0 to accept any consistent read.
-    /// Pass a non-zero version to reject features written after that version
-    /// (for epoch-stable training — features don't change mid-epoch).
+    /// `staging1_ptr` and `staging2_ptr` each point to `batch_size`
+    /// consecutive slots of `slot_size` bytes — the two sequential snapshots
+    /// of the same remote rows. Caller owns the buffers' lifetimes. This
+    /// intentionally does not take a `GpuGatherBuffer` so that CUDA-only
+    /// tests can exercise the kernel without an RDMA-registered MR.
     pub fn validate(
         &mut self,
-        staging_ptr: u64,
+        staging1_ptr: u64,
+        staging2_ptr: u64,
         slot_size: usize,
         batch_size: usize,
-        epoch_version: u64,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         if batch_size > self.max_batch_size {
             return Err(format!(
@@ -109,14 +107,14 @@ impl SeqlockValidator {
         unsafe {
             self.stream
                 .launch_builder(&self.func)
-                .arg(&staging_ptr)
+                .arg(&staging1_ptr)
+                .arg(&staging2_ptr)
                 .arg(&mut self.output)
                 .arg(&mut self.retry_mask)
                 .arg(&mut self.retry_count)
                 .arg(&feature_dim)
                 .arg(&batch_size_i32)
                 .arg(&slot_size_i32)
-                .arg(&epoch_version)
                 .launch(cfg)?;
         }
 
@@ -158,8 +156,12 @@ impl SeqlockValidator {
         &self,
         batch_size: usize,
     ) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+        // `retry_mask` is allocated at max_batch_size; only the first
+        // `batch_size` entries belong to this gather. Copy exactly those —
+        // the D2H copy requires dst.len() >= src.len().
         let mut mask = vec![0i32; batch_size];
-        self.stream.memcpy_dtoh(&self.retry_mask, &mut mask)?;
+        self.stream
+            .memcpy_dtoh(&self.retry_mask.slice(0..batch_size), &mut mask)?;
         Ok(mask
             .iter()
             .enumerate()

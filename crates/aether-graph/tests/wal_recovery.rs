@@ -83,26 +83,51 @@ fn panicked_writer_leaves_no_records_in_wal() {
             let mut w = g2.writer().unwrap();
             w.insert_edge(0, 1).unwrap();
             w.insert_edge(2, 3).unwrap();
-            // Simulate a crash mid-batch — the writer is poisoned on drop
-            // and the WAL is NOT synced. The in-memory state still shows
-            // the edges (they were inserted), but the WAL has not been
-            // fsynced, so a clean process restart would not see them.
+            // Simulate a crash mid-batch — the poisoned drop discards
+            // the guard's buffered records instead of flushing them.
             panic!("simulated crash mid-batch");
         }));
+        assert!(g.is_poisoned(), "panicked writer must poison the graph");
+        assert!(
+            g.writer().is_err(),
+            "poisoned graph must not hand out writers"
+        );
     }
 
-    // Verify: WAL should be syntactically valid (header is durable from
-    // creation) but contain zero records, because no clean drop fsynced.
-    // NOTE: This test is sensitive to BufWriter's behavior — records
-    // *may* have been written to the OS page cache and only fail to be
-    // fsynced. On a real crash the page cache would also be lost; in
-    // this test the file is local so the page cache survives.
-    //
-    // What we CAN assert: the graph is poisoned, so future writer()
-    // calls fail. That's the production-facing guarantee.
+    // The guard never committed, so its records must not be in the log.
+    // Both records were still in the WalWriter's buffer (well under its
+    // capacity) when the panic hit; the poisoned drop discarded them, so
+    // nothing reaches the file even via the WalWriter's drop-time flush.
+    // (Records a guard already spilled past the buffer to the OS would
+    // be out of reach — discard is best-effort at the buffer boundary.)
+    let mut count = 0u64;
+    let outcome = replay_wal(&path, |_| count += 1).unwrap();
+    assert_eq!(
+        outcome.applied, 0,
+        "panicked guard's records must not persist"
+    );
+    assert_eq!(count, 0);
+    assert!(outcome.truncate_to.is_none());
+
     let g = DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
-    let _ = g; // built without error; further inserts allowed on fresh
-    // graph. The poison was per-instance, not per-WAL.
+    assert_eq!(g.num_edges(), 0, "recovery must see an empty log");
+}
+
+#[test]
+fn second_graph_on_same_wal_path_is_rejected_while_locked() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    let g1 = DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
+    match DynamicGraph::open_with_wal(&path, 16, 1 << 20) {
+        Err(WalError::Locked) => {}
+        Err(other) => panic!("expected Locked, got {other:?}"),
+        Ok(_) => panic!("expected Locked, got a second live graph"),
+    }
+
+    // Dropping the graph closes the WAL file and releases the lock.
+    drop(g1);
+    DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
 }
 
 #[test]

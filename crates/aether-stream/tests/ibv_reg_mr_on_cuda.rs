@@ -1,15 +1,17 @@
-//! `ibv_reg_mr` on a CUDA device pointer.
+//! Registering a CUDA device pointer with the HCA.
 //!
-//! Registers 1 MiB of VRAM with the HCA and asserts the returned MR has
-//! non-zero `lkey` / `rkey`. This call only succeeds when `nvidia-peermem`
-//! (or an equivalent peer-memory module) is loaded and the HCA supports
-//! GPUDirect — it's the cheapest signal that GPUDirect is actually wired
-//! up on a host that has CUDA and ibverbs individually working.
+//! Registers 1 MiB of VRAM via `reg_mr_cuda` — nvidia-peermem
+//! (`ibv_reg_mr` on the device VA) with a dma-buf fallback
+//! (`ibv_reg_dmabuf_mr`) — and asserts the returned MR has non-zero
+//! `lkey` / `rkey`. This is the cheapest signal that GPUDirect is
+//! actually wired up on a host that has CUDA and ibverbs individually
+//! working.
 //!
 //! Skipped automatically if either RDMA or CUDA is missing.
 
 #![cfg(all(target_os = "linux", feature = "rdma", feature = "gpudirect"))]
 
+use aether_stream::gpu::buffer::reg_mr_cuda;
 use aether_stream::rdma::context::RdmaContext;
 use aether_stream::rdma::ffi::IBV_ACCESS_LOCAL_WRITE;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtrMut};
@@ -39,17 +41,18 @@ fn ibv_reg_mr_on_cuda_device_pointer() {
         p as u64
     };
 
-    // The critical call: register VRAM with the HCA. This only succeeds when
-    // `nvidia-peermem` (or equivalent peer-memory module) is loaded and the
-    // device/HCA pair supports GPUDirect.
-    let mr = match rdma_ctx.reg_mr(vram_ptr as *mut u8, size, IBV_ACCESS_LOCAL_WRITE) {
+    // The critical call: register VRAM with the HCA. Succeeds via
+    // nvidia-peermem on bare metal, or via the dma-buf fallback under
+    // IOMMU-mediated virtualization (driver ≥ 515, rdma-core ≥ v34).
+    // SAFETY: `vram` is a live CUDA allocation held for the whole test; the
+    // MR is dropped explicitly before `vram` goes out of scope.
+    let mr = match unsafe { reg_mr_cuda(&rdma_ctx, vram_ptr, size, IBV_ACCESS_LOCAL_WRITE) } {
         Ok(mr) => mr,
         Err(e) => {
-            // The single most likely cause on a misconfigured box. Surface it
-            // explicitly so the failure tells the operator what to fix.
             panic!(
-                "ibv_reg_mr on CUDA pointer failed: {e}\n\
-                 hint: `sudo modprobe nvidia-peermem` and check `dmesg | grep peermem`"
+                "CUDA MR registration failed on both peermem and dmabuf paths: {e}\n\
+                 hint: `sudo modprobe nvidia-peermem`; for the dmabuf path the \
+                 open-flavor NVIDIA kernel modules and rdma-core ≥ v34 are required"
             );
         }
     };

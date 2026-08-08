@@ -48,13 +48,16 @@ fn build_loopback() -> Loopback {
     let feats: Vec<f32> = (0..8).map(|i| i as f32 + 1.0).collect();
     table.write_node(3, &feats);
     let schema = table.schema();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `table` owns the registered range and outlives `server_mr`
+    // (both stored in the loopback bundle; MR field drops first).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
     let server_rkey = server_mr.rkey();
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).expect("server qp");
 
@@ -117,10 +120,13 @@ fn mr_on_main_post_on_worker() {
     let mut buf = vec![0u8; lb.slot_size];
     let buf_ptr = buf.as_mut_ptr();
     let buf_len = buf.len();
-    let mr = lb
-        .client_ctx
-        .reg_mr(buf_ptr, buf_len, IBV_ACCESS_LOCAL_WRITE)
-        .expect("client reg_mr on main");
+    // SAFETY: `buf` and `mr` move into the worker together; the READ is
+    // drained inside the closure before either drops.
+    let mr = unsafe {
+        lb.client_ctx
+            .reg_mr(buf_ptr, buf_len, IBV_ACCESS_LOCAL_WRITE)
+    }
+    .expect("client reg_mr on main");
     let lkey = mr.lkey();
     eprintln!("[A] main-registered: buf_ptr={buf_ptr:p} lkey={lkey} len={buf_len}");
 
@@ -188,8 +194,9 @@ fn mr_on_worker_post_on_worker() {
     let result = thread::spawn(move || -> Result<Vec<u8>, String> {
         let mut buf = vec![0u8; slot_size];
         let buf_ptr = buf.as_mut_ptr();
-        let mr = client_ctx
-            .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
+        // SAFETY: `buf` outlives `mr` in this closure and the READ is
+        // drained before either drops.
+        let mr = unsafe { client_ctx.reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE) }
             .map_err(|e| format!("reg_mr: {e}"))?;
         let lkey = mr.lkey();
         let read = RdmaRead {
@@ -234,10 +241,13 @@ fn mr_on_main_post_on_main() {
     let lb = build_loopback();
     let mut buf = vec![0u8; lb.slot_size];
     let buf_ptr = buf.as_mut_ptr();
-    let mr = lb
-        .client_ctx
-        .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
-        .expect("reg_mr");
+    // SAFETY: `buf` owns the registered range and outlives `mr`; the READ
+    // is drained by `post_and_wait` below before either drops.
+    let mr = unsafe {
+        lb.client_ctx
+            .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
+    }
+    .expect("reg_mr");
     let lkey = mr.lkey();
     let read = RdmaRead {
         local_addr: buf_ptr as u64,
@@ -268,10 +278,13 @@ fn mr_on_main_touched_by_worker_then_post_on_main() {
     let lb = build_loopback();
     let mut buf = vec![0u8; lb.slot_size];
     let buf_ptr = buf.as_mut_ptr();
-    let mr = lb
-        .client_ctx
-        .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
-        .expect("reg_mr");
+    // SAFETY: `buf` owns the registered range and outlives `mr`; the READ
+    // is drained by `post_and_wait` below before either drops.
+    let mr = unsafe {
+        lb.client_ctx
+            .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
+    }
+    .expect("reg_mr");
     let lkey = mr.lkey();
 
     // Touch from worker thread.

@@ -4,50 +4,12 @@ Outstanding test work only. Delete rows from these tables as they land.
 
 ## Status
 
-| ID  | What                                  | Code written? | Blocker to run                                    |
-| --- | ------------------------------------- | ------------- | ------------------------------------------------- |
-| R5  | GPUDirect tests (T2.4 e2e, T3.1–T3.5) | Yes           | Bare-metal GPU + RDMA NIC (peermem fails in VMs)  |
-| R6  | T4.3 Ray Data multi-GPU               | Yes           | ≥2 GPUs (Modal `gpu="T4:2"` suffices)             |
+| ID  | What                    | Code written? | Blocker to run                        |
+| --- | ----------------------- | ------------- | ------------------------------------- |
+| R6  | T4.3 Ray Data multi-GPU | Yes           | ≥2 GPUs (Modal `gpu="T4:2"` suffices) |
 
 All test code is written and gated. What's left is _running_ it on the right
 hardware.
-
----
-
-## R5 — GPUDirect tests (T2.4 e2e, T3.1–T3.5)
-
-Every test here registers CUDA memory with `ibv_reg_mr`, which needs a working
-nvidia-peermem peer-memory path. Inside VMs (KVM GPU passthrough), that
-registration fails with `EFAULT` even when `nvidia_peermem` is loaded against
-a MOFED `ib_core` — the driver's p2p page path requires bare metal, and the
-failed peer-client registration leaves no dmesg trace. Two unblockers:
-
-- Hourly bare-metal GPU + ConnectX (Voltage Park, Latitude.sh, Vultr bare
-  metal) — runs the tests as written.
-- A dmabuf registration path (`ibv_reg_dmabuf_mr` +
-  `cuMemGetHandleForAddressRange`) — the VM-friendly modern API, but a new
-  code path in `aether-stream`, not just a test run.
-
-```bash
-cargo test --release -p aether-stream --features "rdma gpudirect" -- --nocapture
-cargo test --release -p aether-stream --features "rdma gpudirect" \
-    --test gpudirect_latency -- --ignored --nocapture
-cd python && uv run pytest tests/test_rdma_feature_source.py \
-    tests/test_rdma_live_training.py -v
-```
-
-| ID   | File                                                       | Notes       |
-| ---- | ---------------------------------------------------------- | ----------- |
-| T2.4 | `python/tests/test_rdma_feature_source.py`                 | e2e layer   |
-| T3.1 | `crates/aether-stream/tests/ibv_reg_mr_on_cuda.rs`         |             |
-| T3.2 | `crates/aether-stream/tests/gpudirect_loopback.rs`         |             |
-| T3.3 | `crates/aether-stream/tests/gpudirect_torn_read_stress.rs` |             |
-| T3.4 | `crates/aether-stream/tests/gpudirect_latency.rs`          | `#[ignore]` |
-| T3.5 | `python/tests/test_rdma_live_training.py`                  |             |
-
-T2.4 and T3.5 spawn `cargo run -p aether-stream --example rdma_feature_server`
-as a subprocess and read its `READY port=<…>` line to synchronize; T3.5 sets
-`--live-rate` so the server overwrites features while training runs.
 
 ---
 
@@ -84,7 +46,7 @@ single-worker baseline.
 | EFA needs SG self-reference on ingress AND egress | A generic egress `0.0.0.0/0` silently drops EFA                                                                             |
 | `cargo test -p ... -p ...` shares compile         | One crate's build failure cancels sibling test runs mid-build                                                               |
 | `xdp_bpf` feature needs `clang` + `libbpf-dev`    | `build.rs` invokes clang with `--target=bpf` to compile the redirect program                                                |
-| `ibv_reg_mr` on CUDA VAs EFAULTs in VMs           | nvidia-peermem loads cleanly but its peer-client registration silently does nothing; bare metal required                    |
+| `ibv_reg_mr` on CUDA VAs EFAULTs in VMs           | nvidia-peermem needs bare metal; `reg_mr_cuda` falls back to dma-buf (`ibv_reg_dmabuf_mr`, needs rdma-core ≥ v34, driver ≥ 515) |
 | auditwheel-bundled libibverbs sees 0 devices      | Bundled lib can't load the mlx5 provider plugin — build the extension with `maturin develop` so it links system libibverbs  |
 | torch wheel CUDA flavor must match the driver     | e.g. driver 570 = CUDA 12.8 → install `+cu128` wheels from `download.pytorch.org/whl/cu128`                                 |
 

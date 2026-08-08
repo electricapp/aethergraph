@@ -30,8 +30,8 @@ pub use graph::{
 };
 pub use loader::{
     HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig, NeighborLoader,
-    NeighborSampler, ParallelBatchSampler, PrefetchStats, SampledSubgraph, SamplingConfig,
-    SubgraphType, SyncFeatureStore, TemporalSamplingError, TemporalStrategy,
+    NeighborSampler, ParallelBatchSampler, PrefetchError, PrefetchStats, SampledSubgraph,
+    SamplingConfig, SubgraphType, SyncFeatureStore, TemporalSamplingError, TemporalStrategy,
 };
 
 // Feature store exports (needed for file-backed features)

@@ -378,6 +378,22 @@ impl Graph {
         (offsets[idx + 1].saturating_sub(offsets[idx])) as usize
     }
 
+    /// Returns the degree of every node in one pass over the offsets array.
+    ///
+    /// Equivalent to calling [`Graph::degree`] for each node in
+    /// `0..num_nodes`, but amortizes the per-call overhead — useful for FFI
+    /// callers that would otherwise cross the boundary once per node.
+    ///
+    /// # Performance
+    /// O(num_nodes) - a single sequential scan over the (possibly mmap'd)
+    /// offsets array.
+    pub fn degrees(&self) -> Vec<u32> {
+        self.offsets_slice()
+            .windows(2)
+            .map(|w| w[1].saturating_sub(w[0]) as u32)
+            .collect()
+    }
+
     /// Returns the neighbor IDs for a given node as a slice.
     ///
     /// # Performance
@@ -725,6 +741,21 @@ mod tests {
         assert_eq!(graph.neighbors(2), empty);
 
         graph.validate().unwrap();
+    }
+
+    #[test]
+    fn test_degrees_bulk() {
+        let edges = vec![(0, 1), (0, 2), (1, 2), (3, 0)];
+        let graph = Graph::from_edges(4, &edges, None).unwrap();
+
+        assert_eq!(graph.degrees(), vec![2, 1, 0, 1]);
+        let per_node: Vec<u32> = (0..graph.num_nodes() as NodeId)
+            .map(|n| graph.degree(n) as u32)
+            .collect();
+        assert_eq!(graph.degrees(), per_node);
+
+        let empty = Graph::from_edges(0, &[], None).unwrap();
+        assert!(empty.degrees().is_empty());
     }
 
     #[test]

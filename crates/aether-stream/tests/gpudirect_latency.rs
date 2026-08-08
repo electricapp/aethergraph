@@ -87,13 +87,16 @@ fn gpudirect_latency_profile() {
         let feats: Vec<f32> = (0..FEATURE_DIM).map(|i| (node * 7 + i) as f32).collect();
         server_table.write_node(node, &feats);
     }
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `server_table` owns the registered range and outlives
+    // `server_mr` (dropped explicitly at end of test, before the table).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             server_table.base_addr() as *mut u8,
             server_table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
     let adv = RdmaAdvertisement {
         base_addr: server_table.base_addr(),
         rkey: server_mr.rkey(),
@@ -137,13 +140,13 @@ fn gpudirect_latency_profile() {
 
     // Warmup: lets the validator's CUDA module fully resident, MR cache primed.
     for nids in batches.iter().take(WARMUP) {
-        client.gather(nids, 0).expect("warmup gather");
+        client.gather(nids).expect("warmup gather");
     }
 
     let mut samples = Vec::with_capacity(ITERS);
     for nids in batches.iter().skip(WARMUP).take(ITERS) {
         let t0 = Instant::now();
-        client.gather(nids, 0).expect("gather");
+        client.gather(nids).expect("gather");
         let elapsed = t0.elapsed();
         samples.push(elapsed.as_nanos() as u64 / 1_000); // µs
     }

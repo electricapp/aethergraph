@@ -120,6 +120,7 @@ impl CTree {
     /// Collect all neighbors into a pre-allocated buffer.
     #[inline]
     pub fn collect_into(&self, arena: &Arena, buf: &mut Vec<u32>) {
+        buf.reserve(self.count(arena));
         self.for_each_chunk(arena, |chunk| {
             buf.extend_from_slice(chunk.as_slice());
         });
@@ -211,7 +212,12 @@ impl CTree {
         let mut depth = 0usize;
         let mut cur = self.root;
         while !is_leaf(cur) {
-            assert!(depth < MAX_DEPTH, "C-tree exceeded MAX_DEPTH");
+            // A path this deep only exists when rebalances have been
+            // failing for lack of arena space (see the rebalance-failure
+            // note below), so report the root cause rather than panic.
+            if depth >= MAX_DEPTH {
+                return InsertResult::ArenaFull;
+            }
             // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
             let node: &Interior = unsafe { arena.get(strip_tag(cur)) };
             path[depth] = cur;
@@ -288,7 +294,9 @@ impl CTree {
         // α-height bound, rebuild the highest α-weight-unbalanced node on
         // it. If the rebuild allocation fails we still return the (valid,
         // temporarily too-deep) new tree — the element is inserted either
-        // way and a later insert retries the rebalance.
+        // way and a later insert retries the rebalance. Repeated failures
+        // can only deepen the tree to MAX_DEPTH: the descent above returns
+        // `ArenaFull` past that, so depth stays bounded.
         let total = subtree_size(new_root, arena);
         if depth + split_levels > depth_limit(total) {
             // SAFETY: caller upholds single-writer invariant.
@@ -609,6 +617,41 @@ mod tests {
             }
             val += 1;
             assert!(val < 1_000_000, "should hit ArenaFull before 1M iterations");
+        }
+    }
+
+    #[test]
+    fn repeated_failed_rebuilds_return_arena_full_without_panicking() {
+        // A nearly-full arena lets cheap path-copy inserts succeed while
+        // every scapegoat rebuild (which needs O(subtree) fresh space)
+        // fails, deepening the tree past its α-height bound. Inserts must
+        // keep terminating and degrade to ArenaFull — never panic.
+        let arena = Arena::new(8 << 10);
+        let mut tree = CTree::empty();
+        let mut val = 0u32;
+        loop {
+            // SAFETY: test is single-threaded.
+            match unsafe { tree.insert(&arena, val) } {
+                InsertResult::Inserted(t) => tree = t,
+                InsertResult::ArenaFull => break,
+                InsertResult::Duplicate => unreachable!("monotonic vals"),
+            }
+            val += 1;
+            assert!(val < 1_000_000, "should hit ArenaFull before 1M inserts");
+        }
+        // Once full, every further insert keeps returning ArenaFull.
+        for extra in val..val + 100 {
+            // SAFETY: test is single-threaded.
+            let result = unsafe { tree.insert(&arena, extra) };
+            assert_eq!(result, InsertResult::ArenaFull);
+        }
+        // The tree is still readable and intact.
+        assert_eq!(tree.count(&arena), val as usize);
+        let mut buf = Vec::new();
+        tree.collect_into(&arena, &mut buf);
+        assert_eq!(buf.len(), val as usize);
+        for w in buf.windows(2) {
+            assert!(w[0] < w[1]);
         }
     }
 

@@ -414,6 +414,18 @@ unsafe extern "C" {
         length: usize,
         access: i32,
     ) -> *mut IbvMr;
+    // dma-buf registration — a real exported symbol since rdma-core v34
+    // (Ubuntu 22.04 ships v39). `offset` is the byte offset of the region
+    // inside the dma-buf; `iova` is the virtual address the MR's range
+    // starts at from the HCA's point of view.
+    pub fn ibv_reg_dmabuf_mr(
+        pd: *mut IbvPd,
+        offset: u64,
+        length: usize,
+        iova: u64,
+        fd: i32,
+        access: i32,
+    ) -> *mut IbvMr;
     pub fn ibv_dereg_mr(mr: *mut IbvMr) -> i32;
 
     // Data path: linked via the C shim in build.rs because the upstream

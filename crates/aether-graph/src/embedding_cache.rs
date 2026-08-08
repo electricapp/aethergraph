@@ -68,12 +68,16 @@ impl EmbeddingCache {
     /// Allocate (or find) the row for `node`. The new row is zeroed and
     /// carries generation 0 until written via [`update`](Self::update).
     fn slot_or_insert(&mut self, node: u32) -> Slot {
-        debug_assert!((node as usize) < self.num_nodes);
+        assert!(
+            (node as usize) < self.num_nodes,
+            "EmbeddingCache: node {node} out of range (num_nodes {})",
+            self.num_nodes
+        );
         if let Some(&s) = self.slots.get(&node) {
             return s;
         }
         let next_row = self.data.len() / self.dim;
-        debug_assert!(
+        assert!(
             next_row <= u32::MAX as usize,
             "EmbeddingCache row index {next_row} overflows u32"
         );
@@ -101,6 +105,9 @@ impl EmbeddingCache {
     /// Return mutable embedding slice for `node`, allocating a zeroed row
     /// on first access (caller writes the new embedding). Does not stamp
     /// the generation — use [`update`](Self::update) for that.
+    ///
+    /// # Panics
+    /// Panics if `node >= num_nodes`.
     #[inline]
     pub fn get_mut(&mut self, node: u32) -> &mut [f32] {
         let slot = self.slot_or_insert(node);
@@ -109,6 +116,9 @@ impl EmbeddingCache {
     }
 
     /// Write embedding and stamp current generation.
+    ///
+    /// # Panics
+    /// Panics if `node >= num_nodes`.
     pub fn update(&mut self, node: u32, embedding: &[f32]) {
         debug_assert_eq!(embedding.len(), self.dim);
         let slot = self.slot_or_insert(node);
@@ -134,12 +144,23 @@ impl EmbeddingCache {
         }
     }
 
-    /// True if node has never had an embedding computed.
+    /// True if node has never had an embedding computed, or its cached
+    /// embedding was dropped via [`invalidate`](Self::invalidate).
     #[inline]
     pub fn is_uninitialized(&self, node: u32) -> bool {
         match self.slots.get(&node) {
             Some(s) => s.generation == 0,
             None => true,
+        }
+    }
+
+    /// Drop `node`'s cached embedding from service: its slot (if any) is
+    /// reset to generation 0, so [`is_uninitialized`](Self::is_uninitialized)
+    /// reports true until the next [`update`](Self::update). The row
+    /// storage is retained and reused. No-op for nodes without a slot.
+    pub fn invalidate(&mut self, node: u32) {
+        if let Some(s) = self.slots.get_mut(&node) {
+            s.generation = 0;
         }
     }
 
@@ -266,6 +287,27 @@ mod tests {
         assert_eq!(cache.computed_nodes(), 100);
         assert!(cache.is_uninitialized(5));
         assert!(!cache.is_uninitialized(0));
+    }
+
+    #[test]
+    fn invalidate_marks_node_uninitialized_until_update() {
+        let mut cache = EmbeddingCache::new(10, 4);
+        cache.update(0, &[1.0; 4]);
+        assert!(!cache.is_uninitialized(0));
+        cache.invalidate(0);
+        assert!(cache.is_uninitialized(0));
+        cache.update(0, &[2.0; 4]);
+        assert!(!cache.is_uninitialized(0));
+        // Invalidating a node without a slot is a no-op.
+        cache.invalidate(9);
+        assert!(cache.is_uninitialized(9));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn update_out_of_range_panics() {
+        let mut cache = EmbeddingCache::new(10, 4);
+        cache.update(10, &[0.0; 4]);
     }
 
     #[test]

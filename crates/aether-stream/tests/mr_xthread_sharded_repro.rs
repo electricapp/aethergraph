@@ -56,13 +56,16 @@ fn main_preregisters_mrs_ships_to_caller_threads() {
     let schema = server_table.schema();
     let server_base = server_table.base_addr();
     let server_total = server_table.total_size();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `server_table` owns the registered range and outlives
+    // `server_mr` (both live to end of test; MR drops first in scope order).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             server_base as *mut u8,
             server_total,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
     let server_rkey = server_mr.rkey();
     let server_qps: Vec<RdmaQp> = (0..NUM_SHARDS)
         .map(|_| RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).expect("server qp"))
@@ -95,8 +98,9 @@ fn main_preregisters_mrs_ships_to_caller_threads() {
     for _ in 0..NUM_CALLER_THREADS {
         let mut buf = vec![0u8; READS_PER_BATCH * schema.slot_size];
         let buf_ptr = buf.as_mut_ptr();
-        let mr = client_ctx
-            .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
+        // SAFETY: `buf` moves into the same `CallerBundle` as `mr`, so the
+        // registered range outlives the MR; gathers drain before drop.
+        let mr = unsafe { client_ctx.reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE) }
             .expect("reg_mr on main");
         let lkey = mr.lkey();
         bundles.push(CallerBundle { buf, mr, lkey });

@@ -50,44 +50,55 @@ impl PyCsrGraph {
     ///         validation fails.
     #[staticmethod]
     #[pyo3(signature = (path, *, storage = "auto", validation = "auto"))]
-    fn load(path: std::path::PathBuf, storage: &str, validation: &str) -> PyResult<Self> {
+    fn load(
+        py: Python<'_>,
+        path: std::path::PathBuf,
+        storage: &str,
+        validation: &str,
+    ) -> PyResult<Self> {
         let storage_norm = storage.to_ascii_lowercase();
         let validation_norm = validation.to_ascii_lowercase();
 
+        // Reading + validating the file is O(E) I/O and touches no Python
+        // state; release the GIL so other Python threads keep running.
         // `load_graph*` functions take `impl AsRef<Path>` so `&path` works
         // directly — no string round-trip needed.
-        let graph = match storage_norm.as_str() {
-            "auto" => {
-                if validation_norm == "auto" {
-                    load_graph(&path)
-                } else {
-                    let mode = parse_validation_mode(&validation_norm)?;
-                    load_graph_with_validation(&path, mode)
+        let graph = py.detach(|| -> PyResult<_> {
+            let result = match storage_norm.as_str() {
+                "auto" => {
+                    if validation_norm == "auto" {
+                        load_graph(&path)
+                    } else {
+                        let mode = parse_validation_mode(&validation_norm)?;
+                        load_graph_with_validation(&path, mode)
+                    }
                 }
-            }
-            "mmap" => {
-                let mode = if validation_norm == "auto" {
-                    GraphValidationMode::OffsetsOnly
-                } else {
-                    parse_validation_mode(&validation_norm)?
-                };
-                load_graph_mmap(&path, mode)
-            }
-            "owned" => {
-                let mode = if validation_norm == "auto" {
-                    auto_validation_mode(&path)?
-                } else {
-                    parse_validation_mode(&validation_norm)?
-                };
-                load_graph_owned(&path, mode)
-            }
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid storage mode '{other}'. Must be one of: auto, mmap, owned"
-                )));
-            }
-        }
-        .map_err(|e| graph_load_error(format!("Failed to load graph ({storage_norm}): {e}")))?;
+                "mmap" => {
+                    let mode = if validation_norm == "auto" {
+                        GraphValidationMode::OffsetsOnly
+                    } else {
+                        parse_validation_mode(&validation_norm)?
+                    };
+                    load_graph_mmap(&path, mode)
+                }
+                "owned" => {
+                    let mode = if validation_norm == "auto" {
+                        auto_validation_mode(&path)?
+                    } else {
+                        parse_validation_mode(&validation_norm)?
+                    };
+                    load_graph_owned(&path, mode)
+                }
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid storage mode '{other}'. Must be one of: auto, mmap, owned"
+                    )));
+                }
+            };
+            result.map_err(|e| {
+                graph_load_error(format!("Failed to load graph ({storage_norm}): {e}"))
+            })
+        })?;
 
         Ok(Self {
             inner: Arc::new(graph),
@@ -106,6 +117,7 @@ impl PyCsrGraph {
     #[staticmethod]
     #[pyo3(signature = (num_nodes, src, dst, weights=None))]
     fn from_edges(
+        py: Python<'_>,
         num_nodes: usize,
         src: PyReadonlyArray1<u32>,
         dst: PyReadonlyArray1<u32>,
@@ -126,7 +138,11 @@ impl PyCsrGraph {
             .map(|(&s, &d)| (s, d))
             .collect();
         let w = weights.as_ref().map(|w| w.as_slice()).transpose()?;
-        let graph = Graph::from_edges(num_nodes, &edges, w)
+        // The O(E) CSR build touches only owned edges plus the numpy-backed
+        // weight slice (kept alive by the readonly guard above); release the
+        // GIL across it.
+        let graph = py
+            .detach(|| Graph::from_edges(num_nodes, &edges, w))
             .map_err(|e| graph_load_error(format!("Failed to create graph: {}", e)))?;
         Ok(Self {
             inner: Arc::new(graph),
@@ -149,11 +165,13 @@ impl PyCsrGraph {
     ///
     /// Returns:
     ///     CsrGraph: Reordered graph with improved cache locality.
-    fn permute(&self, perm: PyReadonlyArray1<u32>) -> PyResult<Self> {
+    fn permute(&self, py: Python<'_>, perm: PyReadonlyArray1<u32>) -> PyResult<Self> {
         let perm_slice = perm.as_slice()?;
-        let new_graph = self
-            .inner
-            .permute(perm_slice)
+        // The O(V + E) rebuild reads only the shared graph and the
+        // numpy-backed permutation slice (kept alive by the readonly guard);
+        // release the GIL across it.
+        let new_graph = py
+            .detach(|| self.inner.permute(perm_slice))
             .map_err(|e| graph_load_error(format!("Permutation failed: {}", e)))?;
         Ok(Self {
             inner: Arc::new(new_graph),
@@ -164,8 +182,9 @@ impl PyCsrGraph {
     ///
     /// Args:
     ///     path: Path to save the binary graph file
-    fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
-        save_graph(self.inner.as_ref(), &path)
+    fn save(&self, py: Python<'_>, path: std::path::PathBuf) -> PyResult<()> {
+        // The O(E) file write touches no Python state; release the GIL.
+        py.detach(|| save_graph(self.inner.as_ref(), &path))
             .map_err(|e| graph_load_error(format!("Failed to save graph: {}", e)))
     }
 
@@ -190,6 +209,19 @@ impl PyCsrGraph {
     ///     int: Number of outgoing edges from this node
     fn degree(&self, node: u32) -> usize {
         self.inner.degree(node)
+    }
+
+    /// Returns the degree of every node as a numpy array.
+    ///
+    /// One FFI call and a single pass over the CSR offsets — use this instead
+    /// of a per-node `degree()` loop when the whole distribution is needed.
+    ///
+    /// Returns:
+    ///     numpy.ndarray: Per-node degrees, length num_nodes (dtype=uint32)
+    fn degrees<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
+        // O(V) scan over the (possibly mmap'd) offsets; release the GIL.
+        let degrees = py.detach(|| self.inner.degrees());
+        PyArray1::from_vec(py, degrees)
     }
 
     /// Returns the neighbor IDs for a given node as a numpy array.

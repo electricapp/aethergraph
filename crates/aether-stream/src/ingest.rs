@@ -90,11 +90,13 @@ pub fn ingest_loop(
             // release). Drop the descriptor on violation; it's not a UMEM frame
             // we own, so we must not release it back to the pool.
             let frame_idx = (desc.addr / umem.frame_size() as u64) as usize;
-            if desc.addr >= umem.total_size() as u64 || frame_idx >= umem.frame_count() {
+            let end = desc.addr.checked_add(desc.len as u64);
+            if end.is_none_or(|e| e > umem.total_size() as u64) || frame_idx >= umem.frame_count() {
                 tracing::warn!(
                     addr = desc.addr,
+                    len = desc.len,
                     frame_idx,
-                    "RX descriptor addr out of UMEM bounds; dropping frame"
+                    "RX descriptor [addr, addr+len) out of UMEM bounds; dropping frame"
                 );
                 continue;
             }
@@ -106,11 +108,18 @@ pub fn ingest_loop(
             let frame = InboundFrame {
                 umem_idx: frame_idx,
                 len: desc.len,
-                // SAFETY: bounds-checked above; offset_in_frame < frame_size.
+                // SAFETY: [desc.addr, desc.addr + desc.len) is bounds-checked
+                // against the UMEM above; frame stride equals frame_size
+                // (enforced by Umem::new), so base + frame_idx * frame_size
+                // + offset_in_frame == base + desc.addr.
                 data: unsafe { umem.frame_ptr(frame_idx).add(offset_in_frame) },
             };
 
-            // If channel is full/disconnected, release frame back
+            // Bounded channel: `send` BLOCKS when the queue is full — that is
+            // the intended backpressure (this pinned busy-poll thread parks
+            // until a consumer drains). `Err` only means the receiver
+            // disconnected: release the in-hand frame and shut down. Frames
+            // already inside the channel are dropped at shutdown.
             if tx.send(frame).is_err() {
                 umem.release_frame(frame_idx);
                 return; // receiver gone, shut down

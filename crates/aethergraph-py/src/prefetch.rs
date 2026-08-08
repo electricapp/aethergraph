@@ -1,7 +1,7 @@
 //! PyO3 bindings for the prefetching sampler.
 
 use aethergraph_core::Graph;
-use aethergraph_core::NeighborLoader;
+use aethergraph_core::{NeighborLoader, PrefetchError};
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -16,9 +16,38 @@ use crate::sampler::{PySampledSubgraph, PySamplingConfig};
 ///
 /// `Some((subgraph, Some(features)))` — both subgraph and features available.
 /// `Some((subgraph, None))` — loader has no feature column attached.
-/// `None` — the prefetcher has finished and there are no more batches.
+/// `None` — the loader was shut down / drained and there are no more batches.
 pub type NextWithFeaturesResult<'py> =
     Option<(PySampledSubgraph, Option<Bound<'py, PyArray2<f32>>>)>;
+
+/// Maps a core [`PrefetchError`] onto the closest Python exception type.
+///
+/// - `Timeout` → `TimeoutError` carrying the waited duration; the worker may
+///   just be slow, so the caller may retry the call.
+/// - `WorkerExited` → `RuntimeError` including the captured panic/error
+///   message when one is available.
+/// - `FeatureLoad` → `RuntimeError` naming the batch whose features failed.
+fn prefetch_error_to_py(err: PrefetchError) -> PyErr {
+    match err {
+        PrefetchError::Timeout { waited } => pyo3::exceptions::PyTimeoutError::new_err(format!(
+            "prefetch timed out after {waited:?}; the worker may be slow or deadlocked \
+             — the call may be retried"
+        )),
+        PrefetchError::WorkerExited {
+            message: Some(message),
+        } => {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("prefetch worker exited: {message}"))
+        }
+        PrefetchError::WorkerExited { message: None } => {
+            pyo3::exceptions::PyRuntimeError::new_err("prefetch worker exited unexpectedly")
+        }
+        PrefetchError::FeatureLoad { batch_idx, source } => {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "feature load failed for batch {batch_idx}: {source:#}"
+            ))
+        }
+    }
+}
 
 /// Python wrapper for PrefetchStats.
 ///
@@ -215,6 +244,10 @@ impl PyNeighborLoader {
     /// Uses io_uring with SQPOLL for zero-syscall graph topology reads.
     /// Ideal for graphs that don't fit in RAM - topology stays on NVMe.
     ///
+    /// The io_uring path supports plain uniform sampling only: configs that
+    /// set weighted, temporal_strategy, disjoint, deterministic, max_degree,
+    /// or a non-default subgraph_type are rejected.
+    ///
     /// Args:
     ///     graph_path: Path to binary graph file (AETHGRAPH format)
     ///     config: SamplingConfig for sampling parameters
@@ -224,7 +257,8 @@ impl PyNeighborLoader {
     ///     NeighborLoader that reads graph topology via io_uring
     ///
     /// Raises:
-    ///     OSError: If not on Linux or io_uring is unavailable
+    ///     OSError: If not on Linux, io_uring is unavailable, or the config
+    ///         sets an option the io_uring path does not support
     ///
     /// Example:
     ///     >>> # Linux only - for TB-scale graphs
@@ -276,15 +310,21 @@ impl PyNeighborLoader {
 
     /// Submit a batch to be sampled.
     ///
+    /// Results come back from `next()` in completion order, which is FIFO —
+    /// the single sampler thread processes submissions in the order they were
+    /// sent, so it matches submission order. `batch_idx` is caller bookkeeping
+    /// echoed back on the result; nothing is reordered by it and duplicate or
+    /// gapped indices are harmless.
+    ///
+    /// Blocks (with the GIL released) when the pipeline is full, until the
+    /// consumer drains a result — so interleave `submit()` with `next()`, or
+    /// submit from a separate thread.
+    ///
     /// Args:
-    ///     batch_idx: Per-epoch index of this batch, used for ordering.
-    ///         The prefetch thread delivers results in `batch_idx` order, but
-    ///         submissions themselves do NOT need to be in order — duplicates
-    ///         and gaps are caller-visible: a duplicate `batch_idx` collides
-    ///         in the result queue and a missing one leaves a permanent gap
-    ///         that blocks `next()` forever.
+    ///     batch_idx: Caller-chosen index for this batch, echoed back on the
+    ///         result for bookkeeping.
     ///     seeds: Seed node IDs (numpy uint32, numpy int64, or `list[int]`).
-    fn submit(&self, batch_idx: usize, seeds: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn submit(&self, py: Python<'_>, batch_idx: usize, seeds: &Bound<'_, PyAny>) -> PyResult<()> {
         let inner = self
             .inner
             .as_ref()
@@ -292,18 +332,24 @@ impl PyNeighborLoader {
 
         let seeds_vec = crate::error::extract_seeds(seeds)?;
 
-        inner
-            .submit(batch_idx, seeds_vec)
+        // The bounded work channel blocks when the pipeline is full; release
+        // the GIL so the consumer thread can drain. No Python object is
+        // touched inside.
+        py.detach(|| inner.submit(batch_idx, seeds_vec))
             .map_err(|e| sampling_error(format!("Submit failed: {}", e)))
     }
 
     /// Submit all batches for an epoch.
     ///
+    /// Each submission can block when the pipeline is full (see `submit()`),
+    /// so call this from a separate thread unless a consumer is draining
+    /// results concurrently.
+    ///
     /// Args:
     ///     batches: List of seed arrays, one per batch
-    fn submit_epoch(&self, batches: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
+    fn submit_epoch(&self, py: Python<'_>, batches: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
         for (idx, seeds) in batches.iter().enumerate() {
-            self.submit(idx, seeds)?;
+            self.submit(py, idx, seeds)?;
         }
         Ok(())
     }
@@ -312,7 +358,13 @@ impl PyNeighborLoader {
     ///
     /// Returns:
     ///     SampledSubgraph: The next prefetched subgraph
-    ///     None: If the prefetcher has been shut down
+    ///     None: Only after `shutdown()` — the pipeline was drained and no
+    ///         more batches will arrive
+    ///
+    /// Raises:
+    ///     TimeoutError: No result arrived within the wait window; the worker
+    ///         may just be slow, so the call may be retried.
+    ///     RuntimeError: The prefetch worker exited unexpectedly.
     fn next(&self, py: Python<'_>) -> PyResult<Option<PySampledSubgraph>> {
         let inner = self
             .inner
@@ -321,7 +373,7 @@ impl PyNeighborLoader {
 
         // The blocking recv can stall while the worker samples; release the GIL
         // so other Python threads run. No Python object is touched inside.
-        match py.detach(|| inner.next()) {
+        match py.detach(|| inner.next()).map_err(prefetch_error_to_py)? {
             Some(subgraph) => {
                 let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;
                 Ok(Some(py_subgraph))
@@ -334,7 +386,10 @@ impl PyNeighborLoader {
     ///
     /// Returns:
     ///     SampledSubgraph: If a batch is immediately available
-    ///     None: If no batch is ready yet
+    ///     None: If no batch is ready yet, or after `shutdown()`
+    ///
+    /// Raises:
+    ///     RuntimeError: The prefetch worker exited unexpectedly.
     fn try_next(&self, py: Python<'_>) -> PyResult<Option<PySampledSubgraph>> {
         let inner = self
             .inner
@@ -343,7 +398,10 @@ impl PyNeighborLoader {
 
         // Non-blocking, but the channel recv still does a little work; release
         // the GIL across it for consistency with `next()`.
-        match py.detach(|| inner.try_next()) {
+        match py
+            .detach(|| inner.try_next())
+            .map_err(prefetch_error_to_py)?
+        {
             Some(subgraph) => {
                 let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;
                 Ok(Some(py_subgraph))
@@ -360,6 +418,14 @@ impl PyNeighborLoader {
     /// Returns:
     ///     tuple: (SampledSubgraph, features) where features is a 2D numpy array
     ///            of shape (num_nodes, feature_dim), or None if no features loaded
+    ///     None: Only after `shutdown()` — the pipeline was drained and no
+    ///         more batches will arrive
+    ///
+    /// Raises:
+    ///     TimeoutError: No result arrived within the wait window; the call
+    ///         may be retried.
+    ///     RuntimeError: The prefetch worker exited unexpectedly, or loading
+    ///         this batch's features failed.
     fn next_with_features<'py>(&self, py: Python<'py>) -> PyResult<NextWithFeaturesResult<'py>> {
         let inner = self
             .inner
@@ -369,7 +435,10 @@ impl PyNeighborLoader {
         // The blocking recv can stall while the worker samples and loads
         // features; release the GIL across it. The numpy/py outputs are built
         // afterward, back under the GIL.
-        match py.detach(|| inner.next_with_features()) {
+        match py
+            .detach(|| inner.next_with_features())
+            .map_err(prefetch_error_to_py)?
+        {
             Some((subgraph, features_opt)) => {
                 let num_nodes = subgraph.nodes.len();
                 let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;
@@ -456,9 +525,18 @@ impl PyNeighborLoader {
     ///
     /// Samples a subgraph, then gathers features via RDMA directly into VRAM.
     /// Returns (SampledSubgraph, PyCapsule) where the capsule is a DLPack
-    /// managed tensor. Use `torch.from_dlpack(capsule)` in Python.
+    /// managed tensor owning its VRAM — the buffer stays valid for the
+    /// consuming tensor's whole lifetime, independent of later gathers or the
+    /// loader itself. Use `torch.from_dlpack(capsule)` in Python.
     ///
-    /// Returns None if the prefetcher has been shut down.
+    /// Returns None only after `shutdown()` — the pipeline was drained and no
+    /// more batches will arrive.
+    ///
+    /// Raises:
+    ///     TimeoutError: No result arrived within the wait window; the call
+    ///         may be retried.
+    ///     RuntimeError: The prefetch worker exited unexpectedly, or the RDMA
+    ///         gather failed.
     #[cfg(all(target_os = "linux", feature = "gpudirect"))]
     fn next_with_gpu_features(
         &mut self,
@@ -473,30 +551,39 @@ impl PyNeighborLoader {
             sampling_error("Not an RDMA-enabled loader. Use with_rdma_features().")
         })?;
 
-        // Get next sampled subgraph from the prefetch thread
-        let subgraph = match inner.next() {
-            Some(sg) => sg,
-            None => return Ok(None),
-        };
+        // Both the blocking recv and the RDMA gather can stall; run them with
+        // the GIL released. No Python object is touched inside the closure —
+        // it works purely on Rust data and hands back the subgraph plus the
+        // owned GPU feature buffer.
+        type GpuBatch = (
+            aethergraph_core::SampledSubgraph,
+            aether_stream::rdma::gather::OwnedGpuFeatures,
+        );
+        let result = py.detach(|| -> PyResult<Option<GpuBatch>> {
+            let subgraph = match inner.next().map_err(prefetch_error_to_py)? {
+                Some(sg) => sg,
+                None => return Ok(None),
+            };
 
-        // Gather features via RDMA into VRAM (~20μs). `subgraph.nodes` is
-        // already `Vec<u32>`; we hand a `&[u32]` straight to RDMA.
-        let node_ids: &[u32] = &subgraph.nodes;
-        // epoch_version=0: accept any consistent read (no MVCC pinning from Python yet)
-        let gpu_features = rdma
-            .gather(node_ids, 0)
-            .map_err(|e| sampling_error(format!("RDMA gather failed: {e}")))?;
+            // Gather features via RDMA into VRAM (~20μs). `subgraph.nodes` is
+            // already `Vec<u32>`; we hand a `&[u32]` straight to RDMA.
+            let gpu_features = rdma
+                .gather(&subgraph.nodes)
+                .map_err(|e| sampling_error(format!("RDMA gather failed: {e}")))?;
+
+            Ok(Some((subgraph, gpu_features)))
+        })?;
+
+        let Some((subgraph, gpu_features)) = result else {
+            return Ok(None);
+        };
 
         let py_subgraph = PySampledSubgraph::from_subgraph(py, subgraph)?;
 
-        // Create DLPack capsule for zero-copy transfer to PyTorch
-        let capsule = crate::dlpack::create_dlpack_capsule(
-            py,
-            gpu_features.ptr,
-            gpu_features.num_nodes,
-            gpu_features.feature_dim,
-            gpu_features.gpu_id,
-        )?;
+        // DLPack capsule for zero-copy transfer to PyTorch. The capsule takes
+        // ownership of the gathered buffer, so the tensor's VRAM lives until
+        // its consumer drops it.
+        let capsule = crate::dlpack::create_dlpack_capsule(py, gpu_features)?;
 
         Ok(Some((py_subgraph, capsule)))
     }

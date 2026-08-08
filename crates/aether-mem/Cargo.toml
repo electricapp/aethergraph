@@ -18,22 +18,18 @@ parallel-prefault = ["dep:rayon"]
 tracing = ["dep:tracing"]
 rdma = []
 cuda = ["dep:cudarc"]
-# Swaps the free-list atomics for loom's so the loom test exercises the real
-# shipped code. Only enable for the scoped loom run:
-#   cargo test -p aether-mem --features loom --test loom_lockfree
-loom = ["dep:loom"]
 
 [dependencies]
 libc    = "0.2"
 rayon   = { version = "1.12", optional = true }
 tracing = { version = "0.1", optional = true }
 cudarc  = { version = "0.19", features = ["cuda-12050"], optional = true }
-loom    = { version = "0.7", optional = true }
+
+# Swaps the free-list atomics for loom's so the loom test exercises the real
+# shipped code. Off unless the scoped loom run enables the cfg:
+#   RUSTFLAGS="--cfg loom" cargo test -p aether-mem --test loom_lockfree --release
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [dev-dependencies]
 proptest = "1"
-
-[[test]]
-name = "loom_lockfree"
-path = "tests/loom_lockfree.rs"
-required-features = ["loom"]

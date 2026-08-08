@@ -197,25 +197,31 @@ def convert(
                     delim = _detect_delimiter(line, delimiter)
 
                 parts = line.split(delim)
-                if len(parts) >= 2:
-                    try:
-                        src, dst = int(parts[0]), int(parts[1])
-                    except ValueError:
-                        errors.append(
-                            f"bad token at line {i + 1}: could not parse "
-                            f"'{parts[0]}' / '{parts[1]}' as integers"
-                        )
-                        if len(errors) >= max_errors:
-                            break
-                        continue
+                if len(parts) < 2:
+                    _print_error(
+                        f"invalid edge format at line {i + 1} (expected at least "
+                        f"2 fields separated by {delim!r}): {line}"
+                    )
+                    raise typer.Exit(1)
 
-                    error = _validate_edge(src, dst, num_nodes, i + 1)
-                    if error:
-                        errors.append(error)
-                        if len(errors) >= max_errors:
-                            break
-                    else:
-                        edges.append((src, dst))
+                try:
+                    src, dst = int(parts[0]), int(parts[1])
+                except ValueError:
+                    errors.append(
+                        f"bad token at line {i + 1}: could not parse "
+                        f"'{parts[0]}' / '{parts[1]}' as integers"
+                    )
+                    if len(errors) >= max_errors:
+                        break
+                    continue
+
+                error = _validate_edge(src, dst, num_nodes, i + 1)
+                if error:
+                    errors.append(error)
+                    if len(errors) >= max_errors:
+                        break
+                else:
+                    edges.append((src, dst))
 
                 if len(edges) % 100_000 == 0:
                     progress.update(task, description=f"Read {len(edges):,} edges")

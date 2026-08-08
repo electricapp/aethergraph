@@ -23,10 +23,15 @@ impl PyFeatureCacheConfig {
     ///     gpu_capacity: Maximum number of features in GPU cache
     ///     cpu_capacity: Maximum number of features in CPU cache
     ///     feature_dim: Feature vector dimension
-    ///     nvme_path: Path to NVMe storage for cold features
+    ///     nvme_path: Path to NVMe storage for cold features. Required —
+    ///         the cache always spills cold features to this directory.
     ///
     /// Returns:
     ///     FeatureCacheConfig: Configuration object
+    ///
+    /// Raises:
+    ///     ValueError: If nvme_path is missing, feature_dim is 0, or both
+    ///         capacities are 0.
     #[new]
     #[pyo3(signature = (gpu_capacity=10_000, cpu_capacity=1_000_000, feature_dim=128, nvme_path=None))]
     fn new(
@@ -45,12 +50,18 @@ impl PyFeatureCacheConfig {
                 "at least one of gpu_capacity / cpu_capacity must be > 0",
             ));
         }
+        let Some(nvme_path) = nvme_path else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "nvme_path is required: the cache spills cold features to it, \
+                 e.g. FeatureCacheConfig(nvme_path=\"/tmp/feature_cache\")",
+            ));
+        };
         Ok(Self {
             inner: FeatureCacheConfig {
                 gpu_capacity,
                 cpu_capacity,
                 feature_dim,
-                nvme_path: nvme_path.map(PathBuf::from),
+                nvme_path: Some(PathBuf::from(nvme_path)),
                 warmup_frequencies: None,
                 pin_ratio: 0.8,
             },
@@ -109,7 +120,7 @@ impl PyFeatureCache {
     ///     Coroutine that resolves to FeatureCache instance
     ///
     /// Example:
-    ///     config = FeatureCacheConfig()
+    ///     config = FeatureCacheConfig(nvme_path="/tmp/feature_cache")
     ///     cache = await FeatureCache.create(config)
     #[staticmethod]
     fn create<'py>(py: Python<'py>, config: PyFeatureCacheConfig) -> PyResult<Bound<'py, PyAny>> {

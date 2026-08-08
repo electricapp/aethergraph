@@ -96,7 +96,8 @@ impl PyFeatureStore {
     /// Get features for a single node (zero-copy).
     ///
     /// # Returns
-    /// numpy array of shape [feature_dim] (float32)
+    /// Read-only numpy array of shape [feature_dim] (float32), viewing the
+    /// mmap'd file. Writing to it raises ValueError.
     ///
     /// # Example
     /// ```python
@@ -120,7 +121,11 @@ impl PyFeatureStore {
         // PyFeatureStore so the mmap outlives the returned array.
         let view = unsafe { ArrayView1::from_shape_ptr(len, ptr) };
         // SAFETY: same backing mmap; `slf.into_any()` is the lifetime anchor.
-        Ok(unsafe { PyArray1::borrow_from_array(&view, slf.into_any()) })
+        let arr = unsafe { PyArray1::borrow_from_array(&view, slf.into_any()) };
+        // The backing mmap is read-only; clear the WRITEABLE flag so Python
+        // writes raise ValueError instead of faulting on the mapped pages.
+        arr.readwrite().make_nonwriteable();
+        Ok(arr)
     }
 
     /// Get features for multiple nodes in batch (optimized).
@@ -177,7 +182,8 @@ impl PyFeatureStore {
     /// Get all features as a 2D array (zero-copy when possible).
     ///
     /// # Returns
-    /// numpy array of shape [num_nodes, feature_dim] (float32)
+    /// Read-only numpy array of shape [num_nodes, feature_dim] (float32),
+    /// viewing the mmap'd file. Writing to it raises ValueError.
     ///
     /// # Warning
     /// Only use this if features fit in RAM! For large graphs, use get_batch() instead.
@@ -205,7 +211,11 @@ impl PyFeatureStore {
         // the mmap — alive for as long as Python holds the array.
         let view = unsafe { ArrayView2::from_shape_ptr((num_nodes, feature_dim), ptr) };
         // SAFETY: same backing mmap; `slf.into_any()` is the lifetime anchor.
-        Ok(unsafe { PyArray2::borrow_from_array(&view, slf.into_any()) })
+        let arr = unsafe { PyArray2::borrow_from_array(&view, slf.into_any()) };
+        // The backing mmap is read-only; clear the WRITEABLE flag so Python
+        // writes raise ValueError instead of faulting on the mapped pages.
+        arr.readwrite().make_nonwriteable();
+        Ok(arr)
     }
 
     fn __repr__(&self) -> String {

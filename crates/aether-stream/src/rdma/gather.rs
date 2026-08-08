@@ -7,23 +7,35 @@
 //! NeighborLoader calls `gather()` inline after sampling — takes ~20μs.
 
 use crate::rdma::client::RdmaFeatureClient;
+use cudarc::driver::{CudaSlice, DevicePtr};
+use std::sync::Arc;
 
-/// Handle to a feature tensor sitting in VRAM.
+/// Feature tensor in VRAM, owned by this handle.
 ///
-/// The pointer is valid until the next call to `RdmaFeatureGather::gather()`,
-/// which reuses the validator's output buffer. Callers must consume or copy
-/// the tensor before the next gather.
+/// The buffer is a fresh per-call allocation that the compacted validator
+/// output is copied into, so the tensor stays valid across subsequent
+/// `gather()` calls and after the [`RdmaFeatureGather`] drops — the VRAM is
+/// freed when the last clone of `buf` is dropped.
 #[derive(Debug, Clone)]
-pub struct GpuFeatures {
-    /// Raw CUDA device pointer (`CUdeviceptr`) to the output tensor.
+pub struct OwnedGpuFeatures {
+    /// Owned device buffer holding the tensor.
     /// Layout: contiguous `[num_nodes, feature_dim]` row-major f32.
-    pub ptr: u64,
+    pub buf: Arc<CudaSlice<f32>>,
     /// Number of nodes (rows) in the tensor.
     pub num_nodes: usize,
     /// Feature dimension (columns).
     pub feature_dim: usize,
     /// CUDA device ordinal.
     pub gpu_id: i32,
+}
+
+impl OwnedGpuFeatures {
+    /// Raw CUDA device pointer (`CUdeviceptr`) to the tensor data, ordered
+    /// on the buffer's own allocation stream.
+    pub fn device_ptr(&self) -> u64 {
+        let (ptr, _sync) = self.buf.device_ptr(self.buf.stream());
+        ptr as u64
+    }
 }
 
 /// RDMA feature gather — connects to a remote FeatureTable and pulls
@@ -57,27 +69,26 @@ impl RdmaFeatureGather {
 
     /// Gather features for a batch of node IDs into VRAM.
     ///
-    /// Returns a `GpuFeatures` handle. The underlying VRAM is reused across
-    /// calls — the caller must consume (e.g., DLPack export) before the next
-    /// `gather()`.
-    ///
-    /// `epoch_version`: pass 0 for latest features, or a version number
-    /// to pin features to a specific epoch (MVCC snapshot isolation).
+    /// After seqlock validation, the compacted rows are copied
+    /// device-to-device out of the validator's reused output buffer into a
+    /// fresh per-call allocation on the same stream, so the returned
+    /// [`OwnedGpuFeatures`] owns its VRAM outright.
     pub fn gather(
         &mut self,
         node_ids: &[u32],
-        epoch_version: u64,
-    ) -> Result<GpuFeatures, Box<dyn std::error::Error>> {
-        self.client.gather(node_ids, epoch_version)?;
+    ) -> Result<OwnedGpuFeatures, Box<dyn std::error::Error>> {
+        self.client.gather(node_ids)?;
 
+        let num_nodes = node_ids.len();
+        let feature_dim = self.client.feature_dim();
         let stream = self.client.validator().stream();
         let output = self.client.validator().output();
-        let (ptr, _guard) = cudarc::driver::DevicePtr::device_ptr(output, stream);
+        let buf = stream.clone_dtod(&output.slice(0..num_nodes * feature_dim))?;
 
-        Ok(GpuFeatures {
-            ptr: ptr as u64,
-            num_nodes: node_ids.len(),
-            feature_dim: self.client.feature_dim(),
+        Ok(OwnedGpuFeatures {
+            buf: Arc::new(buf),
+            num_nodes,
+            feature_dim,
             gpu_id: self.gpu_id,
         })
     }

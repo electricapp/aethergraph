@@ -4,6 +4,7 @@
 //! can consume via `torch.from_dlpack()`. This is the standard zero-copy
 //! path for sharing GPU tensors across frameworks.
 
+use aether_stream::rdma::gather::OwnedGpuFeatures;
 use pyo3::ffi as pyffi;
 use pyo3::prelude::*;
 use std::os::raw::c_void;
@@ -54,13 +55,18 @@ struct DLManagedTensor {
 struct DlpackContext {
     shape: Vec<i64>,
     strides: Vec<i64>,
+    /// Keeps the CUDA buffer alive for the tensor's lifetime. `Some` for
+    /// gather results (the tensor owns its VRAM via the inner `Arc`);
+    /// `None` when the caller owns the buffer (test-only raw-pointer path).
+    owner: Option<OwnedGpuFeatures>,
 }
 
-/// DLPack deleter callback — frees the context when PyTorch releases the tensor.
+/// DLPack deleter callback — runs when PyTorch releases the tensor.
 ///
-/// Note: we do NOT free the CUDA memory here. The VRAM is owned by
-/// `SeqlockValidator.output` and reused across gather calls. The Python
-/// tensor is a view into that buffer.
+/// Dropping the context drops its `owner` (when present), releasing the
+/// tensor's reference on the CUDA buffer — the VRAM is freed once the last
+/// `Arc` clone goes away. With `owner: None` the caller keeps ownership of
+/// the CUDA memory and only the context/tensor structs are freed.
 unsafe extern "C" fn dlpack_deleter(managed: *mut DLManagedTensor) {
     if managed.is_null() {
         return;
@@ -120,18 +126,22 @@ unsafe extern "C" fn dlpack_capsule_destructor(capsule: *mut pyffi::PyObject) {
 ///
 /// # Safety
 /// `ptr` must reference valid CUDA memory for the lifetime implied by
-/// whoever eventually consumes the tensor.
+/// whoever eventually consumes the tensor. Passing the buffer's owner as
+/// `owner` satisfies that for gather results; with `owner: None` the caller
+/// must keep the allocation alive themselves.
 fn build_managed_tensor(
     ptr: u64,
     num_nodes: usize,
     feature_dim: usize,
     gpu_id: i32,
+    owner: Option<OwnedGpuFeatures>,
 ) -> *mut DLManagedTensor {
     let mut ctx = Box::new(DlpackContext {
         shape: vec![num_nodes as i64, feature_dim as i64],
         // Row-major: stride[0]=feature_dim elements, stride[1]=1 element.
         // DLPack measures strides in elements, not bytes — see comment above.
         strides: vec![feature_dim as i64, 1],
+        owner,
     });
 
     let tensor = DLTensor {
@@ -165,13 +175,14 @@ fn build_managed_tensor(
 
 /// Test-only Python entry point. Lets pytest hand in an existing CUDA buffer
 /// (e.g. `torch.empty(..., device='cuda').data_ptr()`) and round-trip it
-/// through `create_dlpack_capsule` + `torch.from_dlpack`. The capsule's
-/// deleter does not free VRAM, so the original tensor stays the owner.
+/// through the capsule path + `torch.from_dlpack`. The capsule's deleter does
+/// not free VRAM on this path (no owner is attached), so the original tensor
+/// stays the owner.
 ///
 /// # Safety
 /// Caller is responsible for `ptr` being a valid CUDA allocation with at least
 /// `num_nodes * feature_dim * sizeof(f32)` bytes that outlives the resulting
-/// numpy/torch view. Exposed only so T2.2 can exercise the capsule path
+/// numpy/torch view. Exposed only so tests can exercise the capsule path
 /// without spinning up a full RDMA server.
 #[pyfunction]
 #[pyo3(name = "_dlpack_capsule_from_cuda_ptr")]
@@ -182,25 +193,39 @@ pub fn dlpack_capsule_from_cuda_ptr_py(
     feature_dim: usize,
     gpu_id: i32,
 ) -> PyResult<Py<PyAny>> {
-    create_dlpack_capsule(py, ptr, num_nodes, feature_dim, gpu_id)
+    capsule_from_parts(py, ptr, num_nodes, feature_dim, gpu_id, None)
 }
 
-/// Create a PyCapsule wrapping a DLPack managed tensor for a CUDA f32 buffer.
+/// Create a PyCapsule wrapping a DLPack managed tensor for an owned CUDA
+/// feature buffer.
 ///
 /// The capsule can be consumed by `torch.from_dlpack()` for zero-copy access.
+/// `features` moves into the capsule's manager context, so the VRAM lives
+/// exactly as long as the consuming tensor (or the unconsumed capsule).
+pub fn create_dlpack_capsule(py: Python<'_>, features: OwnedGpuFeatures) -> PyResult<Py<PyAny>> {
+    let ptr = features.device_ptr();
+    let num_nodes = features.num_nodes;
+    let feature_dim = features.feature_dim;
+    let gpu_id = features.gpu_id;
+    capsule_from_parts(py, ptr, num_nodes, feature_dim, gpu_id, Some(features))
+}
+
+/// Shared capsule construction for the owned and raw-pointer entry points.
 ///
 /// # Safety
 /// `ptr` must be a valid CUDA device pointer with at least
-/// `num_nodes * feature_dim * sizeof(f32)` bytes allocated.
-/// The memory must remain valid for the lifetime of the returned tensor.
-pub fn create_dlpack_capsule(
+/// `num_nodes * feature_dim * sizeof(f32)` bytes allocated, kept alive by
+/// `owner` (or by the caller when `owner` is `None`) for the lifetime of the
+/// returned tensor.
+fn capsule_from_parts(
     py: Python<'_>,
     ptr: u64,
     num_nodes: usize,
     feature_dim: usize,
     gpu_id: i32,
+    owner: Option<OwnedGpuFeatures>,
 ) -> PyResult<Py<PyAny>> {
-    let managed_ptr = build_managed_tensor(ptr, num_nodes, feature_dim, gpu_id);
+    let managed_ptr = build_managed_tensor(ptr, num_nodes, feature_dim, gpu_id, owner);
 
     // Create PyCapsule with name "dltensor" (required by DLPack spec).
     // PyCapsule_New stores the name *pointer*, not a copy, and consumers
@@ -231,12 +256,12 @@ pub fn create_dlpack_capsule(
 
 #[cfg(test)]
 mod tests {
-    //! TEST_PLAN T2.2 — DLPack capsule ABI.
+    //! DLPack capsule ABI.
     //!
-    //! The live `torch.from_dlpack()` consumer path is already exercised in
-    //! T2.5 (full PyG training loop) via `next_with_gpu_features`. What we
-    //! cover locally is the struct encoding — catching the failure modes that
-    //! make PyTorch silently reject: wrong `device_type`, wrong
+    //! The live `torch.from_dlpack()` consumer path is exercised by the full
+    //! PyG training loop integration test via `next_with_gpu_features`. What
+    //! we cover locally is the struct encoding — catching the failure modes
+    //! that make PyTorch silently reject: wrong `device_type`, wrong
     //! `dtype.code`/`bits`, missing deleter, bad shape/strides/ndim.
     //!
     //! Targets the pure-Rust `build_managed_tensor` helper rather than going
@@ -251,7 +276,7 @@ mod tests {
         const FEATURE_DIM: usize = 128;
         const GPU_ID: i32 = 3;
 
-        let managed_ptr = build_managed_tensor(PTR, NUM_NODES, FEATURE_DIM, GPU_ID);
+        let managed_ptr = build_managed_tensor(PTR, NUM_NODES, FEATURE_DIM, GPU_ID, None);
         assert!(!managed_ptr.is_null());
 
         // SAFETY: `managed_ptr` is a valid heap allocation from build_managed_tensor.

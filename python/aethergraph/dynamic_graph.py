@@ -14,6 +14,7 @@ import numpy as np
 import numpy.typing as npt
 
 from aethergraph._core import DynamicGraph as _DynamicGraph
+from aethergraph._ids import _to_uint32_ids
 
 if TYPE_CHECKING:
     from aethergraph.graph import Graph
@@ -108,18 +109,19 @@ class DynamicGraph:
 
         Args:
             num_vertices: Number of vertices.
-            src: Source vertex array. Will be converted to uint32.
-            dst: Destination vertex array. Will be converted to uint32.
+            src: Source vertex array. Range-checked and converted to uint32.
+            dst: Destination vertex array. Range-checked and converted to uint32.
             arena_mb: Arena capacity in megabytes.
 
         Returns:
             DynamicGraph with all edges inserted.
 
         Raises:
-            ValueError: If src and dst have different lengths.
+            ValueError: If src and dst have different lengths, or an ID is
+                negative or exceeds the uint32 range.
         """
-        src_arr: npt.NDArray[np.uint32] = np.asarray(src, dtype=np.uint32)
-        dst_arr: npt.NDArray[np.uint32] = np.asarray(dst, dtype=np.uint32)
+        src_arr = _to_uint32_ids(src, "src")
+        dst_arr = _to_uint32_ids(dst, "dst")
 
         obj = cls.__new__(cls)
         obj._inner = _DynamicGraph.from_edges(num_vertices, src_arr, dst_arr, arena_mb)
@@ -145,19 +147,20 @@ class DynamicGraph:
         """Batch-insert edges from arrays.
 
         Args:
-            src: Source vertex array. Will be converted to uint32.
-            dst: Destination vertex array. Will be converted to uint32.
+            src: Source vertex array. Range-checked and converted to uint32.
+            dst: Destination vertex array. Range-checked and converted to uint32.
 
         Returns:
             Number of new edges inserted (duplicates are skipped).
 
         Raises:
-            ValueError: If src and dst have different lengths, or an edge
-                references a vertex >= num_vertices.
+            ValueError: If src and dst have different lengths, an ID is
+                negative or exceeds the uint32 range, or an edge references
+                a vertex >= num_vertices.
             RuntimeError: If the arena is full.
         """
-        src_arr: npt.NDArray[np.uint32] = np.asarray(src, dtype=np.uint32)
-        dst_arr: npt.NDArray[np.uint32] = np.asarray(dst, dtype=np.uint32)
+        src_arr = _to_uint32_ids(src, "src")
+        dst_arr = _to_uint32_ids(dst, "dst")
         return self._inner.insert_edges(src_arr, dst_arr)
 
     @property

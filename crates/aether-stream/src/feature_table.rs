@@ -4,8 +4,10 @@
 //! wrapping the feature vector. Writers bump head to odd, write features,
 //! then set tail and head to the next even version.
 //!
-//! This head/tail layout is RDMA-safe: a one-sided read of the full slot
-//! lets the reader detect torn reads by comparing head != tail.
+//! This head/tail layout is RDMA-safe under a two-snapshot protocol: a
+//! remote reader takes two complete one-sided reads of the slot and accepts
+//! a row only when both snapshots carry the same even version and identical
+//! payload bytes (see the RDMA reader contract on [`FeatureTable::read_node`]).
 //!
 //! This table is backed by a separate `SharedMemoryRing` (not the UMEM).
 //! When RDMA is enabled, the memory is registered with the HCA so GPU nodes
@@ -30,7 +32,8 @@ const FEATURE_OFFSET: usize = 8;
 /// single one-sided RDMA READ of the slot fetches both version stamps. Note the
 /// stored stride is NOT this compact size — `SharedMemoryRing` rounds each
 /// slot up to a page boundary, so the per-slot stride (`schema.slot_size`) is
-/// page-aligned and the gather reads one page-rounded slot per node.
+/// page-aligned; the gather reads only the live prefix of each slot (through
+/// `tail_offset_in_slot + 8`).
 pub struct FeatureTable {
     ring: SharedMemoryRing,
     node_count: usize,
@@ -95,6 +98,30 @@ fn compute_slot_size(feature_dim: usize) -> usize {
     compute_tail_offset(feature_dim) + 8 // tail_version is 8 bytes
 }
 
+/// Element-wise volatile copy of `len` f32s.
+///
+/// The seqlock payload is read while a writer may be storing into it (and
+/// vice versa); volatile accesses make each element a real load/store the
+/// compiler cannot elide, fuse, or invent under an exclusive-access
+/// assumption, so the racing copy stays well-defined for race-checking
+/// tools while the version checks arbitrate validity.
+///
+/// # Safety
+/// `src` must be valid for `len` reads and `dst` for `len` writes.
+#[inline]
+unsafe fn volatile_copy_f32s(src: *const f32, dst: *mut f32, len: usize) {
+    for i in 0..len {
+        // SAFETY: `i < len`; the caller guarantees `src` covers `len` reads.
+        let s = unsafe { src.add(i) };
+        // SAFETY: `i < len`; the caller guarantees `dst` covers `len` writes.
+        let d = unsafe { dst.add(i) };
+        // SAFETY: `s` is in-bounds per above.
+        let v = unsafe { s.read_volatile() };
+        // SAFETY: `d` is in-bounds per above.
+        unsafe { d.write_volatile(v) };
+    }
+}
+
 impl FeatureTable {
     /// Allocate a new feature table.
     ///
@@ -119,7 +146,10 @@ impl FeatureTable {
         let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook::new())];
         hooks.extend(extra_hooks);
 
-        let (ring, _hook_failures) = SharedMemoryRing::new(slot_count, slot_size, hooks).ok()?;
+        let (ring, hook_failures) = SharedMemoryRing::new(slot_count, slot_size, hooks).ok()?;
+        for failure in &hook_failures {
+            tracing::warn!(error = %failure, "feature table memory hook failed");
+        }
 
         // We access slots positionally by node ID, not via the free list;
         // the ring is used for its allocation + hooks only.
@@ -147,11 +177,22 @@ impl FeatureTable {
     /// the write to complete.
     ///
     /// # Concurrency
-    /// Multiple concurrent writers to the *same* node produce torn reads.
-    /// Different nodes can be written concurrently without issue.
+    /// Writers to the *same* node serialize on the head CAS below: a second
+    /// writer spins until the first restores an even head. Different nodes
+    /// can be written concurrently without issue.
     pub fn write_node(&self, node: usize, features: &[f32]) {
-        debug_assert!(node < self.node_count);
-        debug_assert_eq!(features.len(), self.feature_dim);
+        assert!(
+            node < self.node_count,
+            "node {node} out of range (node_count {})",
+            self.node_count
+        );
+        assert_eq!(
+            features.len(),
+            self.feature_dim,
+            "features slice length {} != feature_dim {}",
+            features.len(),
+            self.feature_dim
+        );
 
         let base = self.slot_ptr(node);
 
@@ -163,10 +204,23 @@ impl FeatureTable {
         // SAFETY: `tail_ptr` references the tail AtomicU64 inside the slot.
         let tail = unsafe { &*tail_ptr };
 
-        // Step 1: head → odd. AcqRel: Release orders prior writes before
-        // head goes odd; Acquire prevents the feature copy below from
-        // being reordered before this RMW.
-        let prev = head.fetch_add(1, Ordering::AcqRel);
+        // Step 1: head even→odd via CAS. Same-node writers serialize here:
+        // while another writer holds the head odd, spin until it releases.
+        // AcqRel on success: Release orders prior writes before head goes
+        // odd; Acquire prevents the feature copy below from being reordered
+        // before this RMW.
+        let mut prev = head.load(Ordering::Relaxed);
+        let prev = loop {
+            if prev & 1 != 0 {
+                std::hint::spin_loop();
+                prev = head.load(Ordering::Relaxed);
+                continue;
+            }
+            match head.compare_exchange_weak(prev, prev + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(p) => break p,
+                Err(actual) => prev = actual,
+            }
+        };
         let target = prev + 2;
 
         // Arm the panic-recovery guard. From here through the explicit
@@ -179,13 +233,17 @@ impl FeatureTable {
             disarmed: false,
         };
 
-        // Step 2: copy features (non-atomic).
+        // Step 2: copy features (volatile, element-wise). Readers and the
+        // remote HCA race this copy by design — the seqlock versions
+        // arbitrate validity — so each element is a volatile store the
+        // compiler cannot elide or widen under an exclusive-access
+        // assumption.
         // SAFETY: FEATURE_OFFSET is within the slot.
         let feat_ptr = unsafe { base.add(FEATURE_OFFSET) } as *mut f32;
         // SAFETY: `feat_ptr` points to `feature_dim` f32 slots inside the slot;
-        // `features` has the same length (debug_assert above).
+        // `features` has the same length (asserted above).
         unsafe {
-            std::ptr::copy_nonoverlapping(features.as_ptr(), feat_ptr, self.feature_dim);
+            volatile_copy_f32s(features.as_ptr(), feat_ptr, self.feature_dim);
         }
 
         // Step 3: tail → target.
@@ -211,25 +269,48 @@ impl FeatureTable {
     /// touched the slot during our copy is guaranteed to leave a head value
     /// different from the snapshot we started with.
     ///
-    /// We keep the `head == tail` check too — it's still required for the
-    /// RDMA path (one-shot read of the entire slot, no second load possible)
-    /// and provides a cheap early-out here.
+    /// We keep the `head == tail` check too — the RDMA path relies on the
+    /// same version comparison within each of its slot snapshots, and it
+    /// provides a cheap early-out here.
     ///
-    /// # RDMA reader invariant
-    /// A remote HCA reads the slot once and can only compare `head == tail`; it
-    /// cannot re-load head. Correctness rests on: the writer's first step
-    /// (`head → odd`) is a LOCK-prefixed read-modify-write (`fetch_add`), which
-    /// is atomic and globally ordered across the coherence fabric, and the HCA's
-    /// DMA reads participate in that same cache coherence. So the HCA can never
-    /// observe the pre-write even `head` together with a half-written payload:
-    /// once the writer is mid-write, head is odd to every coherent observer
-    /// (CPU or NIC), and a torn read shows up as `head != tail`. The payload and
-    /// tail stores between the odd and final-even head are ordinary `Release`
-    /// stores, so the matching even `head == tail` the reader requires is only
-    /// visible after the whole generation has landed.
+    /// # RDMA reader contract (two-snapshot validation)
+    /// A remote HCA cannot re-load head after its payload copy the way the
+    /// local loop below does, and it can assume nothing about the order in
+    /// which the bytes of one READ complete: a single slot READ may be split
+    /// into multiple PCIe transactions whose completions land in any order,
+    /// so within one snapshot a stale version pair can accompany fresher
+    /// payload bytes (or vice versa). No single-snapshot version comparison
+    /// is sound under that model. Remote readers therefore take TWO complete
+    /// snapshots of the slot — the second issued only after the first has
+    /// fully completed — and accept a row iff:
+    ///   - `snap1.head == snap1.tail == snap2.head == snap2.tail`,
+    ///   - the common version is even and nonzero, and
+    ///   - the payload bytes of the two snapshots are identical.
+    ///
+    /// Soundness rests on three properties: (1) the writer's head→odd
+    /// transition is a LOCK-prefixed RMW, globally ordered across the
+    /// coherence fabric (which the HCA's DMA reads participate in), so it is
+    /// visible to every coherent observer before any of the writer's payload
+    /// stores; (2) per-location visibility is monotone — once a snapshot has
+    /// observed a value at a location, a later snapshot observes that value
+    /// or a newer one; (3) snapshot 2 begins strictly after snapshot 1 ends.
+    /// A writer whose payload stores land during either snapshot leaves
+    /// either mismatched versions across the snapshots or a payload byte
+    /// that differs between them; a writer stalled mid-payload across both
+    /// snapshots leaves an odd version in snapshot 2. No assumption about
+    /// intra-READ completion ordering is required.
     pub fn read_node(&self, node: usize, out: &mut [f32]) -> bool {
-        debug_assert!(node < self.node_count);
-        debug_assert!(out.len() >= self.feature_dim);
+        assert!(
+            node < self.node_count,
+            "node {node} out of range (node_count {})",
+            self.node_count
+        );
+        assert!(
+            out.len() >= self.feature_dim,
+            "out slice length {} < feature_dim {}",
+            out.len(),
+            self.feature_dim
+        );
 
         let base = self.slot_ptr(node);
 
@@ -250,13 +331,15 @@ impl FeatureTable {
                 continue; // writer in progress
             }
 
-            // Read features (non-atomic).
+            // Read features (volatile, element-wise) — a writer may be
+            // storing into the payload concurrently; the version checks
+            // below arbitrate validity.
             // SAFETY: FEATURE_OFFSET is within the slot.
             let feat_ptr = unsafe { base.add(FEATURE_OFFSET) } as *const f32;
             // SAFETY: `feat_ptr` covers `feature_dim` f32s; `out` has
-            // `>= feature_dim` slots (debug_assert above).
+            // `>= feature_dim` slots (asserted above).
             unsafe {
-                std::ptr::copy_nonoverlapping(feat_ptr, out.as_mut_ptr(), self.feature_dim);
+                volatile_copy_f32s(feat_ptr, out.as_mut_ptr(), self.feature_dim);
             }
 
             // Ensure all feature reads complete before we read tail/head.

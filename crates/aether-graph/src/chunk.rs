@@ -39,7 +39,7 @@ impl Chunk {
     ///
     /// # Panics
     /// Panics if `sorted.len() > CHUNK_CAP`. The slice is also expected to be
-    /// sorted ascending (debug-asserted).
+    /// strictly ascending — sorted with no duplicates (debug-asserted).
     #[inline]
     pub fn from_sorted(sorted: &[u32]) -> Self {
         assert!(
@@ -48,7 +48,7 @@ impl Chunk {
             sorted.len(),
             CHUNK_CAP
         );
-        debug_assert!(is_sorted(sorted), "chunk input must be sorted");
+        debug_assert!(is_sorted(sorted), "chunk input must be strictly sorted");
         let mut c = Self::empty();
         c.count = sorted.len() as u8;
         c.data[..sorted.len()].copy_from_slice(sorted);
@@ -181,7 +181,7 @@ impl Chunk {
 
 #[inline]
 fn is_sorted(s: &[u32]) -> bool {
-    s.windows(2).all(|w| w[0] <= w[1])
+    s.windows(2).all(|w| w[0] < w[1])
 }
 
 // Verify cache-line alignment at compile time.

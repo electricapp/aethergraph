@@ -195,3 +195,100 @@ fn stress_seqlock_concurrent_writers_readers() {
         "ran only {writes} writes — writer threads didn't make progress"
     );
 }
+
+/// Multiple writers hammering the SAME node concurrently. `write_node`
+/// serializes same-node writers on the head CAS, so every generation a
+/// reader observes must be one complete write — all bytes from a single
+/// `write_node` call, never a mix of two writers' payloads.
+///
+/// Encoding: `features[i] = base + i`, with a distinct `base` per
+/// (writer, iteration). `features[i] - i` is constant across `i` within one
+/// complete write and differs between any two writes, so a mixed row is
+/// detected without coordination.
+#[test]
+fn stress_seqlock_same_node_concurrent_writers() {
+    const SAME_NODE_WRITERS: usize = 4;
+    const SAME_NODE_READERS: usize = 4;
+    const DIM: usize = 16;
+    const RUNTIME: Duration = Duration::from_secs(3);
+    const NODE: usize = 0;
+
+    let table = Arc::new(FeatureTable::new(4, DIM, vec![]).expect("alloc"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let total_writes = Arc::new(AtomicU64::new(0));
+    let total_reads = Arc::new(AtomicU64::new(0));
+    let mixed_rows = Arc::new(AtomicU64::new(0));
+
+    let mut workers = Vec::new();
+    for w in 0..SAME_NODE_WRITERS {
+        let table = Arc::clone(&table);
+        let stop = Arc::clone(&stop);
+        let total_writes = Arc::clone(&total_writes);
+        workers.push(thread::spawn(move || {
+            let mut iter: u64 = 0;
+            let mut writes_local: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                // Distinct base per (writer, iteration), kept within f32's
+                // exact-integer range so `base + i` round-trips exactly.
+                let base = ((iter * SAME_NODE_WRITERS as u64 + w as u64) & 0x007F_FFFF) as f32;
+                let mut feats = [0f32; DIM];
+                for (i, slot) in feats.iter_mut().enumerate() {
+                    *slot = base + i as f32;
+                }
+                table.write_node(NODE, &feats);
+                iter += 1;
+                writes_local += 1;
+            }
+            total_writes.fetch_add(writes_local, Ordering::Relaxed);
+        }));
+    }
+
+    for _ in 0..SAME_NODE_READERS {
+        let table = Arc::clone(&table);
+        let stop = Arc::clone(&stop);
+        let total_reads = Arc::clone(&total_reads);
+        let mixed_rows = Arc::clone(&mixed_rows);
+        workers.push(thread::spawn(move || {
+            let mut buf = vec![0f32; DIM];
+            let mut reads_local: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                if table.read_node(NODE, &mut buf) {
+                    let base = buf[0];
+                    if buf.iter().enumerate().any(|(i, &v)| v - i as f32 != base) {
+                        mixed_rows.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                reads_local += 1;
+            }
+            total_reads.fetch_add(reads_local, Ordering::Relaxed);
+        }));
+    }
+
+    thread::sleep(RUNTIME);
+    stop.store(true, Ordering::Relaxed);
+    for wkr in workers {
+        wkr.join().expect("worker panicked");
+    }
+
+    let writes = total_writes.load(Ordering::Relaxed);
+    let reads = total_reads.load(Ordering::Relaxed);
+    let mixed = mixed_rows.load(Ordering::Relaxed);
+    eprintln!("same-node stress: {writes} writes, {reads} reads, {mixed} mixed rows");
+
+    assert_eq!(
+        mixed,
+        0,
+        "{mixed} rows mixed bytes from different writes — same-node writer \
+         serialization is broken on {}",
+        std::env::consts::ARCH
+    );
+    // Sanity: real contention happened.
+    assert!(
+        writes >= 10_000,
+        "ran only {writes} writes — writer threads didn't make progress"
+    );
+    assert!(
+        reads >= 10_000,
+        "ran only {reads} reads — reader threads didn't make progress"
+    );
+}

@@ -52,13 +52,16 @@ fn sharded_concurrent_gather_correctness() {
     let schema = server_table.schema();
     let server_base = server_table.base_addr();
     let server_total = server_table.total_size();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `server_table` owns the registered range and outlives
+    // `server_mr` (both live to end of test; MR drops first in scope order).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             server_base as *mut u8,
             server_total,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
     let server_rkey = server_mr.rkey();
 
     // Server: NUM_SHARDS standalone QPs (one per client shard).
@@ -112,9 +115,12 @@ fn sharded_concurrent_gather_correctness() {
             let mut buf = vec![0u8; READS_PER_BATCH * schema.slot_size];
             let buf_ptr = buf.as_mut_ptr();
             let buf_len = buf.len();
-            let mr = client_ctx_for_thread
-                .reg_mr(buf_ptr, buf_len, IBV_ACCESS_LOCAL_WRITE)
-                .expect("client mr");
+            // SAFETY: `buf` moves into `ThreadState` alongside `mr` below, so
+            // the registered range outlives the MR; gathers drain before drop.
+            let mr = unsafe {
+                client_ctx_for_thread.reg_mr(buf_ptr, buf_len, IBV_ACCESS_LOCAL_WRITE)
+            }
+            .expect("client mr");
             let mr_lkey = mr.lkey();
             let mut state = ThreadState { buf, mr_lkey, _mr: mr };
             let mut rng: u64 = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul((tidx as u64) + 1);
@@ -210,13 +216,16 @@ fn sharded_4shard_sequential_gather() {
     let feats: Vec<f32> = (0..8).map(|i| i as f32 + 7.0).collect();
     table.write_node(5, &feats);
     let schema = table.schema();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `table` owns the registered range and outlives `server_mr`
+    // (both live to end of test; MR drops first in scope order).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .unwrap();
+    }
+    .unwrap();
     let server_rkey = server_mr.rkey();
 
     let server_qps: Vec<RdmaQp> = (0..NUM_SHARDS)
@@ -244,9 +253,10 @@ fn sharded_4shard_sequential_gather() {
 
     let mut buf = vec![0u8; schema.slot_size];
     let buf_ptr = buf.as_mut_ptr();
-    let client_mr = client_ctx
-        .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
-        .unwrap();
+    // SAFETY: `buf` owns the registered range and outlives `client_mr`
+    // (both live to end of test); each gather drains before the next.
+    let client_mr =
+        unsafe { client_ctx.reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE) }.unwrap();
     let client_lkey = client_mr.lkey();
 
     // Submit a gather one at a time, exercising each shard via round-robin.
@@ -282,13 +292,16 @@ fn sharded_single_shard_single_gather() {
     let feats: Vec<f32> = (0..8).map(|i| i as f32 + 1.0).collect();
     table.write_node(3, &feats);
     let schema = table.schema();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `table` owns the registered range and outlives `server_mr`
+    // (both live to end of test; MR drops first in scope order).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .unwrap();
+    }
+    .unwrap();
     let server_rkey = server_mr.rkey();
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).unwrap();
 
@@ -312,9 +325,9 @@ fn sharded_single_shard_single_gather() {
     let mut buf = vec![0u8; schema.slot_size];
     let buf_ptr = buf.as_mut_ptr();
     let buf_len = buf.len();
-    let client_mr = client_ctx
-        .reg_mr(buf_ptr, buf_len, IBV_ACCESS_LOCAL_WRITE)
-        .unwrap();
+    // SAFETY: `buf` owns the registered range and outlives `client_mr`
+    // (both live to end of test); the gather drains before either drops.
+    let client_mr = unsafe { client_ctx.reg_mr(buf_ptr, buf_len, IBV_ACCESS_LOCAL_WRITE) }.unwrap();
     let client_lkey = client_mr.lkey();
 
     let read = RdmaRead {
@@ -351,13 +364,16 @@ fn sharded_two_threads_minimal() {
     let feats: Vec<f32> = (0..8).map(|i| i as f32 + 7.0).collect();
     table.write_node(2, &feats);
     let schema = table.schema();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `table` owns the registered range and outlives `server_mr`
+    // (both live to end of test; MR drops first in scope order).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .unwrap();
+    }
+    .unwrap();
     let server_rkey = server_mr.rkey();
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).unwrap();
 
@@ -388,8 +404,9 @@ fn sharded_two_threads_minimal() {
         handles.push(std::thread::spawn(move || -> Result<u64, String> {
             let mut buf = vec![0u8; schema.slot_size];
             let buf_ptr = buf.as_mut_ptr();
-            let mr = client_ctx
-                .reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
+            // SAFETY: `buf` owns the registered range and outlives `mr` in
+            // this closure; each gather drains before the iteration ends.
+            let mr = unsafe { client_ctx.reg_mr(buf_ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE) }
                 .map_err(|e| format!("t{tidx} reg_mr: {e}"))?;
             let lkey = mr.lkey();
             let read = RdmaRead {

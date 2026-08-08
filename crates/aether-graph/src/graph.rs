@@ -141,10 +141,13 @@ pub struct DynamicGraph {
     /// Single-writer guard. `true` while a `Writer` exists.
     writer_locked: AtomicBool,
     /// Poison flag — set when a `Writer` is dropped during unwinding (a
-    /// panic mid-insert). Once poisoned, the graph's internal invariants
-    /// (per-vertex root pointers, dirty bitmap, num_edges counter, arena
-    /// cursor) may all be in inconsistent states. New `writer()` calls
-    /// return [`WriterError::Poisoned`]; reads (`degree`, `neighbors_into`,
+    /// panic mid-insert) or when a WAL append/fsync failed during the
+    /// guard's lifetime. Once poisoned, bookkeeping (num_edges counter,
+    /// dirty bitmap, WAL contents) may be out of step with the published
+    /// roots, so no further writes are allowed: new `writer()` calls
+    /// return [`WriterError::Poisoned`]. Every published root points at a
+    /// fully-built tree — roots are stored only after their nodes are
+    /// written and WAL-appended — so reads (`degree`, `neighbors_into`,
     /// `has_edge`) keep working at their last consistent state.
     poisoned: AtomicBool,
     /// Shared monotonic version clock. Advanced once per successful writer
@@ -278,6 +281,8 @@ impl DynamicGraph {
                 Err(InsertError::ArenaFull) => {
                     replay_err = Some(WalError::ReplayArenaFull);
                 }
+                // `graph.wal` is None during replay, so no append happens.
+                Err(InsertError::WalAppend) => unreachable!("no WAL attached during replay"),
             }
             let _ = rec.epoch; // reserved for future MVCC pinning
         })?;
@@ -286,12 +291,17 @@ impl DynamicGraph {
         }
 
         // If the WAL ended in a torn record, truncate so future appends
-        // sit on top of clean data.
+        // sit on top of clean data. The truncation is fsynced before any
+        // new appends: an unsynced set_len could be undone by a later
+        // crash, resurrecting the discarded torn bytes mid-log.
         if let Some(off) = outcome.truncate_to {
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(path)
-                .and_then(|f| f.set_len(off))
+                .and_then(|f| {
+                    f.set_len(off)?;
+                    f.sync_data()
+                })
                 .map_err(WalError::Io)?;
         }
 
@@ -323,10 +333,11 @@ impl DynamicGraph {
     /// # Errors
     /// - [`WriterError::Busy`] if another `Writer` is currently held.
     /// - [`WriterError::Poisoned`] if a previous writer was dropped during
-    ///   a panic. Once poisoned, the graph is read-only forever — the
-    ///   internal arena cursor / per-vertex roots / dirty bitmap may all
-    ///   be in mutually-inconsistent states. Recovery requires destroying
-    ///   the graph and rebuilding from a checkpoint (see the WAL story).
+    ///   a panic or hit a WAL failure. Once poisoned, the graph is
+    ///   read-only forever — bookkeeping (num_edges, dirty bitmap, WAL)
+    ///   may be out of step with the published roots, though reads stay
+    ///   consistent. Recovery requires destroying the graph and
+    ///   rebuilding from a checkpoint (see the WAL story).
     pub fn writer(&self) -> Result<Writer<'_>, WriterError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(WriterError::Poisoned);
@@ -498,7 +509,7 @@ impl DynamicGraph {
     /// the snapshot is a consistent (though not globally atomic) view.
     pub fn snapshot_csr(&self) -> (Vec<u64>, Vec<u32>) {
         let mut offsets = Vec::with_capacity(self.num_vertices + 1);
-        let mut edges = Vec::new();
+        let mut edges = Vec::with_capacity(self.num_edges() as usize);
 
         offsets.push(0);
         // Iterate via usize to avoid u32 truncation when num_vertices is large.
@@ -554,6 +565,9 @@ impl DynamicGraph {
                     Err(InsertError::ArenaFull) => {
                         panic!("DynamicGraph::from_edges: arena full ({arena_bytes} bytes)")
                     }
+                    // A graph built by `Self::new` carries no WAL.
+                    #[cfg(feature = "wal")]
+                    Err(InsertError::WalAppend) => unreachable!("no WAL attached"),
                 }
             }
         }
@@ -585,7 +599,10 @@ impl<'a> Writer<'a> {
     /// Returns `Ok(true)` if the edge was new, `Ok(false)` if it already
     /// existed (no allocation occurred). Errors distinguish a full arena
     /// (compact or grow, then retry) from an out-of-range vertex (the
-    /// edge is invalid for this graph and was not inserted).
+    /// edge is invalid for this graph and was not inserted). With a WAL
+    /// attached, the record is appended before the edge becomes
+    /// reader-visible; a failed append returns `InsertError::WalAppend`
+    /// and publishes nothing.
     pub fn insert_edge(&mut self, src: u32, dst: u32) -> Result<bool, InsertError> {
         if (src as usize) >= self.graph.num_vertices || (dst as usize) >= self.graph.num_vertices {
             return Err(InsertError::VertexOutOfRange { src, dst });
@@ -599,19 +616,12 @@ impl<'a> Writer<'a> {
             tree.insert_with_scratch(&self.graph.arena, dst, &mut self.rebalance_scratch)
         } {
             InsertResult::Inserted(new_tree) => {
-                // Release ordering ensures all arena writes (new nodes) are
-                // visible before the root pointer becomes visible to readers.
-                // The edge is observable to readers from here on; the
-                // counter and dirty bits are published only after the WAL
-                // append below succeeds so they never count an insert that
-                // recovery will discard.
-                self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
-
-                // WAL append (buffered; fsync happens in `Writer::drop`).
-                // Errors here mean the in-memory state is ahead of the log
-                // — we record the error so `Writer::drop` can poison the
-                // graph instead of silently bumping the epoch on lossy
-                // state.
+                // WAL append first (buffered; fsync happens in
+                // `Writer::drop`). The freshly allocated tree nodes are
+                // invisible to readers until the root store below, so a
+                // failed append leaves readers on the old root — the edge
+                // exists in neither memory nor the log. The arena bytes
+                // allocated for the failed insert leak until `compact`.
                 #[cfg(feature = "wal")]
                 if let Some(wal_mu) = self.graph.wal.as_ref() {
                     let rec = EdgeRecord {
@@ -629,25 +639,20 @@ impl<'a> Writer<'a> {
                         // Record the failure so `Writer::drop` can poison.
                         self.wal_failed = true;
                         tracing::error!(error = %e, "WAL append failed");
+                        return Err(InsertError::WalAppend);
                     }
                 }
 
-                // Bookkeeping runs only when the edge is durable-pending:
-                // no WAL attached, or the append above (and every earlier
-                // append in this guard) succeeded. A failed append leaves
-                // the log torn, so the guard's edges are dropped on
-                // recovery — counting them here would over-report.
-                #[cfg(feature = "wal")]
-                let durable = !self.wal_failed;
-                #[cfg(not(feature = "wal"))]
-                let durable = true;
-                if durable {
-                    self.graph.num_edges.fetch_add(1, Ordering::Relaxed);
-                    // Out-of-range src/dst are already rejected by the bounds
-                    // check at the top of `insert_edge`, so both marks succeed.
-                    let _ = self.graph.dirty.mark(src);
-                    let _ = self.graph.dirty.mark(dst);
-                }
+                // Release ordering ensures all arena writes (new nodes) are
+                // visible before the root pointer becomes visible to
+                // readers. Every published edge is counted and dirty-marked
+                // — publication and bookkeeping never diverge.
+                self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
+                self.graph.num_edges.fetch_add(1, Ordering::Relaxed);
+                // Out-of-range src/dst are already rejected by the bounds
+                // check at the top of `insert_edge`, so both marks succeed.
+                let _ = self.graph.dirty.mark(src);
+                let _ = self.graph.dirty.mark(dst);
 
                 Ok(true)
             }
@@ -659,16 +664,29 @@ impl<'a> Writer<'a> {
 
 impl Drop for Writer<'_> {
     fn drop(&mut self) {
-        // If we're unwinding from a panic mid-insert, the graph's invariants
-        // may be partially updated: arena cursor advanced past a node that
-        // was never linked into the tree, a root pointer that points at a
-        // freshly-allocated but uninitialized chunk, num_edges incremented
-        // for an insert that aborted, etc. Poison the graph so no further
-        // writer can run; readers keep working at their last consistent
-        // state.
+        // If we're unwinding from a panic mid-insert, the graph's
+        // bookkeeping may be partially updated: arena cursor advanced past
+        // a node that was never linked into the tree, an edge published
+        // but not yet counted or dirty-marked, etc. Published roots always
+        // point at fully-built trees, so reads stay consistent — but no
+        // further writer can be trusted. Poison the graph, and discard the
+        // guard's buffered WAL records so they are not flushed later:
+        // the guard never committed, so its records must not become
+        // durable. Records the BufWriter already spilled to the OS are
+        // out of reach — the discard is best-effort (see the WAL
+        // durability contract).
         let panicking = std::thread::panicking();
         if panicking {
             self.graph.poisoned.store(true, Ordering::Release);
+            #[cfg(feature = "wal")]
+            if let Some(wal_mu) = self.graph.wal.as_ref() {
+                // Take the guard even if poisoned; panicking here (during
+                // unwinding) would abort the process.
+                let mut w = wal_mu.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = w.discard_pending() {
+                    tracing::error!(error = %e, "failed to discard pending WAL records");
+                }
+            }
             tracing::warn!("DynamicGraph writer panicked — graph poisoned");
             self.graph.writer_locked.store(false, Ordering::Release);
             return;
@@ -761,6 +779,12 @@ pub enum InsertError {
     /// `src` or `dst` is not a vertex of this graph
     /// (≥ `num_vertices`). The edge was not inserted.
     VertexOutOfRange { src: u32, dst: u32 },
+    /// The WAL append for this edge failed. The edge was not published —
+    /// readers never see it and it carries no log record — but the guard
+    /// is marked failed, so `Writer::drop` poisons the graph. The
+    /// underlying I/O error is logged via `tracing`.
+    #[cfg(feature = "wal")]
+    WalAppend,
 }
 
 impl std::fmt::Display for InsertError {
@@ -770,6 +794,8 @@ impl std::fmt::Display for InsertError {
             Self::VertexOutOfRange { src, dst } => {
                 write!(f, "edge ({src}, {dst}) references a vertex out of range")
             }
+            #[cfg(feature = "wal")]
+            Self::WalAppend => write!(f, "WAL append failed; edge not inserted"),
         }
     }
 }

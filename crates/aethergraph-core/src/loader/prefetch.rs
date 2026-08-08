@@ -43,9 +43,10 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use half::f16;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use tracing::{debug, trace, warn};
 
 use std::os::unix::fs::FileExt;
@@ -70,6 +71,10 @@ const MAX_GRAPH_EDGES: u64 = 100_000_000_000;
 /// is clamped here to avoid faulting in (and evicting) gigabytes of pages.
 const PREFETCH_SPAN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
+/// How long a blocking consumer call waits for the worker before reporting
+/// [`PrefetchError::Timeout`].
+const RECV_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Work item for the prefetch thread.
 #[derive(Debug)]
 pub struct PrefetchWork {
@@ -86,10 +91,93 @@ pub struct PrefetchResult {
     pub batch_idx: usize,
     /// Sampled subgraph
     pub subgraph: SampledSubgraph,
-    /// Optional features for all nodes in the subgraph (flattened: num_nodes * feature_dim)
-    pub features: Option<Vec<f32>>,
-    /// Feature dimension (if features are loaded)
+    /// Features for all nodes in the subgraph (flattened: num_nodes * feature_dim).
+    /// `None` when the loader has no feature column attached; `Some(Err(_))`
+    /// when a feature column is attached but loading it failed.
+    pub features: Option<anyhow::Result<Vec<f32>>>,
+    /// Feature dimension (if a feature column is attached)
     pub feature_dim: Option<usize>,
+}
+
+/// A sampled subgraph paired with its features. The feature slot is `Some`
+/// when the loader has a feature column attached and `None` when it does not.
+pub type SubgraphWithFeatures = (SampledSubgraph, Option<Vec<f32>>);
+
+/// Error returned by [`NeighborLoader::next`], [`NeighborLoader::try_next`],
+/// and [`NeighborLoader::next_with_features`].
+#[derive(Debug)]
+pub enum PrefetchError {
+    /// No result arrived within the wait window. The worker may just be slow
+    /// (or deadlocked); the caller may call again.
+    Timeout {
+        /// How long the call waited before giving up.
+        waited: Duration,
+    },
+    /// The worker exited without `shutdown()` being requested (panic or
+    /// internal error). `message` carries the captured panic payload or
+    /// worker error when one is available.
+    WorkerExited { message: Option<String> },
+    /// A feature column is attached but loading features for this batch
+    /// failed. The batch's subgraph is dropped along with the error.
+    FeatureLoad {
+        batch_idx: usize,
+        source: anyhow::Error,
+    },
+}
+
+impl std::fmt::Display for PrefetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrefetchError::Timeout { waited } => {
+                write!(f, "prefetch timed out after {waited:?}")
+            }
+            PrefetchError::WorkerExited {
+                message: Some(message),
+            } => {
+                write!(f, "prefetch worker exited: {message}")
+            }
+            PrefetchError::WorkerExited { message: None } => {
+                write!(f, "prefetch worker exited unexpectedly")
+            }
+            PrefetchError::FeatureLoad { batch_idx, source } => {
+                write!(f, "feature load failed for batch {batch_idx}: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PrefetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PrefetchError::FeatureLoad { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+/// Runs a worker body, recording a panic payload or error into `fault` so the
+/// consumer can report why the result channel disconnected.
+fn run_worker(fault: &Mutex<Option<String>>, body: impl FnOnce() -> anyhow::Result<()>) {
+    let message = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(payload) => panic_message(payload.as_ref()),
+    };
+    warn!("prefetch worker fault: {}", message);
+    fault
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert(message);
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        format!("panic: {s}")
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        format!("panic: {s}")
+    } else {
+        "panic with non-string payload".to_string()
+    }
 }
 
 /// Sync feature store for use in prefetch thread.
@@ -439,6 +527,11 @@ impl PrefetchStats {
         }
     }
 
+    /// Resets all counters.
+    ///
+    /// Each counter is cleared with an independent relaxed store, so a reset
+    /// racing concurrent recorders is not atomic — a snapshot taken around it
+    /// can mix pre- and post-reset values.
     pub fn reset(&self) {
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
@@ -538,18 +631,18 @@ fn worker_loop_feature_loader(
 
         // Load features for current batch
         let t0 = std::time::Instant::now();
-        let (features, feature_dim) = match feature_store.get_batch(&sampled.subgraph.nodes) {
+        let features = match feature_store.get_batch(&sampled.subgraph.nodes) {
             Ok(feats) => {
                 trace!(
                     batch_idx = sampled.work.batch_idx,
                     nodes = sampled.subgraph.nodes.len(),
                     "features loaded"
                 );
-                (Some(feats), Some(feature_store.feature_dim()))
+                Ok(feats)
             }
             Err(e) => {
                 warn!(batch_idx = sampled.work.batch_idx, error = %e, "feature load failed");
-                (None, None)
+                Err(e)
             }
         };
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
@@ -560,8 +653,8 @@ fn worker_loop_feature_loader(
         let result = PrefetchResult {
             batch_idx: sampled.work.batch_idx,
             subgraph: sampled.subgraph,
-            features,
-            feature_dim,
+            features: Some(features),
+            feature_dim: Some(feature_store.feature_dim()),
         };
 
         if result_tx.send(result).is_err() {
@@ -580,8 +673,9 @@ fn worker_loop_feature_loader(
 pub struct NeighborLoader {
     /// Send work to prefetch thread (Option so we can take it on shutdown)
     work_tx: Option<Sender<PrefetchWork>>,
-    /// Receive results from prefetch thread
-    result_rx: Receiver<PrefetchResult>,
+    /// Receive results from prefetch thread (Option so shutdown can drop it
+    /// and unblock a worker mid-`send` on a full result channel)
+    result_rx: Option<Receiver<PrefetchResult>>,
     /// Shutdown signal
     shutdown: Arc<AtomicBool>,
     /// Thread handles (1 for no-features mode, 2 for with-features mode)
@@ -592,6 +686,8 @@ pub struct NeighborLoader {
     prefetch_depth: usize,
     /// Feature dimension (if features are being loaded)
     feature_dim: Option<usize>,
+    /// Why a worker exited on its own (captured panic or error), if it did
+    worker_fault: Arc<Mutex<Option<String>>>,
 }
 
 impl NeighborLoader {
@@ -635,13 +731,20 @@ impl NeighborLoader {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
+        let worker_fault = Arc::new(Mutex::new(None));
 
         let handle = {
             let shutdown = shutdown.clone();
+            let fault = worker_fault.clone();
             thread::Builder::new()
                 .name("aethergraph-prefetch".into())
                 .spawn(move || {
-                    Self::worker_loop_inmemory(graph, config, work_rx, result_tx, shutdown, None);
+                    run_worker(&fault, move || {
+                        Self::worker_loop_inmemory(
+                            graph, config, work_rx, result_tx, shutdown, None,
+                        );
+                        Ok(())
+                    });
                 })?
         };
 
@@ -652,12 +755,13 @@ impl NeighborLoader {
 
         Ok(Self {
             work_tx: Some(work_tx),
-            result_rx,
+            result_rx: Some(result_rx),
             shutdown,
             handles: vec![handle],
             stats,
             prefetch_depth,
             feature_dim: None,
+            worker_fault,
         })
     }
 
@@ -695,14 +799,19 @@ impl NeighborLoader {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
+        let worker_fault = Arc::new(Mutex::new(None));
 
         let sampler_handle = {
             let shutdown = shutdown.clone();
             let stats = stats.clone();
+            let fault = worker_fault.clone();
             thread::Builder::new()
                 .name("aethergraph-sampler".into())
                 .spawn(move || {
-                    worker_loop_sampler(graph, config, work_rx, sample_tx, shutdown, stats);
+                    run_worker(&fault, move || {
+                        worker_loop_sampler(graph, config, work_rx, sample_tx, shutdown, stats);
+                        Ok(())
+                    });
                 })
                 .map_err(|e| anyhow::anyhow!("failed to spawn sampler thread: {}", e))?
         };
@@ -710,16 +819,20 @@ impl NeighborLoader {
         let loader_handle = {
             let shutdown = shutdown.clone();
             let stats = stats.clone();
+            let fault = worker_fault.clone();
             thread::Builder::new()
                 .name("aethergraph-feat-loader".into())
                 .spawn(move || {
-                    worker_loop_feature_loader(
-                        sample_rx,
-                        result_tx,
-                        shutdown,
-                        feature_store,
-                        stats,
-                    );
+                    run_worker(&fault, move || {
+                        worker_loop_feature_loader(
+                            sample_rx,
+                            result_tx,
+                            shutdown,
+                            feature_store,
+                            stats,
+                        );
+                        Ok(())
+                    });
                 })
                 .map_err(|e| anyhow::anyhow!("failed to spawn feature loader thread: {}", e))?
         };
@@ -731,21 +844,28 @@ impl NeighborLoader {
 
         Ok(Self {
             work_tx: Some(work_tx),
-            result_rx,
+            result_rx: Some(result_rx),
             shutdown,
             handles: vec![sampler_handle, loader_handle],
             stats,
             prefetch_depth,
             feature_dim: Some(feature_dim),
+            worker_fault,
         })
     }
 
     /// Create a prefetching sampler for NVMe-backed graphs (Linux only).
     ///
-    /// Uses io_uring with SQPOLL for zero-syscall I/O.
+    /// Uses io_uring with SQPOLL for zero-syscall I/O. The io_uring sampling
+    /// path honors only `fanout`, `replace`, `cumulative`, and `seed`; edge
+    /// ids are always tracked regardless of `track_edge_ids`.
     ///
     /// # Errors
-    /// Returns an error if the prefetch thread cannot be spawned.
+    /// Returns `InvalidInput` if `config` sets a field the io_uring path does
+    /// not implement: `weighted`, `temporal_strategy`, `disjoint`,
+    /// `deterministic`, `max_degree` (note: `SamplingConfig::default()` sets
+    /// `max_degree`), or a non-default `subgraph_type`. Also returns an error
+    /// if the prefetch thread cannot be spawned.
     #[cfg(target_os = "linux")]
     pub fn new_nvme(
         graph_path: &std::path::Path,
@@ -758,9 +878,13 @@ impl NeighborLoader {
     /// Create a prefetching sampler for NVMe-backed graphs with feature loading.
     ///
     /// Combines io_uring graph sampling with mmap-backed feature gathering.
+    /// The same `SamplingConfig` restrictions as [`NeighborLoader::new_nvme`]
+    /// apply.
     ///
     /// # Errors
-    /// Returns an error if the feature file cannot be loaded or the prefetch thread cannot be spawned.
+    /// Returns an error if `config` sets a field the io_uring path does not
+    /// implement (see [`NeighborLoader::new_nvme`]), if the feature file
+    /// cannot be loaded, or if the prefetch thread cannot be spawned.
     #[cfg(target_os = "linux")]
     pub fn with_features_nvme(
         graph_path: &std::path::Path,
@@ -771,6 +895,38 @@ impl NeighborLoader {
         let feature_store = SyncFeatureStore::load(feature_path.as_ref())?;
         Self::new_nvme_inner(graph_path, config, prefetch_depth, Some(feature_store))
             .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Rejects `SamplingConfig` fields the io_uring path does not implement,
+    /// rather than silently ignoring them at sample time.
+    #[cfg(target_os = "linux")]
+    fn validate_nvme_config(config: &SamplingConfig) -> std::io::Result<()> {
+        let unsupported = if config.weighted {
+            Some("weighted = true")
+        } else if config.temporal_strategy.is_some() {
+            Some("temporal_strategy = Some(_)")
+        } else if config.disjoint {
+            Some("disjoint = true")
+        } else if config.deterministic {
+            Some("deterministic = true")
+        } else if config.max_degree.is_some() {
+            Some("max_degree = Some(_)")
+        } else if config.subgraph_type != super::sampler::SubgraphType::Directional {
+            Some("subgraph_type != Directional")
+        } else {
+            None
+        };
+        if let Some(field) = unsupported {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "SamplingConfig field not supported by the NVMe io_uring sampler: {field} \
+                     (this path honors fanout, replace, cumulative, and seed; use the \
+                     in-memory sampler for the rest)"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -786,6 +942,7 @@ impl NeighborLoader {
                 "prefetch_depth must be >= 1",
             ));
         }
+        Self::validate_nvme_config(&config)?;
 
         // Same bounding strategy as the other constructors: bounded work
         // channel applies producer-side backpressure so a runaway submit
@@ -796,24 +953,26 @@ impl NeighborLoader {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
+        let worker_fault = Arc::new(Mutex::new(None));
 
         let feature_dim = feature_store.as_ref().map(|s| s.feature_dim());
         let path = graph_path.to_path_buf();
         let handle = {
             let shutdown = shutdown.clone();
+            let fault = worker_fault.clone();
             thread::Builder::new()
                 .name("aethergraph-prefetch-nvme".into())
                 .spawn(move || {
-                    if let Err(e) = Self::worker_loop_nvme(
-                        &path,
-                        config,
-                        work_rx,
-                        result_tx,
-                        shutdown,
-                        feature_store,
-                    ) {
-                        warn!("NVMe prefetch worker error: {}", e);
-                    }
+                    run_worker(&fault, move || {
+                        Self::worker_loop_nvme(
+                            &path,
+                            config,
+                            work_rx,
+                            result_tx,
+                            shutdown,
+                            feature_store,
+                        )
+                    });
                 })?
         };
 
@@ -825,12 +984,13 @@ impl NeighborLoader {
 
         Ok(Self {
             work_tx: Some(work_tx),
-            result_rx,
+            result_rx: Some(result_rx),
             shutdown,
             handles: vec![handle],
             stats,
             prefetch_depth,
             feature_dim,
+            worker_fault,
         })
     }
 
@@ -857,59 +1017,87 @@ impl NeighborLoader {
 
     /// Get next sampled subgraph (blocking).
     ///
-    /// Returns `None` both when the worker has exited (channel disconnected —
-    /// the normal end-of-epoch state, logged at debug) and when the 30s wait
-    /// elapses (logged at warn, indicating a deadlock or very slow I/O). The
-    /// two cases are distinguishable in the logs.
-    pub fn next(&self) -> Option<SampledSubgraph> {
+    /// Returns:
+    /// - `Ok(Some(_))` when a batch is ready.
+    /// - `Ok(None)` after `shutdown()` — the clean end-of-stream state.
+    /// - `Err(PrefetchError::Timeout { .. })` when no result arrived within
+    ///   30s (logged at warn); the worker may just be slow, so the caller may
+    ///   call again.
+    /// - `Err(PrefetchError::WorkerExited { .. })` when the worker exited
+    ///   without `shutdown()` being requested (panic or internal error).
+    pub fn next(&self) -> Result<Option<SampledSubgraph>, PrefetchError> {
+        Ok(self.next_timeout(RECV_TIMEOUT)?.map(|r| r.subgraph))
+    }
+
+    /// Blocking receive with an explicit wait window (shared by the
+    /// `next*` methods).
+    fn next_timeout(&self, timeout: Duration) -> Result<Option<PrefetchResult>, PrefetchError> {
+        let Some(result_rx) = self.result_rx.as_ref() else {
+            return Ok(None);
+        };
         self.stats.total.fetch_add(1, Ordering::Relaxed);
 
         // Try non-blocking first to track hit rate
-        match self.result_rx.try_recv() {
+        match result_rx.try_recv() {
             Ok(result) => {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
                 trace!(batch_idx = result.batch_idx, "prefetch hit");
-                Some(result.subgraph)
+                Ok(Some(result))
             }
             Err(TryRecvError::Empty) => {
                 // Cache miss - need to wait (with timeout to detect issues)
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
                 trace!("prefetch miss - blocking");
-                match self
-                    .result_rx
-                    .recv_timeout(std::time::Duration::from_secs(30))
-                {
-                    Ok(r) => Some(r.subgraph),
+                match result_rx.recv_timeout(timeout) {
+                    Ok(r) => Ok(Some(r)),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         warn!(
-                            "Prefetch timeout after 30s - worker may have deadlocked or I/O is very slow"
+                            "Prefetch timeout after {:?} - worker may have deadlocked or I/O is very slow",
+                            timeout
                         );
-                        None
+                        Err(PrefetchError::Timeout { waited: timeout })
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        // Distinct from a timeout: the worker has exited (epoch
-                        // drained or shut down), which is the normal end state.
-                        debug!("prefetch channel disconnected - worker exited");
-                        None
-                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => self.disconnected(),
                 }
             }
-            Err(TryRecvError::Disconnected) => {
-                debug!("prefetch channel disconnected - worker exited");
-                None
-            }
+            Err(TryRecvError::Disconnected) => self.disconnected(),
+        }
+    }
+
+    /// Maps a disconnected result channel to its meaning: clean end of
+    /// stream when shutdown was requested, worker death otherwise.
+    fn disconnected(&self) -> Result<Option<PrefetchResult>, PrefetchError> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            debug!("prefetch channel disconnected - loader shut down");
+            Ok(None)
+        } else {
+            Err(PrefetchError::WorkerExited {
+                message: self
+                    .worker_fault
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            })
         }
     }
 
     /// Try to get next without blocking.
-    pub fn try_next(&self) -> Option<SampledSubgraph> {
-        match self.result_rx.try_recv() {
+    ///
+    /// Returns `Ok(None)` when no batch is ready yet or the loader has been
+    /// shut down, and `Err(PrefetchError::WorkerExited { .. })` when the
+    /// worker exited without `shutdown()` being requested.
+    pub fn try_next(&self) -> Result<Option<SampledSubgraph>, PrefetchError> {
+        let Some(result_rx) = self.result_rx.as_ref() else {
+            return Ok(None);
+        };
+        match result_rx.try_recv() {
             Ok(result) => {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
                 self.stats.total.fetch_add(1, Ordering::Relaxed);
-                Some(result.subgraph)
+                Ok(Some(result.subgraph))
             }
-            _ => None,
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => self.disconnected().map(|r| r.map(|r| r.subgraph)),
         }
     }
 
@@ -930,55 +1118,47 @@ impl NeighborLoader {
 
     /// Get next sampled subgraph with features (blocking).
     ///
-    /// Returns (subgraph, optional features). Features are `Some` if the
-    /// prefetcher was created with `with_features()`.
+    /// Returns `(subgraph, features)` pairs; `features` is `Some` when the
+    /// prefetcher was created with a feature column attached (e.g.
+    /// `with_features()`) and `None` when it was not.
     ///
-    /// Returns `None` both when the worker has exited (channel disconnected —
-    /// the normal end-of-epoch state, logged at debug) and when the 30s wait
-    /// elapses (logged at warn, indicating a deadlock or very slow I/O). The
-    /// two cases are distinguishable in the logs.
-    pub fn next_with_features(&self) -> Option<(SampledSubgraph, Option<Vec<f32>>)> {
-        self.stats.total.fetch_add(1, Ordering::Relaxed);
-
-        match self.result_rx.try_recv() {
-            Ok(result) => {
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                trace!(batch_idx = result.batch_idx, "prefetch hit");
-                Some((result.subgraph, result.features))
-            }
-            Err(TryRecvError::Empty) => {
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                trace!("prefetch miss - blocking");
-                match self
-                    .result_rx
-                    .recv_timeout(std::time::Duration::from_secs(30))
-                {
-                    Ok(r) => Some((r.subgraph, r.features)),
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        warn!(
-                            "Prefetch timeout after 30s - worker may have deadlocked or I/O is very slow"
-                        );
-                        None
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        debug!("prefetch channel disconnected - worker exited");
-                        None
-                    }
-                }
-            }
-            Err(TryRecvError::Disconnected) => {
-                debug!("prefetch channel disconnected - worker exited");
-                None
-            }
+    /// Returns:
+    /// - `Ok(Some(_))` when a batch is ready.
+    /// - `Ok(None)` after `shutdown()` — the clean end-of-stream state.
+    /// - `Err(PrefetchError::Timeout { .. })` when no result arrived within
+    ///   30s; the caller may call again.
+    /// - `Err(PrefetchError::WorkerExited { .. })` when the worker exited
+    ///   without `shutdown()` being requested.
+    /// - `Err(PrefetchError::FeatureLoad { .. })` when a feature column is
+    ///   attached but loading this batch's features failed.
+    pub fn next_with_features(&self) -> Result<Option<SubgraphWithFeatures>, PrefetchError> {
+        match self.next_timeout(RECV_TIMEOUT)? {
+            None => Ok(None),
+            Some(result) => match result.features {
+                None => Ok(Some((result.subgraph, None))),
+                Some(Ok(features)) => Ok(Some((result.subgraph, Some(features)))),
+                Some(Err(source)) => Err(PrefetchError::FeatureLoad {
+                    batch_idx: result.batch_idx,
+                    source,
+                }),
+            },
         }
     }
 
     /// Shutdown the prefetch thread(s).
+    ///
+    /// Closes the work channel, drops the result receiver so a worker blocked
+    /// mid-`send` on a full result channel unblocks, then joins the workers.
+    /// Undelivered results are discarded; subsequent consumer calls return
+    /// `Ok(None)`.
     #[tracing::instrument(skip(self), fields(num_handles = self.handles.len()))]
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Drop sender to unblock workers (take it so channel actually closes)
+        // Drop sender to unblock workers waiting for work (take it so the
+        // channel actually closes)
         drop(self.work_tx.take());
+        // Drop receiver to unblock workers waiting to deliver a result
+        drop(self.result_rx.take());
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
@@ -1060,11 +1240,11 @@ impl NeighborLoader {
                             nodes = subgraph.nodes.len(),
                             "features loaded"
                         );
-                        (Some(feats), Some(store.feature_dim()))
+                        (Some(Ok(feats)), Some(store.feature_dim()))
                     }
                     Err(e) => {
                         warn!(batch_idx = work.batch_idx, error = %e, "feature load failed");
-                        (None, None)
+                        (Some(Err(e)), Some(store.feature_dim()))
                     }
                 }
             } else {
@@ -1256,10 +1436,10 @@ impl NeighborLoader {
 
             let (features, feature_dim) = if let Some(ref mut store) = feature_store {
                 match store.get_batch(&subgraph.nodes) {
-                    Ok(feats) => (Some(feats), Some(store.feature_dim())),
+                    Ok(feats) => (Some(Ok(feats)), Some(store.feature_dim())),
                     Err(e) => {
                         warn!(batch_idx = work.batch_idx, error = %e, "NVMe feature load failed");
-                        (None, None)
+                        (Some(Err(e)), Some(store.feature_dim()))
                     }
                 }
             } else {
@@ -1291,12 +1471,12 @@ impl Drop for NeighborLoader {
 
 /// io_uring-based k-hop sampling for NVMe graphs.
 ///
-/// This path honors `fanout`, `replace`, `cumulative`, and `seed`. It does NOT
-/// yet honor the following `SamplingConfig` fields, which are silently ignored:
-/// `weighted`, `temporal_strategy`, `disjoint`, `deterministic`,
-/// `track_edge_ids` (edge ids are always tracked), `max_degree`, and
-/// `subgraph_type` (edges are always returned directional). Callers needing
-/// those must use the in-memory [`NeighborSampler`] path.
+/// This path honors `fanout`, `replace`, `cumulative`, and `seed`. Edge ids
+/// are always tracked (`track_edge_ids` is ignored) and edges are always
+/// returned directional. The remaining `SamplingConfig` fields (`weighted`,
+/// `temporal_strategy`, `disjoint`, `deterministic`, `max_degree`,
+/// non-default `subgraph_type`) are rejected by the NVMe constructors;
+/// callers needing those must use the in-memory [`NeighborSampler`] path.
 #[cfg(target_os = "linux")]
 fn sample_with_uring(
     handle: &mut crate::internal::uring::UringHandle,
@@ -1566,13 +1746,13 @@ mod tests {
         prefetcher.submit(1, vec![1]).unwrap();
         prefetcher.submit(2, vec![2]).unwrap();
 
-        let sg1 = prefetcher.next().unwrap();
+        let sg1 = prefetcher.next().unwrap().unwrap();
         assert_eq!(sg1.num_seeds(), 1);
 
-        let sg2 = prefetcher.next().unwrap();
+        let sg2 = prefetcher.next().unwrap().unwrap();
         assert_eq!(sg2.num_seeds(), 1);
 
-        let sg3 = prefetcher.next().unwrap();
+        let sg3 = prefetcher.next().unwrap().unwrap();
         assert_eq!(sg3.num_seeds(), 1);
     }
 
@@ -1593,7 +1773,7 @@ mod tests {
 
         // Consume all
         for _ in 0..10 {
-            prefetcher.next().unwrap();
+            prefetcher.next().unwrap().unwrap();
         }
 
         let hit_rate = prefetcher.stats().hit_rate();
@@ -1630,5 +1810,128 @@ mod tests {
         let batch = store.get_batch(&[0, 1]).unwrap();
 
         assert_eq!(batch, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_shutdown_unblocks_blocked_worker() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            fanout: vec![2],
+            replace: false,
+            seed: Some(7),
+            ..Default::default()
+        };
+
+        // prefetch_depth 1 => result channel capacity 1. Submitting several
+        // batches leaves the worker blocked mid-`send` on a full channel.
+        let mut prefetcher = NeighborLoader::new(graph, config, 1).unwrap();
+        for i in 0..4 {
+            prefetcher.submit(i, vec![i as u32 % 5]).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Must return promptly even though the worker is blocked in send.
+        prefetcher.shutdown();
+
+        // After shutdown, consumers see a clean end of stream.
+        assert!(matches!(prefetcher.next(), Ok(None)));
+        assert!(matches!(prefetcher.try_next(), Ok(None)));
+        assert!(matches!(prefetcher.next_with_features(), Ok(None)));
+    }
+
+    #[test]
+    fn test_next_reports_timeout() {
+        let graph = create_test_graph();
+        let prefetcher = NeighborLoader::new(graph, SamplingConfig::default(), 2).unwrap();
+
+        // Nothing submitted: the worker is alive but has no results.
+        let waited = Duration::from_millis(50);
+        match prefetcher.next_timeout(waited) {
+            Err(PrefetchError::Timeout { waited: w }) => assert_eq!(w, waited),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_worker_exit_surfaces_error() {
+        // Build a loader whose worker panics immediately, without shutdown()
+        // being requested. The fault is recorded before the channel closes,
+        // so the consumer sees the panic message.
+        let (work_tx, _work_rx) = bounded::<PrefetchWork>(1);
+        let (result_tx, result_rx) = bounded::<PrefetchResult>(1);
+        let worker_fault = Arc::new(Mutex::new(None));
+        let handle = {
+            let fault = worker_fault.clone();
+            thread::Builder::new()
+                .name("aethergraph-test-worker".into())
+                .spawn(move || {
+                    let _result_tx = result_tx;
+                    run_worker(&fault, || panic!("worker died"));
+                })
+                .unwrap()
+        };
+        let loader = NeighborLoader {
+            work_tx: Some(work_tx),
+            result_rx: Some(result_rx),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            handles: vec![handle],
+            stats: Arc::new(PrefetchStats::default()),
+            prefetch_depth: 1,
+            feature_dim: None,
+            worker_fault,
+        };
+
+        match loader.next() {
+            Err(PrefetchError::WorkerExited {
+                message: Some(message),
+            }) => {
+                assert!(message.contains("worker died"), "got: {message}");
+            }
+            other => panic!("expected WorkerExited, got {other:?}"),
+        }
+        assert!(matches!(
+            loader.try_next(),
+            Err(PrefetchError::WorkerExited { .. })
+        ));
+    }
+
+    #[test]
+    fn test_feature_load_error_surfaces() {
+        // Graph has 5 nodes but the feature file only covers 2, so loading
+        // features for a batch that samples node 4 fails.
+        let graph = create_test_graph();
+        let temp_file = NamedTempFile::new().unwrap();
+        let features = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(temp_file.path())
+            .unwrap();
+        file.write_all(b"AETHFEAT").unwrap();
+        file.write_all(&(2u64).to_le_bytes()).unwrap();
+        file.write_all(&(3u64).to_le_bytes()).unwrap();
+        file.write_all(&(0u64).to_le_bytes()).unwrap();
+        file.write_all(bytemuck::cast_slice(&features)).unwrap();
+        file.sync_all().unwrap();
+
+        let config = SamplingConfig {
+            fanout: vec![2],
+            replace: false,
+            seed: Some(1),
+            ..Default::default()
+        };
+        let loader = NeighborLoader::with_features(graph, config, temp_file.path(), 2).unwrap();
+        loader.submit(0, vec![4]).unwrap();
+
+        match loader.next_with_features() {
+            Err(PrefetchError::FeatureLoad { batch_idx, source }) => {
+                assert_eq!(batch_idx, 0);
+                assert!(
+                    source.to_string().contains("out of bounds"),
+                    "got: {source}"
+                );
+            }
+            other => panic!("expected FeatureLoad, got {other:?}"),
+        }
     }
 }

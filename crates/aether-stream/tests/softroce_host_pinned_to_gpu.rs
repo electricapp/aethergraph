@@ -3,6 +3,8 @@
 //! Exercises the feature-gather pipeline on a box that has CUDA but no
 //! peer-memory module — the NIC writes into a regular host buffer, the CPU
 //! stages the bytes into VRAM, and the seqlock kernel verifies each slot.
+//! Mirrors the two-snapshot protocol: each slot is READ twice, sequentially,
+//! into two host regions that become the kernel's two staging inputs.
 //! Requires a loaded RDMA device and a CUDA-capable GPU; otherwise the test
 //! skips cleanly.
 
@@ -83,13 +85,16 @@ fn rdma_into_host_then_memcpy_into_vram_and_validate() {
     }
 
     let schema = server_table.schema();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `server_table` owns the registered range and outlives
+    // `server_mr`, which is dropped before the table at end of test.
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             server_table.base_addr() as *mut u8,
             server_table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
     let server_rkey = server_mr.rkey();
 
     // --- Client side: a pageable host buffer registered for local writes -----
@@ -106,30 +111,38 @@ fn rdma_into_host_then_memcpy_into_vram_and_validate() {
         .connect(&client_ctx, &server_qp.endpoint(&server_ctx))
         .unwrap();
 
-    let host_len = NODES_READ * schema.slot_size;
+    // Two snapshot regions, back-to-back in one host buffer. Snapshot 2 is
+    // READ only after snapshot 1's completion has been drained, matching the
+    // production client's ordering.
+    let snap_len = NODES_READ * schema.slot_size;
+    let host_len = snap_len * 2;
     let mut host_buf = vec![0u8; host_len];
-    let client_mr = client_ctx
-        .reg_mr(host_buf.as_mut_ptr(), host_len, IBV_ACCESS_LOCAL_WRITE)
-        .expect("client reg_mr");
+    // SAFETY: `host_buf` owns the registered range and outlives `client_mr`,
+    // which is dropped before the buffer at end of test.
+    let client_mr =
+        unsafe { client_ctx.reg_mr(host_buf.as_mut_ptr(), host_len, IBV_ACCESS_LOCAL_WRITE) }
+            .expect("client reg_mr");
     let client_lkey = client_mr.lkey();
 
-    // --- RDMA READ NODES_READ slots into the host buffer ---------------------
+    // --- RDMA READ both snapshots of NODES_READ slots -------------------------
     let server_base = server_table.base_addr();
     let host_base = host_buf.as_mut_ptr() as u64;
-    let reads: Vec<RdmaRead> = (0..NODES_READ)
-        .map(|i| RdmaRead {
-            local_addr: host_base + (i * schema.slot_size) as u64,
-            local_lkey: client_lkey,
-            remote_addr: server_base + (i * schema.slot_size) as u64,
-            remote_rkey: server_rkey,
-            length: schema.slot_size as u32,
-        })
-        .collect();
+    for snapshot in 0..2usize {
+        let reads: Vec<RdmaRead> = (0..NODES_READ)
+            .map(|i| RdmaRead {
+                local_addr: host_base + (snapshot * snap_len + i * schema.slot_size) as u64,
+                local_lkey: client_lkey,
+                remote_addr: server_base + (i * schema.slot_size) as u64,
+                remote_rkey: server_rkey,
+                length: schema.slot_size as u32,
+            })
+            .collect();
 
-    client_qp.post_reads(&reads).expect("post_reads");
-    let wc =
-        drain_one_completion(&client_qp, &client_ctx, Duration::from_secs(5)).expect("CQ drain");
-    assert_eq!(wc.status, IBV_WC_SUCCESS, "RDMA READ must succeed");
+        client_qp.post_reads(&reads).expect("post_reads");
+        let wc = drain_one_completion(&client_qp, &client_ctx, Duration::from_secs(5))
+            .expect("CQ drain");
+        assert_eq!(wc.status, IBV_WC_SUCCESS, "RDMA READ must succeed");
+    }
 
     // --- Stage the host buffer in VRAM and run the validator -----------------
     let cuda_ctx = CudaContext::new(0).expect("CUDA init");
@@ -139,17 +152,17 @@ fn rdma_into_host_then_memcpy_into_vram_and_validate() {
     stream
         .memcpy_htod(&host_buf, &mut staging)
         .expect("H2D memcpy");
-    let staging_ptr = {
+    let staging1_ptr = {
         let (p, _g) = staging.device_ptr_mut(&stream);
         p as u64
     };
+    let staging2_ptr = staging1_ptr + snap_len as u64;
 
     let mut validator = SeqlockValidator::new(&cuda_ctx, &stream, NODES_READ, FEATURE_DIM)
         .expect("SeqlockValidator nvrtc compile");
 
-    // epoch_version=0 → accept any consistent read.
     let retries = validator
-        .validate(staging_ptr, schema.slot_size, NODES_READ, 0)
+        .validate(staging1_ptr, staging2_ptr, schema.slot_size, NODES_READ)
         .expect("kernel launch");
     assert_eq!(
         retries, 0,

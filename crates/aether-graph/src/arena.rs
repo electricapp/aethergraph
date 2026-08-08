@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Fixed-capacity bump arena. Pre-allocates all memory upfront.
 ///
 /// Nodes are allocated by bumping `offset`. Individual nodes are never
-/// freed; space is reclaimed in bulk by [`reset`](Self::reset) (used by
-/// `DynamicGraph::compact`) or by dropping the arena.
+/// freed; space is reclaimed in bulk by dropping the arena.
 ///
 /// The backing buffer is a raw `NonNull<u8>` paired with the `Layout` it was
 /// allocated with. `Vec<u8>` is not used because `Vec` would deallocate with
@@ -80,7 +79,9 @@ impl Arena {
     }
 
     /// Allocate `size` bytes with `align` alignment. Returns byte offset
-    /// into the arena. Returns None if arena is full.
+    /// into the arena. Returns None if the arena is full or `size == 0` —
+    /// a zero-size allocation at an exactly-full 2 GiB arena would return
+    /// offset `1 << 31`, colliding with the C-tree's bit-31 tag.
     ///
     /// # Safety
     /// Single-writer invariant. The bump cursor is updated via a non-atomic
@@ -91,6 +92,9 @@ impl Arena {
     #[inline]
     pub unsafe fn alloc(&self, size: usize, align: usize) -> Option<u32> {
         debug_assert!(align.is_power_of_two(), "alignment must be power of two");
+        if size == 0 {
+            return None;
+        }
         let current = self.offset.load(Ordering::Relaxed);
         // Align up — checked to catch malformed (size, align) inputs.
         let aligned = current.checked_add(align - 1)? & !(align - 1);
@@ -162,14 +166,6 @@ impl Arena {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
-
-    /// Reset the arena (reclaims all allocations). Writer only.
-    ///
-    /// # Safety
-    /// Caller must ensure no readers hold references to arena data.
-    pub unsafe fn reset(&self) {
-        self.offset.store(0, Ordering::Relaxed);
-    }
 }
 
 impl Drop for Arena {
@@ -240,13 +236,10 @@ mod tests {
     }
 
     #[test]
-    fn reset() {
+    fn zero_size_alloc_returns_none() {
         let arena = Arena::new(4096);
         // SAFETY: test is single-threaded.
-        let _ = unsafe { arena.alloc(64, 64) }.unwrap();
-        assert_eq!(arena.used(), 64);
-        // SAFETY: test is single-threaded.
-        unsafe { arena.reset() };
+        assert!(unsafe { arena.alloc(0, 1) }.is_none());
         assert_eq!(arena.used(), 0);
     }
 

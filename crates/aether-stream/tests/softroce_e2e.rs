@@ -144,13 +144,16 @@ fn t1_4_rdma_read_feature_table_bytes_match() {
     let server_total = server_table.total_size();
 
     // Register the full table for remote read.
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `server_table` owns the registered range and outlives
+    // `server_mr` (RAII drop at end of scope, before the table).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             server_base as *mut u8,
             server_total,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
     let server_rkey = server_mr.rkey();
     assert_ne!(server_rkey, 0, "rkey must be nonzero");
 
@@ -167,9 +170,11 @@ fn t1_4_rdma_read_feature_table_bytes_match() {
     // Client buffer: one slot per node we'll read, back-to-back.
     let client_len = NODES_READ * schema.slot_size;
     let mut client_buf = vec![0u8; client_len];
-    let client_mr = client_ctx
-        .reg_mr(client_buf.as_mut_ptr(), client_len, IBV_ACCESS_LOCAL_WRITE)
-        .expect("client reg_mr");
+    // SAFETY: `client_buf` owns the registered range and outlives
+    // `client_mr`; the READ completions below are drained before either drops.
+    let client_mr =
+        unsafe { client_ctx.reg_mr(client_buf.as_mut_ptr(), client_len, IBV_ACCESS_LOCAL_WRITE) }
+            .expect("client reg_mr");
     let client_lkey = client_mr.lkey();
 
     // Build one RDMA READ per node.
@@ -242,13 +247,16 @@ fn t1_5_control_plane_qp_exchange() {
 
     let server_ctx = RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("server open");
     let table = FeatureTable::new(NODE_COUNT, FEATURE_DIM, vec![]).unwrap();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `table` owns the registered range and outlives `server_mr`
+    // (dropped explicitly before the table at end of test).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("reg_mr");
+    }
+    .expect("reg_mr");
     let adv = RdmaAdvertisement {
         base_addr: table.base_addr(),
         rkey: server_mr.rkey(),
@@ -319,13 +327,17 @@ fn t1_6_cq_error_recovery() {
     table.write_node(0, &feats);
 
     let schema = table.schema();
-    let server_mr_initial = server_ctx
-        .reg_mr(
+    // SAFETY: `table` owns the registered range and outlives this MR — the
+    // test drops the MR deliberately (to provoke error CQEs) while the
+    // table stays alive.
+    let server_mr_initial = unsafe {
+        server_ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("initial reg_mr");
+    }
+    .expect("initial reg_mr");
     let initial_rkey = server_mr_initial.rkey();
 
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).unwrap();
@@ -338,13 +350,17 @@ fn t1_6_cq_error_recovery() {
         .unwrap();
 
     let mut client_buf = vec![0u8; schema.slot_size];
-    let client_mr = client_ctx
-        .reg_mr(
+    // SAFETY: `client_buf` owns the registered range and outlives
+    // `client_mr` (explicit drop at end of test); all READs targeting it
+    // are drained before then.
+    let client_mr = unsafe {
+        client_ctx.reg_mr(
             client_buf.as_mut_ptr(),
             client_buf.len(),
             IBV_ACCESS_LOCAL_WRITE,
         )
-        .expect("client reg_mr");
+    }
+    .expect("client reg_mr");
     let client_lkey = client_mr.lkey();
 
     // Step 1: deregister the server MR — any subsequent READ must fail.
@@ -379,13 +395,16 @@ fn t1_6_cq_error_recovery() {
     }
 
     // Step 4: re-register and confirm a fresh QP pair + MR lets READs succeed.
-    let server_mr_fresh = server_ctx
-        .reg_mr(
+    // SAFETY: `table` owns the registered range and outlives
+    // `server_mr_fresh` (dropped explicitly before the table).
+    let server_mr_fresh = unsafe {
+        server_ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("re-reg_mr");
+    }
+    .expect("re-reg_mr");
     let new_rkey = server_mr_fresh.rkey();
 
     let server_qp2 = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).unwrap();
@@ -459,13 +478,16 @@ fn bench_rdma_read_latency() {
     let schema = server_table.schema();
     let server_base = server_table.base_addr();
     let server_total = server_table.total_size();
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `server_table` owns the registered range and outlives
+    // `server_mr` (dropped explicitly at end of bench, before the table).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             server_base as *mut u8,
             server_total,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
     let server_rkey = server_mr.rkey();
 
     let client_ctx = RdmaContext::open(1024, ROCE_V2_GID_INDEX).expect("client open");
@@ -489,9 +511,13 @@ fn bench_rdma_read_latency() {
         }
         let client_len = batch * schema.slot_size;
         let mut client_buf = vec![0u8; client_len];
-        let client_mr = client_ctx
-            .reg_mr(client_buf.as_mut_ptr(), client_len, IBV_ACCESS_LOCAL_WRITE)
-            .expect("client reg_mr");
+        // SAFETY: `client_buf` owns the registered range and outlives
+        // `client_mr` (explicit drop at end of this batch iteration); all
+        // READ completions are drained before that.
+        let client_mr = unsafe {
+            client_ctx.reg_mr(client_buf.as_mut_ptr(), client_len, IBV_ACCESS_LOCAL_WRITE)
+        }
+        .expect("client reg_mr");
         let client_lkey = client_mr.lkey();
         let client_base = client_buf.as_mut_ptr() as u64;
 

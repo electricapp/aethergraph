@@ -3,6 +3,7 @@
 //! Uses lock-free atomic counters for minimal overhead. No automatic logging.
 //! Call `.summary()` to get metrics on-demand.
 
+use crate::features::PaddedAtomicU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,11 @@ pub struct SamplingTelemetry {
     /// Total sampling operations
     pub total_samples: AtomicU64,
 
-    /// Number of hub nodes encountered (degree > max_degree)
-    pub hub_nodes_capped: AtomicU64,
+    /// Number of hub nodes encountered (degree > max_degree).
+    ///
+    /// Bumped from every sampling thread via `record_hub_node`, so it gets
+    /// its own cache line to avoid false sharing with the counters around it.
+    hub_nodes_capped: PaddedAtomicU64,
 
     /// Total nodes sampled across all operations
     pub total_nodes_sampled: AtomicU64,
@@ -68,7 +72,11 @@ impl SamplingTelemetry {
         }
     }
 
-    /// Resets all counters (useful for benchmarking)
+    /// Resets all counters (useful for benchmarking).
+    ///
+    /// Each counter is cleared with an independent relaxed store, so a reset
+    /// racing concurrent recorders is not atomic — a summary taken around it
+    /// can mix pre- and post-reset values.
     pub fn reset(&self) {
         self.total_samples.store(0, Ordering::Relaxed);
         self.hub_nodes_capped.store(0, Ordering::Relaxed);

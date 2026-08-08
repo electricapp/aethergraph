@@ -9,7 +9,8 @@ mod sampler;
 
 pub use hetero_sampler::{HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig};
 pub use prefetch::{
-    NeighborLoader, PrefetchResult, PrefetchStats, PrefetchWork, SubmitError, SyncFeatureStore,
+    NeighborLoader, PrefetchError, PrefetchResult, PrefetchStats, PrefetchWork,
+    SubgraphWithFeatures, SubmitError, SyncFeatureStore,
 };
 pub use sampler::{
     NeighborSampler, ParallelBatchSampler, SampledSubgraph, SamplingConfig, SubgraphType,

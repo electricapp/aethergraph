@@ -65,14 +65,17 @@ fn start_server() -> (String, RdmaAdvertisement) {
     let table = Box::leak(Box::new(
         FeatureTable::new(16, 4, vec![]).expect("table alloc"),
     ));
+    // SAFETY: both `table` and the MR are Box::leak'd, so the registered
+    // range lives for the whole process — it can never be freed under the MR.
     let mr = Box::leak(Box::new(
-        server_ctx
-            .reg_mr(
+        unsafe {
+            server_ctx.reg_mr(
                 table.base_addr() as *mut u8,
                 table.total_size(),
                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
             )
-            .expect("reg_mr"),
+        }
+        .expect("reg_mr"),
     ));
     let adv = RdmaAdvertisement {
         base_addr: table.base_addr(),

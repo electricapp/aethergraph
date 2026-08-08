@@ -264,7 +264,10 @@ class Sampler:
 
     Attributes:
         graph: The graph to sample from.
-        config: The sampling configuration.
+        config: The sampling configuration passed at construction. This is a
+            snapshot kept for inspection only — the Rust sampler holds its own
+            copy, so mutating this attribute after construction has no effect
+            on sampling. Build a new Sampler to change parameters.
         _inner: The underlying Rust NeighborSampler instance.
 
     Example:
@@ -308,10 +311,10 @@ class Sampler:
         """Sample k-hop neighborhoods for a batch of seed nodes.
 
         Args:
-            seeds: Seed node IDs. Accepts numpy `uint32` arrays (zero-copy),
-                numpy `int64` arrays (range-checked widening), or any Python
-                sequence of ints. Dispatch happens at the FFI boundary, not
-                here.
+            seeds: Seed node IDs. Accepts numpy `uint32` arrays (copied
+                directly), numpy `int64` arrays (range-checked, then copied),
+                or any Python sequence of ints. Dispatch happens at the FFI
+                boundary, not here.
             input_times: Per-seed timestamps (`float64`), required when
                 `config.temporal_strategy` is set.
 
@@ -344,7 +347,10 @@ class ParallelBatchSampler:
 
     Attributes:
         graph: The graph to sample from.
-        config: The sampling configuration.
+        config: The sampling configuration passed at construction. This is a
+            snapshot kept for inspection only — the Rust sampler holds its own
+            copy, so mutating this attribute after construction has no effect
+            on sampling. Build a new ParallelBatchSampler to change parameters.
         _inner: The underlying Rust ParallelBatchSampler instance.
 
     Example:

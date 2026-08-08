@@ -20,8 +20,15 @@
 use crate::graph::{DynamicGraph, InsertError, WriterError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
 use std::time::Duration;
+
+/// Number of edges a single writer guard absorbs before every ingest
+/// loop drops and reacquires it. Each guard drop commits (WAL sync when
+/// attached, epoch advance), so this bounds both the window of inserts a
+/// crash can lose and how stale epoch-pinned readers can get during a
+/// long ingest session.
+pub const COMMIT_INTERVAL_EDGES: usize = 65_536;
 
 /// Ingestion statistics. Lock-free, read from any thread.
 #[derive(Debug)]
@@ -105,14 +112,20 @@ impl std::error::Error for IngestSpawnError {
 /// Calls `next_edge()` repeatedly until it returns `None`. Single-threaded
 /// on the write side. Readers may sample concurrently.
 ///
-/// Returns `Err(IngestSpawnError::Writer(_))` if the writer slot is busy or
-/// poisoned (see [`WriterError`]).
+/// Durability cadence: the writer guard is dropped and reacquired every
+/// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
+/// epoch advance) at that interval and again when the run ends.
+///
+/// Returns `Err(IngestSpawnError::Writer(_))` if the writer slot is busy
+/// or poisoned (see [`WriterError`]), either at the start or when a
+/// periodic reacquire finds the slot stolen or the graph poisoned.
 pub fn run(
     graph: &DynamicGraph,
     mut next_edge: impl FnMut() -> Option<(u32, u32)>,
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
     let mut writer = graph.writer()?;
+    let mut guard_edges = 0usize;
     while let Some((src, dst)) = next_edge() {
         stats.received.fetch_add(1, Ordering::Relaxed);
         match writer.insert_edge(src, dst) {
@@ -125,22 +138,37 @@ pub fn run(
             Err(InsertError::VertexOutOfRange { .. }) => {
                 stats.errors.fetch_add(1, Ordering::Relaxed);
             }
-            Err(InsertError::ArenaFull) => {
+            // Arena exhaustion (and WAL append failure when enabled)
+            // cannot be recovered here: stop ingesting.
+            Err(_) => {
                 stats.errors.fetch_add(1, Ordering::Relaxed);
                 break;
             }
+        }
+        guard_edges += 1;
+        if guard_edges >= COMMIT_INTERVAL_EDGES {
+            drop(writer);
+            writer = graph.writer()?;
+            guard_edges = 0;
         }
     }
     Ok(stats)
 }
 
 /// Ingest edges in batches from an iterator of `(src, dst)` slices.
+///
+/// Durability cadence: the writer guard is dropped and reacquired at
+/// every batch boundary and every [`COMMIT_INTERVAL_EDGES`] edges within
+/// a batch, committing (WAL sync when attached, epoch advance) at each
+/// cycle. A failed reacquire (slot stolen or graph poisoned) returns
+/// `Err(IngestSpawnError::Writer(_))`.
 pub fn run_batches(
     graph: &DynamicGraph,
     batches: impl Iterator<Item = Vec<(u32, u32)>>,
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
     let mut writer = graph.writer()?;
+    let mut guard_edges = 0usize;
     'outer: for batch in batches {
         for &(src, dst) in &batch {
             stats.received.fetch_add(1, Ordering::Relaxed);
@@ -154,12 +182,24 @@ pub fn run_batches(
                 Err(InsertError::VertexOutOfRange { .. }) => {
                     stats.errors.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(InsertError::ArenaFull) => {
+                // Arena exhaustion (and WAL append failure when enabled)
+                // cannot be recovered here: stop ingesting.
+                Err(_) => {
                     stats.errors.fetch_add(1, Ordering::Relaxed);
                     break 'outer;
                 }
             }
+            guard_edges += 1;
+            if guard_edges >= COMMIT_INTERVAL_EDGES {
+                drop(writer);
+                writer = graph.writer()?;
+                guard_edges = 0;
+            }
         }
+        // Commit at the batch boundary.
+        drop(writer);
+        writer = graph.writer()?;
+        guard_edges = 0;
     }
     Ok(stats)
 }
@@ -167,30 +207,40 @@ pub fn run_batches(
 /// Spawn an ingestion thread that reads edges from `next_edge` and inserts
 /// them into the graph until `stop` is set.
 ///
-/// Returns `Err` if the writer slot is busy or the OS refuses to spawn the
-/// thread. On exhaustion, the thread blocks on a channel rather than busy-
-/// looping, so producers can signal new work via `notify` (or set `stop`).
+/// The spawned thread acquires the writer slot itself and reports the
+/// result back before this returns, so `Err` means no idle ingestor was
+/// left behind. Returns `Err` if the writer slot is busy or poisoned, or
+/// if the OS refuses to spawn the thread.
+///
+/// Durability cadence: the writer guard is dropped and reacquired every
+/// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
+/// epoch advance) at that interval. A failed reacquire bumps
+/// `stats.errors` and stops the thread.
 pub fn spawn(
     graph: Arc<DynamicGraph>,
     stop: Arc<AtomicBool>,
     mut next_edge: impl FnMut() -> Option<(u32, u32)> + Send + 'static,
 ) -> Result<(std::thread::JoinHandle<()>, Arc<IngestStats>), IngestSpawnError> {
-    // Probe the writer slot up front so the caller learns about Busy /
-    // Poisoned synchronously, then immediately release so the spawned
-    // thread can take it.
-    drop(graph.writer()?);
-
     let stats = Arc::new(IngestStats::new());
     let stats_clone = Arc::clone(&stats);
+    // The spawned thread reports its writer acquisition over this channel
+    // so the caller learns about Busy / Poisoned synchronously.
+    let (ready_tx, ready_rx) = channel::<Result<(), WriterError>>();
 
     let handle = std::thread::Builder::new()
         .name("edge-ingestor".into())
         .spawn(move || {
-            let Ok(mut writer) = graph.writer() else {
-                // Slot got taken or poisoned between probe and re-acquire.
-                // Exit cleanly; caller already has the JoinHandle.
-                return;
+            let mut writer = match graph.writer() {
+                Ok(w) => {
+                    let _ = ready_tx.send(Ok(()));
+                    w
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
             };
+            let mut guard_edges = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match next_edge() {
                     Some((src, dst)) => {
@@ -205,10 +255,28 @@ pub fn spawn(
                             Err(InsertError::VertexOutOfRange { .. }) => {
                                 stats_clone.errors.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(InsertError::ArenaFull) => {
+                            // Arena exhaustion (and WAL append failure when
+                            // enabled) cannot be recovered here: stop.
+                            Err(_) => {
                                 stats_clone.errors.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
+                        }
+                        guard_edges += 1;
+                        if guard_edges >= COMMIT_INTERVAL_EDGES {
+                            drop(writer);
+                            writer = match graph.writer() {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    stats_clone.errors.fetch_add(1, Ordering::Relaxed);
+                                    tracing::error!(
+                                        error = %e,
+                                        "ingestor could not reacquire the writer slot; stopping"
+                                    );
+                                    return;
+                                }
+                            };
+                            guard_edges = 0;
                         }
                     }
                     None => {
@@ -222,13 +290,30 @@ pub fn spawn(
         })
         .map_err(IngestSpawnError::Thread)?;
 
-    Ok((handle, stats))
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((handle, stats)),
+        Ok(Err(e)) => {
+            let _ = handle.join();
+            Err(IngestSpawnError::Writer(e))
+        }
+        Err(_) => {
+            let _ = handle.join();
+            Err(IngestSpawnError::Thread(std::io::Error::other(
+                "ingestor thread exited before reporting writer acquisition",
+            )))
+        }
+    }
 }
 
 /// Drain a [`Receiver<(u32, u32)>`] of edges into the graph.
 ///
 /// Replaces the busy-wait pattern: the thread blocks on the channel and wakes
 /// on each batch. Returns when the sender is dropped or `stop` is set.
+///
+/// Durability cadence: the writer guard is dropped and reacquired every
+/// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
+/// epoch advance) at that interval. A failed reacquire returns
+/// `Err(IngestSpawnError::Writer(_))`.
 pub fn drain_channel(
     graph: &DynamicGraph,
     rx: Receiver<(u32, u32)>,
@@ -236,6 +321,7 @@ pub fn drain_channel(
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
     let mut writer = graph.writer()?;
+    let mut guard_edges = 0usize;
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok((src, dst)) => {
@@ -250,10 +336,18 @@ pub fn drain_channel(
                     Err(InsertError::VertexOutOfRange { .. }) => {
                         stats.errors.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(InsertError::ArenaFull) => {
+                    // Arena exhaustion (and WAL append failure when
+                    // enabled) cannot be recovered here: stop ingesting.
+                    Err(_) => {
                         stats.errors.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
+                }
+                guard_edges += 1;
+                if guard_edges >= COMMIT_INTERVAL_EDGES {
+                    drop(writer);
+                    writer = graph.writer()?;
+                    guard_edges = 0;
                 }
             }
             Err(RecvTimeoutError::Timeout) => continue,
@@ -308,24 +402,42 @@ pub struct ChannelIngestor {
 /// Drop the returned [`ChannelIngestor::sender`] to signal completion; the
 /// drainer exits cleanly when the channel disconnects.
 ///
+/// The drainer thread acquires the writer slot itself and reports the
+/// result back before this returns, so `Err` means no idle drainer was
+/// left behind.
+///
 /// The channel is bounded by `cfg.capacity`. Producers block on full —
 /// see [`SyncSender::try_send`] for non-blocking variants.
+///
+/// Durability cadence: the writer guard is dropped and reacquired every
+/// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
+/// epoch advance) at that interval. A failed reacquire bumps
+/// `stats.errors` and stops the drainer.
 pub fn spawn_channel(
     graph: Arc<DynamicGraph>,
     stop: Arc<AtomicBool>,
     cfg: ChannelIngestorConfig,
 ) -> Result<ChannelIngestor, IngestSpawnError> {
-    drop(graph.writer()?);
     let (tx, rx) = sync_channel::<(u32, u32)>(cfg.capacity);
     let stats = Arc::new(IngestStats::new());
     let stats_clone = Arc::clone(&stats);
+    // The drainer reports its writer acquisition over this channel so
+    // the caller learns about Busy / Poisoned synchronously.
+    let (ready_tx, ready_rx) = channel::<Result<(), WriterError>>();
     let handle = std::thread::Builder::new()
         .name("edge-ingestor-chan".into())
         .spawn(move || {
-            let Ok(mut writer) = graph.writer() else {
-                // Slot taken or graph poisoned between probe and re-acquire.
-                return;
+            let mut writer = match graph.writer() {
+                Ok(w) => {
+                    let _ = ready_tx.send(Ok(()));
+                    w
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
             };
+            let mut guard_edges = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok((src, dst)) => {
@@ -340,10 +452,28 @@ pub fn spawn_channel(
                             Err(InsertError::VertexOutOfRange { .. }) => {
                                 stats_clone.errors.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(InsertError::ArenaFull) => {
+                            // Arena exhaustion (and WAL append failure when
+                            // enabled) cannot be recovered here: stop.
+                            Err(_) => {
                                 stats_clone.errors.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
+                        }
+                        guard_edges += 1;
+                        if guard_edges >= COMMIT_INTERVAL_EDGES {
+                            drop(writer);
+                            writer = match graph.writer() {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    stats_clone.errors.fetch_add(1, Ordering::Relaxed);
+                                    tracing::error!(
+                                        error = %e,
+                                        "drainer could not reacquire the writer slot; stopping"
+                                    );
+                                    return;
+                                }
+                            };
+                            guard_edges = 0;
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => continue,
@@ -352,11 +482,23 @@ pub fn spawn_channel(
             }
         })
         .map_err(IngestSpawnError::Thread)?;
-    Ok(ChannelIngestor {
-        sender: tx,
-        handle,
-        stats,
-    })
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(ChannelIngestor {
+            sender: tx,
+            handle,
+            stats,
+        }),
+        Ok(Err(e)) => {
+            let _ = handle.join();
+            Err(IngestSpawnError::Writer(e))
+        }
+        Err(_) => {
+            let _ = handle.join();
+            Err(IngestSpawnError::Thread(std::io::Error::other(
+                "drainer thread exited before reporting writer acquisition",
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn spawn_reports_busy_writer() {
+        let graph = Arc::new(DynamicGraph::new(10, 1 << 20));
+        let _hold = graph.writer_or_panic();
+        let stop = Arc::new(AtomicBool::new(false));
+        let r = spawn(Arc::clone(&graph), stop, || None);
+        assert!(matches!(
+            r,
+            Err(IngestSpawnError::Writer(WriterError::Busy))
+        ));
+    }
+
+    #[test]
+    fn spawn_channel_reports_busy_writer() {
+        let graph = Arc::new(DynamicGraph::new(10, 1 << 20));
+        let _hold = graph.writer_or_panic();
+        let stop = Arc::new(AtomicBool::new(false));
+        let r = spawn_channel(Arc::clone(&graph), stop, ChannelIngestorConfig::default());
+        assert!(matches!(
+            r,
+            Err(IngestSpawnError::Writer(WriterError::Busy))
+        ));
+    }
+
+    #[test]
     fn channel_drain_works() {
         let graph = Arc::new(DynamicGraph::new(100, 1 << 20));
         let stop = Arc::new(AtomicBool::new(false));
@@ -446,23 +612,12 @@ mod tests {
 
     #[test]
     fn channel_applies_backpressure_when_full() {
-        // Hold the writer slot externally so the drainer thread can't
-        // acquire it. That keeps the drainer alive but stuck — items
+        // Stuff edges faster than the drainer can absorb them: items
         // accumulate in the channel up to `capacity`, then `try_send`
         // returns `Full` (not `Disconnected`).
         use std::sync::mpsc::TrySendError;
         let graph = Arc::new(DynamicGraph::new(100, 1 << 20));
-        let _writer_hold = graph.writer_or_panic();
-
         let stop = Arc::new(AtomicBool::new(false));
-        // spawn_channel probes writer() once up front — but it ALSO drops
-        // the probe before spawning. Since we're holding the writer, the
-        // probe fails. Use a private graph for the probe path: bind the
-        // ingestor to a different graph and the holder to the test graph.
-        // For this test, what we really want is to show the SyncSender
-        // bounding works. Easier: bind to a fresh graph and let the drainer
-        // run, but stuff edges faster than the drainer can absorb.
-        drop(_writer_hold);
 
         let bundle = spawn_channel(
             Arc::clone(&graph),

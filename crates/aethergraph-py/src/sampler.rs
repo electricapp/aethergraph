@@ -269,10 +269,11 @@ impl PySamplingConfig {
 /// - `*_i64` numpy arrays — what Python sees on `.nodes()`, `.edges()` etc.
 ///   PyTorch's `Tensor` indexing uses `int64`, so we widen once at conversion
 ///   time and never narrow again on the Python-facing path.
-/// - `original_*` `Arc<[u32]>` — the canonical Rust-side data, kept so that
-///   `to_arrow()` and other consumers don't have to round-trip i64→u32 (which
-///   in addition to being wasteful would lose the bounds check that node IDs
-///   actually fit in u32).
+/// - `original_*` `Vec` buffers — the canonical Rust-side data, moved (not
+///   copied) out of the sampled subgraph so that `to_arrow()` and other
+///   consumers don't have to round-trip i64→u32 (which in addition to being
+///   wasteful would lose the bounds check that node IDs actually fit in u32).
+///   They are copied on demand only when such a consumer asks.
 #[pyclass(name = "SampledSubgraph")]
 pub struct PySampledSubgraph {
     // Pre-computed numpy arrays as int64 (PyTorch's native index type)
@@ -293,13 +294,13 @@ pub struct PySampledSubgraph {
     // Per-hop sampling stats (for PyG compatibility)
     num_sampled_nodes: Vec<usize>,
     num_sampled_edges: Vec<usize>,
-    // Canonical u32 buffers — Arc so to_arrow() etc. can hand them to Arrow
-    // (which takes ownership of a Vec) without an additional clone.
-    original_nodes: Arc<[u32]>,
-    original_seeds: Arc<[u32]>,
-    original_edge_src: Arc<[u32]>,
-    original_edge_dst: Arc<[u32]>,
-    original_edge_ids: Arc<[u64]>,
+    // Canonical u32/u64 buffers, moved out of the core subgraph at
+    // construction; `to_arrow()` clones from them on demand.
+    original_nodes: Vec<u32>,
+    original_seeds: Vec<u32>,
+    original_edge_src: Vec<u32>,
+    original_edge_dst: Vec<u32>,
+    original_edge_ids: Vec<u64>,
 }
 
 impl PySampledSubgraph {
@@ -364,31 +365,25 @@ impl PySampledSubgraph {
                 .map_err(|e| sampling_error(format!("Failed to compute seed indices: {}", e)))?
         };
 
-        // Cache canonical u32 buffers before widening into the Python-facing
-        // i64 arrays so `to_arrow()` and similar consumers can hand them
-        // straight to Arrow without an i64→u32 narrowing pass.
-        let original_nodes: Arc<[u32]> = subgraph.nodes.clone().into();
-        let original_seeds: Arc<[u32]> = subgraph.seeds.clone().into();
-        let original_edge_src: Arc<[u32]> = subgraph.edge_src.clone().into();
-        let original_edge_dst: Arc<[u32]> = subgraph.edge_dst.clone().into();
-        let original_edge_ids: Arc<[u64]> = subgraph.edge_ids.clone().into();
-
-        // u32 → i64 widening, one pass per buffer. The cast is monotonic and
-        // free of branches; whether LLVM emits a vectorized form
-        // (vpmovzxdq on x86_64 AVX2 / uxtl on aarch64 NEON) is target- and
-        // codegen-flag-dependent and has NOT been audited here.
+        // u32 → i64 widening, one pass per buffer — the only per-buffer copy
+        // on this path; the source Vecs move into `original_*` below so
+        // `to_arrow()` and similar consumers can clone them on demand without
+        // an i64→u32 narrowing pass. The cast is monotonic and free of
+        // branches; whether LLVM emits a vectorized form (vpmovzxdq on x86_64
+        // AVX2 / uxtl on aarch64 NEON) is target- and codegen-flag-dependent
+        // and has NOT been audited here.
         // TODO(perf): pin this in CI with a `cargo asm` snapshot job that
         // fails the build if the widening lowers to a scalar loop on
         // either target.
-        let nodes_i64: Vec<i64> = subgraph.nodes.into_iter().map(|n| n as i64).collect();
-        let seeds_i64: Vec<i64> = subgraph.seeds.into_iter().map(|s| s as i64).collect();
+        let nodes_i64: Vec<i64> = subgraph.nodes.iter().map(|&n| n as i64).collect();
+        let seeds_i64: Vec<i64> = subgraph.seeds.iter().map(|&s| s as i64).collect();
         let seed_indices_i64: Vec<i64> = seed_indices_local.into_iter().map(|i| i as i64).collect();
-        let edge_ids_i64: Vec<i64> = subgraph.edge_ids.into_iter().map(|e| e as i64).collect();
+        let edge_ids_i64: Vec<i64> = subgraph.edge_ids.iter().map(|&e| e as i64).collect();
 
         // Global edge_index (original node IDs)
         let mut edge_data: Vec<i64> = Vec::with_capacity(num_edges * 2);
-        edge_data.extend(subgraph.edge_src.into_iter().map(|e| e as i64));
-        edge_data.extend(subgraph.edge_dst.into_iter().map(|e| e as i64));
+        edge_data.extend(subgraph.edge_src.iter().map(|&e| e as i64));
+        edge_data.extend(subgraph.edge_dst.iter().map(|&e| e as i64));
 
         // Local edge_index (remapped to [0, num_nodes))
         let mut edge_data_local: Vec<i64> = Vec::with_capacity(num_edges * 2);
@@ -431,11 +426,12 @@ impl PySampledSubgraph {
             num_seeds,
             num_sampled_nodes,
             num_sampled_edges,
-            original_nodes,
-            original_seeds,
-            original_edge_src,
-            original_edge_dst,
-            original_edge_ids,
+            // Move (not copy) the canonical buffers out of the core subgraph.
+            original_nodes: subgraph.nodes,
+            original_seeds: subgraph.seeds,
+            original_edge_src: subgraph.edge_src,
+            original_edge_dst: subgraph.edge_dst,
+            original_edge_ids: subgraph.edge_ids,
         })
     }
 }
@@ -699,7 +695,7 @@ impl PyNeighborSampler {
     ///     SampledSubgraph: Sampled subgraph containing nodes and edges
     #[pyo3(signature = (seeds, input_times=None))]
     fn sample(
-        &mut self,
+        &self,
         py: Python<'_>,
         seeds: &Bound<'_, PyAny>,
         input_times: Option<numpy::PyReadonlyArray1<f64>>,

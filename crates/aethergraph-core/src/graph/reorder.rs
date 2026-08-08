@@ -984,12 +984,14 @@ mod tests {
             seed: Some(42),
             ..Default::default()
         };
+        let num_batches = batches.len();
         let loader = crate::loader::NeighborLoader::new(graph, config, 2).unwrap();
         loader.submit_epoch(batches).unwrap();
 
         // Consume all results
         let mut total_seeds = 0;
-        while let Some(sg) = loader.next() {
+        for _ in 0..num_batches {
+            let sg = loader.next().unwrap().unwrap();
             total_seeds += sg.num_seeds();
         }
         assert_eq!(total_seeds, 8);

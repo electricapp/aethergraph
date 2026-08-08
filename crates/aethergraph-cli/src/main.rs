@@ -153,13 +153,7 @@ fn convert_edge_list(
     let file = File::open(input).context("failed to open input file")?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file); // 8MB buffer for HPC
 
-    // Pre-allocate with estimated capacity (assume avg degree ~20)
-    let estimated_edges = num_nodes * 20;
-    let mut edges = Vec::with_capacity(estimated_edges);
-    trace!(
-        "Pre-allocated edge vector with capacity {}",
-        estimated_edges
-    );
+    let mut edges = Vec::new();
 
     // Set up progress bar only if not quiet
     let pb = if tracing::level_enabled!(tracing::Level::INFO) {
@@ -175,6 +169,10 @@ fn convert_edge_list(
     };
 
     let mut line_count = 0;
+    // Delimiter is resolved once from the first data line and reused for the
+    // whole file, so a stray tab/comma in a later row can't switch the parser
+    // mid-stream.
+    let mut delim: Option<String> = delimiter;
 
     for (idx, line) in reader.lines().enumerate() {
         let line = line.context("failed to read line")?;
@@ -190,19 +188,24 @@ fn convert_edge_list(
             continue;
         }
 
-        // Auto-detect delimiter if not provided
-        let delim = delimiter.as_deref().unwrap_or_else(|| {
+        // Auto-detect delimiter from the first data line if not provided
+        let delim = delim.get_or_insert_with(|| {
             if line.contains('\t') {
-                "\t"
+                "\t".to_string()
             } else if line.contains(',') {
-                ","
+                ",".to_string()
             } else {
-                " "
+                " ".to_string()
             }
         });
 
-        // Parse edge
-        let parts: Vec<&str> = line.split(delim).collect();
+        // Parse edge. A space delimiter splits on any whitespace run so
+        // aligned columns (multiple spaces) parse cleanly.
+        let parts: Vec<&str> = if delim == " " {
+            line.split_whitespace().collect()
+        } else {
+            line.split(delim.as_str()).collect()
+        };
         if parts.len() < 2 {
             anyhow::bail!("invalid edge format at line {}: {}", idx + 1, line);
         }

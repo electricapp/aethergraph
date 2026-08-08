@@ -12,6 +12,11 @@
 //! - [`DynamicGraph`] integration: each clean `Writer::drop` calls `sync`
 //!   exactly once. Crash mid-writer-guard loses every insert in that guard;
 //!   crash after a clean drop loses zero inserts.
+//! - A panicked writer guard never commits: its drop path calls
+//!   [`WalWriter::discard_pending`], dropping the still-buffered records
+//!   instead of flushing them. This is best-effort discard — records the
+//!   buffer already spilled to the OS (a guard that appends more than the
+//!   buffer holds) are out of reach and will replay as a valid prefix.
 //!
 //! # Record format
 //!
@@ -46,11 +51,13 @@
 //!   and truncate everything below the checkpoint epoch.
 //! - **Atomic batch semantics**: there is no "transaction begin / commit".
 //!   A crash mid-batch can recover a prefix.
-//! - **Concurrent writers**: a single `WalWriter` is single-writer by
-//!   construction — the surrounding [`DynamicGraph`] already enforces
-//!   single-writer with the `Writer` guard.
+//! - **Concurrent writers**: a `WalWriter` holds an exclusive advisory
+//!   lock on the file for its lifetime, so a second open of the same path
+//!   fails with [`WalError::Locked`] instead of interleaving appends. The
+//!   surrounding [`DynamicGraph`] additionally enforces single-writer
+//!   in-process with the `Writer` guard.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -69,6 +76,10 @@ pub enum WalError {
     /// File exists but the magic header doesn't match — it isn't ours, or
     /// it's been overwritten by another process.
     BadMagic { found: [u8; 8] },
+    /// The WAL file is exclusively locked by another `WalWriter` (in this
+    /// process or another). Two writers appending to one log would
+    /// silently overwrite each other, so only one may hold it open.
+    Locked,
     /// Header says a version we don't know how to read.
     UnknownVersion(u32),
     /// A replayed record references a vertex at or beyond the
@@ -89,6 +100,7 @@ impl std::fmt::Display for WalError {
         match self {
             Self::Io(e) => write!(f, "WAL io error: {e}"),
             Self::BadMagic { found } => write!(f, "WAL bad magic: {found:?}"),
+            Self::Locked => write!(f, "WAL file is locked by another writer"),
             Self::UnknownVersion(v) => write!(f, "WAL version {v} not supported"),
             Self::RecordOutOfRange {
                 src,
@@ -140,6 +152,11 @@ impl WalWriter {
     /// Open an existing WAL or create one at `path`. The header is
     /// written and fsynced before this returns, so an interrupted
     /// open never leaves a half-initialized file.
+    ///
+    /// Takes an exclusive advisory lock on the file, held until the
+    /// writer (and its `File`) is dropped. A second `create_or_open` on
+    /// the same path fails with [`WalError::Locked`] while the lock is
+    /// held.
     pub fn create_or_open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let path = path.as_ref();
         let mut file = OpenOptions::new()
@@ -148,6 +165,13 @@ impl WalWriter {
             .create(true)
             .truncate(false)
             .open(path)?;
+
+        // Lock before reading or writing anything: a concurrent holder
+        // may be mid-append, and our header write below would clobber it.
+        file.try_lock().map_err(|e| match e {
+            TryLockError::WouldBlock => WalError::Locked,
+            TryLockError::Error(e) => WalError::Io(e),
+        })?;
 
         let len = file.metadata()?.len();
         if len < HEADER_LEN {
@@ -227,6 +251,25 @@ impl WalWriter {
         }
         self.inner.flush()?;
         self.inner.get_ref().sync_data()?;
+        self.pending = 0;
+        Ok(())
+    }
+
+    /// Discard every buffered record that has not yet been flushed to the
+    /// OS, without writing it. Called from the panicked-writer drop path:
+    /// a guard that never committed must not have its records persisted
+    /// by a later flush. Bytes already flushed to the file are untouched
+    /// — the discard reaches only the in-process buffer.
+    pub fn discard_pending(&mut self) -> Result<(), WalError> {
+        // A dup of the handle shares the file description (offset, lock),
+        // so the rebuilt BufWriter appends exactly where the old one
+        // last flushed.
+        let file = self.inner.get_ref().try_clone()?;
+        let fresh = BufWriter::with_capacity(self.inner.capacity(), file);
+        // `into_parts` hands back the file and the buffered bytes without
+        // flushing; dropping them discards the records. (A plain drop of
+        // the BufWriter would flush them instead.)
+        let _ = std::mem::replace(&mut self.inner, fresh).into_parts();
         self.pending = 0;
         Ok(())
     }
@@ -573,6 +616,58 @@ mod tests {
             Some(0),
             "partial header must be cleared before reopening"
         );
+    }
+
+    #[test]
+    fn second_open_fails_while_locked() {
+        let tmp = tmp_wal();
+        let w = WalWriter::create_or_open(tmp.path()).unwrap();
+        match WalWriter::create_or_open(tmp.path()) {
+            Err(WalError::Locked) => {}
+            other => panic!("expected Locked, got {other:?}"),
+        }
+        // Dropping the writer releases the lock with its File.
+        drop(w);
+        WalWriter::create_or_open(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn discard_pending_drops_unflushed_records() {
+        let tmp = tmp_wal();
+        let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
+        w.append_edge(EdgeRecord {
+            epoch: 1,
+            src: 0,
+            dst: 1,
+        })
+        .unwrap();
+        w.sync().unwrap();
+        // Buffered but never synced — must not survive the discard.
+        w.append_edge(EdgeRecord {
+            epoch: 1,
+            src: 2,
+            dst: 3,
+        })
+        .unwrap();
+        assert_eq!(w.pending_bytes(), RECORD_LEN as u64);
+        w.discard_pending().unwrap();
+        assert_eq!(w.pending_bytes(), 0);
+        // Appends after a discard land on the last flushed boundary.
+        w.append_edge(EdgeRecord {
+            epoch: 2,
+            src: 4,
+            dst: 5,
+        })
+        .unwrap();
+        w.sync().unwrap();
+        drop(w);
+
+        let mut got = Vec::new();
+        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        assert_eq!(out.applied, 2);
+        assert!(out.truncate_to.is_none());
+        assert_eq!(got[0].src, 0);
+        assert_eq!(got[1].src, 4);
     }
 
     #[test]

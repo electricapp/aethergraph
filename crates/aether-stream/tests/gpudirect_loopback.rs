@@ -73,13 +73,16 @@ fn gpudirect_rdma_read_byte_for_byte_match() {
         expected.push(feats);
     }
 
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `server_table` owns the registered range and outlives
+    // `server_mr` (dropped explicitly at end of test, before the table).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             server_table.base_addr() as *mut u8,
             server_table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
 
     let adv = RdmaAdvertisement {
         base_addr: server_table.base_addr(),
@@ -118,7 +121,7 @@ fn gpudirect_rdma_read_byte_for_byte_match() {
         }
     }
 
-    client.gather(&node_ids, 0).expect("gather");
+    client.gather(&node_ids).expect("gather");
 
     // Copy the compacted output back to host and compare byte-for-byte.
     let validator = client.validator();

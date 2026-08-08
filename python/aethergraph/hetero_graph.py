@@ -12,40 +12,9 @@ import numpy as np
 import numpy.typing as npt
 
 from aethergraph._core import HeteroCsrGraph
+from aethergraph._ids import _to_uint32_ids
 
 __all__ = ["HeteroGraph"]
-
-_U32_MAX = np.iinfo(np.uint32).max
-
-
-def _to_uint32_ids(arr: npt.NDArray[Any], what: str) -> npt.NDArray[np.uint32]:
-    """Convert node IDs to ``uint32`` after range-checking.
-
-    The Rust ``HeteroCsrGraph`` indexes nodes with ``u32``. A bare
-    ``astype(np.uint32)`` would silently wrap IDs >= 2**32 and turn negative
-    sentinels (e.g. ``-1``) into huge IDs, so the range is validated first.
-
-    Args:
-        arr: Array-like of node IDs.
-        what: Human-readable description of the array, used in error messages.
-
-    Returns:
-        A ``uint32`` array of node IDs.
-
-    Raises:
-        ValueError: If any ID is negative or exceeds ``2**32 - 1``.
-    """
-    a = np.asarray(arr)
-    if a.size:
-        a_min = int(a.min())
-        a_max = int(a.max())
-        if a_min < 0:
-            raise ValueError(f"{what} contains negative node IDs (min {a_min})")
-        if a_max > _U32_MAX:
-            raise ValueError(
-                f"{what} contains node IDs exceeding uint32 range (max {a_max} > {_U32_MAX})"
-            )
-    return a.astype(np.uint32)
 
 
 class HeteroGraph:

@@ -72,6 +72,11 @@ def configure_tracing(
     to the specified OTLP endpoint. Call this once at application startup
     before creating any NeighborLoader instances.
 
+    Only the first call has any effect: the OpenTelemetry global provider
+    cannot be replaced, so a repeat call would leak a provider (and its
+    exporter thread/channel) that never becomes active. Repeat calls return
+    immediately without constructing anything.
+
     Args:
         endpoint: OTLP gRPC endpoint (e.g., "localhost:4317" for Jaeger).
             Ignored if config is provided.
@@ -98,6 +103,9 @@ def configure_tracing(
         >>> configure_tracing(config=config)
     """
     global _tracer, _configured
+
+    if _configured:
+        return
 
     try:
         from opentelemetry import trace

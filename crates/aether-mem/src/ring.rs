@@ -18,12 +18,12 @@
 //! the allocator to any specific domain.
 
 use std::ptr::NonNull;
-// The free-list atomics are aliased to loom's under the `loom` feature so the
+// The free-list atomics are aliased to loom's under `--cfg loom` so the
 // `loom_lockfree` test model-checks the real `FreeList` code rather than a copy.
 // Off by default; production builds use the std atomics.
-#[cfg(feature = "loom")]
+#[cfg(loom)]
 use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-#[cfg(not(feature = "loom"))]
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Hook called after allocation and before deallocation.
@@ -129,8 +129,14 @@ unsafe impl Sync for SyncPtr {}
 /// `slot_count`, `hooks`, `next_free`). Without this, every successful free-list
 /// CAS would invalidate those fields in other cores' caches (false sharing).
 ///
-/// 64 bytes matches the cache line on x86_64 and aarch64.
-#[repr(align(64))]
+/// 128 bytes on x86_64 (the adjacent-line prefetcher pulls cache lines in
+/// pairs) and aarch64 (Apple Silicon has 128-byte destructive-interference
+/// granules); 64 bytes elsewhere. Matches the crossbeam-utils convention.
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(128)))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    repr(align(64))
+)]
 struct CachePadded<T>(T);
 
 impl<T> std::ops::Deref for CachePadded<T> {
@@ -169,6 +175,12 @@ const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 /// Sentinel for free list end.
 const FREE_LIST_EMPTY: u32 = u32::MAX;
+
+/// Sentinel stored in `next[i]` while slot `i` is leased. `release` requires
+/// it, so releasing an index that is not currently held (a double release, or
+/// an index that never came from `acquire`) panics instead of corrupting the
+/// Treiber stack. Excluded from valid slot indices by the constructors.
+const FREE_LIST_LEASED: u32 = u32::MAX - 1;
 
 /// Exponential backoff for contended CAS loops on the free-list head.
 ///
@@ -210,9 +222,11 @@ impl Backoff {
 /// ABA window: the tag is u32, so the protocol survives up to 2^32 successful
 /// free-list mutations between a stalled thread's `load` and its retry. At
 /// 350M ops/sec that bound is ~12 seconds; at typical allocator rates it is
-/// hours. Callers that need a stronger guarantee (e.g. a thread parked under
-/// a debugger) should wrap acquisition in epoch-based reclamation rather than
-/// rely solely on the tag.
+/// hours. The tag, together with the lease discipline (each index has exactly
+/// one holder between `acquire` and `release`, enforced by the
+/// `FREE_LIST_LEASED` sentinel), is the only protection: a thread stalled
+/// through 2^32 mutations (e.g. parked under a debugger while other cores
+/// allocate at full rate) can still CAS on a recycled tag value.
 #[inline]
 const fn pack_free_head(index: u32, tag: u32) -> u64 {
     ((tag as u64) << 32) | (index as u64)
@@ -229,7 +243,7 @@ const fn unpack_free_head(value: u64) -> (u32, u32) {
 /// [`SharedMemoryRing`] holds one and delegates slot acquisition to it. Keeping
 /// it as a standalone type (with no pointer/mmap state) is what lets the
 /// `loom_lockfree` test model-check the *real* [`acquire`](FreeList::acquire) /
-/// [`release`](FreeList::release) under the `loom` feature instead of a copy.
+/// [`release`](FreeList::release) under `--cfg loom` instead of a copy.
 pub struct FreeList {
     /// Free-list head with ABA tag, isolated on its own cache line.
     head: CachePadded<AtomicU64>,
@@ -242,7 +256,17 @@ pub struct FreeList {
 impl FreeList {
     /// Build a free list over `slot_count` slots, all initially free and
     /// chained `0 -> 1 -> ... -> slot_count-1 -> empty`.
+    ///
+    /// # Panics
+    /// Panics if `slot_count` is zero (the list would mis-initialize) or large
+    /// enough that a slot index or `i + 1` chain link would collide with the
+    /// `FREE_LIST_LEASED` / `FREE_LIST_EMPTY` sentinels when truncated to u32.
     pub fn new(slot_count: usize) -> Self {
+        assert!(slot_count >= 1, "slot_count must be >= 1");
+        assert!(
+            slot_count <= FREE_LIST_LEASED as usize,
+            "slot_count {slot_count} collides with the free-list sentinels"
+        );
         let mut next: Vec<AtomicU32> = Vec::with_capacity(slot_count);
         for i in 0..slot_count {
             let n = if i + 1 < slot_count {
@@ -292,6 +316,11 @@ impl FreeList {
                 .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Acquire)
                 .is_ok()
             {
+                // Mark the slot leased so `release` can reject an index that
+                // is not currently held. Relaxed: only this lease's `release`
+                // reads it back, ordered by program order or by whatever
+                // synchronization hands the lease to another thread.
+                next_cell.store(FREE_LIST_LEASED, Ordering::Relaxed);
                 return Some(head as usize);
             }
             backoff.spin();
@@ -302,6 +331,13 @@ impl FreeList {
     ///
     /// Out-of-range indices are ignored in both debug and release builds; the
     /// runtime check protects against silent memory corruption.
+    ///
+    /// # Panics
+    /// Panics if the slot is not currently leased — a double release, or an
+    /// index that never came from [`acquire`](Self::acquire). Pushing such an
+    /// index would corrupt the Treiber stack (e.g. into a self-loop that
+    /// leases one slot to two holders), so the protocol violation fails fast
+    /// instead.
     #[inline]
     pub fn release(&self, index: usize) {
         if index >= self.slot_count {
@@ -313,6 +349,11 @@ impl FreeList {
             return;
         }
         let slot = &self.next[index];
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            FREE_LIST_LEASED,
+            "release: slot {index} is not leased (double release or foreign index)"
+        );
 
         let mut backoff = Backoff::new();
         loop {
@@ -587,14 +628,18 @@ impl SharedMemoryRing {
         page_align: usize,
         hooks: Vec<Box<dyn MemoryHook>>,
     ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
-        use std::alloc::{Layout, alloc};
+        use std::alloc::{Layout, alloc_zeroed};
 
         let layout = Layout::from_size_align(addressable_size, page_align)
             .map_err(|_| RingBuilderError::SizeOverflow)?;
 
+        // Zeroed so every slot byte is initialized before the first lease —
+        // safe accessors like `RingSlot::as_slice` may expose unwritten bytes.
+        // The huge-page mmap path gets the same guarantee from the kernel.
         // SAFETY: layout is non-zero (slot_count >= 1, aligned_slot_size > 0) and
-        // page_align is a power of two (a page size floored at PAGE_SIZE); alloc is sound.
-        let raw = unsafe { alloc(layout) };
+        // page_align is a power of two (a page size floored at PAGE_SIZE);
+        // alloc_zeroed is sound.
+        let raw = unsafe { alloc_zeroed(layout) };
         let Some(non_null) = NonNull::new(raw) else {
             return Err(RingBuilderError::AllocationFailed);
         };
@@ -652,6 +697,11 @@ impl SharedMemoryRing {
     ///
     /// Out-of-range indices are ignored both in debug and release builds;
     /// the runtime check protects against silent memory corruption.
+    ///
+    /// # Panics
+    /// Panics if the slot is not currently leased — a double release, or an
+    /// index that never came from [`Self::acquire_index`]. See
+    /// [`FreeList::release`].
     #[inline]
     pub fn release_index(&self, index: usize) {
         self.free_list.release(index);
@@ -661,22 +711,27 @@ impl SharedMemoryRing {
     #[inline]
     fn slot_ptr(&self, index: usize) -> *mut u8 {
         debug_assert!(index < self.slot_count);
-        // SAFETY: index is bounds-checked, offset is within allocation.
+        // SAFETY: callers pass indices leased from the free list (or already
+        // asserted in range by `slot_ptr_for_ffi`), so `index < slot_count`
+        // and the offset stays within the allocation.
         unsafe { self.ptr.0.as_ptr().add(index * self.slot_size) }
     }
 
     /// Get raw pointer to a specific slot for FFI use.
     ///
-    /// The full `slot_size` bytes are addressable, but a slot is never zeroed
-    /// between lessees: bytes past the current write hold initialized-but-stale
-    /// data from a prior holder of this index. FFI/DMA consumers must bound
-    /// their read to the valid length they were handed (see [`RingSlot::len`])
-    /// and never treat the slot tail as meaningful.
+    /// The full `slot_size` bytes are addressable. Slots start zeroed at
+    /// allocation and are never re-zeroed between lessees: bytes past the
+    /// current write hold zero or stale data from a prior holder of this
+    /// index. FFI/DMA consumers must bound their read to the valid length they
+    /// were handed (see [`RingSlot::len`]) and never treat the slot tail as
+    /// meaningful.
     ///
-    /// # Safety Contract
-    /// Caller must ensure:
-    /// - `index < slot_count`
-    /// - Memory is not accessed after ring buffer is dropped
+    /// The returned pointer must not be accessed after the ring buffer is
+    /// dropped.
+    ///
+    /// # Panics
+    /// Panics if `index >= slot_count`. Called at FFI-setup frequency, not
+    /// per packet, so the bounds check is off the hot path.
     ///
     /// ```ignore
     /// let ring = SharedMemoryRing::new_or_panic(4, 4096, vec![]);
@@ -685,6 +740,11 @@ impl SharedMemoryRing {
     /// ```
     #[inline]
     pub fn slot_ptr_for_ffi(&self, index: usize) -> *mut u8 {
+        assert!(
+            index < self.slot_count,
+            "slot index {index} out of range (slot_count {})",
+            self.slot_count
+        );
         self.slot_ptr(index)
     }
 
@@ -804,6 +864,12 @@ impl<'a> RingSlot<'a> {
 
     /// Write `len` bytes using a caller-provided writer. Returns `Err` if
     /// `len > slot_size`.
+    ///
+    /// The closure is expected to write `len` bytes starting at the given
+    /// pointer. Slot memory is always initialized — zeroed at allocation, then
+    /// carrying whatever prior lessees wrote — so any bytes the closure leaves
+    /// unwritten read back as zero or stale data rather than garbage; their
+    /// content is unspecified and must not be relied upon.
     #[inline]
     pub fn write_with<F>(&mut self, len: usize, writer: F) -> Result<(), SlotOverflow>
     where
@@ -825,8 +891,8 @@ impl<'a> RingSlot<'a> {
     /// Get the slot contents as a slice.
     ///
     /// The slice spans exactly the [`len`](Self::len) bytes written to this
-    /// slot, so the initialized-but-stale tail left by a prior lessee is never
-    /// exposed.
+    /// slot, so the tail — zeroed at allocation, then stale from prior lessees
+    /// — is never exposed.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: data_len was set by a successful write_with; the slot is exclusive.
@@ -841,9 +907,9 @@ impl<'a> RingSlot<'a> {
     /// Get raw pointer for FFI.
     ///
     /// The pointer carries no length: only the first [`len`](Self::len) bytes
-    /// are valid for this lessee. Bytes beyond that are initialized-but-stale
-    /// data from a prior holder of this slot index, so FFI/DMA consumers must
-    /// bound their read to `len()`.
+    /// are valid for this lessee. Bytes beyond that are initialized — zero
+    /// from allocation or stale from a prior holder of this slot index — so
+    /// FFI/DMA consumers must bound their read to `len()`.
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.ring.slot_ptr(self.slot_index)

@@ -3,7 +3,9 @@
 //! These tests exercise every `unsafe` call site in `Arena`, `Chunk`, and
 //! `CTree` end-to-end. They are deliberately small so miri can run them in
 //! seconds; the proptest suite in `tests/proptest_ctree.rs` provides the
-//! breadth coverage but is too slow for miri's interpreter.
+//! breadth coverage but is too slow for miri's interpreter. One test runs
+//! a real writer/reader race so miri checks the Release/Acquire root
+//! publication, not just the single-threaded paths.
 //!
 //! Run with:
 //!     cargo +nightly miri test -p aether-graph --test miri_smoke
@@ -62,6 +64,51 @@ fn ctree_insert_and_contains_exercises_all_unsafe_paths() {
     let mut buf = Vec::new();
     tree.collect_into(&arena, &mut buf);
     assert_eq!(buf, (0..32u32).collect::<Vec<_>>());
+}
+
+#[test]
+fn concurrent_writer_and_reader_publication_is_clean() {
+    // One writer thread publishing roots (Release stores) racing one
+    // reader thread loading them (Acquire loads). Every snapshot a reader
+    // observes must be a fully-built, strictly sorted tree. Iteration
+    // counts are kept small so `cargo miri test` can interpret the whole
+    // interleaving space in reasonable time.
+    use std::sync::Arc;
+    use std::thread;
+
+    let g = Arc::new(DynamicGraph::new(32, 1 << 16));
+
+    let gw = Arc::clone(&g);
+    let writer = thread::spawn(move || {
+        let mut w = gw.writer_or_panic();
+        for i in 0..100u32 {
+            w.insert_edge(i % 4, i / 4).unwrap();
+        }
+    });
+
+    let gr = Arc::clone(&g);
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        for _ in 0..25 {
+            for v in 0..4u32 {
+                let _ = gr.degree(v);
+                gr.neighbors_into(v, &mut buf);
+                for w in buf.windows(2) {
+                    assert!(w[0] < w[1], "reader saw an unsorted snapshot");
+                }
+            }
+        }
+    });
+
+    writer.join().unwrap();
+    reader.join().unwrap();
+
+    // After the join, every insert is visible.
+    let mut buf = Vec::new();
+    for v in 0..4u32 {
+        g.neighbors_into(v, &mut buf);
+        assert_eq!(buf.len(), 25, "vertex {v} missing edges after join");
+    }
 }
 
 #[test]

@@ -238,7 +238,9 @@ jobs:
           key: loom
       - run: cargo test -p aether-graph --features loom --test loom_writer_guard
       - run: cargo test -p aethergraph-core --features loom --test loom_union_find
-      - run: cargo test -p aether-mem --features loom --test loom_lockfree
+      - run: cargo test -p aether-mem --test loom_lockfree --release
+        env:
+          RUSTFLAGS: --cfg loom
       - name: Summary
         if: always()
         run: |

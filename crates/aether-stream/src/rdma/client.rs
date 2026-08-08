@@ -11,7 +11,7 @@ use crate::rdma::context::RdmaContext;
 use crate::rdma::control;
 use crate::rdma::ffi::IbvWc;
 use crate::rdma::qp::{RdmaQp, RdmaRead};
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, sys};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,10 @@ pub struct RdmaFeatureClient {
     schema: FeatureSchema,
     remote_rkey: u32,
     remote_base: u64,
+    /// Cumulative torn-slot detections across all gathers — every slot the
+    /// seqlock validator rejected (first pass and retries). Nonzero means
+    /// writer contention actually interleaved with RDMA reads.
+    torn_slots_detected: u64,
 }
 
 impl RdmaFeatureClient {
@@ -84,7 +88,16 @@ impl RdmaFeatureClient {
             schema,
             remote_rkey,
             remote_base,
+            torn_slots_detected: 0,
         })
+    }
+
+    /// Cumulative number of torn-slot detections across all gathers on this
+    /// client. Observability hook for writer/reader contention: each unit is
+    /// one slot validation the seqlock kernel rejected and the gather loop
+    /// re-read.
+    pub fn torn_slots_detected(&self) -> u64 {
+        self.torn_slots_detected
     }
 
     /// Gather features for a batch of node IDs into VRAM.
@@ -93,17 +106,11 @@ impl RdmaFeatureClient {
     /// `self.validator().output()`. Use `validator().stream()` to get
     /// a properly stream-ordered device pointer.
     ///
-    /// `epoch_version`: MVCC epoch pin. Pass 0 to accept any consistent read
-    /// (latest features). Pass a non-zero version to reject features written
-    /// after that version — ensures training sees a stable feature snapshot
-    /// for the entire epoch even while writers update the FeatureTable.
-    ///
+    /// Each row is READ twice, sequentially, into two staging regions; the
+    /// GPU kernel accepts a row only when both snapshots agree on version
+    /// and payload (see the RDMA reader contract in `feature_table.rs`).
     /// Handles seqlock validation and automatic retry for torn reads.
-    pub fn gather(
-        &mut self,
-        node_ids: &[u32],
-        epoch_version: u64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn gather(&mut self, node_ids: &[u32]) -> Result<(), Box<dyn std::error::Error>> {
         if node_ids.len() > self.buffer.max_batch_size() {
             return Err(format!(
                 "node_ids.len() {} exceeds buffer.max_batch_size() {}",
@@ -137,72 +144,38 @@ impl RdmaFeatureClient {
         }
 
         let batch_size = node_ids.len();
-        let lkey = self.buffer.lkey();
 
-        // Build initial RDMA READ list for all nodes. Each remote address is
-        // validated against the advertised table bounds (see `remote_addr_for`)
-        // before it's turned into a one-sided READ — a node_id past the table
-        // must never be translated into a read outside the server's registered
-        // region.
-        let reads: Vec<RdmaRead> = node_ids
-            .iter()
-            .enumerate()
-            .map(|(i, &node_id)| {
-                Ok(RdmaRead {
-                    local_addr: self.buffer.slot_addr(i),
-                    local_lkey: lkey,
-                    remote_addr: self.remote_addr_for(node_id)?,
-                    remote_rkey: self.remote_rkey,
-                    length: self.schema.slot_size as u32,
-                })
-            })
-            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-
-        // Post RDMA READs and wait for completion
-        self.post_and_wait(&reads)?;
-
-        // Validate on GPU
+        // READ both snapshots for every row, then cross-validate on the GPU.
+        let all_indices: Vec<usize> = (0..batch_size).collect();
+        self.read_snapshots(node_ids, &all_indices)?;
         let retry_count = self.validator.validate(
             self.buffer.staging_ptr(),
+            self.buffer.staging2_ptr(),
             self.buffer.slot_size(),
             batch_size,
-            epoch_version,
         )?;
 
         if retry_count == 0 {
             return Ok(());
         }
+        self.torn_slots_detected += retry_count as u64;
 
-        // Retry loop for torn reads
+        // Retry loop for torn reads — both snapshots are re-read for every
+        // failed row.
         for _ in 0..MAX_RETRIES {
             let retry_indices = self.validator.retry_indices(batch_size)?;
             if retry_indices.is_empty() {
                 break;
             }
 
-            // Re-post reads only for failed nodes. node_ids were already
-            // bounds-checked when the initial batch was built, but re-validate
-            // here so this loop is correct independent of the caller above.
-            let retry_reads: Vec<RdmaRead> = retry_indices
-                .iter()
-                .map(|&i| {
-                    Ok(RdmaRead {
-                        local_addr: self.buffer.slot_addr(i),
-                        local_lkey: lkey,
-                        remote_addr: self.remote_addr_for(node_ids[i])?,
-                        remote_rkey: self.remote_rkey,
-                        length: self.schema.slot_size as u32,
-                    })
-                })
-                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-
-            self.post_and_wait(&retry_reads)?;
+            self.read_snapshots(node_ids, &retry_indices)?;
             let remaining = self.validator.validate(
                 self.buffer.staging_ptr(),
+                self.buffer.staging2_ptr(),
                 self.buffer.slot_size(),
                 batch_size,
-                epoch_version,
             )?;
+            self.torn_slots_detected += remaining as u64;
             if remaining == 0 {
                 return Ok(());
             }
@@ -256,6 +229,74 @@ impl RdmaFeatureClient {
         self.remote_base
             .checked_add(start_offset)
             .ok_or_else(|| "remote address overflow".into())
+    }
+
+    /// READ the two sequential snapshots of each row in `indices` into the
+    /// buffer's two staging regions.
+    ///
+    /// The snapshot-2 batch is posted only after every snapshot-1 completion
+    /// has been observed AND the GPUDirect write flush has run, so per-slot
+    /// visibility in VRAM is monotone between the snapshots — the ordering
+    /// the two-snapshot contract in `feature_table.rs` requires. Each remote
+    /// address is validated against the advertised table bounds (see
+    /// `remote_addr_for`) before it's turned into a one-sided READ — a
+    /// node_id past the table must never be translated into a read outside
+    /// the server's registered region.
+    fn read_snapshots(
+        &self,
+        node_ids: &[u32],
+        indices: &[usize],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let lkey = self.buffer.lkey();
+        // Live bytes end at tail_version's last byte; the page-rounded
+        // remainder of the slot is dead padding not worth the PCIe traffic.
+        let read_len = (self.schema.tail_offset_in_slot + 8) as u32;
+
+        for snapshot in 0..2 {
+            let reads: Vec<RdmaRead> = indices
+                .iter()
+                .map(|&i| {
+                    Ok(RdmaRead {
+                        local_addr: if snapshot == 0 {
+                            self.buffer.slot_addr(i)
+                        } else {
+                            self.buffer.slot_addr2(i)
+                        },
+                        local_lkey: lkey,
+                        remote_addr: self.remote_addr_for(node_ids[i])?,
+                        remote_rkey: self.remote_rkey,
+                        length: read_len,
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+            self.post_and_wait(&reads)?;
+            self.flush_gpudirect_writes()?;
+        }
+        Ok(())
+    }
+
+    /// Make third-party DMA writes (the NIC's RDMA READ completions) visible
+    /// to subsequently launched device work. A CPU-observed CQE orders the
+    /// data for the CPU, not for the GPU; this flush closes that gap. Cheap
+    /// no-op on platforms with native GPUDirect write ordering.
+    fn flush_gpudirect_writes(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // SAFETY: no pointers involved; both enum arguments are valid, and a
+        // live CUDA context exists for this process (created in `connect`).
+        let res = unsafe {
+            sys::cuFlushGPUDirectRDMAWrites(
+                sys::CUflushGPUDirectRDMAWritesTarget::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+                sys::CUflushGPUDirectRDMAWritesScope::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER,
+            )
+        };
+        // CUDA_ERROR_NOT_SUPPORTED means the platform does not expose the
+        // flush (CU_FLUSH_GPU_DIRECT_RDMA_WRITES_OPTION_HOST absent) —
+        // remote-write visibility is then governed by the device's native
+        // ordering, so there is nothing to flush.
+        if res != sys::CUresult::CUDA_SUCCESS && res != sys::CUresult::CUDA_ERROR_NOT_SUPPORTED {
+            return Err(format!("cuFlushGPUDirectRDMAWrites failed: {res:?}").into());
+        }
+        Ok(())
     }
 
     /// Access the validator (for stream-ordered access to the output tensor).

@@ -387,6 +387,7 @@ impl FeatureCache {
 
         let mut resolved: AHashMap<NodeId, FeatureVector> = AHashMap::with_capacity(nodes.len());
         let mut missing: Vec<NodeId> = Vec::new();
+        let mut missing_set: FxHashSet<NodeId> = FxHashSet::default();
 
         // GPU tier: one lock for the whole batch.
         {
@@ -404,7 +405,7 @@ impl FeatureCache {
                         pinned_hits += 1;
                     }
                     resolved.insert(node, features);
-                } else if !missing.contains(&node) {
+                } else if missing_set.insert(node) {
                     missing.push(node);
                 }
             }

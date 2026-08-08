@@ -8,7 +8,7 @@ use aether_mem::{MemoryHook, SharedMemoryRing};
 
 /// AF_XDP UMEM frame pool backed by `SharedMemoryRing`.
 ///
-/// Frame size must be 2048 or 4096 (kernel requirement).
+/// Frame size must be 4096 (see [`Umem::new`]).
 /// Frames are page-aligned and mlock'd to prevent swapping.
 pub struct Umem {
     ring: SharedMemoryRing,
@@ -20,11 +20,17 @@ impl Umem {
     ///
     /// # Arguments
     /// * `frame_count` - Number of frames (must be power of two)
-    /// * `frame_size` - 2048 or 4096
+    /// * `frame_size` - must be 4096
     /// * `extra_hooks` - Additional hooks (e.g. RdmaRegHook for RDMA one-sided reads)
     ///
     /// # Panics
-    /// Panics if `frame_size` is not 2048 or 4096.
+    /// Panics if `frame_size` is not 4096.
+    ///
+    /// Returns `None` (with an error log) if the ring's page-rounded slot
+    /// stride diverges from `frame_size` — on kernels with a page size above
+    /// 4 KiB the ring lays frames out at page stride while the kernel is
+    /// told `chunk_size = frame_size`, which would corrupt the frame lease
+    /// protocol.
     pub fn new(
         frame_count: usize,
         frame_size: u32,
@@ -47,8 +53,27 @@ impl Umem {
         let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook::new())];
         hooks.extend(extra_hooks);
 
-        let (ring, _hook_failures) =
+        let (ring, hook_failures) =
             SharedMemoryRing::new(frame_count, frame_size as usize, hooks).ok()?;
+        for failure in &hook_failures {
+            tracing::warn!(error = %failure, "UMEM memory hook failed");
+        }
+
+        // The frame lease protocol addresses frames at `ring.slot_size()`
+        // stride while the kernel is registered with `chunk_size =
+        // frame_size`. SharedMemoryRing rounds slots up to the runtime page
+        // size, so on 16K/64K-page kernels the two diverge — every
+        // frame_ptr/frame_addr past index 0 would point at the wrong chunk.
+        if ring.slot_size() != frame_size as usize {
+            tracing::error!(
+                ring_slot_size = ring.slot_size(),
+                frame_size,
+                "UMEM frame stride mismatch: runtime page size rounds ring \
+                 slots past the kernel-registered chunk_size; refusing to \
+                 build a corrupt frame pool"
+            );
+            return None;
+        }
 
         Some(Self { ring, frame_size })
     }

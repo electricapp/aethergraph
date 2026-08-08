@@ -53,13 +53,16 @@ fn build_loopback(node_count: usize, feature_dim: usize, cq_size: i32) -> Loopba
         let v: Vec<f32> = (0..feature_dim).map(|i| (n * 10 + i) as f32).collect();
         table.write_node(n, &v);
     }
-    let server_mr = server_ctx
-        .reg_mr(
+    // SAFETY: `table` owns the registered range and outlives `server_mr`
+    // (both stored in the loopback bundle; MR field drops first).
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("server reg_mr");
+    }
+    .expect("server reg_mr");
     let server_rkey = server_mr.rkey();
     let server_base = table.base_addr();
     let slot_size = table.schema().slot_size;
@@ -143,10 +146,13 @@ fn long_wr_chain_at_max_send_wr_per_wr_signal() {
 
     let mut client_buf = vec![0u8; BATCH * lb.slot_size];
     let client_ptr = client_buf.as_mut_ptr();
-    let client_mr = lb
-        .client_ctx
-        .reg_mr(client_ptr, client_buf.len(), IBV_ACCESS_LOCAL_WRITE)
-        .expect("client reg_mr");
+    // SAFETY: `client_buf` owns the registered range and outlives
+    // `client_mr`; every batch's completions drain before either drops.
+    let client_mr = unsafe {
+        lb.client_ctx
+            .reg_mr(client_ptr, client_buf.len(), IBV_ACCESS_LOCAL_WRITE)
+    }
+    .expect("client reg_mr");
     let lkey = client_mr.lkey();
 
     let reads: Vec<RdmaRead> = (0..BATCH)
@@ -205,10 +211,13 @@ fn sustained_pipelining_with_signal_stride() {
 
     let mut client_buf = vec![0u8; PER_BATCH * lb.slot_size];
     let client_ptr = client_buf.as_mut_ptr();
-    let client_mr = lb
-        .client_ctx
-        .reg_mr(client_ptr, client_buf.len(), IBV_ACCESS_LOCAL_WRITE)
-        .expect("client reg_mr");
+    // SAFETY: `client_buf` owns the registered range and outlives
+    // `client_mr`; every batch's completions drain before either drops.
+    let client_mr = unsafe {
+        lb.client_ctx
+            .reg_mr(client_ptr, client_buf.len(), IBV_ACCESS_LOCAL_WRITE)
+    }
+    .expect("client reg_mr");
     let lkey = client_mr.lkey();
 
     let cqes_per_batch = PER_BATCH.div_ceil(SIGNAL_EVERY_N); // includes final-WR-always-signaled
@@ -268,10 +277,10 @@ fn zero_length_read_succeeds() {
 
     let mut buf = vec![0xAAu8; lb.slot_size]; // untouched after post
     let ptr = buf.as_mut_ptr();
-    let mr = lb
-        .client_ctx
-        .reg_mr(ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE)
-        .expect("reg_mr");
+    // SAFETY: `buf` owns the registered range and outlives `mr`; the WR's
+    // completion is drained before either drops.
+    let mr =
+        unsafe { lb.client_ctx.reg_mr(ptr, buf.len(), IBV_ACCESS_LOCAL_WRITE) }.expect("reg_mr");
     let lkey = mr.lkey();
     let read = RdmaRead {
         local_addr: ptr as u64,

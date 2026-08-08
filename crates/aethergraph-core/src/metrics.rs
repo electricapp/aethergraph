@@ -70,7 +70,13 @@ impl From<&PrefetchStats> for PrefetchSummary {
             hits,
             misses,
             total,
-            hit_rate: stats.hit_rate(),
+            // Derived from the values loaded above so the rate always agrees
+            // with the hits/total fields within this snapshot.
+            hit_rate: if total == 0 {
+                1.0
+            } else {
+                hits as f64 / total as f64
+            },
             sample_time_ns: stats.sample_time_ns.load(Ordering::Relaxed),
             feature_load_time_ns: stats.feature_load_time_ns.load(Ordering::Relaxed),
         }

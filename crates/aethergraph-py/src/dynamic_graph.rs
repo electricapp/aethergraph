@@ -36,6 +36,10 @@ impl PyDynamicGraph {
                     "edge ({src}, {dst}) references a vertex out of range for this graph"
                 ))
             }
+            aether_graph::InsertError::WalAppend => pyo3::exceptions::PyOSError::new_err(
+                "WAL append failed; the edge was not published and the graph is \
+                 poisoned — rebuild from a checkpoint (see logs for the I/O error)",
+            ),
         }
     }
 
@@ -63,6 +67,10 @@ impl PyDynamicGraph {
             WalError::UnknownVersion(v) => pyo3::exceptions::PyValueError::new_err(format!(
                 "WAL version {v} not supported by this build"
             )),
+            WalError::Locked => pyo3::exceptions::PyOSError::new_err(
+                "WAL file is exclusively locked by another writer (this process \
+                 or another); close the other DynamicGraph before reopening",
+            ),
             WalError::RecordOutOfRange {
                 src,
                 dst,
@@ -74,6 +82,19 @@ impl PyDynamicGraph {
             WalError::ReplayArenaFull => pyo3::exceptions::PyRuntimeError::new_err(
                 "arena filled during WAL replay; reopen with a larger arena_mb",
             ),
+        }
+    }
+
+    /// Bounds-check a vertex id against `num_vertices` so out-of-range reads
+    /// raise `ValueError` instead of panicking inside the Rust core.
+    fn check_vertex(&self, vertex: u32) -> PyResult<()> {
+        let num_vertices = self.inner.num_vertices();
+        if (vertex as usize) < num_vertices {
+            Ok(())
+        } else {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "vertex {vertex} out of range for graph with {num_vertices} vertices"
+            )))
         }
     }
 }
@@ -236,28 +257,45 @@ impl PyDynamicGraph {
     }
 
     /// Degree (number of outgoing edges) for a vertex.
-    fn degree(&self, vertex: u32) -> usize {
-        self.inner.degree(vertex)
+    ///
+    /// Raises ValueError if the vertex is out of range.
+    fn degree(&self, vertex: u32) -> PyResult<usize> {
+        self.check_vertex(vertex)?;
+        Ok(self.inner.degree(vertex))
     }
 
     /// Check whether edge (src -> dst) exists.
-    fn has_edge(&self, src: u32, dst: u32) -> bool {
-        self.inner.has_edge(src, dst)
+    ///
+    /// Raises ValueError if src or dst is out of range.
+    fn has_edge(&self, src: u32, dst: u32) -> PyResult<bool> {
+        self.check_vertex(src)?;
+        self.check_vertex(dst)?;
+        Ok(self.inner.has_edge(src, dst))
     }
 
     /// Get sorted neighbor array for a vertex as int64 (PyTorch compatible).
-    fn neighbors<'py>(&self, py: Python<'py>, vertex: u32) -> Bound<'py, PyArray1<i64>> {
+    ///
+    /// Raises ValueError if the vertex is out of range.
+    fn neighbors<'py>(&self, py: Python<'py>, vertex: u32) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        self.check_vertex(vertex)?;
         let mut buf = self.buf.lock();
         self.inner.neighbors_into(vertex, &mut buf);
         let i64_vec: Vec<i64> = buf.iter().map(|&v| v as i64).collect();
-        PyArray1::from_vec(py, i64_vec)
+        Ok(PyArray1::from_vec(py, i64_vec))
     }
 
     /// Get sorted neighbor array for a vertex as uint32 (zero-copy convertible).
-    fn neighbors_u32<'py>(&self, py: Python<'py>, vertex: u32) -> Bound<'py, PyArray1<u32>> {
+    ///
+    /// Raises ValueError if the vertex is out of range.
+    fn neighbors_u32<'py>(
+        &self,
+        py: Python<'py>,
+        vertex: u32,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        self.check_vertex(vertex)?;
         let mut buf = self.buf.lock();
         self.inner.neighbors_into(vertex, &mut buf);
-        PyArray1::from_slice(py, &buf)
+        Ok(PyArray1::from_slice(py, &buf))
     }
 
     /// Number of vertices (fixed at construction).
@@ -297,10 +335,14 @@ impl PyDynamicGraph {
     ///
     /// Collects all edges from the C-tree neighbor lists into a static CSR
     /// graph. O(V + E) time — call once per epoch, not per batch.
-    fn snapshot(&self) -> PyCsrGraph {
-        let (offsets, edges) = self.inner.snapshot_csr();
-        let num_vertices = self.inner.num_vertices();
-        let graph = Graph::from_csr_arrays(num_vertices, offsets, edges, None);
+    fn snapshot(&self, py: Python<'_>) -> PyCsrGraph {
+        let inner = Arc::clone(&self.inner);
+        // The O(V + E) collection touches no Python state; release the GIL so
+        // other Python threads (e.g. concurrent inserters) keep running.
+        let graph = py.detach(move || {
+            let (offsets, edges) = inner.snapshot_csr();
+            Graph::from_csr_arrays(inner.num_vertices(), offsets, edges, None)
+        });
         PyCsrGraph {
             inner: Arc::new(graph),
         }

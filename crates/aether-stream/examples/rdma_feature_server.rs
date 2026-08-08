@@ -98,13 +98,16 @@ fn main() {
     };
 
     let ctx = RdmaContext::open(256, ROCE_V2_GID_INDEX).expect("RdmaContext::open");
-    let mr = ctx
-        .reg_mr(
+    // SAFETY: `table` is Arc-held to the end of main (see the final `let _`),
+    // so the registered range outlives the MR and all remote reads.
+    let mr = unsafe {
+        ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("reg_mr");
+    }
+    .expect("reg_mr");
 
     let adv = RdmaAdvertisement {
         base_addr: table.base_addr(),

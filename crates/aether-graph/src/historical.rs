@@ -24,8 +24,6 @@ pub struct HistoricalBatch {
 pub struct HistoricalSampler {
     /// Embedding cache for this layer.
     cache: EmbeddingCache,
-    /// Dirty nodes collected at the last epoch boundary.
-    dirty_set: Vec<u32>,
 }
 
 impl HistoricalSampler {
@@ -33,7 +31,6 @@ impl HistoricalSampler {
     pub fn new(num_nodes: usize, embedding_dim: usize) -> Self {
         Self {
             cache: EmbeddingCache::new(num_nodes, embedding_dim),
-            dirty_set: Vec::new(),
         }
     }
 
@@ -43,13 +40,15 @@ impl HistoricalSampler {
     /// their k-hop neighbors), not just seeds. The caller is responsible
     /// for running the sampler first to get the full node set.
     ///
-    /// A node needs recomputation if it is in the dirty set (received new
-    /// edges since the last epoch) or has never been computed.
-    /// Nodes computed in a prior epoch but NOT dirty use cached embeddings --
+    /// A node needs recomputation if its cache entry is invalid: never
+    /// computed, or invalidated by `advance_epoch` because it received
+    /// new edges. An invalidated node stays in need of recomputation
+    /// across any number of epochs until a batch actually recomputes and
+    /// commits it. Nodes with a valid entry use cached embeddings --
     /// this is the GNNAutoScale approximation: their neighbor structure is
     /// unchanged, so the cached embedding is a valid approximation.
     ///
-    /// The dirty set is read from internal state populated by `advance_epoch`;
+    /// Invalidation state lives in the cache, populated by `advance_epoch`;
     /// the graph itself is not consulted, so callers should ensure
     /// `advance_epoch` has been invoked at least once for accurate results.
     pub fn prepare_batch(&self, nodes: &[u32]) -> HistoricalBatch {
@@ -59,10 +58,7 @@ impl HistoricalSampler {
         let mut cached_embeddings = Vec::with_capacity(nodes.len() * dim);
 
         for &node in nodes {
-            let is_dirty = self.dirty_set.binary_search(&node).is_ok();
-            let never_computed = self.cache.is_uninitialized(node);
-
-            if is_dirty || never_computed {
+            if self.cache.is_uninitialized(node) {
                 recompute_nodes.push(node);
             } else {
                 cached_nodes.push(node);
@@ -108,8 +104,9 @@ impl HistoricalSampler {
     /// }
     /// ```
     ///
-    /// After this, previously-dirty nodes will be stale in the cache
-    /// (requiring recomputation) unless they were updated in this epoch.
+    /// Each drained node's cache entry is invalidated, so it requires
+    /// recomputation — in this epoch or any later one — before its
+    /// cached embedding is served again.
     pub fn advance_epoch(&mut self, graph: &DynamicGraph) {
         let dirty = graph.drain_dirty();
         self.advance_epoch_with(&dirty);
@@ -120,9 +117,12 @@ impl HistoricalSampler {
     /// correct pattern for multi-layer training (see
     /// [`advance_epoch`](Self::advance_epoch)).
     pub fn advance_epoch_with(&mut self, dirty: &[u32]) {
-        self.dirty_set.clear();
-        self.dirty_set.extend_from_slice(dirty);
-        self.dirty_set.sort_unstable();
+        // Invalidate rather than remember: a dirty node not recomputed
+        // this epoch must still recompute in every later epoch until a
+        // commit refreshes it.
+        for &node in dirty {
+            self.cache.invalidate(node);
+        }
         self.cache.advance_epoch();
     }
 
@@ -213,6 +213,30 @@ mod tests {
                 "layer {i} missed the node-0 invalidation"
             );
         }
+    }
+
+    #[test]
+    fn dirty_node_missed_by_an_epoch_still_recomputes_later() {
+        let g = DynamicGraph::new(100, 4096);
+        fill_graph(&g, &[(0, 1)]);
+
+        let mut sampler = HistoricalSampler::new(100, 4);
+        sampler.advance_epoch(&g);
+        let batch = sampler.prepare_batch(&[0]);
+        let emb = vec![1.0; batch.recompute_nodes.len() * 4];
+        sampler.commit_batch(&batch, &emb);
+
+        // Node 0 receives a new edge, then sits out an entire epoch (no
+        // batch samples it) before another epoch begins.
+        fill_graph(&g, &[(0, 5)]);
+        sampler.advance_epoch(&g);
+        sampler.advance_epoch(&g);
+
+        let batch2 = sampler.prepare_batch(&[0]);
+        assert!(
+            batch2.recompute_nodes.contains(&0),
+            "unprocessed dirty node must stay invalidated across epochs"
+        );
     }
 
     #[test]
