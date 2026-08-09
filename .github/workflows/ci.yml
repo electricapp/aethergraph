@@ -356,16 +356,22 @@ jobs:
         working-directory: python
         run: uv run pytest tests/ -v --tb=short
 
-  # Baseline wheels stay portable x86-64; this variant targets x86-64-v3
-  # (AVX2/FMA/BMI2) for hosts that have it — runtime dispatch covers F16C,
-  # but whole-binary codegen only comes from target-cpu. Published as a CI
-  # artifact; attach to releases alongside the baseline wheel.
-  python-wheel-v3:
-    name: wheel x86-64-v3
+  python-wheel:
+    name: wheel ${{ matrix.level }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - level: x86-64
+            rustflags: -D warnings
+            out_dir: dist-x86-64
+          - level: x86-64-v3
+            rustflags: -D warnings -C target-cpu=x86-64-v3
+            out_dir: dist-x86-64-v3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -378,19 +384,19 @@ jobs:
           enable-cache: true
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: wheel-v3
+          key: wheel-${{ matrix.level }}
       - name: Sync build deps
         working-directory: python
         run: uv sync --group dev --no-install-project
-      - name: Build x86-64-v3 wheel
+      - name: Build wheel
         working-directory: python
-        run: uv run --no-sync maturin build --release --out dist-v3
+        run: uv run --no-sync maturin build --release --out ${{ matrix.out_dir }}
         env:
-          RUSTFLAGS: -D warnings -C target-cpu=x86-64-v3
+          RUSTFLAGS: ${{ matrix.rustflags }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: aethergraph-wheel-x86-64-v3
-          path: python/dist-v3/*.whl
+          name: aethergraph-wheel-${{ matrix.level }}
+          path: python/${{ matrix.out_dir }}/*.whl
 
   rdma-hardware:
     name: rdma hardware (self-hosted)
@@ -452,7 +458,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, supply-chain, unused-deps, python]
+    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, supply-chain, unused-deps, python, python-wheel]
     if: always()
     steps:
       - name: Render summary
@@ -472,6 +478,8 @@ jobs:
             echo "| wal  | Linux x86_64 | wal feature  | ${{ needs.wal.result }} |"
             echo "| python ubuntu | Linux x86_64 | test group | ${{ needs.python.result }} |"
             echo "| python macos | macOS arm64 | test group | ${{ needs.python.result }} |"
+            echo "| wheel x86-64 | Linux x86_64 | portable baseline | ${{ needs.python-wheel.result }} |"
+            echo "| wheel x86-64-v3 | Linux x86_64 | target-cpu=x86-64-v3 | ${{ needs.python-wheel.result }} |"
             echo ""
             echo "Hardware-gated tests (SoftRoCE micro-bench, SRD loopback,"
             echo "billion-node scale) run only on the self-hosted \`rdma-hardware\`"

@@ -29,10 +29,9 @@ single-worker baseline.
 
 Remaining larger redesigns; land each with its own tests.
 
-| Area                   | Change                                                                                                                                        |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| FeatureCache NVMe tier | Route the slot file through the io_uring lane with `O_DIRECT` (it uses positional reads on the blocking pool today)                           |
-| HeteroNeighborLoader   | Extend the sampler-pool `num_workers` semantics to the hetero loader (one background thread today; the homogeneous loader has the pooled form) |
+| Area                   | Change                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| FeatureCache NVMe tier | Route the slot file through the io_uring lane with `O_DIRECT` (it uses positional reads on the blocking pool today) |
 
 ---
 
