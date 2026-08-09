@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use aether_graph::{Arena, CTree, Chunk, DynamicGraph, InsertResult};
+use aether_graph::{Arena, ArenaWriter, CTree, Chunk, DynamicGraph, InsertResult};
 use proptest::prelude::*;
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
@@ -21,11 +21,10 @@ fn is_sorted_nonstrict(s: &[u32]) -> bool {
     s.windows(2).all(|w| w[0] <= w[1])
 }
 
-/// Insert into the arena via the new unsafe API. Returns the updated tree
-/// (unchanged on Duplicate or ArenaFull).
-fn ctree_insert(tree: CTree, arena: &Arena, val: u32) -> (CTree, InsertResult) {
-    // SAFETY: tests are single-threaded.
-    let result = unsafe { tree.insert(arena, val) };
+/// Insert through the write handle. Returns the updated tree (unchanged
+/// on Duplicate or ArenaFull).
+fn ctree_insert(tree: CTree, aw: &mut ArenaWriter<'_>, val: u32) -> (CTree, InsertResult) {
+    let result = tree.insert(aw, val);
     let new_tree = match result {
         InsertResult::Inserted(t) => t,
         _ => tree,
@@ -129,7 +128,11 @@ proptest! {
     #[test]
     fn insert_any_order_same_result(vals in prop::collection::hash_set(0..10_000u32, 1..50)) {
         let arena1 = Arena::new(1 << 20);
+        // SAFETY: sole write handle for this arena; the test body is single-threaded.
+        let mut aw1 = unsafe { arena1.writer() };
         let arena2 = Arena::new(1 << 20);
+        // SAFETY: sole write handle for this arena; the test body is single-threaded.
+        let mut aw2 = unsafe { arena2.writer() };
 
         let order1: Vec<u32> = vals.iter().copied().collect();
         let mut order2 = order1.clone();
@@ -137,13 +140,13 @@ proptest! {
 
         let mut tree1 = CTree::empty();
         for &v in &order1 {
-            let (t, _) = ctree_insert(tree1, &arena1, v);
+            let (t, _) = ctree_insert(tree1, &mut aw1, v);
             tree1 = t;
         }
 
         let mut tree2 = CTree::empty();
         for &v in &order2 {
-            let (t, _) = ctree_insert(tree2, &arena2, v);
+            let (t, _) = ctree_insert(tree2, &mut aw2, v);
             tree2 = t;
         }
 
@@ -159,11 +162,13 @@ proptest! {
     #[test]
     fn insert_then_contains_all(vals in prop::collection::hash_set(0..10_000u32, 0..100)) {
         let arena = Arena::new(2 << 20);
+        // SAFETY: sole write handle for this arena; the test body is single-threaded.
+        let mut aw = unsafe { arena.writer() };
         let mut tree = CTree::empty();
         let vals_vec: Vec<u32> = vals.into_iter().collect();
 
         for &v in &vals_vec {
-            let (t, _) = ctree_insert(tree, &arena, v);
+            let (t, _) = ctree_insert(tree, &mut aw, v);
             tree = t;
         }
 
@@ -176,11 +181,13 @@ proptest! {
     #[test]
     fn insert_never_loses_elements(vals in prop::collection::vec(0..5_000u32, 0..200)) {
         let arena = Arena::new(4 << 20);
+        // SAFETY: sole write handle for this arena; the test body is single-threaded.
+        let mut aw = unsafe { arena.writer() };
         let mut tree = CTree::empty();
         let mut unique = BTreeSet::new();
 
         for &v in &vals {
-            let (t, result) = ctree_insert(tree, &arena, v);
+            let (t, result) = ctree_insert(tree, &mut aw, v);
             tree = t;
             if unique.insert(v) {
                 prop_assert!(matches!(result, InsertResult::Inserted(_)),
@@ -200,10 +207,12 @@ proptest! {
     #[test]
     fn collect_is_sorted(vals in prop::collection::vec(0..10_000u32, 0..200)) {
         let arena = Arena::new(4 << 20);
+        // SAFETY: sole write handle for this arena; the test body is single-threaded.
+        let mut aw = unsafe { arena.writer() };
         let mut tree = CTree::empty();
 
         for &v in &vals {
-            let (t, _) = ctree_insert(tree, &arena, v);
+            let (t, _) = ctree_insert(tree, &mut aw, v);
             tree = t;
         }
 
@@ -220,10 +229,12 @@ proptest! {
         phase2 in prop::collection::hash_set(10_000..20_000u32, 1..30),
     ) {
         let arena = Arena::new(2 << 20);
+        // SAFETY: sole write handle for this arena; the test body is single-threaded.
+        let mut aw = unsafe { arena.writer() };
 
         let mut tree1 = CTree::empty();
         for &v in &phase1 {
-            let (t, _) = ctree_insert(tree1, &arena, v);
+            let (t, _) = ctree_insert(tree1, &mut aw, v);
             tree1 = t;
         }
 
@@ -232,7 +243,7 @@ proptest! {
 
         let mut tree2 = tree1;
         for &v in &phase2 {
-            let (t, _) = ctree_insert(tree2, &arena, v);
+            let (t, _) = ctree_insert(tree2, &mut aw, v);
             tree2 = t;
         }
 
@@ -257,12 +268,14 @@ proptest! {
     #[test]
     fn stress_insert_1000(vals in prop::collection::vec(0..100_000u32, 1000..=1000)) {
         let arena = Arena::new(8 << 20);
+        // SAFETY: sole write handle for this arena; the test body is single-threaded.
+        let mut aw = unsafe { arena.writer() };
         let mut tree = CTree::empty();
         let mut unique = BTreeSet::new();
 
         for &v in &vals {
             unique.insert(v);
-            let (t, _) = ctree_insert(tree, &arena, v);
+            let (t, _) = ctree_insert(tree, &mut aw, v);
             tree = t;
         }
 

@@ -121,11 +121,13 @@ impl RowStore {
     #[inline]
     fn row(&self, r: u32, dim: usize) -> &[f32] {
         #[cfg(unix)]
-        // SAFETY: `r` was handed out by the cache's allocator, so it is
-        // inside the mapping; anonymous pages read as zero before first
-        // write, so the slice is always initialized memory.
-        unsafe {
-            std::slice::from_raw_parts(self.base.as_ptr().add(r as usize * self.stride), dim)
+        {
+            // SAFETY: `r` was handed out by the cache's allocator, so the
+            // offset stays inside the mapping.
+            let p = unsafe { self.base.as_ptr().add(r as usize * self.stride) };
+            // SAFETY: anonymous pages read as zero before first write, so
+            // the slice is always initialized memory.
+            unsafe { std::slice::from_raw_parts(p, dim) }
         }
         #[cfg(not(unix))]
         {
@@ -138,9 +140,12 @@ impl RowStore {
     #[inline]
     fn row_mut(&mut self, r: u32, dim: usize) -> &mut [f32] {
         #[cfg(unix)]
-        // SAFETY: as `row`, and `&mut self` guarantees exclusivity.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.base.as_ptr().add(r as usize * self.stride), dim)
+        {
+            // SAFETY: `r` was handed out by the cache's allocator, so the
+            // offset stays inside the mapping.
+            let p = unsafe { self.base.as_ptr().add(r as usize * self.stride) };
+            // SAFETY: as `row`, and `&mut self` guarantees exclusivity.
+            unsafe { std::slice::from_raw_parts_mut(p, dim) }
         }
         #[cfg(not(unix))]
         {
@@ -227,24 +232,10 @@ impl EmbeddingCache {
         row
     }
 
-    /// Return cached embedding slice for `node`.
-    ///
-    /// # Panics
-    /// Panics if `node` has never been computed (check
-    /// [`is_uninitialized`](Self::is_uninitialized) first).
-    #[inline]
-    pub fn get(&self, node: u32) -> &[f32] {
-        let slot = self
-            .slots
-            .get(&node)
-            .unwrap_or_else(|| panic!("EmbeddingCache::get({node}): node never computed"));
-        self.store.row(slot.row, self.dim)
-    }
-
-    /// Return the cached embedding for `node` in one probe, or `None` when
-    /// the node was never computed (or was invalidated). Replaces the
-    /// `is_uninitialized` + `get` pair, which paid two hash probes per
-    /// node on the hottest per-node loop of the training path.
+    /// Return the cached embedding for `node`, or `None` when the node
+    /// was never computed (or was invalidated). One hash probe answers
+    /// both "is it usable?" and "what is it?" — the hottest per-node loop
+    /// of the training path asks exactly that question.
     #[inline]
     pub fn get_if_computed(&self, node: u32) -> Option<&[f32]> {
         let slot = self.slots.get(&node)?;
@@ -252,29 +243,6 @@ impl EmbeddingCache {
             return None;
         }
         Some(self.store.row(slot.row, self.dim))
-    }
-
-    /// Return mutable embedding slice for `node`, allocating a zeroed row
-    /// on first access (caller writes the new embedding). Does not stamp
-    /// the generation — use [`update`](Self::update) for that.
-    ///
-    /// # Panics
-    /// Panics if `node >= num_nodes`.
-    #[inline]
-    pub fn get_mut(&mut self, node: u32) -> &mut [f32] {
-        assert!(
-            (node as usize) < self.num_nodes,
-            "EmbeddingCache: node {node} out of range (num_nodes {})",
-            self.num_nodes
-        );
-        let slot = match self.slots.entry(node) {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let row = Self::alloc_row(&mut self.store, &mut self.rows);
-                *e.insert(Slot { row, generation: 0 })
-            }
-        };
-        self.store.row_mut(slot.row, self.dim)
     }
 
     /// Write embedding and stamp current generation. One hash probe.
@@ -318,19 +286,9 @@ impl EmbeddingCache {
         }
     }
 
-    /// True if node has never had an embedding computed, or its cached
-    /// embedding was dropped via [`invalidate`](Self::invalidate).
-    #[inline]
-    pub fn is_uninitialized(&self, node: u32) -> bool {
-        match self.slots.get(&node) {
-            Some(s) => s.generation == 0,
-            None => true,
-        }
-    }
-
     /// Drop `node`'s cached embedding from service: its slot (if any) is
-    /// reset to generation 0, so [`is_uninitialized`](Self::is_uninitialized)
-    /// reports true until the next [`update`](Self::update). The row
+    /// reset to generation 0, so [`get_if_computed`](Self::get_if_computed)
+    /// returns `None` until the next [`update`](Self::update). The row
     /// storage is retained and reused. No-op for nodes without a slot.
     pub fn invalidate(&mut self, node: u32) {
         if let Some(s) = self.slots.get_mut(&node) {
@@ -392,7 +350,7 @@ mod tests {
         let mut cache = EmbeddingCache::new(10, 4);
         let emb = [1.0, 2.0, 3.0, 4.0];
         cache.update(0, &emb);
-        assert_eq!(cache.get(0), &emb);
+        assert_eq!(cache.get_if_computed(0), Some(&emb[..]));
         assert!(!cache.is_stale(0));
     }
 
@@ -439,16 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn get_mut_writes() {
-        let mut cache = EmbeddingCache::new(5, 3);
-        let slot = cache.get_mut(2);
-        slot[0] = 7.0;
-        slot[1] = 8.0;
-        slot[2] = 9.0;
-        assert_eq!(cache.get(2), &[7.0, 8.0, 9.0]);
-    }
-
-    #[test]
     fn allocation_is_lazy_and_proportional_to_touched_nodes() {
         // A billion-node cache costs nothing until nodes are written.
         let mut cache = EmbeddingCache::new(1_000_000_000, 128);
@@ -457,22 +405,22 @@ mod tests {
             cache.update(n * 1_000_000, &[1.0; 128]);
         }
         assert_eq!(cache.computed_nodes(), 100);
-        assert!(cache.is_uninitialized(5));
-        assert!(!cache.is_uninitialized(0));
+        assert!(cache.get_if_computed(5).is_none());
+        assert!(cache.get_if_computed(0).is_some());
     }
 
     #[test]
-    fn invalidate_marks_node_uninitialized_until_update() {
+    fn invalidate_hides_node_until_update() {
         let mut cache = EmbeddingCache::new(10, 4);
         cache.update(0, &[1.0; 4]);
-        assert!(!cache.is_uninitialized(0));
+        assert!(cache.get_if_computed(0).is_some());
         cache.invalidate(0);
-        assert!(cache.is_uninitialized(0));
+        assert!(cache.get_if_computed(0).is_none());
         cache.update(0, &[2.0; 4]);
-        assert!(!cache.is_uninitialized(0));
+        assert_eq!(cache.get_if_computed(0), Some(&[2.0f32; 4][..]));
         // Invalidating a node without a slot is a no-op.
         cache.invalidate(9);
-        assert!(cache.is_uninitialized(9));
+        assert!(cache.get_if_computed(9).is_none());
     }
 
     #[test]
@@ -483,9 +431,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "never computed")]
-    fn get_uncomputed_panics() {
+    fn uncomputed_node_reads_none() {
         let cache = EmbeddingCache::new(10, 4);
-        let _ = cache.get(3);
+        assert!(cache.get_if_computed(3).is_none());
     }
 }

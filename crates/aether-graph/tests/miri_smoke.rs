@@ -16,9 +16,10 @@ use aether_graph::{Arena, CTree, Chunk, DynamicGraph, InsertResult};
 fn arena_alloc_write_read_roundtrip() {
     let arena = Arena::new(4096);
     let chunk = Chunk::from_sorted(&[7, 8, 9]);
-    // SAFETY: single-threaded test.
-    let idx = unsafe { arena.alloc_write_chunk(chunk) }.unwrap();
-    // SAFETY: single-threaded test; `idx` was just written as a Chunk.
+    // SAFETY: sole write handle in a single-threaded test.
+    let mut aw = unsafe { arena.writer() };
+    let idx = aw.alloc_write_chunk(chunk).unwrap();
+    // SAFETY: `idx` was just written as a Chunk and cannot have been retired.
     let read: &Chunk = unsafe { arena.chunk(idx) };
     assert_eq!(read.as_slice(), &[7, 8, 9]);
 }
@@ -26,14 +27,17 @@ fn arena_alloc_write_read_roundtrip() {
 #[test]
 fn arena_regions_are_disjoint_and_aligned() {
     let arena = Arena::new(8192);
-    // SAFETY: single-threaded test.
-    unsafe {
-        let c = arena.alloc_chunk().unwrap();
-        let i = arena.alloc_interior().unwrap();
-        assert_eq!(arena.chunk_ptr(c).addr() % 64, 0);
-        assert_eq!(arena.interior_ptr(i).addr() % 16, 0);
-        assert!(arena.chunk_ptr(c) < arena.interior_ptr(i));
-    }
+    // SAFETY: sole write handle in a single-threaded test.
+    let mut aw = unsafe { arena.writer() };
+    let c = aw.alloc_chunk().unwrap();
+    let i = aw.alloc_interior().unwrap();
+    // SAFETY: slot `c` was just allocated.
+    let pc = unsafe { arena.chunk_ptr(c) };
+    // SAFETY: slot `i` was just allocated.
+    let pi = unsafe { arena.interior_ptr(i) };
+    assert_eq!(pc.addr() % 64, 0);
+    assert_eq!(pi.addr() % 16, 0);
+    assert!(pc < pi);
 }
 
 #[test]
@@ -49,12 +53,13 @@ fn chunk_insert_split_merge_roundtrip() {
 #[test]
 fn ctree_insert_and_contains_exercises_all_unsafe_paths() {
     let arena = Arena::new(1 << 20);
+    // SAFETY: sole write handle in a single-threaded test.
+    let mut aw = unsafe { arena.writer() };
     let mut tree = CTree::empty();
     // Trigger leaf path (single insert) AND split path (>15 inserts) AND
     // interior insert (>30 inserts) — covers every unsafe block in ctree.rs.
     for v in 0..32u32 {
-        // SAFETY: single-threaded test.
-        match unsafe { tree.insert(&arena, v) } {
+        match tree.insert(&mut aw, v) {
             InsertResult::Inserted(t) => tree = t,
             other => panic!("unexpected {other:?}"),
         }

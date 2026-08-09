@@ -17,11 +17,16 @@
 //! bumping a cursor, so steady-state ingest reuses garbage instead of
 //! growing until [`compact`](crate::DynamicGraph::compact).
 //!
-//! The arena is NOT thread-safe for allocation (single writer). It IS safe
-//! for concurrent reads of previously-allocated nodes, provided readers
-//! hold a [`ReadGuard`] for the duration of the traversal — the guard is
-//! what makes slot reuse sound.
+//! Mutation goes through [`ArenaWriter`], obtained once from
+//! [`Arena::writer`] — the one `unsafe` point where the caller proves the
+//! single-writer invariant; every allocation after that is safe code
+//! borrowing the handle. Concurrent reads of previously-allocated nodes
+//! are safe provided readers hold a [`ReadGuard`] for the duration of the
+//! traversal — the guard is what makes slot reuse sound.
 
+use crate::chunk::Chunk;
+use crate::ctree::Interior;
+use crate::pad::CachePadded;
 use std::alloc::Layout;
 use std::cell::{Cell, UnsafeCell};
 use std::ptr::NonNull;
@@ -49,15 +54,6 @@ pub(crate) const RETIRE_LOG_CAP: usize = 4096;
 /// slot is somehow still awaiting grace at flush time, the staged slots
 /// are dropped (left as garbage for `compact`) rather than blocking.
 const RING_SLOTS: usize = 4;
-
-/// Pads a field group onto its own cache line. 128 bytes covers the
-/// adjacent-line prefetcher on x86_64 and Apple Silicon's 128-byte granules.
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(128)))]
-#[cfg_attr(
-    not(any(target_arch = "x86_64", target_arch = "aarch64")),
-    repr(align(64))
-)]
-struct CachePadded<T>(T);
 
 /// One stripe of the reader gate: monotonic entry/exit counters.
 struct GateStripe {
@@ -143,8 +139,8 @@ struct PendingBatch {
     interiors: Vec<u32>,
 }
 
-/// Writer-only recycling state (behind `UnsafeCell`, same single-writer
-/// contract as the bump cursors).
+/// Recycling state, reached only through an [`ArenaWriter`] (whose
+/// construction contract makes access exclusive).
 struct Recycler {
     /// Stamped batches awaiting grace.
     ring: [PendingBatch; RING_SLOTS],
@@ -181,7 +177,7 @@ impl Recycler {
 /// Tree operations only *record* what they superseded; nothing here is
 /// reusable until the writer has published the root stores that made the
 /// slots unreachable and then handed the log to
-/// [`Arena::retire_log`], which stamps it with a reader-gate snapshot.
+/// [`ArenaWriter::retire`], which stamps it with a reader-gate snapshot.
 /// Separating "record" from "stamp" is what keeps the grace reasoning
 /// sound: a stamp taken before the unpublishing store could clear a
 /// reader that goes on to walk the still-published old tree.
@@ -239,21 +235,22 @@ pub struct Arena {
     /// Reader gate for grace-period recycling. Striped; read-mostly from
     /// the writer's perspective.
     gate: ReadGate,
-    /// Bump cursors, writer-only. `low` is the next free byte in the chunk
-    /// region (grows up); `high` is one past the last free byte of the
-    /// interior region (grows down). Isolated on their own cache line so
-    /// writer bumps don't evict the read-mostly fields above from reader
-    /// caches.
+    /// Bump cursors, advanced only through an [`ArenaWriter`]. `low` is
+    /// the next free byte in the chunk region (grows up); `high` is one
+    /// past the last free byte of the interior region (grows down).
+    /// Isolated on their own cache line so writer bumps don't evict the
+    /// read-mostly fields above from reader caches.
     cursors: CachePadded<(AtomicUsize, AtomicUsize)>,
-    /// Recycling state, writer-only.
+    /// Recycling state, reached only through an [`ArenaWriter`].
     recycler: UnsafeCell<Recycler>,
 }
 
-// SAFETY: The arena is single-writer (only the graph writer thread allocates,
-// retires, and reclaims — `recycler` and the cursors are never touched
-// concurrently). Concurrent readers access previously-allocated nodes, which
-// are immutable until retired; retired slots are rewritten only after the
-// reader gate proves no reader can still observe them.
+// SAFETY: Mutation (cursors, recycler, slot writes) flows exclusively
+// through `ArenaWriter` / `RegionWriter`, whose construction contracts
+// guarantee a single mutator. Concurrent readers access
+// previously-allocated nodes, which are immutable until retired; retired
+// slots are rewritten only after the reader gate proves no reader can
+// still observe them.
 unsafe impl Send for Arena {}
 // SAFETY: see Send impl above.
 unsafe impl Sync for Arena {}
@@ -306,153 +303,20 @@ impl Arena {
         ReadGuard { stripe }
     }
 
-    // -- Allocation (single-writer) -----------------------------------------
-
-    /// Allocate one 64-byte chunk slot. Returns the slot index, or `None`
-    /// when the arena is full (free list empty, cursors met, and no
-    /// pending batch has cleared its grace period).
+    /// Obtain the arena's write handle. All allocation, retirement, and
+    /// reclamation go through the returned [`ArenaWriter`]; this is the
+    /// single point where the exclusivity proof is made, so the handle's
+    /// methods are safe.
     ///
     /// # Safety
-    /// Single-writer invariant: only one thread may allocate, retire, or
-    /// reclaim concurrently. Callers in `aether-graph` go through
-    /// `DynamicGraph::writer()`, which enforces this at runtime.
+    /// At most one `ArenaWriter` may be live per arena at any time, and no
+    /// [`RegionWriter`] (from [`region`](Self::region)) or
+    /// [`commit_regions`](Self::commit_regions) call may overlap its
+    /// lifetime. In `aether-graph` the proof is `DynamicGraph::writer()`'s
+    /// CAS guard: one `Writer` exists at a time and owns the handle.
     #[inline]
-    pub unsafe fn alloc_chunk(&self) -> Option<u32> {
-        // SAFETY: single-writer contract makes the recycler ours.
-        let rec = unsafe { &mut *self.recycler.get() };
-        if rec.free_chunk_head != NO_SLOT {
-            let idx = rec.free_chunk_head;
-            // SAFETY: a free chunk slot stores the next free index in its
-            // first 4 bytes; the slot is in bounds by construction.
-            rec.free_chunk_head = unsafe { self.read_link(idx as usize * CHUNK_SLOT) };
-            rec.free_chunks -= 1;
-            return Some(idx);
-        }
-        if let Some(idx) = self.bump_chunk() {
-            return Some(idx);
-        }
-        // Cursors met: reclaim any grace-cleared pending batches and retry
-        // the free list before reporting full.
-        // SAFETY: single-writer contract.
-        unsafe { self.reclaim_ready(rec) };
-        if rec.free_chunk_head != NO_SLOT {
-            let idx = rec.free_chunk_head;
-            // SAFETY: as above.
-            rec.free_chunk_head = unsafe { self.read_link(idx as usize * CHUNK_SLOT) };
-            rec.free_chunks -= 1;
-            return Some(idx);
-        }
-        None
-    }
-
-    /// Allocate one 16-byte interior slot. See [`alloc_chunk`](Self::alloc_chunk).
-    ///
-    /// # Safety
-    /// Single-writer invariant (see [`alloc_chunk`](Self::alloc_chunk)).
-    #[inline]
-    pub unsafe fn alloc_interior(&self) -> Option<u32> {
-        // SAFETY: single-writer contract makes the recycler ours.
-        let rec = unsafe { &mut *self.recycler.get() };
-        if rec.free_interior_head != NO_SLOT {
-            let idx = rec.free_interior_head;
-            // SAFETY: a free interior slot stores the next free index in
-            // its first 4 bytes; the slot is in bounds by construction.
-            rec.free_interior_head = unsafe { self.read_link(self.interior_byte(idx)) };
-            rec.free_interiors -= 1;
-            return Some(idx);
-        }
-        if let Some(idx) = self.bump_interior() {
-            return Some(idx);
-        }
-        // SAFETY: single-writer contract.
-        unsafe { self.reclaim_ready(rec) };
-        if rec.free_interior_head != NO_SLOT {
-            let idx = rec.free_interior_head;
-            // SAFETY: as above.
-            rec.free_interior_head = unsafe { self.read_link(self.interior_byte(idx)) };
-            rec.free_interiors -= 1;
-            return Some(idx);
-        }
-        None
-    }
-
-    #[inline]
-    fn bump_chunk(&self) -> Option<u32> {
-        let low = self.cursors.0.0.load(Ordering::Relaxed);
-        let high = self.cursors.0.1.load(Ordering::Relaxed);
-        let new_low = low + CHUNK_SLOT;
-        if new_low > high {
-            return None;
-        }
-        self.cursors.0.0.store(new_low, Ordering::Relaxed);
-        Some((low / CHUNK_SLOT) as u32)
-    }
-
-    #[inline]
-    fn bump_interior(&self) -> Option<u32> {
-        let low = self.cursors.0.0.load(Ordering::Relaxed);
-        let high = self.cursors.0.1.load(Ordering::Relaxed);
-        if high < low + INTERIOR_SLOT {
-            return None;
-        }
-        let new_high = high - INTERIOR_SLOT;
-        let idx = ((self.capacity - new_high) / INTERIOR_SLOT - 1) as u32;
-        // Reserve index 0x7FFF_FFFF: tagged it would collide with the
-        // NULL sentinel (u32::MAX).
-        if idx >= (1 << 31) - 1 {
-            return None;
-        }
-        self.cursors.0.1.store(new_high, Ordering::Relaxed);
-        Some(idx)
-    }
-
-    /// Byte offset of interior slot `idx` (slots count down from the top).
-    #[inline(always)]
-    fn interior_byte(&self, idx: u32) -> usize {
-        self.capacity - (idx as usize + 1) * INTERIOR_SLOT
-    }
-
-    /// Allocate a chunk slot and write `val` into it.
-    ///
-    /// # Safety
-    /// Single-writer invariant; `T` must be exactly [`CHUNK_SLOT`] bytes
-    /// with alignment ≤ 64 (the chunk region is 64-byte aligned).
-    #[inline]
-    pub unsafe fn alloc_write_chunk<T: Copy>(&self, val: T) -> Option<u32> {
-        debug_assert_eq!(std::mem::size_of::<T>(), CHUNK_SLOT);
-        debug_assert!(std::mem::align_of::<T>() <= 64);
-        // SAFETY: caller upholds the single-writer invariant.
-        let idx = unsafe { self.alloc_chunk()? };
-        // SAFETY: idx is a fresh in-bounds chunk slot, 64-byte aligned.
-        unsafe {
-            std::ptr::write(
-                self.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) as *mut T,
-                val,
-            );
-        }
-        Some(idx)
-    }
-
-    /// Allocate an interior slot and write `val` into it.
-    ///
-    /// # Safety
-    /// Single-writer invariant; `T` must be exactly [`INTERIOR_SLOT`] bytes
-    /// with alignment ≤ 16 (interior slots are 16-byte aligned: the region
-    /// top is the 64-aligned capacity and slots are 16 bytes).
-    #[inline]
-    pub unsafe fn alloc_write_interior<T: Copy>(&self, val: T) -> Option<u32> {
-        debug_assert_eq!(std::mem::size_of::<T>(), INTERIOR_SLOT);
-        debug_assert!(std::mem::align_of::<T>() <= 16);
-        // SAFETY: caller upholds the single-writer invariant.
-        let idx = unsafe { self.alloc_interior()? };
-        // SAFETY: idx is a fresh in-bounds interior slot, 16-byte aligned.
-        unsafe {
-            std::ptr::write(
-                self.ptr.as_ptr().add(self.interior_byte(idx)) as *mut T,
-                val,
-            );
-        }
-        Some(idx)
+    pub unsafe fn writer(&self) -> ArenaWriter<'_> {
+        ArenaWriter { arena: self }
     }
 
     // -- Access -------------------------------------------------------------
@@ -477,97 +341,77 @@ impl Arena {
         unsafe { self.ptr.as_ptr().add(self.interior_byte(idx)) as *const u8 }
     }
 
-    /// Typed reference to the chunk at slot `idx`.
+    /// Reference to the chunk at slot `idx`.
     ///
     /// # Safety
     /// `idx` must be an allocated, initialized chunk slot, and the caller
-    /// must hold either the writer guard or a [`ReadGuard`] entered before
+    /// must hold either the write handle or a [`ReadGuard`] entered before
     /// the slot could have been retired.
     #[inline(always)]
-    pub unsafe fn chunk<T>(&self, idx: u32) -> &T {
-        debug_assert_eq!(std::mem::size_of::<T>(), CHUNK_SLOT);
-        // SAFETY: caller-asserted invariants make the pointer dereferenceable.
-        unsafe { &*(self.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) as *const T) }
+    pub unsafe fn chunk(&self, idx: u32) -> &Chunk {
+        // SAFETY: `idx` is an allocated slot, so the offset is in bounds.
+        let p = unsafe { self.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) } as *const Chunk;
+        // SAFETY: the slot is initialized and, per the caller's guard
+        // contract, cannot be rewritten while this reference lives.
+        unsafe { &*p }
     }
 
-    /// Typed reference to the interior node at slot `idx`.
+    /// Reference to the interior node at slot `idx`.
     ///
     /// # Safety
     /// As [`chunk`](Self::chunk), for the interior region.
     #[inline(always)]
-    pub unsafe fn interior<T>(&self, idx: u32) -> &T {
-        debug_assert_eq!(std::mem::size_of::<T>(), INTERIOR_SLOT);
-        // SAFETY: caller-asserted invariants make the pointer dereferenceable.
-        unsafe { &*(self.ptr.as_ptr().add(self.interior_byte(idx)) as *const T) }
+    pub unsafe fn interior(&self, idx: u32) -> &Interior {
+        // SAFETY: `idx` is an allocated slot, so the offset is in bounds.
+        let p = unsafe { self.ptr.as_ptr().add(self.interior_byte(idx)) } as *const Interior;
+        // SAFETY: the slot is initialized and, per the caller's guard
+        // contract, cannot be rewritten while this reference lives.
+        unsafe { &*p }
     }
 
-    // -- Retirement + reclamation (single-writer) ---------------------------
-
-    /// Stamp the writer's retire log with a gate snapshot and queue it for
-    /// reclamation, then fold any batches whose grace period has already
-    /// passed onto the free lists.
-    ///
-    /// Must be called only after the root stores that made every logged
-    /// slot unreachable — the snapshot's meaning is "any reader that
-    /// entered after this point cannot observe the logged slots". The
-    /// log's buffers are swapped with pre-sized ring buffers, so a flush
-    /// at the [`RetireLog::wants_flush`] watermark never allocates. If
-    /// every ring slot is still awaiting grace, the logged slots are
-    /// dropped (garbage until compact) — recycling is an optimization and
-    /// must never block the writer.
-    ///
-    /// # Safety
-    /// Single-writer invariant, every logged slot unpublished, and no slot
-    /// logged twice.
-    pub(crate) unsafe fn retire_log(&self, log: &mut RetireLog) {
-        if log.chunks.is_empty() && log.interiors.is_empty() {
-            return;
-        }
-        // SAFETY: single-writer contract makes the recycler ours.
-        let rec = unsafe { &mut *self.recycler.get() };
-        // SAFETY: single-writer contract.
-        unsafe { self.reclaim_ready(rec) };
-        let Some(slot) = rec.ring.iter_mut().find(|b| !b.occupied) else {
-            rec.leaked += (log.chunks.len() + log.interiors.len()) as u64;
-            log.chunks.clear();
-            log.interiors.clear();
-            return;
-        };
-        std::mem::swap(&mut slot.chunks, &mut log.chunks);
-        std::mem::swap(&mut slot.interiors, &mut log.interiors);
-        log.chunks.clear();
-        log.interiors.clear();
-        self.gate.snapshot(&mut slot.snap);
-        slot.occupied = true;
+    /// Byte offset of interior slot `idx` (slots count down from the top).
+    #[inline(always)]
+    fn interior_byte(&self, idx: u32) -> usize {
+        self.capacity - (idx as usize + 1) * INTERIOR_SLOT
     }
 
-    /// Fold grace-cleared pending batches onto the free lists without
-    /// stamping anything new. Useful at commit points when the log is
-    /// empty but earlier batches may have cleared.
+    /// Read an intrusive free-list link stored at `byte`.
     ///
     /// # Safety
-    /// Single-writer invariant.
-    pub(crate) unsafe fn reclaim(&self) {
-        // SAFETY: single-writer contract makes the recycler ours.
-        let rec = unsafe { &mut *self.recycler.get() };
-        // SAFETY: single-writer contract.
-        unsafe { self.reclaim_ready(rec) };
+    /// `byte` must be the in-bounds start of a slot on a free list.
+    #[inline]
+    unsafe fn read_link(&self, byte: usize) -> u32 {
+        // SAFETY: `byte` is in bounds per the caller contract.
+        let p = unsafe { self.ptr.as_ptr().add(byte) } as *const u32;
+        // SAFETY: the location holds a link written by `write_link`.
+        unsafe { std::ptr::read(p) }
+    }
+
+    /// Write an intrusive free-list link at `byte`.
+    ///
+    /// # Safety
+    /// `byte` must be in-bounds and the slot unobservable by readers.
+    #[inline]
+    unsafe fn write_link(&self, byte: usize, next: u32) {
+        // SAFETY: `byte` is in bounds per the caller contract.
+        let p = unsafe { self.ptr.as_ptr().add(byte) } as *mut u32;
+        // SAFETY: the slot is unobservable by readers per the caller
+        // contract, so the write cannot race a reference.
+        unsafe { std::ptr::write(p, next) };
     }
 
     /// Thread every grace-cleared pending batch onto the intrusive free
     /// lists. Writing the link into a freed slot is sound precisely
     /// because grace has passed: no reader can still hold a reference.
-    ///
-    /// # Safety
-    /// Single-writer invariant; `rec` must be the arena's recycler.
-    unsafe fn reclaim_ready(&self, rec: &mut Recycler) {
+    fn reclaim_ready(&self, rec: &mut Recycler) {
         for batch in &mut rec.ring {
             if !batch.occupied || !self.gate.grace_passed(&batch.snap) {
                 continue;
             }
             for idx in batch.chunks.drain(..) {
                 // SAFETY: grace passed — the slot is unobservable; the
-                // link write targets in-bounds, writer-owned memory.
+                // link write targets in-bounds memory owned by the sole
+                // mutator (`rec` is reached only through `ArenaWriter`).
                 unsafe { self.write_link(idx as usize * CHUNK_SLOT, rec.free_chunk_head) };
                 rec.free_chunk_head = idx;
                 rec.free_chunks += 1;
@@ -580,26 +424,6 @@ impl Arena {
             }
             batch.occupied = false;
         }
-    }
-
-    /// Read an intrusive free-list link stored at `byte`.
-    ///
-    /// # Safety
-    /// `byte` must be the in-bounds start of a slot on a free list.
-    #[inline]
-    unsafe fn read_link(&self, byte: usize) -> u32 {
-        // SAFETY: caller asserts the location holds a link we wrote.
-        unsafe { std::ptr::read(self.ptr.as_ptr().add(byte) as *const u32) }
-    }
-
-    /// Write an intrusive free-list link at `byte`.
-    ///
-    /// # Safety
-    /// `byte` must be in-bounds and the slot unobservable by readers.
-    #[inline]
-    unsafe fn write_link(&self, byte: usize, next: u32) {
-        // SAFETY: caller asserts exclusivity over the slot.
-        unsafe { std::ptr::write(self.ptr.as_ptr().add(byte) as *mut u32, next) };
     }
 
     // -- Stats --------------------------------------------------------------
@@ -617,35 +441,15 @@ impl Arena {
         self.capacity
     }
 
-    /// Recycling counters. Writer-thread only (reads the recycler).
-    ///
-    /// # Safety
-    /// Single-writer invariant.
-    pub unsafe fn recycle_stats(&self) -> RecycleStats {
-        // SAFETY: single-writer contract makes the recycler ours.
-        let rec = unsafe { &*self.recycler.get() };
-        let pending = rec
-            .ring
-            .iter()
-            .filter(|b| b.occupied)
-            .map(|b| b.chunks.len() + b.interiors.len())
-            .sum::<usize>();
-        RecycleStats {
-            free_chunks: rec.free_chunks,
-            free_interiors: rec.free_interiors,
-            pending,
-            leaked: rec.leaked,
-        }
-    }
-
     // -- Parallel compaction support ----------------------------------------
 
     /// Carve a private, disjoint slot region for one compaction thread.
     ///
     /// # Safety
     /// The caller must guarantee (a) exclusive access to the arena's
-    /// regions being written (fresh arena, cursors untouched), (b) that
-    /// the handed-out `[chunk_start, chunk_start + chunk_count)` and
+    /// regions being written (fresh arena, cursors untouched, no live
+    /// [`ArenaWriter`]), (b) that the handed-out
+    /// `[chunk_start, chunk_start + chunk_count)` and
     /// `[interior_start, interior_start + interior_count)` ranges are
     /// disjoint across threads and within the eventual cursor commit from
     /// [`commit_regions`](Self::commit_regions).
@@ -695,6 +499,223 @@ impl Drop for Arena {
     }
 }
 
+/// The arena's write handle: allocation, retirement, and reclamation.
+///
+/// Constructed by the one `unsafe` call [`Arena::writer`], whose contract
+/// (at most one live handle, no overlapping region builds) is what makes
+/// every method here safe — the type carries the single-writer proof so
+/// call sites don't re-assert it. Derefs to [`Arena`] for the read-side
+/// API.
+pub struct ArenaWriter<'a> {
+    arena: &'a Arena,
+}
+
+impl std::ops::Deref for ArenaWriter<'_> {
+    type Target = Arena;
+    #[inline(always)]
+    fn deref(&self) -> &Arena {
+        self.arena
+    }
+}
+
+impl<'a> ArenaWriter<'a> {
+    /// The underlying arena, at the handle's full lifetime — so node
+    /// references taken for reading coexist with `&mut self` allocation
+    /// calls (all arena mutation is interior; shared references to live
+    /// nodes are never invalidated by allocating elsewhere).
+    #[inline(always)]
+    pub fn arena(&self) -> &'a Arena {
+        self.arena
+    }
+}
+
+impl ArenaWriter<'_> {
+    /// The recycler, exclusive by the construction contract.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    fn recycler(&self) -> &mut Recycler {
+        // SAFETY: `Arena::writer`'s contract makes this handle the only
+        // path to the recycler, and the handle is not Sync.
+        unsafe { &mut *self.arena.recycler.get() }
+    }
+
+    /// Allocate one 64-byte chunk slot. Returns the slot index, or `None`
+    /// when the arena is full (free list empty, cursors met, and no
+    /// pending batch has cleared its grace period).
+    #[inline]
+    pub fn alloc_chunk(&mut self) -> Option<u32> {
+        let rec = self.recycler();
+        if let Some(idx) = self.pop_free_chunk(rec) {
+            return Some(idx);
+        }
+        if let Some(idx) = self.bump_chunk() {
+            return Some(idx);
+        }
+        // Cursors met: reclaim any grace-cleared pending batches and retry
+        // the free list before reporting full.
+        self.arena.reclaim_ready(rec);
+        self.pop_free_chunk(rec)
+    }
+
+    /// Allocate one 16-byte interior slot. See [`alloc_chunk`](Self::alloc_chunk).
+    #[inline]
+    pub fn alloc_interior(&mut self) -> Option<u32> {
+        let rec = self.recycler();
+        if let Some(idx) = self.pop_free_interior(rec) {
+            return Some(idx);
+        }
+        if let Some(idx) = self.bump_interior() {
+            return Some(idx);
+        }
+        self.arena.reclaim_ready(rec);
+        self.pop_free_interior(rec)
+    }
+
+    #[inline]
+    fn pop_free_chunk(&self, rec: &mut Recycler) -> Option<u32> {
+        if rec.free_chunk_head == NO_SLOT {
+            return None;
+        }
+        let idx = rec.free_chunk_head;
+        // SAFETY: a free chunk slot stores the next free index in its
+        // first 4 bytes; the slot is in bounds by construction.
+        rec.free_chunk_head = unsafe { self.arena.read_link(idx as usize * CHUNK_SLOT) };
+        rec.free_chunks -= 1;
+        Some(idx)
+    }
+
+    #[inline]
+    fn pop_free_interior(&self, rec: &mut Recycler) -> Option<u32> {
+        if rec.free_interior_head == NO_SLOT {
+            return None;
+        }
+        let idx = rec.free_interior_head;
+        // SAFETY: a free interior slot stores the next free index in its
+        // first 4 bytes; the slot is in bounds by construction.
+        rec.free_interior_head = unsafe { self.arena.read_link(self.arena.interior_byte(idx)) };
+        rec.free_interiors -= 1;
+        Some(idx)
+    }
+
+    #[inline]
+    fn bump_chunk(&self) -> Option<u32> {
+        let low = self.arena.cursors.0.0.load(Ordering::Relaxed);
+        let high = self.arena.cursors.0.1.load(Ordering::Relaxed);
+        let new_low = low + CHUNK_SLOT;
+        if new_low > high {
+            return None;
+        }
+        self.arena.cursors.0.0.store(new_low, Ordering::Relaxed);
+        Some((low / CHUNK_SLOT) as u32)
+    }
+
+    #[inline]
+    fn bump_interior(&self) -> Option<u32> {
+        let low = self.arena.cursors.0.0.load(Ordering::Relaxed);
+        let high = self.arena.cursors.0.1.load(Ordering::Relaxed);
+        if high < low + INTERIOR_SLOT {
+            return None;
+        }
+        let new_high = high - INTERIOR_SLOT;
+        let idx = ((self.arena.capacity - new_high) / INTERIOR_SLOT - 1) as u32;
+        // Reserve index 0x7FFF_FFFF: tagged it would collide with the
+        // NULL sentinel (u32::MAX).
+        if idx >= (1 << 31) - 1 {
+            return None;
+        }
+        self.arena.cursors.0.1.store(new_high, Ordering::Relaxed);
+        Some(idx)
+    }
+
+    /// Allocate a chunk slot and write `val` into it.
+    #[inline]
+    pub fn alloc_write_chunk(&mut self, val: Chunk) -> Option<u32> {
+        let idx = self.alloc_chunk()?;
+        // SAFETY: `idx` is a fresh slot, so the offset is in bounds.
+        let p = unsafe { self.arena.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) } as *mut Chunk;
+        // SAFETY: the slot is fresh (unobservable), 64-byte aligned, and
+        // `Chunk` is exactly one slot (const-asserted in ctree.rs).
+        unsafe { std::ptr::write(p, val) };
+        Some(idx)
+    }
+
+    /// Allocate an interior slot and write `val` into it.
+    #[inline]
+    pub fn alloc_write_interior(&mut self, val: Interior) -> Option<u32> {
+        let idx = self.alloc_interior()?;
+        // SAFETY: `idx` is a fresh slot, so the offset is in bounds.
+        let p =
+            unsafe { self.arena.ptr.as_ptr().add(self.arena.interior_byte(idx)) } as *mut Interior;
+        // SAFETY: the slot is fresh (unobservable), 16-byte aligned, and
+        // `Interior` is exactly one slot (const-asserted in ctree.rs).
+        unsafe { std::ptr::write(p, val) };
+        Some(idx)
+    }
+
+    /// Stamp the retire log with a gate snapshot and queue it for
+    /// reclamation, then fold any batches whose grace period has already
+    /// passed onto the free lists.
+    ///
+    /// The log's buffers are swapped with pre-sized ring buffers, so a
+    /// flush at the [`RetireLog::wants_flush`] watermark never allocates.
+    /// If every ring slot is still awaiting grace, the logged slots are
+    /// dropped (garbage until compact) — recycling is an optimization and
+    /// must never block the writer.
+    ///
+    /// # Safety
+    /// Every logged slot must already be unreachable from any published
+    /// root (the root stores superseding it have happened), and no slot
+    /// may be logged twice. The snapshot's meaning is "any reader that
+    /// entered after this point cannot observe the logged slots"; stamping
+    /// a still-published slot would let a later reader walk memory that
+    /// gets rewritten under it.
+    pub(crate) unsafe fn retire(&mut self, log: &mut RetireLog) {
+        if log.chunks.is_empty() && log.interiors.is_empty() {
+            return;
+        }
+        let rec = self.recycler();
+        self.arena.reclaim_ready(rec);
+        let Some(slot) = rec.ring.iter_mut().find(|b| !b.occupied) else {
+            rec.leaked += (log.chunks.len() + log.interiors.len()) as u64;
+            log.chunks.clear();
+            log.interiors.clear();
+            return;
+        };
+        std::mem::swap(&mut slot.chunks, &mut log.chunks);
+        std::mem::swap(&mut slot.interiors, &mut log.interiors);
+        log.chunks.clear();
+        log.interiors.clear();
+        self.arena.gate.snapshot(&mut slot.snap);
+        slot.occupied = true;
+    }
+
+    /// Fold grace-cleared pending batches onto the free lists without
+    /// stamping anything new. Useful at commit points when the log is
+    /// empty but earlier batches may have cleared.
+    pub(crate) fn reclaim(&mut self) {
+        let rec = self.recycler();
+        self.arena.reclaim_ready(rec);
+    }
+
+    /// Recycling counters. Slots recorded in a not-yet-stamped
+    /// [`RetireLog`] count as neither free nor pending.
+    pub(crate) fn recycle_stats(&self) -> RecycleStats {
+        let rec = self.recycler();
+        let pending = rec
+            .ring
+            .iter()
+            .filter(|b| b.occupied)
+            .map(|b| b.chunks.len() + b.interiors.len())
+            .sum::<usize>();
+        RecycleStats {
+            free_chunks: rec.free_chunks,
+            free_interiors: rec.free_interiors,
+            pending,
+            leaked: rec.leaked,
+        }
+    }
+}
+
 /// Private slot range handed to one compaction thread. Writes are plain
 /// (no atomics): the range is disjoint from every other thread's by the
 /// [`Arena::region`] contract.
@@ -710,38 +731,33 @@ impl RegionWriter<'_> {
     /// Write a chunk into the next reserved slot. Panics (debug) past the
     /// reservation — the compaction prepass sizes ranges exactly.
     #[inline]
-    pub fn write_chunk<T: Copy>(&mut self, val: T) -> u32 {
-        debug_assert_eq!(std::mem::size_of::<T>(), CHUNK_SLOT);
+    pub fn write_chunk(&mut self, val: Chunk) -> u32 {
         debug_assert!(self.next_chunk < self.chunk_end, "chunk region overrun");
         let idx = self.next_chunk;
         self.next_chunk += 1;
-        // SAFETY: idx is inside this writer's exclusive reservation.
-        unsafe {
-            std::ptr::write(
-                self.arena.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) as *mut T,
-                val,
-            );
-        }
+        // SAFETY: `idx` is inside this writer's reservation, in bounds.
+        let p = unsafe { self.arena.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) } as *mut Chunk;
+        // SAFETY: the reservation is exclusive to this writer, so the
+        // write cannot race another thread.
+        unsafe { std::ptr::write(p, val) };
         idx
     }
 
     /// Write an interior node into the next reserved slot.
     #[inline]
-    pub fn write_interior<T: Copy>(&mut self, val: T) -> u32 {
-        debug_assert_eq!(std::mem::size_of::<T>(), INTERIOR_SLOT);
+    pub fn write_interior(&mut self, val: Interior) -> u32 {
         debug_assert!(
             self.next_interior < self.interior_end,
             "interior region overrun"
         );
         let idx = self.next_interior;
         self.next_interior += 1;
-        // SAFETY: idx is inside this writer's exclusive reservation.
-        unsafe {
-            std::ptr::write(
-                self.arena.ptr.as_ptr().add(self.arena.interior_byte(idx)) as *mut T,
-                val,
-            );
-        }
+        // SAFETY: `idx` is inside this writer's reservation, in bounds.
+        let p =
+            unsafe { self.arena.ptr.as_ptr().add(self.arena.interior_byte(idx)) } as *mut Interior;
+        // SAFETY: the reservation is exclusive to this writer, so the
+        // write cannot race another thread.
+        unsafe { std::ptr::write(p, val) };
         idx
     }
 }
@@ -755,117 +771,114 @@ mod tests {
     fn basic_alloc_two_regions() {
         let arena = Arena::new(4096);
         assert_eq!(arena.used(), 0);
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
 
-        // SAFETY: test is single-threaded.
-        let c0 = unsafe { arena.alloc_chunk() }.unwrap();
-        assert_eq!(c0, 0);
-        // SAFETY: test is single-threaded.
-        let c1 = unsafe { arena.alloc_chunk() }.unwrap();
-        assert_eq!(c1, 1);
-        // SAFETY: test is single-threaded.
-        let i0 = unsafe { arena.alloc_interior() }.unwrap();
-        assert_eq!(i0, 0);
+        assert_eq!(aw.alloc_chunk().unwrap(), 0);
+        assert_eq!(aw.alloc_chunk().unwrap(), 1);
+        assert_eq!(aw.alloc_interior().unwrap(), 0);
         assert_eq!(arena.used(), 2 * CHUNK_SLOT + INTERIOR_SLOT);
     }
 
     #[test]
     fn alloc_write_chunk_roundtrip() {
         let arena = Arena::new(4096);
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
         let chunk = Chunk::from_sorted(&[10, 20, 30]);
 
-        // SAFETY: test is single-threaded.
-        let idx = unsafe { arena.alloc_write_chunk(chunk) }.unwrap();
-        // SAFETY: idx was just written as a Chunk.
-        let read: &Chunk = unsafe { arena.chunk(idx) };
+        let idx = aw.alloc_write_chunk(chunk).unwrap();
+        // SAFETY: idx was just written as a Chunk; the writer holds the
+        // sole handle, so the slot cannot have been retired.
+        let read = unsafe { arena.chunk(idx) };
         assert_eq!(read.as_slice(), &[10, 20, 30]);
     }
 
     #[test]
     fn arena_full_returns_none() {
         let arena = Arena::new(128);
-        // SAFETY: test is single-threaded.
-        unsafe {
-            assert!(arena.alloc_chunk().is_some());
-            assert!(arena.alloc_chunk().is_some());
-            assert!(arena.alloc_chunk().is_none());
-        }
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        assert!(aw.alloc_chunk().is_some());
+        assert!(aw.alloc_chunk().is_some());
+        assert!(aw.alloc_chunk().is_none());
     }
 
     #[test]
     fn regions_meet_in_the_middle() {
         let arena = Arena::new(2 * CHUNK_SLOT + 2 * INTERIOR_SLOT);
-        // SAFETY: test is single-threaded.
-        unsafe {
-            assert!(arena.alloc_chunk().is_some());
-            assert!(arena.alloc_interior().is_some());
-            assert!(arena.alloc_interior().is_some());
-            // One chunk slot's worth of bytes remains, and it is free.
-            assert!(arena.alloc_chunk().is_some());
-            assert!(arena.alloc_interior().is_none());
-            assert!(arena.alloc_chunk().is_none());
-        }
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        assert!(aw.alloc_chunk().is_some());
+        assert!(aw.alloc_interior().is_some());
+        assert!(aw.alloc_interior().is_some());
+        // One chunk slot's worth of bytes remains, and it is free.
+        assert!(aw.alloc_chunk().is_some());
+        assert!(aw.alloc_interior().is_none());
+        assert!(aw.alloc_chunk().is_none());
     }
 
     #[test]
     fn recycling_reuses_slots_after_grace() {
         let arena = Arena::new(4096);
         let mut log = RetireLog::new();
-        // SAFETY: test is single-threaded.
-        unsafe {
-            let a = arena.alloc_chunk().unwrap();
-            let b = arena.alloc_chunk().unwrap();
-            log.chunks.push(a);
-            log.chunks.push(b);
-            // No readers in flight: grace passes at the next reclaim.
-            arena.retire_log(&mut log);
-            arena.reclaim();
-            let stats = arena.recycle_stats();
-            assert_eq!(stats.free_chunks, 2);
-            // LIFO within a batch: `b` was threaded last.
-            assert_eq!(arena.alloc_chunk().unwrap(), b);
-            assert_eq!(arena.alloc_chunk().unwrap(), a);
-            assert_eq!(arena.recycle_stats().free_chunks, 0);
-        }
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let a = aw.alloc_chunk().unwrap();
+        let b = aw.alloc_chunk().unwrap();
+        log.chunks.push(a);
+        log.chunks.push(b);
+        // No readers in flight: grace passes at the next reclaim.
+        // SAFETY: the logged slots are test-local and never published.
+        unsafe { aw.retire(&mut log) };
+        aw.reclaim();
+        let stats = aw.recycle_stats();
+        assert_eq!(stats.free_chunks, 2);
+        // LIFO within a batch: `b` was threaded last.
+        assert_eq!(aw.alloc_chunk().unwrap(), b);
+        assert_eq!(aw.alloc_chunk().unwrap(), a);
+        assert_eq!(aw.recycle_stats().free_chunks, 0);
     }
 
     #[test]
     fn active_reader_blocks_reclaim() {
         let arena = Arena::new(4096);
         let mut log = RetireLog::new();
-        // SAFETY: test is single-threaded (the guard plays the reader).
-        unsafe {
-            let a = arena.alloc_chunk().unwrap();
-            let guard = arena.read_guard();
-            log.chunks.push(a);
-            arena.retire_log(&mut log);
-            arena.reclaim();
-            assert_eq!(
-                arena.recycle_stats().free_chunks,
-                0,
-                "slot must stay pending while the reader is inside the gate"
-            );
-            assert_eq!(arena.recycle_stats().pending, 1);
-            drop(guard);
-            arena.reclaim();
-            assert_eq!(arena.recycle_stats().free_chunks, 1);
-        }
+        // SAFETY: sole handle in a single-threaded test (the guard plays
+        // the reader).
+        let mut aw = unsafe { arena.writer() };
+        let a = aw.alloc_chunk().unwrap();
+        let guard = arena.read_guard();
+        log.chunks.push(a);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log) };
+        aw.reclaim();
+        assert_eq!(
+            aw.recycle_stats().free_chunks,
+            0,
+            "slot must stay pending while the reader is inside the gate"
+        );
+        assert_eq!(aw.recycle_stats().pending, 1);
+        drop(guard);
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, 1);
     }
 
     #[test]
     fn reader_entered_after_stamp_does_not_block() {
         let arena = Arena::new(4096);
         let mut log = RetireLog::new();
-        // SAFETY: test is single-threaded.
-        unsafe {
-            let a = arena.alloc_chunk().unwrap();
-            log.chunks.push(a);
-            arena.retire_log(&mut log);
-            // This reader entered after the snapshot: it can only see the
-            // post-retirement roots, so it must not block reuse.
-            let _guard = arena.read_guard();
-            arena.reclaim();
-            assert_eq!(arena.recycle_stats().free_chunks, 1);
-        }
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let a = aw.alloc_chunk().unwrap();
+        log.chunks.push(a);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log) };
+        // This reader entered after the snapshot: it can only see the
+        // post-retirement roots, so it must not block reuse.
+        let _guard = arena.read_guard();
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, 1);
     }
 
     #[test]
@@ -873,63 +886,67 @@ mod tests {
         // Room for exactly two chunk slots.
         let arena = Arena::new(128);
         let mut log = RetireLog::new();
-        // SAFETY: test is single-threaded.
-        unsafe {
-            let a = arena.alloc_chunk().unwrap();
-            let _b = arena.alloc_chunk().unwrap();
-            log.chunks.push(a);
-            arena.retire_log(&mut log);
-            // The stamped batch is reclaimed by the exhausted alloc itself.
-            let c = arena.alloc_chunk().unwrap();
-            assert_eq!(c, a);
-        }
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let a = aw.alloc_chunk().unwrap();
+        let _b = aw.alloc_chunk().unwrap();
+        log.chunks.push(a);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log) };
+        // The stamped batch is reclaimed by the exhausted alloc itself.
+        let c = aw.alloc_chunk().unwrap();
+        assert_eq!(c, a);
     }
 
     #[test]
     fn interior_recycling_roundtrip() {
         let arena = Arena::new(4096);
         let mut log = RetireLog::new();
-        // SAFETY: test is single-threaded.
-        unsafe {
-            let i0 = arena.alloc_interior().unwrap();
-            let i1 = arena.alloc_interior().unwrap();
-            log.interiors.push(i0);
-            arena.retire_log(&mut log);
-            arena.reclaim();
-            assert_eq!(arena.recycle_stats().free_interiors, 1);
-            assert_eq!(arena.alloc_interior().unwrap(), i0);
-            // The bump cursor was untouched by the recycled alloc.
-            assert_eq!(arena.alloc_interior().unwrap(), i1 + 1);
-        }
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let i0 = aw.alloc_interior().unwrap();
+        let i1 = aw.alloc_interior().unwrap();
+        log.interiors.push(i0);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log) };
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_interiors, 1);
+        assert_eq!(aw.alloc_interior().unwrap(), i0);
+        // The bump cursor was untouched by the recycled alloc.
+        assert_eq!(aw.alloc_interior().unwrap(), i1 + 1);
     }
 
     #[test]
     fn interior_slots_count_from_the_top() {
         let arena = Arena::new(4096);
-        // SAFETY: test is single-threaded.
-        unsafe {
-            let i0 = arena.alloc_interior().unwrap();
-            let i1 = arena.alloc_interior().unwrap();
-            assert_eq!((i0, i1), (0, 1));
-            assert!(arena.interior_ptr(0) > arena.interior_ptr(1));
-            assert_eq!(arena.interior_ptr(0).addr() % INTERIOR_SLOT, 0);
-        }
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let i0 = aw.alloc_interior().unwrap();
+        let i1 = aw.alloc_interior().unwrap();
+        assert_eq!((i0, i1), (0, 1));
+        // SAFETY: slot 0 was just allocated.
+        let p0 = unsafe { arena.interior_ptr(0) };
+        // SAFETY: slot 1 was just allocated.
+        let p1 = unsafe { arena.interior_ptr(1) };
+        assert!(p0 > p1);
+        assert_eq!(p0.addr() % INTERIOR_SLOT, 0);
     }
 
     #[test]
     fn region_writer_places_slots_exactly() {
         let arena = Arena::new(4096);
         // SAFETY: fresh arena, single region, cursors committed below.
-        unsafe {
-            let mut region = arena.region(0, 2, 0, 1);
-            let c0 = region.write_chunk(Chunk::from_sorted(&[1, 2]));
-            let c1 = region.write_chunk(Chunk::from_sorted(&[3]));
-            assert_eq!((c0, c1), (0, 1));
-            arena.commit_regions(2, 1);
-            assert_eq!(arena.used(), 2 * CHUNK_SLOT + INTERIOR_SLOT);
-            let read: &Chunk = arena.chunk(0);
-            assert_eq!(read.as_slice(), &[1, 2]);
-        }
+        let mut region = unsafe { arena.region(0, 2, 0, 1) };
+        let c0 = region.write_chunk(Chunk::from_sorted(&[1, 2]));
+        let c1 = region.write_chunk(Chunk::from_sorted(&[3]));
+        assert_eq!((c0, c1), (0, 1));
+        // SAFETY: the sole region writer is finished; its range tiles the
+        // committed extents exactly.
+        unsafe { arena.commit_regions(2, 1) };
+        assert_eq!(arena.used(), 2 * CHUNK_SLOT + INTERIOR_SLOT);
+        // SAFETY: slot 0 was written above and never retired.
+        let read = unsafe { arena.chunk(0) };
+        assert_eq!(read.as_slice(), &[1, 2]);
     }
 
     #[test]

@@ -19,21 +19,30 @@
 //! logarithmic.
 //!
 //! Nodes are arena-allocated (offsets, not pointers). A null offset (0xFFFFFFFF)
-//! means "no node."
+//! means "no node." Mutation goes through the arena's [`ArenaWriter`]
+//! handle, whose construction carries the single-writer proof — the write
+//! operations here are safe functions over `&mut ArenaWriter`.
+//!
+//! Every tagged offset handled in this module refers to a live node of
+//! the arena it is used with: offsets originate from this module's own
+//! allocations and are only ever stored in nodes or published roots. The
+//! read API leans on that crate invariant (see [`node_at`]).
 
-use crate::arena::{Arena, RegionWriter, RetireLog};
+use crate::arena::{Arena, ArenaWriter, RegionWriter, RetireLog};
 use crate::chunk::Chunk;
 use std::mem::MaybeUninit;
 
 // The arena's slot classes are sized for exactly these node types.
 const _: () = assert!(std::mem::size_of::<Chunk>() == crate::arena::CHUNK_SLOT);
+const _: () = assert!(std::mem::align_of::<Chunk>() <= 64);
 const _: () = assert!(std::mem::size_of::<Interior>() == crate::arena::INTERIOR_SLOT);
+const _: () = assert!(std::mem::align_of::<Interior>() <= 16);
 
 /// Hint the CPU to pull the line containing `ptr` toward L1. Prefetch is a
 /// pure hint — any address is architecturally safe — so this wraps the
 /// per-arch instruction without touching memory.
 #[inline(always)]
-fn prefetch_read(ptr: *const u8) {
+fn prefetch_read<T>(ptr: *const T) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: prefetch has no memory effects; any address is safe.
     unsafe {
@@ -44,7 +53,7 @@ fn prefetch_read(ptr: *const u8) {
     unsafe {
         core::arch::asm!(
             "prfm pldl1keep, [{p}]",
-            p = in(reg) ptr,
+            p = in(reg) ptr as *const u8,
             options(nostack, preserves_flags),
         )
     };
@@ -105,6 +114,47 @@ pub struct Interior {
     pub split_key: u32,
 }
 
+/// Decoded view of one tagged node offset.
+///
+/// The tag bit packs a two-variant union into a u32; this enum is its
+/// typed form. [`node_at`] is the single point where the packed form is
+/// parsed — traversals `match` on the result instead of re-deriving the
+/// class and accessor at each site.
+pub(crate) enum NodeRef<'a> {
+    Leaf(&'a Chunk),
+    Interior(&'a Interior),
+}
+
+/// Decode the node at a tagged offset.
+///
+/// Relies on the module invariant that every tagged offset in circulation
+/// names a live node of `arena` (offsets are created only by this
+/// module's allocations and stored only in nodes and published roots),
+/// and on the caller-side reader contract of the safe read API: hold a
+/// [`ReadGuard`](crate::ReadGuard) or the write handle across the
+/// traversal.
+#[inline(always)]
+pub(crate) fn node_at(arena: &Arena, tagged: u32) -> NodeRef<'_> {
+    debug_assert_ne!(tagged, NULL, "node_at on NULL offset");
+    if is_leaf(tagged) {
+        // SAFETY: module invariant above — the offset names a live,
+        // initialized chunk slot.
+        NodeRef::Leaf(unsafe { arena.chunk(tagged) })
+    } else {
+        // SAFETY: module invariant above, interior class per the tag.
+        NodeRef::Interior(unsafe { arena.interior(strip_tag(tagged)) })
+    }
+}
+
+/// [`node_at`] for offsets the caller knows carry the interior tag
+/// (path entries recorded during a descent).
+#[inline(always)]
+fn interior_at(arena: &Arena, tagged: u32) -> &Interior {
+    debug_assert!(!is_leaf(tagged), "interior_at on a leaf offset");
+    // SAFETY: module invariant (see node_at); interior class per the tag.
+    unsafe { arena.interior(strip_tag(tagged)) }
+}
+
 /// A C-tree root is just an offset into an arena.
 /// NULL means empty (no neighbors).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,37 +205,34 @@ impl CTree {
     /// Does this tree contain `val`?
     #[inline]
     pub fn contains(&self, arena: &Arena, val: u32) -> bool {
-        let mut cur = self.root;
-        if cur == NULL {
+        if self.root == NULL {
             return false;
         }
-        while !is_leaf(cur) {
-            // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
-            let node: &Interior = unsafe { arena.interior(strip_tag(cur)) };
-            cur = if val < node.split_key {
-                node.left
-            } else {
-                node.right
-            };
+        let mut cur = self.root;
+        loop {
+            match node_at(arena, cur) {
+                NodeRef::Interior(node) => {
+                    cur = if val < node.split_key {
+                        node.left
+                    } else {
+                        node.right
+                    };
+                }
+                NodeRef::Leaf(chunk) => return chunk.contains(val),
+            }
         }
-        // SAFETY: leaf tag is clear, so cur is a Chunk allocated in this arena.
-        let chunk: &Chunk = unsafe { arena.chunk(cur) };
-        chunk.contains(val)
     }
 
     /// Build a balanced tree over a sorted, deduplicated slice.
     ///
-    /// Used by graph compaction to rebuild adjacency lists with zero
-    /// garbage. Returns `None` if the arena runs out of space.
-    ///
-    /// # Safety
-    /// Single-writer invariant on the arena. See [`Arena::alloc`].
-    pub(crate) unsafe fn from_sorted(arena: &Arena, vals: &[u32]) -> Option<CTree> {
+    /// Used by bulk inserts and graph compaction to rebuild adjacency
+    /// lists with zero garbage. Returns `None` if the arena runs out of
+    /// space.
+    pub(crate) fn from_sorted(aw: &mut ArenaWriter<'_>, vals: &[u32]) -> Option<CTree> {
         if vals.is_empty() {
             return Some(CTree::empty());
         }
-        // SAFETY: caller upholds single-writer invariant.
-        let root = unsafe { build_balanced(arena, vals)? };
+        let root = build_balanced(aw, vals)?;
         Some(CTree { root })
     }
 
@@ -193,26 +240,17 @@ impl CTree {
     ///
     /// Returns [`InsertResult::Duplicate`] if `val` already exists, or
     /// [`InsertResult::ArenaFull`] if a fresh node could not be allocated.
-    /// All new nodes are allocated from `arena`. The old tree is untouched.
+    /// All new nodes are allocated through `aw`. The old tree is untouched.
     ///
-    /// Allocates a fresh scratch buffer per call for any rebalance.
-    /// Callers on a hot insert path should use
-    /// [`insert_with_scratch`](Self::insert_with_scratch) with a reused
-    /// buffer instead.
-    ///
-    /// # Safety
-    /// Single-writer invariant on the arena: only one thread may call `insert`
-    /// concurrently for a given arena.
-    ///
-    /// Superseded nodes are discarded rather than recycled (the retire log
-    /// is call-local) — the write path in `graph.rs` uses
-    /// [`insert_with_scratch`](Self::insert_with_scratch) with the writer's
-    /// persistent log to get recycling.
-    pub unsafe fn insert(&self, arena: &Arena, val: u32) -> InsertResult {
+    /// Allocates a fresh scratch buffer and a discarded retire log per
+    /// call. Callers on a hot insert path should use
+    /// [`insert_with_scratch`](Self::insert_with_scratch) with reused
+    /// buffers instead — that is also what makes superseded nodes
+    /// recyclable rather than garbage.
+    pub fn insert(&self, aw: &mut ArenaWriter<'_>, val: u32) -> InsertResult {
         let mut scratch = Vec::new();
         let mut retire = RetireLog::new();
-        // SAFETY: caller upholds the single-writer invariant.
-        unsafe { self.insert_with_scratch(arena, val, &mut scratch, &mut retire) }
+        self.insert_with_scratch(aw, val, &mut scratch, &mut retire)
     }
 
     /// Insert `val`, reusing `scratch` for any scapegoat rebalance instead
@@ -224,21 +262,17 @@ impl CTree {
     /// interior path, and — on a rebalance — the rebuilt subtree) is
     /// recorded in `retire`, and only on success: a failed insert leaves
     /// the old tree fully live, so nothing may be logged for reuse.
-    ///
-    /// # Safety
-    /// Single-writer invariant on the arena: only one thread may insert
-    /// concurrently for a given arena.
-    pub(crate) unsafe fn insert_with_scratch(
+    pub(crate) fn insert_with_scratch(
         &self,
-        arena: &Arena,
+        aw: &mut ArenaWriter<'_>,
         val: u32,
         scratch: &mut Vec<u32>,
         retire: &mut RetireLog,
     ) -> InsertResult {
+        let arena = aw.arena();
         if self.root == NULL {
             let chunk = Chunk::from_sorted(&[val]);
-            // SAFETY: caller upholds single-writer invariant.
-            return match unsafe { arena.alloc_write_chunk(chunk) } {
+            return match aw.alloc_write_chunk(chunk) {
                 Some(off) => InsertResult::Inserted(CTree { root: off }),
                 None => InsertResult::ArenaFull,
             };
@@ -253,21 +287,25 @@ impl CTree {
         let mut went_left = [MaybeUninit::<bool>::uninit(); MAX_DEPTH];
         let mut depth = 0usize;
         let mut cur = self.root;
-        while !is_leaf(cur) {
-            // A path this deep only exists when rebalances have been
-            // failing for lack of arena space (see the rebalance-failure
-            // note below), so report the root cause rather than panic.
-            if depth >= MAX_DEPTH {
-                return InsertResult::ArenaFull;
+        let chunk: &Chunk = loop {
+            match node_at(arena, cur) {
+                NodeRef::Interior(node) => {
+                    // A path this deep only exists when rebalances have
+                    // been failing for lack of arena space (see the
+                    // rebalance-failure note below), so report the root
+                    // cause rather than panic.
+                    if depth >= MAX_DEPTH {
+                        return InsertResult::ArenaFull;
+                    }
+                    path[depth].write(cur);
+                    let left = val < node.split_key;
+                    went_left[depth].write(left);
+                    depth += 1;
+                    cur = if left { node.left } else { node.right };
+                }
+                NodeRef::Leaf(chunk) => break chunk,
             }
-            // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
-            let node: &Interior = unsafe { arena.interior(strip_tag(cur)) };
-            path[depth].write(cur);
-            let left = val < node.split_key;
-            went_left[depth].write(left);
-            depth += 1;
-            cur = if left { node.left } else { node.right };
-        }
+        };
 
         // The post-insert element count is known before any copying: the
         // current root's count plus one (duplicates return before this
@@ -277,8 +315,6 @@ impl CTree {
         let total = subtree_size(self.root, arena) + 1;
 
         // Leaf insert (splitting a full chunk adds one level).
-        // SAFETY: leaf tag is clear, so cur is a Chunk allocated in this arena.
-        let chunk: &Chunk = unsafe { arena.chunk(cur) };
         let mut split_levels = 0usize;
         let mut new_child = if chunk.is_full() {
             let (left_c, right_c) = chunk.split();
@@ -294,18 +330,15 @@ impl CTree {
                     None => return InsertResult::Duplicate,
                 }
             };
-            // SAFETY: caller upholds single-writer invariant on the arena.
-            let left_off = alloc_or_full!(unsafe { arena.alloc_write_chunk(new_left) });
-            // SAFETY: same invariant.
-            let right_off = alloc_or_full!(unsafe { arena.alloc_write_chunk(new_right) });
+            let left_off = alloc_or_full!(aw.alloc_write_chunk(new_left));
+            let right_off = alloc_or_full!(aw.alloc_write_chunk(new_right));
             let interior = Interior {
                 left: left_off,
                 right: right_off,
                 count: (new_left.len() + new_right.len()) as u32,
                 split_key,
             };
-            // SAFETY: same invariant.
-            let int_off = alloc_or_full!(unsafe { arena.alloc_write_interior(interior) });
+            let int_off = alloc_or_full!(aw.alloc_write_interior(interior));
             split_levels = 1;
             tag_interior(int_off)
         } else {
@@ -313,8 +346,7 @@ impl CTree {
                 Some(c) => c,
                 None => return InsertResult::Duplicate,
             };
-            // SAFETY: caller upholds single-writer invariant.
-            alloc_or_full!(unsafe { arena.alloc_write_chunk(new_chunk) })
+            alloc_or_full!(aw.alloc_write_chunk(new_chunk))
         };
 
         // Scapegoat check, decided before the copy loop (see `total`
@@ -336,8 +368,7 @@ impl CTree {
             let path_i = unsafe { path[i].assume_init() };
             // SAFETY: same bound for the direction array.
             let went_left_i = unsafe { went_left[i].assume_init() };
-            // SAFETY: path[i] was recorded as a tagged interior during descent.
-            let old: &Interior = unsafe { arena.interior(strip_tag(path_i)) };
+            let old = interior_at(arena, path_i);
             let (l, r) = if went_left_i {
                 (new_child, old.right)
             } else {
@@ -349,10 +380,7 @@ impl CTree {
                 count: old.count + 1,
                 split_key: old.split_key,
             };
-            // SAFETY: caller upholds single-writer invariant.
-            new_child = tag_interior(alloc_or_full!(unsafe {
-                arena.alloc_write_interior(copied)
-            }));
+            new_child = tag_interior(alloc_or_full!(aw.alloc_write_interior(copied)));
             if need_rebalance {
                 new_path[i].write(new_child);
             }
@@ -364,9 +392,9 @@ impl CTree {
         // and the copied interior path are now superseded. Log them for
         // recycling; the writer stamps the log after publishing the root.
         retire.chunks.push(cur);
-        for i in 0..depth {
+        for slot in path.iter().take(depth) {
             // SAFETY: entries below `depth` were written during the descent.
-            let path_i = unsafe { path[i].assume_init() };
+            let path_i = unsafe { slot.assume_init() };
             retire.interiors.push(strip_tag(path_i));
         }
 
@@ -387,17 +415,7 @@ impl CTree {
             // during the descent, and MaybeUninit<bool> shares bool's layout.
             let went_left_init =
                 unsafe { &*(&went_left[..depth] as *const [MaybeUninit<bool>] as *const [bool]) };
-            // SAFETY: caller upholds single-writer invariant.
-            match unsafe {
-                rebalance(
-                    arena,
-                    new_root,
-                    new_path_init,
-                    went_left_init,
-                    scratch,
-                    retire,
-                )
-            } {
+            match rebalance(aw, new_root, new_path_init, went_left_init, scratch, retire) {
                 Some(balanced_root) => {
                     return InsertResult::Inserted(CTree {
                         root: balanced_root,
@@ -437,14 +455,9 @@ fn strip_tag(offset: u32) -> u32 {
 /// Number of elements under `offset` (leaf or interior).
 #[inline]
 fn subtree_size(offset: u32, arena: &Arena) -> usize {
-    if is_leaf(offset) {
-        // SAFETY: leaf tag is clear, so offset is a Chunk allocated in this arena.
-        let chunk: &Chunk = unsafe { arena.chunk(offset) };
-        chunk.len()
-    } else {
-        // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
-        let node: &Interior = unsafe { arena.interior(strip_tag(offset)) };
-        node.count as usize
+    match node_at(arena, offset) {
+        NodeRef::Leaf(chunk) => chunk.len(),
+        NodeRef::Interior(node) => node.count as usize,
     }
 }
 
@@ -482,22 +495,18 @@ fn alpha_unbalanced(node: &Interior, arena: &Arena) -> bool {
 /// of the ancestors above it are logged in `retire`. On failure nothing
 /// is logged: the un-rebalanced tree remains the live result, and the
 /// partial rebuild's nodes leak until compact.
-///
-/// # Safety
-/// Single-writer invariant on the arena.
-unsafe fn rebalance(
-    arena: &Arena,
+fn rebalance(
+    aw: &mut ArenaWriter<'_>,
     new_root: u32,
     new_path: &[u32],
     went_left: &[bool],
     scratch: &mut Vec<u32>,
     retire: &mut RetireLog,
 ) -> Option<u32> {
+    let arena = aw.arena();
     let mut scapegoat = 0usize; // rebuild the root unless a deeper node is unbalanced
     for (i, &off) in new_path.iter().enumerate() {
-        // SAFETY: new_path holds tagged interiors created by this insert.
-        let node: &Interior = unsafe { arena.interior(strip_tag(off)) };
-        if alpha_unbalanced(node, arena) {
+        if alpha_unbalanced(interior_at(arena, off), arena) {
             scapegoat = i;
             break;
         }
@@ -517,14 +526,12 @@ unsafe fn rebalance(
     visit_chunks(target, arena, &mut |chunk: &Chunk| {
         scratch.extend_from_slice(chunk.as_slice());
     });
-    // SAFETY: caller upholds single-writer invariant.
-    let mut child = unsafe { build_balanced(arena, &scratch[..])? };
+    let mut child = build_balanced(aw, &scratch[..])?;
 
     // Re-copy the ancestors above the scapegoat (counts and split keys
     // are unchanged — only the child pointer moved).
     for i in (0..scapegoat).rev() {
-        // SAFETY: new_path holds tagged interiors created by this insert.
-        let old: &Interior = unsafe { arena.interior(strip_tag(new_path[i])) };
+        let old = interior_at(arena, new_path[i]);
         let (l, r) = if went_left[i] {
             (child, old.right)
         } else {
@@ -536,15 +543,15 @@ unsafe fn rebalance(
             count: old.count,
             split_key: old.split_key,
         };
-        // SAFETY: caller upholds single-writer invariant.
-        child = tag_interior(unsafe { arena.alloc_write_interior(copied) }?);
+        child = tag_interior(aw.alloc_write_interior(copied)?);
     }
 
     // Full success: the rebuilt subtree replaced `target` (whose nodes
     // include this insert's fresh copies below the scapegoat plus the old
     // off-path descendants), and the re-copy loop replaced the first
     // copies of the ancestors above it.
-    // SAFETY: caller upholds single-writer invariant.
+    // SAFETY: `target` and the first path copies are unreachable from the
+    // root being returned; the caller publishes that root before stamping.
     unsafe { retire_subtree(arena, target, retire) };
     for &off in &new_path[..scapegoat] {
         retire.interiors.push(strip_tag(off));
@@ -557,23 +564,21 @@ unsafe fn rebalance(
 /// nodes are never revisited, so the walk never observes a recycled slot.
 ///
 /// # Safety
-/// Single-writer invariant on the arena; the subtree must be (or be about
-/// to become) unreachable from the tree the caller returns.
+/// The subtree must be (or be about to become) unreachable from every
+/// tree the caller keeps live, and none of its slots may be logged twice
+/// — once the log is stamped, the slots are rewritten under any surviving
+/// reference.
 pub(crate) unsafe fn retire_subtree(arena: &Arena, root: u32, retire: &mut RetireLog) {
     let mut stack = [MaybeUninit::<u32>::uninit(); MAX_DEPTH];
     let mut sp = 0usize;
     let mut cur = root;
     loop {
-        while !is_leaf(cur) {
-            let idx = strip_tag(cur);
-            // SAFETY: interior tag is set; the index was stored on insert.
-            let node: &Interior = unsafe { arena.interior(idx) };
+        while let NodeRef::Interior(node) = node_at(arena, cur) {
             debug_assert!(sp < MAX_DEPTH, "C-tree exceeded MAX_DEPTH");
             stack[sp].write(node.right);
             sp += 1;
-            let left = node.left;
-            retire.interiors.push(idx);
-            cur = left;
+            retire.interiors.push(strip_tag(cur));
+            cur = node.left;
         }
         retire.chunks.push(cur);
         if sp == 0 {
@@ -585,6 +590,41 @@ pub(crate) unsafe fn retire_subtree(arena: &Arena, root: u32, retire: &mut Retir
     }
 }
 
+// ---------------------------------------------------------------------------
+// Balanced builds (shared by bulk insert, rebalance, and compaction)
+// ---------------------------------------------------------------------------
+
+/// Where a balanced build places its nodes: the fallible bump/free-list
+/// allocator during normal writes, or a compaction thread's pre-reserved
+/// (infallible) region. One recursion serves both, so the built shape —
+/// which [`compact_slot_cost`] must predict exactly — exists once.
+pub(crate) trait SlotSink {
+    fn put_chunk(&mut self, c: Chunk) -> Option<u32>;
+    fn put_interior(&mut self, i: Interior) -> Option<u32>;
+}
+
+impl SlotSink for ArenaWriter<'_> {
+    #[inline(always)]
+    fn put_chunk(&mut self, c: Chunk) -> Option<u32> {
+        self.alloc_write_chunk(c)
+    }
+    #[inline(always)]
+    fn put_interior(&mut self, i: Interior) -> Option<u32> {
+        self.alloc_write_interior(i)
+    }
+}
+
+impl SlotSink for RegionWriter<'_> {
+    #[inline(always)]
+    fn put_chunk(&mut self, c: Chunk) -> Option<u32> {
+        Some(self.write_chunk(c))
+    }
+    #[inline(always)]
+    fn put_interior(&mut self, i: Interior) -> Option<u32> {
+        Some(self.write_interior(i))
+    }
+}
+
 /// Build a perfectly weight-balanced subtree over `vals` (sorted, unique,
 /// non-empty). Splits on a chunk-capacity boundary at the leaf-count
 /// midpoint, so every leaf except the last is completely full — an
@@ -592,39 +632,29 @@ pub(crate) unsafe fn retire_subtree(arena: &Arena, root: u32, retire: &mut Retir
 /// wasted capacity, ~25% extra cache lines per scan, forever). Both sides
 /// get within one leaf of half the leaves, so every interior node stays
 /// α-weight-balanced for α = 2/3.
-///
-/// # Safety
-/// Single-writer invariant on the arena. See [`Arena::alloc`].
-unsafe fn build_balanced(arena: &Arena, vals: &[u32]) -> Option<u32> {
+fn build_balanced<S: SlotSink>(sink: &mut S, vals: &[u32]) -> Option<u32> {
     debug_assert!(!vals.is_empty());
     if vals.len() <= crate::chunk::CHUNK_CAP {
-        // SAFETY: caller upholds single-writer invariant.
-        return unsafe { arena.alloc_write_chunk(Chunk::from_sorted_unchecked(vals)) };
+        return sink.put_chunk(Chunk::from_sorted_unchecked(vals));
     }
     let leaves = vals.len().div_ceil(crate::chunk::CHUNK_CAP);
     let mid = (leaves / 2) * crate::chunk::CHUNK_CAP;
     let (left_vals, right_vals) = vals.split_at(mid);
-    // SAFETY: caller upholds single-writer invariant.
-    let left = unsafe { build_balanced(arena, left_vals)? };
-    // SAFETY: same invariant.
-    let right = unsafe { build_balanced(arena, right_vals)? };
+    let left = build_balanced(sink, left_vals)?;
+    let right = build_balanced(sink, right_vals)?;
     let interior = Interior {
         left,
         right,
         count: vals.len() as u32,
         split_key: right_vals[0],
     };
-    // SAFETY: same invariant.
-    Some(tag_interior(unsafe {
-        arena.alloc_write_interior(interior)
-    }?))
+    Some(tag_interior(sink.put_interior(interior)?))
 }
 
 /// Exact slot cost of a perfectly balanced tree over `deg` elements:
 /// `ceil(deg/CHUNK_CAP)` full-except-last leaves and one fewer interiors.
-/// [`build_balanced`] and [`build_balanced_region`] produce exactly this
-/// shape, which is what lets parallel compaction reserve disjoint regions
-/// up front.
+/// [`build_balanced`] produces exactly this shape, which is what lets
+/// parallel compaction reserve disjoint regions up front.
 pub(crate) fn compact_slot_cost(deg: usize) -> (usize, usize) {
     if deg == 0 {
         return (0, 0);
@@ -633,26 +663,11 @@ pub(crate) fn compact_slot_cost(deg: usize) -> (usize, usize) {
     (leaves, leaves - 1)
 }
 
-/// [`build_balanced`], but writing into a compaction thread's private
-/// slot region. The region was reserved from [`compact_slot_cost`]'s
-/// exact figures, so allocation cannot fail (overrun is a debug panic).
+/// [`build_balanced`] into a compaction thread's private slot region. The
+/// region was reserved from [`compact_slot_cost`]'s exact figures, so
+/// allocation cannot fail (overrun is a debug panic).
 pub(crate) fn build_balanced_region(region: &mut RegionWriter<'_>, vals: &[u32]) -> u32 {
-    debug_assert!(!vals.is_empty());
-    if vals.len() <= crate::chunk::CHUNK_CAP {
-        return region.write_chunk(Chunk::from_sorted_unchecked(vals));
-    }
-    let leaves = vals.len().div_ceil(crate::chunk::CHUNK_CAP);
-    let mid = (leaves / 2) * crate::chunk::CHUNK_CAP;
-    let (left_vals, right_vals) = vals.split_at(mid);
-    let left = build_balanced_region(region, left_vals);
-    let right = build_balanced_region(region, right_vals);
-    let interior = Interior {
-        left,
-        right,
-        count: vals.len() as u32,
-        split_key: right_vals[0],
-    };
-    tag_interior(region.write_interior(interior))
+    build_balanced(region, vals).expect("region reservation covers the exact build cost")
 }
 
 // ---------------------------------------------------------------------------
@@ -663,9 +678,7 @@ pub(crate) fn build_balanced_region(region: &mut RegionWriter<'_>, vals: &[u32])
 fn visit_chunks<F: FnMut(&Chunk)>(root: u32, arena: &Arena, f: &mut F) {
     // Fast path for the majority shape: a degree-≤15 vertex is one chunk,
     // and setting up the traversal stack would cost more than the visit.
-    if is_leaf(root) {
-        // SAFETY: leaf tag is clear, so root is a Chunk allocated in this arena.
-        let chunk: &Chunk = unsafe { arena.chunk(root) };
+    if let NodeRef::Leaf(chunk) = node_at(arena, root) {
         f(chunk);
         return;
     }
@@ -678,32 +691,32 @@ fn visit_chunks<F: FnMut(&Chunk)>(root: u32, arena: &Arena, f: &mut F) {
     let mut sp = 0usize;
     let mut cur = root;
     loop {
-        while !is_leaf(cur) {
-            // SAFETY: interior tag is set; strip_tag yields the Interior offset stored on insert.
-            let node: &Interior = unsafe { arena.interior(strip_tag(cur)) };
-            debug_assert!(sp < MAX_DEPTH, "C-tree exceeded MAX_DEPTH");
-            stack[sp].write(node.right);
-            sp += 1;
-            cur = node.left;
-        }
+        let chunk = loop {
+            match node_at(arena, cur) {
+                NodeRef::Interior(node) => {
+                    debug_assert!(sp < MAX_DEPTH, "C-tree exceeded MAX_DEPTH");
+                    stack[sp].write(node.right);
+                    sp += 1;
+                    cur = node.left;
+                }
+                NodeRef::Leaf(chunk) => break chunk,
+            }
+        };
         // The pending right subtree is the next dependent miss; hint it
         // while the callback consumes the current chunk.
         if sp > 0 {
             // SAFETY: stack[sp - 1] was written on the way down.
             let next = unsafe { stack[sp - 1].assume_init() };
-            // SAFETY: prefetch tolerates any address; the tagged index
-            // resolves inside the matching arena region for real nodes.
             let p = if is_leaf(next) {
-                // SAFETY: see above.
+                // SAFETY: `next` was read from a live interior node, so it
+                // names a live chunk slot.
                 unsafe { arena.chunk_ptr(next) }
             } else {
-                // SAFETY: see above.
+                // SAFETY: as above, for the interior region.
                 unsafe { arena.interior_ptr(strip_tag(next)) }
             };
             prefetch_read(p);
         }
-        // SAFETY: leaf tag is clear, so cur is a Chunk allocated in this arena.
-        let chunk: &Chunk = unsafe { arena.chunk(cur) };
         f(chunk);
         if sp == 0 {
             break;
@@ -724,9 +737,15 @@ mod tests {
         Arena::new(1 << 20)
     }
 
-    fn insert_assert(tree: CTree, arena: &Arena, val: u32) -> CTree {
-        // SAFETY: tests are single-threaded.
-        match unsafe { tree.insert(arena, val) } {
+    /// The test-local write handle.
+    fn writer(arena: &Arena) -> ArenaWriter<'_> {
+        // SAFETY: each test constructs exactly one handle per arena and
+        // runs single-threaded.
+        unsafe { arena.writer() }
+    }
+
+    fn insert_assert(tree: CTree, aw: &mut ArenaWriter<'_>, val: u32) -> CTree {
+        match tree.insert(aw, val) {
             InsertResult::Inserted(t) => t,
             other => panic!("expected Inserted, got {other:?}"),
         }
@@ -737,8 +756,7 @@ mod tests {
         if offset == NULL || is_leaf(offset) {
             return 0;
         }
-        // SAFETY: tree invariant — tagged offsets point at valid Interiors.
-        let node: &Interior = unsafe { arena.interior(strip_tag(offset)) };
+        let node = interior_at(arena, offset);
         1 + max_depth(node.left, arena).max(max_depth(node.right, arena))
     }
 
@@ -754,7 +772,8 @@ mod tests {
     #[test]
     fn insert_one() {
         let arena = make_arena();
-        let tree = insert_assert(CTree::empty(), &arena, 42);
+        let mut aw = writer(&arena);
+        let tree = insert_assert(CTree::empty(), &mut aw, 42);
         assert!(!tree.is_empty());
         assert_eq!(tree.count(&arena), 1);
         assert!(tree.contains(&arena, 42));
@@ -764,9 +783,10 @@ mod tests {
     #[test]
     fn insert_sorted_order() {
         let arena = make_arena();
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         for i in 0..10u32 {
-            tree = insert_assert(tree, &arena, i * 10);
+            tree = insert_assert(tree, &mut aw, i * 10);
         }
         assert_eq!(tree.count(&arena), 10);
 
@@ -779,9 +799,10 @@ mod tests {
     #[test]
     fn insert_reverse_order() {
         let arena = make_arena();
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         for i in (0..10u32).rev() {
-            tree = insert_assert(tree, &arena, i * 10);
+            tree = insert_assert(tree, &mut aw, i * 10);
         }
         let mut buf = Vec::new();
         tree.collect_into(&arena, &mut buf);
@@ -792,10 +813,11 @@ mod tests {
     #[test]
     fn insert_random_order() {
         let arena = make_arena();
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         let vals = [50, 20, 80, 10, 30, 70, 90, 5, 15, 25, 35, 60, 75, 85, 95];
         for &v in &vals {
-            tree = insert_assert(tree, &arena, v);
+            tree = insert_assert(tree, &mut aw, v);
         }
         let mut buf = Vec::new();
         tree.collect_into(&arena, &mut buf);
@@ -807,9 +829,9 @@ mod tests {
     #[test]
     fn insert_duplicate_returns_duplicate() {
         let arena = make_arena();
-        let tree = insert_assert(CTree::empty(), &arena, 42);
-        // SAFETY: test is single-threaded.
-        let result = unsafe { tree.insert(&arena, 42) };
+        let mut aw = writer(&arena);
+        let tree = insert_assert(CTree::empty(), &mut aw, 42);
+        let result = tree.insert(&mut aw, 42);
         assert!(matches!(result, InsertResult::Duplicate));
     }
 
@@ -817,12 +839,12 @@ mod tests {
     fn arena_full_returns_arena_full() {
         // Tiny arena: only enough for a single chunk allocation, then split needs more.
         let arena = Arena::new(64);
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         // Fill until ArenaFull.
         let mut val = 0u32;
         loop {
-            // SAFETY: test is single-threaded.
-            match unsafe { tree.insert(&arena, val) } {
+            match tree.insert(&mut aw, val) {
                 InsertResult::Inserted(t) => tree = t,
                 InsertResult::ArenaFull => return,
                 InsertResult::Duplicate => unreachable!("monotonic vals"),
@@ -839,11 +861,11 @@ mod tests {
         // fails, deepening the tree past its α-height bound. Inserts must
         // keep terminating and degrade to ArenaFull — never panic.
         let arena = Arena::new(8 << 10);
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         let mut val = 0u32;
         loop {
-            // SAFETY: test is single-threaded.
-            match unsafe { tree.insert(&arena, val) } {
+            match tree.insert(&mut aw, val) {
                 InsertResult::Inserted(t) => tree = t,
                 InsertResult::ArenaFull => break,
                 InsertResult::Duplicate => unreachable!("monotonic vals"),
@@ -853,8 +875,7 @@ mod tests {
         }
         // Once full, every further insert keeps returning ArenaFull.
         for extra in val..val + 100 {
-            // SAFETY: test is single-threaded.
-            let result = unsafe { tree.insert(&arena, extra) };
+            let result = tree.insert(&mut aw, extra);
             assert_eq!(result, InsertResult::ArenaFull);
         }
         // The tree is still readable and intact.
@@ -870,9 +891,10 @@ mod tests {
     #[test]
     fn triggers_chunk_split() {
         let arena = make_arena();
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         for i in 0..=CHUNK_CAP as u32 {
-            tree = insert_assert(tree, &arena, i);
+            tree = insert_assert(tree, &mut aw, i);
         }
         assert_eq!(tree.count(&arena), CHUNK_CAP + 1);
 
@@ -889,10 +911,11 @@ mod tests {
     #[test]
     fn large_tree() {
         let arena = Arena::new(4 << 20);
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         let n = 1000u32;
         for i in 0..n {
-            tree = insert_assert(tree, &arena, i * 3);
+            tree = insert_assert(tree, &mut aw, i * 3);
         }
         assert_eq!(tree.count(&arena), n as usize);
 
@@ -910,9 +933,10 @@ mod tests {
     #[test]
     fn functional_persistence() {
         let arena = make_arena();
+        let mut aw = writer(&arena);
         let tree1 = CTree::empty();
-        let tree2 = insert_assert(tree1, &arena, 10);
-        let tree3 = insert_assert(tree2, &arena, 20);
+        let tree2 = insert_assert(tree1, &mut aw, 10);
+        let tree3 = insert_assert(tree2, &mut aw, 20);
 
         assert_eq!(tree1.count(&arena), 0);
         assert_eq!(tree2.count(&arena), 1);
@@ -926,9 +950,10 @@ mod tests {
     #[test]
     fn for_each_chunk_visits_all() {
         let arena = make_arena();
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         for i in 0..50u32 {
-            tree = insert_assert(tree, &arena, i);
+            tree = insert_assert(tree, &mut aw, i);
         }
 
         let mut total = 0;
@@ -950,9 +975,10 @@ mod tests {
         // must keep depth logarithmic and arena use linear-ish.
         let n: u32 = 100_000;
         let arena = Arena::new(256 << 20);
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         for i in 0..n {
-            tree = insert_assert(tree, &arena, i);
+            tree = insert_assert(tree, &mut aw, i);
         }
         assert_eq!(tree.count(&arena), n as usize);
 
@@ -986,9 +1012,10 @@ mod tests {
     fn descending_inserts_stay_balanced() {
         let n: u32 = 20_000;
         let arena = Arena::new(64 << 20);
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         for i in (0..n).rev() {
-            tree = insert_assert(tree, &arena, i);
+            tree = insert_assert(tree, &mut aw, i);
         }
         assert_eq!(tree.count(&arena), n as usize);
         let depth = max_depth(tree.root, &arena);
@@ -1007,11 +1034,11 @@ mod tests {
             state
         };
         let arena = Arena::new(64 << 20);
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         let mut inserted = 0usize;
         for _ in 0..30_000 {
-            // SAFETY: test is single-threaded.
-            if let InsertResult::Inserted(t) = unsafe { tree.insert(&arena, next() % 1_000_000) } {
+            if let InsertResult::Inserted(t) = tree.insert(&mut aw, next() % 1_000_000) {
                 tree = t;
                 inserted += 1;
             }
@@ -1025,9 +1052,9 @@ mod tests {
     #[test]
     fn from_sorted_builds_balanced_tree() {
         let arena = Arena::new(16 << 20);
+        let mut aw = writer(&arena);
         let vals: Vec<u32> = (0..50_000u32).map(|i| i * 2).collect();
-        // SAFETY: test is single-threaded.
-        let tree = unsafe { CTree::from_sorted(&arena, &vals) }.unwrap();
+        let tree = CTree::from_sorted(&mut aw, &vals).unwrap();
         assert_eq!(tree.count(&arena), vals.len());
 
         let mut buf = Vec::new();
@@ -1043,8 +1070,7 @@ mod tests {
         assert!(!tree.contains(&arena, 1));
 
         // Empty input → empty tree.
-        // SAFETY: test is single-threaded.
-        let empty = unsafe { CTree::from_sorted(&arena, &[]) }.unwrap();
+        let empty = CTree::from_sorted(&mut aw, &[]).unwrap();
         assert!(empty.is_empty());
     }
 
@@ -1052,13 +1078,14 @@ mod tests {
     fn persistence_survives_rebalance() {
         // Snapshots taken before a rebuild must keep reading the old nodes.
         let arena = Arena::new(64 << 20);
+        let mut aw = writer(&arena);
         let mut tree = CTree::empty();
         let mut snapshots: Vec<(CTree, usize)> = Vec::new();
         for i in 0..10_000u32 {
             if i % 1000 == 0 {
                 snapshots.push((tree, tree.count(&arena)));
             }
-            tree = insert_assert(tree, &arena, i);
+            tree = insert_assert(tree, &mut aw, i);
         }
         for (snap, expected_count) in snapshots {
             assert_eq!(snap.count(&arena), expected_count);

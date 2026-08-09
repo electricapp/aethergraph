@@ -9,19 +9,25 @@
 
 mod arena;
 mod chunk;
+mod compact;
 mod ctree;
+mod dirty;
 mod embedding_cache;
 mod graph;
 mod historical;
 pub mod ingest;
+mod pad;
 #[cfg(feature = "wal")]
 pub mod wal;
+mod writer;
 
-pub use arena::Arena;
+pub use arena::{Arena, ArenaWriter, ReadGuard, RecycleStats};
 pub use chunk::Chunk;
+pub use compact::CompactError;
 pub use ctree::{CTree, InsertResult};
 pub use embedding_cache::EmbeddingCache;
-pub use graph::{CompactError, DynamicGraph, InsertError, Writer, WriterError};
+pub use graph::DynamicGraph;
 pub use historical::{HistoricalBatch, HistoricalSampler};
 #[cfg(feature = "wal")]
 pub use wal::{EdgeRecord, ReplayOutcome, WalError, WalWriter, replay as replay_wal};
+pub use writer::{InsertError, Writer, WriterError};

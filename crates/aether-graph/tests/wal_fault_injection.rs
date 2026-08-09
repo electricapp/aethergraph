@@ -45,7 +45,10 @@ fn build_wal(edges: &[(u32, u32)]) -> Vec<u8> {
 /// reported `applied` total.
 fn replay_edges(path: &std::path::Path) -> Result<Vec<(u32, u32)>, ()> {
     let mut got = Vec::new();
-    match replay_wal(path, |rec| got.push((rec.src, rec.dst))) {
+    match replay_wal(path, |rec| {
+        got.push((rec.src, rec.dst));
+        Ok(())
+    }) {
         Ok(outcome) => {
             assert_eq!(
                 got.len() as u64,

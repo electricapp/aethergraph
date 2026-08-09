@@ -17,7 +17,8 @@
 //! });
 //! ```
 
-use crate::graph::{DynamicGraph, InsertError, WriterError};
+use crate::graph::DynamicGraph;
+use crate::writer::{InsertError, WriterError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
@@ -148,7 +149,7 @@ impl LocalCounts {
 /// logic exists exactly once.
 #[inline]
 fn drive_edge(
-    writer: &mut crate::graph::Writer<'_>,
+    writer: &mut crate::writer::Writer<'_>,
     local: &mut LocalCounts,
     src: u32,
     dst: u32,

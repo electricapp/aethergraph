@@ -101,7 +101,11 @@ fn panicked_writer_leaves_no_records_in_wal() {
     // (Records a guard already spilled past the buffer to the OS would
     // be out of reach — discard is best-effort at the buffer boundary.)
     let mut count = 0u64;
-    let outcome = replay_wal(&path, |_| count += 1).unwrap();
+    let outcome = replay_wal(&path, |_| {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
         outcome.applied, 0,
         "panicked guard's records must not persist"
@@ -290,7 +294,11 @@ fn raw_wal_replay_matches_dynamic_graph_state() {
     // Drive the raw replay API directly; the records should match the
     // edges we inserted, in order.
     let mut got = Vec::new();
-    let outcome = replay_wal(&path, |rec| got.push((rec.src, rec.dst))).unwrap();
+    let outcome = replay_wal(&path, |rec| {
+        got.push((rec.src, rec.dst));
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(outcome.applied, edges.len() as u64);
     assert!(outcome.truncate_to.is_none());
     assert_eq!(got, edges.to_vec());

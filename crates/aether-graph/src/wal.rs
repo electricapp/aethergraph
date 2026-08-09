@@ -298,12 +298,13 @@ impl Drop for WalWriter {
     }
 }
 
-/// Replay every record in the WAL at `path`, invoking `apply` for each.
-/// Stops cleanly at end-of-file or at the first torn record (kernel
-/// crashed mid-write), whether the tear is a short tail (fewer than
-/// `RECORD_LEN` trailing bytes) or a full-size record with a CRC
-/// mismatch. Returns the number of records successfully applied and, if
-/// truncation is needed, the byte offset to truncate to.
+/// Replay every record in the WAL at `path`, invoking `apply` for each;
+/// an `Err` from `apply` aborts the walk and is returned as-is. Stops
+/// cleanly at end-of-file or at the first torn record (kernel crashed
+/// mid-write), whether the tear is a short tail (fewer than `RECORD_LEN`
+/// trailing bytes) or a full-size record with a CRC mismatch. Returns the
+/// number of records successfully applied and, if truncation is needed,
+/// the byte offset to truncate to.
 ///
 /// A missing file or a zero-byte file is treated as "no records yet" —
 /// callers about to create a fresh WAL get an empty outcome rather than an
@@ -312,7 +313,7 @@ impl Drop for WalWriter {
 /// the caller can clear the partial header before reopening.
 pub fn replay<F>(path: impl AsRef<Path>, mut apply: F) -> Result<ReplayOutcome, WalError>
 where
-    F: FnMut(EdgeRecord),
+    F: FnMut(EdgeRecord) -> Result<(), WalError>,
 {
     let path = path.as_ref();
     let file = match File::open(path) {
@@ -395,7 +396,7 @@ where
             src: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             dst: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
         };
-        apply(rec);
+        apply(rec)?;
         applied += 1;
         offset += RECORD_LEN as u64;
     }
@@ -450,7 +451,11 @@ mod tests {
         drop(w);
 
         let mut got = Vec::new();
-        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(out.applied, 3);
         assert!(out.truncate_to.is_none());
         assert_eq!(
@@ -477,7 +482,11 @@ mod tests {
             w.sync().unwrap();
         }
         let mut got = Vec::new();
-        replay(tmp.path(), |r| got.push(r)).unwrap();
+        replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].src, 7);
         assert_eq!(got[1].src, 9);
@@ -500,7 +509,11 @@ mod tests {
             f.sync_data().unwrap();
         }
         let mut got = Vec::new();
-        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(got.len(), 1, "first (good) record applied");
         assert_eq!(
             out.truncate_to,
@@ -524,7 +537,11 @@ mod tests {
             f.sync_data().unwrap();
         }
         let mut got = Vec::new();
-        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(got.len(), 1, "good record applied");
         assert_eq!(
             out.truncate_to,
@@ -566,7 +583,11 @@ mod tests {
         assert_eq!(bytes.len(), HEADER_LEN as usize + RECORD_LEN);
 
         let mut got = Vec::new();
-        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(got.len(), 1);
         assert!(out.truncate_to.is_none());
     }
@@ -579,7 +600,11 @@ mod tests {
             f.write_all(&MAGIC[..4]).unwrap();
         }
         let mut got = Vec::new();
-        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
         assert!(got.is_empty(), "a torn header carries no records");
         assert_eq!(
             out.truncate_to,
@@ -618,7 +643,11 @@ mod tests {
         drop(w);
 
         let mut got = Vec::new();
-        let out = replay(tmp.path(), |r| got.push(r)).unwrap();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(out.applied, 2);
         assert!(out.truncate_to.is_none());
         assert_eq!(got[0].src, 0);
