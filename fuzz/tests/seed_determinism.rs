@@ -23,10 +23,7 @@ fn snapshot_corpus(root: &Path) -> BTreeMap<String, Vec<u8>> {
         let dir = root.join("corpus").join(target);
         for entry in fs::read_dir(&dir).expect("read corpus dir") {
             let entry = entry.expect("dir entry");
-            let name = format!(
-                "{target}/{}",
-                entry.file_name().to_string_lossy()
-            );
+            let name = format!("{target}/{}", entry.file_name().to_string_lossy());
             snap.insert(name, fs::read(entry.path()).expect("read seed"));
         }
     }

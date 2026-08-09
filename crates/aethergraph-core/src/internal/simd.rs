@@ -53,14 +53,20 @@ unsafe fn f16_le_to_f32_f16c(src: &[u8], dst: &mut [f32]) {
     let n = dst.len();
     let mut i = 0;
     while i + 8 <= n {
-        // SAFETY: `i + 8 <= n` bounds both accesses — 16 source bytes at
-        // `2 * i` (since src.len() == 2 * n) and 8 destination floats at `i`.
-        // Unaligned load/store variants are used throughout.
-        unsafe {
-            let h = _mm_loadu_si128(src.as_ptr().add(i * 2) as *const __m128i);
-            let f = _mm256_cvtph_ps(h);
-            _mm256_storeu_ps(dst.as_mut_ptr().add(i), f);
-        }
+        // SAFETY: `i + 8 <= n` and `src.len() == 2 * n` keep byte offset
+        // `2 * i` plus 16 bytes in range.
+        let src_p = unsafe { src.as_ptr().add(i * 2) } as *const __m128i;
+        // SAFETY: `src_p` points at 16 in-range bytes; the unaligned load
+        // variant tolerates any alignment.
+        let h = unsafe { _mm_loadu_si128(src_p) };
+        // Safe under target-feature 1.1: the enclosing fn statically
+        // enables f16c/avx and the intrinsic takes no pointers.
+        let f = _mm256_cvtph_ps(h);
+        // SAFETY: `i + 8 <= n` keeps offset `i` plus 8 floats in range.
+        let dst_p = unsafe { dst.as_mut_ptr().add(i) };
+        // SAFETY: `dst_p` points at 8 in-range floats; the unaligned store
+        // variant tolerates any alignment.
+        unsafe { _mm256_storeu_ps(dst_p, f) };
         i += 8;
     }
     f16_le_to_f32_scalar(&src[i * 2..], &mut dst[i..]);

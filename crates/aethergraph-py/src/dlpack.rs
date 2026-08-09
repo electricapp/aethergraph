@@ -73,7 +73,8 @@ struct DlpackContext {
     /// Keeps the CUDA buffer alive for the tensor's lifetime. `Some` for
     /// gather results (the tensor owns its VRAM via the inner `Arc`);
     /// `None` when the caller owns the buffer (test-only raw-pointer path).
-    owner: Option<OwnedGpuFeatures>,
+    /// Held for its `Drop` only, never read.
+    _owner: Option<OwnedGpuFeatures>,
 }
 
 /// DLPack deleter callback — runs when PyTorch releases the tensor.
@@ -160,7 +161,7 @@ fn build_managed_tensor(
         // Row-major: stride[0]=feature_dim elements, stride[1]=1 element.
         // DLPack measures strides in elements, not bytes — see comment above.
         strides: vec![feature_dim as i64, 1],
-        owner,
+        _owner: owner,
     });
 
     let tensor = DLTensor {

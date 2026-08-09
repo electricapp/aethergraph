@@ -1892,14 +1892,19 @@ fn sample_with_uring(
     ))
 }
 
+/// All neighbor lists back-to-back in one flat allocation, with
+/// `spans[i]` giving `(start, len)` into it for input node `i`
+/// (zero-length for invalid/zero-degree nodes).
+#[cfg(target_os = "linux")]
+type FlatNeighbors = (Vec<NodeId>, Vec<(u32, u32)>);
+
 /// Batch read neighbors for multiple nodes using io_uring.
 ///
 /// Uses SQPOLL-aware submission and registered file descriptors. All
 /// neighbor lists land back-to-back in one flat `Vec<NodeId>` — a single
 /// allocation whose typed backing io_uring writes into directly, so on
 /// little-endian targets there is no per-node buffer, no second decode
-/// pass, and no copy. `spans[i]` is `(start, len)` into the flat array for
-/// input node `i` (zero-length for invalid/zero-degree nodes).
+/// pass, and no copy.
 #[cfg(target_os = "linux")]
 fn batch_read_neighbors_uring(
     handle: &mut crate::internal::uring::UringHandle,
@@ -1908,7 +1913,7 @@ fn batch_read_neighbors_uring(
     edges_start: u64,
     num_nodes: usize,
     nodes: &[NodeId],
-) -> anyhow::Result<(Vec<NodeId>, Vec<(u32, u32)>)> {
+) -> anyhow::Result<FlatNeighbors> {
     use crate::internal::uring::batch_read;
 
     let mut spans: Vec<(u32, u32)> = Vec::with_capacity(nodes.len());

@@ -20,12 +20,15 @@ fuzz_target!(|values: Vec<u32>| {
     }
     // Adequate arena for 2k inserts including path-copy node overhead.
     let arena = Arena::new(1 << 20);
+    // SAFETY: this is the only write handle ever constructed for `arena`,
+    // and no RegionWriter or region commit exists — the fuzz body is the
+    // arena's sole user.
+    let mut aw = unsafe { arena.writer() };
     let mut tree = CTree::empty();
     let mut seen: BTreeSet<u32> = BTreeSet::new();
 
     for v in &values {
-        // SAFETY: fuzz target runs single-threaded by libfuzzer convention.
-        match unsafe { tree.insert(&arena, *v) } {
+        match tree.insert(&mut aw, *v) {
             InsertResult::Inserted(t) => {
                 tree = t;
                 seen.insert(*v);
