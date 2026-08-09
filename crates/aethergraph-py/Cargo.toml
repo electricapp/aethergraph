@@ -55,7 +55,11 @@ anyhow = "1.0"
 
 # Rust-side global allocator: the batch loop is allocation-heavy and
 # mimalloc's thread-local heaps outperform system malloc on that churn.
-mimalloc = { version = "0.1", default-features = false }
+# Pinned to the v2 series: v3's arena reclaim (_mi_arenas_page_unabandon)
+# can yield-spin forever when the main thread frees buffers allocated by
+# an already-exited sampler thread — the loader pool does exactly that on
+# every shutdown. v2's segment abandonment has no such wait loop.
+mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 
 # Other utilities
 parking_lot = "0.12"
