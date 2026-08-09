@@ -11,6 +11,7 @@
 use aethergraph_core::Graph;
 use aethergraph_core::graph::NodeId;
 use aethergraph_core::graph::hetero::{EdgeTypeId, HeteroGraph, NodeTypeId};
+use aethergraph_core::loader::HeteroNeighborLoader;
 use aethergraph_core::loader::hetero_sampler::{
     HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig,
 };
@@ -348,9 +349,9 @@ impl PyHeteroSampledSubgraph {
         Ok(PyArray1::from_vec(py, arr))
     }
 
-    /// Returns sampled node IDs as `uint32` numpy array (zero-copy slice copy,
-    /// no widening). Use this when feeding back into another aether API that
-    /// expects u32 — saves a `.astype(np.uint32)` on the Python side.
+    /// Returns sampled node IDs as `uint32` numpy array (one bulk slice
+    /// copy, no widening). Use this when feeding back into another aether
+    /// API that expects u32 — saves a `.astype(np.uint32)` on the Python side.
     fn nodes_u32<'py>(
         &self,
         py: Python<'py>,
@@ -557,5 +558,211 @@ impl PyHeteroNeighborSampler {
             "HeteroNeighborSampler(edge_types={})",
             self.graph.edge_type_count(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HeteroNeighborLoader
+// ---------------------------------------------------------------------------
+
+/// Prefetching heterogeneous neighbor loader for pipelined GNN training.
+///
+/// Spawns `sampler_threads` Rust worker threads over an MPMC work queue —
+/// the same pipeline as the homogeneous `NeighborLoader`. Results arrive
+/// unordered across the pool; each subgraph carries its own seed type and
+/// seeds, so consumers never rely on arrival order. The seed node type is
+/// fixed at construction; every submitted batch is rooted at it.
+///
+/// Args:
+///     graph: HeteroCsrGraph to sample from
+///     config: HeteroSamplingConfig with per-edge-type fanout parameters
+///     seed_type: Node type name every submitted seed batch is rooted at
+///     prefetch_depth: Number of batches to keep ready (default: 2)
+///     sampler_threads: Sampler worker threads pulling from the shared
+///         work queue (default: 1)
+///
+/// Example:
+///     >>> loader = HeteroNeighborLoader(graph, config, "user", prefetch_depth=3)
+///     >>> for i, batch in enumerate(batches):
+///     ...     loader.submit(i, batch)
+///     >>> for _ in range(len(batches)):
+///     ...     subgraph = loader.next()  # Already ready!
+///     ...     train(subgraph)
+#[pyclass(name = "HeteroNeighborLoader")]
+pub struct PyHeteroNeighborLoader {
+    inner: Option<HeteroNeighborLoader>,
+    /// Graph handle for wrapping results (type-name lookups in
+    /// `PyHeteroSampledSubgraph`); the loader's workers hold their own Arcs.
+    graph: Arc<HeteroGraph>,
+}
+
+#[pymethods]
+impl PyHeteroNeighborLoader {
+    #[new]
+    #[pyo3(signature = (graph, config, seed_type, prefetch_depth=2, sampler_threads=1))]
+    fn new(
+        graph: &PyHeteroCsrGraph,
+        config: PyHeteroSamplingConfig,
+        seed_type: &str,
+        prefetch_depth: usize,
+        sampler_threads: usize,
+    ) -> PyResult<Self> {
+        let graph_arc = graph.inner_arc();
+        let seed_type_id = graph_arc
+            .node_type_id(seed_type)
+            .ok_or_else(|| sampling_error(format!("unknown seed type '{seed_type}'")))?;
+        let core_config = config.to_core_config(&graph_arc)?;
+
+        let inner = HeteroNeighborLoader::new(
+            Arc::clone(&graph_arc),
+            core_config,
+            seed_type_id,
+            prefetch_depth,
+            sampler_threads,
+        )
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to create HeteroNeighborLoader: {e}"
+            ))
+        })?;
+
+        Ok(Self {
+            inner: Some(inner),
+            graph: graph_arc,
+        })
+    }
+
+    /// Submit a batch to be sampled.
+    ///
+    /// `batch_id` is caller bookkeeping echoed back on the Rust-side result;
+    /// nothing is reordered by it and duplicate or gapped indices are
+    /// harmless. With one sampler thread results come back in submission
+    /// order; a larger pool delivers them unordered.
+    ///
+    /// Blocks (with the GIL released) when the pipeline is full, until the
+    /// consumer drains a result — so interleave `submit()` with `next()`, or
+    /// submit from a separate thread.
+    ///
+    /// Args:
+    ///     batch_id: Caller-chosen index for this batch.
+    ///     seeds: Seed node IDs of the loader's seed type (numpy uint32,
+    ///         numpy int64, or `list[int]`).
+    fn submit(&self, py: Python<'_>, batch_id: usize, seeds: &Bound<'_, PyAny>) -> PyResult<()> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| sampling_error("Loader has been shut down"))?;
+
+        let seeds_vec = crate::error::extract_seeds(seeds)?;
+
+        // The bounded work channel blocks when the pipeline is full; release
+        // the GIL so the consumer thread can drain. No Python object is
+        // touched inside.
+        py.detach(|| inner.submit(batch_id, seeds_vec))
+            .map_err(|e| sampling_error(format!("Submit failed: {e}")))
+    }
+
+    /// Get the next sampled subgraph (blocking).
+    ///
+    /// Returns:
+    ///     HeteroSampledSubgraph: The next prefetched subgraph
+    ///     None: Only after `shutdown()` — the pipeline was drained and no
+    ///         more batches will arrive
+    ///
+    /// Raises:
+    ///     TimeoutError: No result arrived within the wait window; the
+    ///         workers may just be slow, so the call may be retried.
+    ///     RuntimeError: The sampler pool exited unexpectedly.
+    fn next(&self, py: Python<'_>) -> PyResult<Option<PyHeteroSampledSubgraph>> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| sampling_error("Loader has been shut down"))?;
+
+        // The blocking recv can stall while the workers sample; release the
+        // GIL so other Python threads run. No Python object is touched inside.
+        match py
+            .detach(|| inner.next())
+            .map_err(crate::prefetch::prefetch_error_to_py)?
+        {
+            Some(subgraph) => Ok(Some(PyHeteroSampledSubgraph {
+                inner: subgraph,
+                graph: Arc::clone(&self.graph),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Get current prefetch statistics.
+    ///
+    /// Returns:
+    ///     PrefetchStats: Statistics about hit rate, misses, etc.
+    ///     (`feature_load_time_ns` stays 0 — this loader samples only).
+    fn stats(&self) -> PyResult<crate::prefetch::PyPrefetchStats> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| sampling_error("Loader has been shut down"))?;
+
+        let stats = inner.stats();
+        Ok(crate::prefetch::PyPrefetchStats {
+            hits: stats.hits.load(std::sync::atomic::Ordering::Relaxed),
+            misses: stats.misses.load(std::sync::atomic::Ordering::Relaxed),
+            total: stats.total.load(std::sync::atomic::Ordering::Relaxed),
+            sample_time_ns: stats
+                .sample_time_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            feature_load_time_ns: stats
+                .feature_load_time_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    /// Get the prefetch depth.
+    #[getter]
+    fn prefetch_depth(&self) -> PyResult<usize> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| sampling_error("Loader has been shut down"))?;
+        Ok(inner.prefetch_depth())
+    }
+
+    /// Shutdown the sampler pool.
+    ///
+    /// Called automatically when the object is garbage collected.
+    fn shutdown(&mut self) {
+        if let Some(mut inner) = self.inner.take() {
+            inner.shutdown();
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.inner {
+            Some(inner) => format!(
+                "HeteroNeighborLoader(prefetch_depth={})",
+                inner.prefetch_depth()
+            ),
+            None => "HeteroNeighborLoader(shutdown)".to_string(),
+        }
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) {
+        self.shutdown();
+    }
+}
+
+impl Drop for PyHeteroNeighborLoader {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

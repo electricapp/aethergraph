@@ -1,11 +1,11 @@
 """
-Tests for the disjoint-mode seed_indices reconstruction in
-PySampledSubgraph::from_subgraph.
+Tests for disjoint-mode seed indices.
 
 In disjoint mode, each seed produces its own isolated subgraph and the
-sampler emits a `batch` vector. The Python wrapper rebuilds `seed_indices`
-by walking the batch vector and recording the first occurrence of each
-seed ID. These tests pin the invariants of that reconstruction.
+sampler emits a `batch` vector. The sampler records each seed's local
+index at build time (a seed is always the first node of its block), and
+`seed_indices` exposes them. These tests pin that contract: one index per
+seed, each pointing at the first node of its batch block.
 """
 
 from __future__ import annotations

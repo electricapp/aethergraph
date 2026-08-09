@@ -392,11 +392,12 @@ impl AsyncFeatureStore {
 
     /// Batch reads via io_uring, run in spawn_blocking to not block tokio runtime.
     ///
-    /// Uses the lane's persistent aligned buffers for O_DIRECT (no per-batch
-    /// aligned allocation), submits the whole batch through one pipelined
-    /// `batch_read` call, and decodes rows straight into the output vector —
-    /// no per-row temporaries. Concurrent batches interleave across the
-    /// lanes of the pool rather than time-slicing one ring.
+    /// The gather itself is [`super::gather::uring_gather_rows`], shared
+    /// with `SyncFeatureStore`: the lane's persistent buffers land the
+    /// reads (no per-batch aligned allocation), one pipelined `batch_read`
+    /// call submits the whole batch, and rows decode straight into the
+    /// output vector. Concurrent batches interleave across the lanes of
+    /// the pool rather than time-slicing one ring.
     #[cfg(target_os = "linux")]
     async fn batch_read_uring_blocking(
         &self,
@@ -430,80 +431,17 @@ impl AsyncFeatureStore {
 
         // Run io_uring operations in spawn_blocking to not block tokio runtime
         let features = tokio::task::spawn_blocking(move || {
-            let fd = file.as_raw_fd();
             let mut lane = uring_arc.lock();
-
-            let mut features = vec![0f32; nodes.len() * feature_dim];
-
-            if direct_io {
-                let total_slots = nodes.len();
-                // Build reads against the lane's persistent aligned pool.
-                let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(total_slots);
-                {
-                    let pool = lane.direct_pool(total_slots, feature_size)?;
-                    for (i, &node) in nodes.iter().enumerate() {
-                        let file_offset =
-                            features_start_offset + (node as u64) * (feature_size as u64);
-                        reads.push((file_offset, pool.slot_ptr(i), feature_size));
-                    }
-                }
-                // SAFETY: each ptr points into the lane's pool, which lives
-                // (under this lock guard) until after this call; batch_read
-                // reaps every submitted completion before returning — on
-                // success AND on error.
-                crate::internal::uring::batch_read(&mut lane.handle, fd, &reads)?;
-                trace!("Completed {} feature reads via io_uring", reads.len());
-
-                let pool = lane.direct_pool(total_slots, feature_size)?;
-                for i in 0..total_slots {
-                    let row = pool.slot_slice(i, feature_size);
-                    let dst = &mut features[i * feature_dim..(i + 1) * feature_dim];
-                    match dtype {
-                        FeatureDtype::F32 => {
-                            dst.copy_from_slice(bytemuck::cast_slice::<u8, f32>(row));
-                        }
-                        FeatureDtype::F16 => {
-                            crate::internal::simd::f16_le_to_f32(row, dst);
-                        }
-                    }
-                }
-            } else {
-                let total_size = nodes
-                    .len()
-                    .checked_mul(feature_size)
-                    .ok_or_else(|| anyhow::anyhow!("buffer size overflow"))?;
-                let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
-                {
-                    let scratch = lane.scratch(total_size);
-                    let base = scratch.as_mut_ptr();
-                    for (i, &node) in nodes.iter().enumerate() {
-                        let file_offset =
-                            features_start_offset + (node as u64) * (feature_size as u64);
-                        // SAFETY: `i < nodes.len()` and the scratch spans
-                        // `nodes.len() * feature_size` bytes.
-                        let buf_ptr = unsafe { base.add(i * feature_size) };
-                        reads.push((file_offset, buf_ptr, feature_size));
-                    }
-                }
-                // SAFETY: every ptr points into the lane's scratch, held
-                // alive under this lock guard; batch_read reaps every
-                // submitted completion before returning.
-                crate::internal::uring::batch_read(&mut lane.handle, fd, &reads)?;
-                trace!("Completed {} feature reads via io_uring", reads.len());
-
-                let scratch = lane.scratch(total_size);
-                match dtype {
-                    FeatureDtype::F32 => {
-                        bytemuck::cast_slice_mut::<f32, u8>(&mut features)
-                            .copy_from_slice(&scratch[..total_size]);
-                    }
-                    FeatureDtype::F16 => {
-                        crate::internal::simd::f16_le_to_f32(&scratch[..total_size], &mut features);
-                    }
-                }
-            }
-
-            Ok::<_, anyhow::Error>(features)
+            super::gather::uring_gather_rows(
+                &mut lane,
+                file.as_raw_fd(),
+                &nodes,
+                features_start_offset,
+                feature_size,
+                direct_io,
+                dtype,
+                feature_dim,
+            )
         })
         .await
         .context("spawn_blocking failed")??;

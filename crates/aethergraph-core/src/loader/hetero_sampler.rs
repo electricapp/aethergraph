@@ -8,53 +8,16 @@
 //! Local node indices are assigned during sampling — no post-sort, no
 //! binary search. Edges are stored with local indices directly.
 
-use crate::graph::NodeId;
 use crate::graph::hetero::{EdgeTypeId, HeteroGraph, NodeTypeId};
+use crate::graph::{CsrView, NodeId};
+use crate::internal::genstamp::{FRONTIER_PREFETCH_DIST, FloydStamps, GenDedup, GenSlots, WyRand};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Per-node-type dedup structure. Node types small enough for a dense
-/// array use generation-stamped slots — one random array load per probe,
-/// where the hash map pays hash + bucket walk (~3-5x slower and the
-/// dominant per-edge cost of the sampler). The generation tag (high 32
-/// bits) makes cross-call reuse a counter bump instead of a clear; the low
-/// 32 bits hold the local index.
-enum TypeDedup {
-    Dense(Vec<u64>),
-    Map(FxHashMap<NodeId, u32>),
-}
-
-/// Node types with at most this many nodes get the dense dedup array
-/// (8 bytes per node, so at most 8 MB per type).
+/// Node types with at most this many nodes get the dense dedup table
+/// (8 bytes per node, so at most 8 MB per type) — one random array load per
+/// probe, where the hash map pays hash + bucket walk (~3-5x slower and the
+/// dominant per-edge cost of the sampler).
 const DENSE_DEDUP_MAX_NODES: usize = 1 << 20;
-
-/// How many frontier entries ahead the hop loop prefetches the first
-/// source edge type's CSR offset word.
-const FRONTIER_PREFETCH_DIST: usize = 4;
-
-/// Ultra-fast wyrand PRNG.
-#[derive(Clone)]
-struct WyRand {
-    state: u64,
-}
-
-impl WyRand {
-    #[inline(always)]
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    #[inline(always)]
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0xa0761d6478bd642f);
-        let t = (self.state as u128).wrapping_mul((self.state ^ 0xe7037ed1a0b428db) as u128);
-        ((t >> 64) ^ t) as u64
-    }
-
-    #[inline(always)]
-    fn next_u32(&mut self) -> u32 {
-        self.next_u64() as u32
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct HeteroSamplingConfig {
@@ -91,11 +54,9 @@ pub struct HeteroNeighborSampler<'a> {
     graph: &'a HeteroGraph,
     config: HeteroSamplingConfig,
     rng: WyRand,
-    /// Per-type dedup: dense generation-stamped array for small types,
+    /// Per-type dedup: dense generation-stamped table for small types,
     /// hash map for large ones.
-    dedup: Vec<TypeDedup>,
-    /// Current generation for the dense dedup arrays.
-    current_gen: u32,
+    dedup: Vec<GenDedup>,
     /// Per-type: nodes in discovery order (parallel to the dedup state).
     node_vecs: Vec<Vec<NodeId>>,
     /// Per-edge-type edge buffers (local indices).
@@ -112,8 +73,7 @@ pub struct HeteroNeighborSampler<'a> {
     dst_types: Vec<NodeTypeId>,
     /// Reusable Floyd scratch (small degree ≤256): generation stamps, so
     /// per-node reuse is a counter bump instead of an O(n) clear.
-    floyd_stamp: [u32; 256],
-    floyd_gen: u32,
+    floyd: FloydStamps,
     /// Reusable Floyd set (large degree).
     floyd_set: FxHashSet<usize>,
 }
@@ -132,13 +92,13 @@ impl<'a> HeteroNeighborSampler<'a> {
             .copied()
             .unwrap_or(25);
 
-        let dedup: Vec<TypeDedup> = (0..num_nt)
+        let dedup: Vec<GenDedup> = (0..num_nt)
             .map(|nt| {
                 let n = graph.num_nodes(nt as NodeTypeId);
                 if n <= DENSE_DEDUP_MAX_NODES {
-                    TypeDedup::Dense(vec![0u64; n])
+                    GenDedup::Dense(GenSlots::new(n))
                 } else {
-                    TypeDedup::Map(FxHashMap::with_capacity_and_hasher(256, Default::default()))
+                    GenDedup::Map(FxHashMap::with_capacity_and_hasher(256, Default::default()))
                 }
             })
             .collect();
@@ -160,7 +120,6 @@ impl<'a> HeteroNeighborSampler<'a> {
             config,
             rng: WyRand::new(seed),
             dedup,
-            current_gen: 0,
             node_vecs,
             edge_src_buf,
             edge_dst_buf,
@@ -168,8 +127,7 @@ impl<'a> HeteroNeighborSampler<'a> {
             next_frontier: Vec::with_capacity(4096),
             src_edge_types,
             dst_types,
-            floyd_stamp: [0u32; 256],
-            floyd_gen: 0,
+            floyd: FloydStamps::new(),
             floyd_set: FxHashSet::with_capacity_and_hasher(max_fanout * 2, Default::default()),
         }
     }
@@ -179,21 +137,10 @@ impl<'a> HeteroNeighborSampler<'a> {
         seed_type: NodeTypeId,
         seeds: &[NodeId],
     ) -> HeteroSampledSubgraph {
-        // Reset reusable state. Dense dedup arrays reset with a generation
+        // Reset reusable state. Dense dedup tables reset with a generation
         // bump (a fill only on the u32 wrap); maps clear normally.
-        self.current_gen = self.current_gen.wrapping_add(1);
-        if self.current_gen == 0 {
-            for d in &mut self.dedup {
-                if let TypeDedup::Dense(slots) = d {
-                    slots.fill(0);
-                }
-            }
-            self.current_gen = 1;
-        }
         for d in &mut self.dedup {
-            if let TypeDedup::Map(m) = d {
-                m.clear();
-            }
+            d.begin();
         }
         for v in &mut self.node_vecs {
             v.clear();
@@ -212,15 +159,12 @@ impl<'a> HeteroNeighborSampler<'a> {
             self.frontier.push((seed_type, seed, idx));
         }
 
-        // Hoist every edge type's CSR slices once per call: the inner loop
+        // Hoist every edge type's CSR view once per call: the inner loop
         // then slices raw arrays instead of re-deriving storage per
         // (node, edge type), and the offsets arrays double as prefetch
         // targets.
-        let csrs: Vec<(&[crate::graph::EdgeOffset], &[NodeId])> = (0..self.dst_types.len())
-            .map(|et| {
-                let g = self.graph.csr(et as EdgeTypeId);
-                (g.offsets(), g.edges())
-            })
+        let csrs: Vec<CsrView<'_>> = (0..self.dst_types.len())
+            .map(|et| self.graph.csr(et as EdgeTypeId).csr_view())
             .collect();
 
         // Hop-by-hop sampling
@@ -235,7 +179,7 @@ impl<'a> HeteroNeighborSampler<'a> {
                 if fi + FRONTIER_PREFETCH_DIST < frontier_len {
                     let (nt_ahead, id_ahead, _) = self.frontier[fi + FRONTIER_PREFETCH_DIST];
                     if let Some(&et0) = self.src_edge_types[nt_ahead as usize].first() {
-                        let offsets = csrs[et0 as usize].0;
+                        let offsets = csrs[et0 as usize].offsets();
                         if (id_ahead as usize) < offsets.len() {
                             crate::internal::prefetch::prefetch_read(&offsets[id_ahead as usize]);
                         }
@@ -267,17 +211,10 @@ impl<'a> HeteroNeighborSampler<'a> {
                         continue;
                     }
 
-                    let (offsets, edges) = csrs[et_id as usize];
-                    let i = local_id as usize;
-                    if i + 1 >= offsets.len() {
+                    let neighbors = csrs[et_id as usize].neighbors(local_id);
+                    if neighbors.is_empty() {
                         continue;
                     }
-                    let start = offsets[i] as usize;
-                    let end = offsets[i + 1] as usize;
-                    if start >= end || end > edges.len() {
-                        continue;
-                    }
-                    let neighbors = &edges[start..end];
 
                     let effective = if let Some(max_deg) = self.config.max_degree {
                         if neighbors.len() > max_deg {
@@ -347,42 +284,16 @@ impl<'a> HeteroNeighborSampler<'a> {
         }
     }
 
-    /// Pack a generation tag and local index into one dense dedup slot.
-    #[inline(always)]
-    const fn pack_slot(generation: u32, idx: u32) -> u64 {
-        ((generation as u64) << 32) | idx as u64
-    }
-
     /// Insert a node of `node_type`, assigning a local index if new.
     /// Returns `(local index, is_new)`.
     #[inline(always)]
     fn insert_node(&mut self, id: NodeId, node_type: NodeTypeId) -> (u32, bool) {
         let nt = node_type as usize;
-        match &mut self.dedup[nt] {
-            TypeDedup::Dense(slots) => {
-                let i = id as usize;
-                let slot = slots[i];
-                if (slot >> 32) as u32 == self.current_gen {
-                    (slot as u32, false)
-                } else {
-                    let idx = self.node_vecs[nt].len() as u32;
-                    slots[i] = Self::pack_slot(self.current_gen, idx);
-                    self.node_vecs[nt].push(id);
-                    (idx, true)
-                }
-            }
-            TypeDedup::Map(map) => {
-                let next_idx = self.node_vecs[nt].len() as u32;
-                match map.entry(id) {
-                    std::collections::hash_map::Entry::Occupied(e) => (*e.get(), false),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(next_idx);
-                        self.node_vecs[nt].push(id);
-                        (next_idx, true)
-                    }
-                }
-            }
+        let (idx, is_new) = self.dedup[nt].probe_or_insert(id, self.node_vecs[nt].len() as u32);
+        if is_new {
+            self.node_vecs[nt].push(id);
         }
+        (idx, is_new)
     }
 
     /// Insert a destination node, assigning a local index if new.
@@ -436,24 +347,16 @@ impl<'a> HeteroNeighborSampler<'a> {
         let n = neighbors.len();
 
         if n <= 256 {
-            // Stamp reuse is a counter bump, not an O(n) clear per node;
-            // direct indexing (no held slice borrow) also lets this loop
-            // call insert_dst instead of duplicating it.
-            self.floyd_gen = self.floyd_gen.wrapping_add(1);
-            if self.floyd_gen == 0 {
-                self.floyd_stamp.fill(0);
-                self.floyd_gen = 1;
-            }
-            let stamp = self.floyd_gen;
+            // Stamp reuse is a counter bump, not an O(n) clear per node.
+            self.floyd.begin();
             for i in (n - k)..n {
                 let s = (i + 1) as u64;
                 let x = self.rng.next_u32();
                 let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
-                let pick = if self.floyd_stamp[j] != stamp {
-                    self.floyd_stamp[j] = stamp;
+                let pick = if self.floyd.test_and_set(j) {
                     j
                 } else {
-                    self.floyd_stamp[i] = stamp;
+                    self.floyd.test_and_set(i);
                     i
                 };
                 let dst_local = self.insert_dst(neighbors[pick], dst_type);

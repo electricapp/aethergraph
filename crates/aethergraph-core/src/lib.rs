@@ -25,13 +25,14 @@ pub use aether_epoch::{Epoch, EpochClock};
 
 // Primary public exports
 pub use graph::{
-    AsyncCsrGraph, EdgeOffset, EdgeTypeId, EdgeTypeMeta, Graph, GraphStats, GraphValidationMode,
-    HeteroGraph, NodeId, NodeTypeId, NodeTypeMeta, partition_aligned_batches,
+    AsyncCsrGraph, CsrView, EdgeOffset, EdgeTypeId, EdgeTypeMeta, Graph, GraphStats,
+    GraphValidationMode, HeteroGraph, NodeId, NodeTypeId, NodeTypeMeta, partition_aligned_batches,
 };
 pub use loader::{
-    HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig, NeighborLoader,
-    NeighborSampler, ParallelBatchSampler, PrefetchError, PrefetchStats, SampledSubgraph,
-    SamplingConfig, SubgraphType, SyncFeatureStore, TemporalSamplingError, TemporalStrategy,
+    HeteroNeighborLoader, HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig,
+    LocalEdgeIndex, NeighborLoader, NeighborSampler, ParallelBatchSampler, PrefetchError,
+    PrefetchStats, SampledSubgraph, SamplingConfig, SubgraphType, SyncFeatureStore,
+    TemporalSamplingError, TemporalStrategy,
 };
 
 // Feature store exports (needed for file-backed features)

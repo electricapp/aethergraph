@@ -27,7 +27,7 @@ pub type NextWithFeaturesResult<'py> =
 /// - `WorkerExited` → `RuntimeError` including the captured panic/error
 ///   message when one is available.
 /// - `FeatureLoad` → `RuntimeError` naming the batch whose features failed.
-fn prefetch_error_to_py(err: PrefetchError) -> PyErr {
+pub(crate) fn prefetch_error_to_py(err: PrefetchError) -> PyErr {
     match err {
         PrefetchError::Timeout { waited } => pyo3::exceptions::PyTimeoutError::new_err(format!(
             "prefetch timed out after {waited:?}; the worker may be slow or deadlocked \
@@ -495,9 +495,11 @@ impl PyNeighborLoader {
     ///     prefetch_depth: Number of batches to prefetch ahead (default: 2)
     ///     gid_index: Local GID-table index for RoCEv2 (default: 1, the
     ///         typical IPv4-mapped GID on Linux; verify with `show_gids`)
+    ///     sampler_threads: Sampler threads feeding the pipeline (default: 1)
     #[staticmethod]
-    #[pyo3(signature = (graph, config, server_addr, gpu_id=0, max_batch_nodes=65536, prefetch_depth=2, gid_index=1))]
+    #[pyo3(signature = (graph, config, server_addr, gpu_id=0, max_batch_nodes=65536, prefetch_depth=2, gid_index=1, sampler_threads=1))]
     #[cfg(all(target_os = "linux", feature = "gpudirect"))]
+    #[allow(clippy::too_many_arguments)]
     fn with_rdma_features(
         graph: &PyCsrGraph,
         config: &PySamplingConfig,
@@ -506,16 +508,21 @@ impl PyNeighborLoader {
         max_batch_nodes: usize,
         prefetch_depth: usize,
         gid_index: u8,
+        sampler_threads: usize,
     ) -> PyResult<Self> {
         let graph_arc = graph.inner_arc();
 
-        let inner =
-            NeighborLoader::new(graph_arc.clone(), config.inner().clone(), prefetch_depth, 1)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to create NeighborLoader: {e}"
-                    ))
-                })?;
+        let inner = NeighborLoader::new(
+            graph_arc.clone(),
+            config.inner().clone(),
+            prefetch_depth,
+            sampler_threads,
+        )
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to create NeighborLoader: {e}"
+            ))
+        })?;
 
         let rdma = aether_stream::rdma::gather::RdmaFeatureGather::connect(
             server_addr,

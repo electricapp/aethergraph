@@ -33,6 +33,21 @@ impl FeatureDtype {
         }
     }
 
+    /// Decode a little-endian feature row (or any contiguous run of rows)
+    /// from `src` into `dst`.
+    ///
+    /// F32 payloads are a straight byte copy into the `f32` destination
+    /// (no source-alignment requirement); F16 payloads upcast through the
+    /// SIMD-dispatched converter. `src.len()` must equal
+    /// `dst.len() * self.element_size()` — both branches panic otherwise.
+    #[inline]
+    pub(crate) fn decode_row(self, src: &[u8], dst: &mut [f32]) {
+        match self {
+            Self::F32 => bytemuck::cast_slice_mut::<f32, u8>(dst).copy_from_slice(src),
+            Self::F16 => crate::internal::simd::f16_le_to_f32(src, dst),
+        }
+    }
+
     pub(crate) fn from_u8(v: u8) -> Result<Self> {
         match v {
             0 => Ok(Self::F32),

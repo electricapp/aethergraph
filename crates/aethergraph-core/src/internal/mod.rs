@@ -2,6 +2,9 @@
 //!
 //! These modules provide low-level functionality used by the rest of the library.
 
+#[cfg(target_os = "linux")]
+pub mod aligned;
+pub mod genstamp;
 pub mod hint;
 pub mod mmap;
 pub mod mmap_hetero;

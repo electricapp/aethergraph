@@ -34,7 +34,8 @@ use error::{ArrowConversionError, CacheError, GraphLoadError, SamplingError};
 use feature_cache::{PyFeatureCache, PyFeatureCacheConfig};
 use graph::PyCsrGraph;
 use hetero::{
-    PyHeteroCsrGraph, PyHeteroNeighborSampler, PyHeteroSampledSubgraph, PyHeteroSamplingConfig,
+    PyHeteroCsrGraph, PyHeteroNeighborLoader, PyHeteroNeighborSampler, PyHeteroSampledSubgraph,
+    PyHeteroSamplingConfig,
 };
 use metrics::PyMetricsSnapshot;
 use prefetch::{PyNeighborLoader, PyPrefetchStats};
@@ -82,6 +83,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHeteroSamplingConfig>()?;
     m.add_class::<PyHeteroSampledSubgraph>()?;
     m.add_class::<PyHeteroNeighborSampler>()?;
+    m.add_class::<PyHeteroNeighborLoader>()?;
 
     // Register feature store
     feature_store::register_feature_store(py, m)?;

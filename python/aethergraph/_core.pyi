@@ -10,10 +10,13 @@ Path-accepting APIs declare `str | os.PathLike[str]` since PyO3's
 
 import os
 from collections.abc import Sequence
-from typing import Any, Literal, TypeAlias
+from typing import Any, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
+
+from aethergraph._types import SubgraphType as SubgraphType
+from aethergraph._types import TemporalStrategy as TemporalStrategy
 
 __version__: str
 __author__: str
@@ -31,8 +34,6 @@ def _dlpack_capsule_from_cuda_ptr(
 
 SeedArray: TypeAlias = npt.NDArray[np.int64] | npt.NDArray[np.uint32]
 PathLike: TypeAlias = str | os.PathLike[str]
-SubgraphType: TypeAlias = Literal["directional", "induced", "bidirectional"]
-TemporalStrategy: TypeAlias = Literal["uniform", "last"]
 
 # -- Exceptions --------------------------------------------------------------
 
@@ -157,10 +158,12 @@ class SampledSubgraph:
 
     The arrays are `int64` because PyTorch's index dtype is `int64`.
 
-    Ownership contract: every array accessor allocates a fresh, Python-owned
-    numpy array on each access. Nothing aliases Rust memory, so callers may
-    mutate the result or wrap it zero-copy (``torch.from_numpy``) without a
-    defensive copy."""
+    Ownership contract: every array accessor returns a Python-owned numpy
+    array that never aliases Rust memory, so wrapping it zero-copy
+    (``torch.from_numpy``) needs no defensive copy. The *same* array object
+    may be returned on every access (accessors cache), so treat the result
+    as immutable — a mutation would be visible through every later access
+    and through ``to_dict()``. Copy first if you need to write."""
 
     # Counts.
     @property
@@ -328,6 +331,7 @@ class NeighborLoader:
         max_batch_nodes: int = 65536,
         prefetch_depth: int = 2,
         gid_index: int = 1,
+        sampler_threads: int = 1,
     ) -> NeighborLoader: ...
     def next_with_gpu_features(self) -> tuple[SampledSubgraph, Any] | None: ...
     @property
@@ -441,10 +445,11 @@ class HeteroSamplingConfig:
 class HeteroSampledSubgraph:
     """One sampled subgraph from `HeteroNeighborSampler`.
 
-    Same ownership contract as `SampledSubgraph`: array accessors return
-    fresh, Python-owned arrays that never alias Rust memory. `sample` accepts
-    int64 seed arrays directly — IDs are range-checked at this boundary, so
-    callers never pre-narrow to uint32."""
+    Array accessors return Python-owned arrays that never alias Rust
+    memory; here each access allocates fresh, so results are independently
+    mutable (unlike `SampledSubgraph`, whose accessors cache). `sample`
+    accepts int64 seed arrays directly — IDs are range-checked at this
+    boundary, so callers never pre-narrow to uint32."""
 
     @property
     def node_types(self) -> list[str]: ...
@@ -467,6 +472,30 @@ class HeteroNeighborSampler:
         seed_type: str,
         seeds: SeedArray | list[int],
     ) -> HeteroSampledSubgraph: ...
+
+class HeteroNeighborLoader:
+    """Prefetching heterogeneous neighbor loader. Spawns `sampler_threads`
+    worker threads over an MPMC work queue — the same pipeline as
+    `NeighborLoader`; bounded submission and result channels apply
+    backpressure both ways. Results arrive unordered across the pool —
+    each subgraph carries its own seed type and seeds, so consumers never
+    rely on arrival order. Every submitted batch is rooted at the
+    `seed_type` fixed at construction."""
+
+    def __init__(
+        self,
+        graph: HeteroCsrGraph,
+        config: HeteroSamplingConfig,
+        seed_type: str,
+        prefetch_depth: int = 2,
+        sampler_threads: int = 1,
+    ) -> None: ...
+    def submit(self, batch_id: int, seeds: SeedArray | list[int]) -> None: ...
+    def next(self) -> HeteroSampledSubgraph | None: ...
+    @property
+    def prefetch_depth(self) -> int: ...
+    def shutdown(self) -> None: ...
+    def stats(self) -> PrefetchStats: ...
 
 # -- FeatureCache (async) ----------------------------------------------------
 

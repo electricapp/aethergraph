@@ -288,7 +288,7 @@ pub struct PySampledSubgraph {
     edge_index_local: Py<PyArray2<i64>>,
     // Global edge IDs (position in CSR edges array)
     edge_ids: Py<PyArray1<i64>>,
-    // Local seed indices (position in sorted nodes array)
+    // Local seed indices (position in the discovery-order nodes array)
     seed_indices: Py<PyArray1<i64>>,
     // Batch vector (disjoint mode only): maps each node to its seed index
     batch_vec: Option<Py<PyArray1<i64>>>,
@@ -309,66 +309,32 @@ pub struct PySampledSubgraph {
 }
 
 impl PySampledSubgraph {
-    /// Create from SampledSubgraph, converting to int64 for PyTorch compatibility.
-    /// Pre-computes local edge indices using binary search.
-    pub fn from_subgraph(py: Python<'_>, mut subgraph: SampledSubgraph) -> PyResult<Self> {
+    /// Create from SampledSubgraph, converting to int64 for PyTorch
+    /// compatibility. Local edge and seed indices come straight from the
+    /// core accessors, which behave identically on every sampler path
+    /// (disjoint included) and on `from_parts` reconstructions.
+    pub fn from_subgraph(py: Python<'_>, subgraph: SampledSubgraph) -> PyResult<Self> {
         let num_nodes = subgraph.nodes.len();
         let num_edges = subgraph.edge_src.len();
         let num_seeds = subgraph.seeds.len();
         let num_sampled_nodes = subgraph.num_sampled_nodes.clone();
         let num_sampled_edges = subgraph.num_sampled_edges.clone();
 
-        let is_disjoint = subgraph.batch.is_some();
+        // Local edge_index (remapped to [0, num_nodes)), widened u32 → i64 in
+        // one pass while the borrow of `subgraph` is scoped. The global-ID
+        // variant is built lazily on first `.edge_index` access instead.
+        let mut edge_data_local: Vec<i64> = Vec::with_capacity(num_edges * 2);
+        {
+            let (src_local, dst_local) = subgraph.edge_index_local().map_err(|e| {
+                sampling_error(format!("Failed to compute local edge indices: {}", e))
+            })?;
+            edge_data_local.extend(src_local.iter().map(|&e| e as i64));
+            edge_data_local.extend(dst_local.iter().map(|&e| e as i64));
+        }
 
-        // Compute local edge indices in Rust (zero-copy move for disjoint precomputed)
-        let (src_local, dst_local) = subgraph
-            .edge_index_local()
-            .map_err(|e| sampling_error(format!("Failed to compute local edge indices: {}", e)))?;
-
-        // In disjoint mode `local_index` is intentionally empty (each seed has
-        // its own remap) so `seed_indices_local()` cannot be used. The seeds
-        // appear in the global `nodes` array in the same order they were
-        // submitted, with each seed at the start of its per-seed block. We
-        // reconstruct the seed positions by walking `batch_vec` and recording
-        // the index of the first occurrence of seed 0, 1, 2, ...
-        //
-        // Invariant assumed: `batch_vec` is monotonic non-decreasing — once we
-        // see seed `k`, we never see seed `k-1` again. The core sampler
-        // guarantees this. We `debug_assert!` it here for catch-on-test if it
-        // ever drifts; in release we trust the producer.
-        let seed_indices_local = if is_disjoint {
-            let batch_ref = subgraph
-                .batch
-                .as_ref()
-                .expect("disjoint mode without batch vector — core sampler bug");
-            debug_assert!(
-                batch_ref.windows(2).all(|w| w[0] <= w[1]),
-                "batch vector must be monotonic non-decreasing"
-            );
-            let mut indices = Vec::with_capacity(subgraph.seeds.len());
-            let mut current_seed = 0u32;
-            for (i, &b) in batch_ref.iter().enumerate() {
-                if b == current_seed {
-                    indices.push(i as u32);
-                    current_seed += 1;
-                    if current_seed as usize >= subgraph.seeds.len() {
-                        break;
-                    }
-                }
-            }
-            if indices.len() != subgraph.seeds.len() {
-                return Err(sampling_error(format!(
-                    "disjoint mode: found {} seed offsets in batch vector, expected {}",
-                    indices.len(),
-                    subgraph.seeds.len()
-                )));
-            }
-            indices
-        } else {
-            subgraph
-                .seed_indices_local()
-                .map_err(|e| sampling_error(format!("Failed to compute seed indices: {}", e)))?
-        };
+        let seed_indices_local = subgraph
+            .seed_indices_local()
+            .map_err(|e| sampling_error(format!("Failed to compute seed indices: {}", e)))?;
 
         // u32 → i64 widening, one pass per buffer — the only per-buffer copy
         // on this path; the source Vecs move into `original_*` below so
@@ -381,12 +347,6 @@ impl PySampledSubgraph {
         let seeds_i64: Vec<i64> = subgraph.seeds.iter().map(|&s| s as i64).collect();
         let seed_indices_i64: Vec<i64> = seed_indices_local.into_iter().map(|i| i as i64).collect();
         let edge_ids_i64: Vec<i64> = subgraph.edge_ids.iter().map(|&e| e as i64).collect();
-
-        // Local edge_index (remapped to [0, num_nodes)). The global-ID
-        // variant is built lazily on first `.edge_index` access instead.
-        let mut edge_data_local: Vec<i64> = Vec::with_capacity(num_edges * 2);
-        edge_data_local.extend(src_local.into_iter().map(|e| e as i64));
-        edge_data_local.extend(dst_local.into_iter().map(|e| e as i64));
 
         let nodes = PyArray1::from_vec(py, nodes_i64).unbind();
         let seeds = PyArray1::from_vec(py, seeds_i64).unbind();
@@ -448,14 +408,18 @@ impl PySampledSubgraph {
         self.num_seeds
     }
 
-    /// All node IDs in the subgraph as a numpy `int64` array (zero-copy view).
-    /// `int64` matches PyTorch's `Tensor` index dtype.
+    /// All node IDs in the subgraph as a numpy `int64` array. `int64`
+    /// matches PyTorch's `Tensor` index dtype. Returns the same cached
+    /// Python-owned array object on every access; it never aliases Rust
+    /// memory — treat it as immutable.
     #[getter]
     fn nodes(&self, py: Python<'_>) -> Py<PyAny> {
         self.nodes.clone_ref(py).into_any()
     }
 
-    /// Seed node IDs as a numpy `int64` array (zero-copy view).
+    /// Seed node IDs as a numpy `int64` array. Returns the same cached
+    /// Python-owned array object on every access; it never aliases Rust
+    /// memory — treat it as immutable.
     #[getter]
     fn seeds(&self, py: Python<'_>) -> Py<PyAny> {
         self.seeds.clone_ref(py).into_any()
@@ -501,7 +465,9 @@ impl PySampledSubgraph {
         self.edge_ids.clone_ref(py).into_any()
     }
 
-    /// Local indices of seed nodes in the sorted `nodes` array — dtype `int64`.
+    /// Local indices of seed nodes in the `nodes` array — dtype `int64`.
+    /// Returns the same cached Python-owned array object on every access;
+    /// treat it as immutable.
     #[getter]
     fn seed_indices(&self, py: Python<'_>) -> Py<PyAny> {
         self.seed_indices.clone_ref(py).into_any()

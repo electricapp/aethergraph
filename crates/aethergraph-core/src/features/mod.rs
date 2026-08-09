@@ -5,6 +5,8 @@
 
 mod async_store;
 mod cache;
+#[cfg(target_os = "linux")]
+pub(crate) mod gather;
 #[cfg(feature = "gds")]
 mod gds;
 pub(crate) mod header;

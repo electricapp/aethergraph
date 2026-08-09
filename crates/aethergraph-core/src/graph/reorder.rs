@@ -494,19 +494,22 @@ impl Graph {
                 }
             }
             if has_weights && let Some(w) = self.neighbor_weights(old_id) {
-                // SAFETY: dst..dst+w.len() is in-bounds of `new_weights`
-                // (parallel to edges) and uniquely owned by this task, so a
-                // temporary exclusive slice is sound — and unlike an
+                // SAFETY: `dst` is in-bounds of `new_weights` (parallel to
+                // edges).
+                let base = unsafe { (wp as *mut f32).add(dst) };
+                // SAFETY: dst..dst+w.len() is uniquely owned by this task,
+                // so a temporary exclusive slice is sound — and unlike an
                 // element-at-a-time raw-pointer loop, `copy_from_slice`
                 // lowers to one memcpy.
-                let out =
-                    unsafe { std::slice::from_raw_parts_mut((wp as *mut f32).add(dst), w.len()) };
+                let out = unsafe { std::slice::from_raw_parts_mut(base, w.len()) };
                 out.copy_from_slice(w);
             }
             if has_timestamps && let Some(ts) = self.neighbor_timestamps(old_id) {
+                // SAFETY: `dst` is in-bounds of `new_timestamps` (parallel
+                // to edges).
+                let base = unsafe { (tp as *mut f64).add(dst) };
                 // SAFETY: same ownership argument as the weights slice.
-                let out =
-                    unsafe { std::slice::from_raw_parts_mut((tp as *mut f64).add(dst), ts.len()) };
+                let out = unsafe { std::slice::from_raw_parts_mut(base, ts.len()) };
                 out.copy_from_slice(ts);
             }
         });
@@ -603,11 +606,11 @@ pub fn partition_aligned_batches(
 
     // Group seeds by partition with one u64 sort — (partition << 32 |
     // original index) keys group by partition and stay stable within it.
-    // The old per-partition Vec map allocated one heap Vec per distinct
-    // community (Rabbit produces many small ones), approaching one
-    // allocation per seed each epoch. A seed id must index into
-    // `partitions` (length == num_nodes); otherwise it would silently fall
-    // into partition 0 and be mis-grouped.
+    // The single key vec is the whole grouping state: a per-partition Vec
+    // map would allocate one heap Vec per distinct community (Rabbit
+    // produces many small ones), approaching one allocation per seed each
+    // epoch. A seed id must index into `partitions` (length == num_nodes);
+    // otherwise it would silently fall into partition 0 and be mis-grouped.
     let mut keyed: Vec<u64> = seeds
         .iter()
         .enumerate()

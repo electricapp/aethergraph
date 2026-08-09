@@ -86,6 +86,82 @@ pub enum GraphValidationMode {
     Full,
 }
 
+/// The canonical guarded neighbor-range lookup over hoisted CSR arrays.
+///
+/// Every neighbor accessor — [`Graph::neighbors`] and the sampler hop loops
+/// via [`CsrView`] — routes through this one function, so an out-of-range
+/// node or a corrupt offset pair yields an empty range everywhere, with
+/// identical semantics.
+#[inline(always)]
+fn neighbor_range_guarded(
+    offsets: &[EdgeOffset],
+    num_nodes: usize,
+    num_edges: usize,
+    node: NodeId,
+) -> Range<usize> {
+    let idx = node as usize;
+    if idx >= num_nodes {
+        return 0..0;
+    }
+    // Safe indexing: bounds are verified by construction (offsets.len() == num_nodes + 1)
+    let start = offsets[idx] as usize;
+    let end = offsets[idx + 1] as usize;
+    if start > end || end > num_edges {
+        return 0..0;
+    }
+    start..end
+}
+
+/// Borrowed CSR view with the storage dispatch already resolved.
+///
+/// The sampler hop loops hoist one view per call (per edge type for the
+/// hetero sampler) so the per-node inner loop indexes raw slices with no
+/// per-access storage `match`, while the neighbor-range guard stays the
+/// single canonical one shared with [`Graph::neighbors`].
+#[derive(Clone, Copy)]
+pub struct CsrView<'a> {
+    offsets: &'a [EdgeOffset],
+    edges: &'a [NodeId],
+    num_nodes: usize,
+    num_edges: usize,
+}
+
+impl<'a> CsrView<'a> {
+    /// Number of nodes covered by the view.
+    #[inline(always)]
+    pub fn num_nodes(&self) -> usize {
+        self.num_nodes
+    }
+
+    /// The hoisted offsets array (`num_nodes + 1` entries) — exposed for
+    /// software prefetch of upcoming offset words.
+    #[inline(always)]
+    pub fn offsets(&self) -> &'a [EdgeOffset] {
+        self.offsets
+    }
+
+    /// The hoisted edges array — exposed for software prefetch of upcoming
+    /// neighbor lines and for slicing a [`CsrView::neighbor_range`].
+    #[inline(always)]
+    pub fn edges(&self) -> &'a [NodeId] {
+        self.edges
+    }
+
+    /// Guarded neighbor range for `node`; empty for out-of-range nodes or
+    /// corrupt offsets. Semantics identical to [`Graph::neighbors`].
+    #[inline(always)]
+    pub fn neighbor_range(&self, node: NodeId) -> Range<usize> {
+        neighbor_range_guarded(self.offsets, self.num_nodes, self.num_edges, node)
+    }
+
+    /// Guarded neighbor slice for `node`; empty for out-of-range nodes or
+    /// corrupt offsets. Semantics identical to [`Graph::neighbors`].
+    #[inline(always)]
+    pub fn neighbors(&self, node: NodeId) -> &'a [NodeId] {
+        &self.edges[self.neighbor_range(node)]
+    }
+}
+
 impl Graph {
     /// Create an empty placeholder graph.
     ///
@@ -203,26 +279,10 @@ impl Graph {
         weights_range: Option<Range<usize>>,
     ) -> Self {
         let base = mmap.as_ptr() as usize;
-        assert!(
-            (base + offsets_range.start).is_multiple_of(std::mem::align_of::<EdgeOffset>())
-                && offsets_range
-                    .len()
-                    .is_multiple_of(std::mem::size_of::<EdgeOffset>()),
-            "mmap offsets range misaligned for u64"
-        );
-        assert!(
-            (base + edges_range.start).is_multiple_of(std::mem::align_of::<NodeId>())
-                && edges_range
-                    .len()
-                    .is_multiple_of(std::mem::size_of::<NodeId>()),
-            "mmap edges range misaligned for u32"
-        );
+        assert_range_aligned::<EdgeOffset>(base, &offsets_range, "offsets");
+        assert_range_aligned::<NodeId>(base, &edges_range, "edges");
         if let Some(ref w) = weights_range {
-            assert!(
-                (base + w.start).is_multiple_of(std::mem::align_of::<f32>())
-                    && w.len().is_multiple_of(std::mem::size_of::<f32>()),
-                "mmap weights range misaligned for f32"
-            );
+            assert_range_aligned::<f32>(base, w, "weights");
         }
         Self {
             num_nodes,
@@ -468,18 +528,19 @@ impl Graph {
     /// Returns the neighbor range for a node in the edges array.
     #[inline(always)]
     fn neighbor_range(&self, node: NodeId) -> Range<usize> {
-        let idx = node as usize;
-        if idx >= self.num_nodes {
-            return 0..0;
+        neighbor_range_guarded(self.offsets_slice(), self.num_nodes, self.num_edges, node)
+    }
+
+    /// Returns a borrowed [`CsrView`] with the storage dispatch resolved
+    /// once, for loops that access many nodes' neighbor lists.
+    #[inline(always)]
+    pub fn csr_view(&self) -> CsrView<'_> {
+        CsrView {
+            offsets: self.offsets_slice(),
+            edges: self.edges_slice(),
+            num_nodes: self.num_nodes,
+            num_edges: self.num_edges,
         }
-        let offsets = self.offsets_slice();
-        // Safe indexing: bounds are verified by construction (offsets.len() == num_nodes + 1)
-        let start = offsets[idx] as usize;
-        let end = offsets[idx + 1] as usize;
-        if start > end || end > self.num_edges {
-            return 0..0;
-        }
-        start..end
     }
 
     /// Returns the starting edge offset for a node (for computing global edge IDs).
@@ -727,18 +788,10 @@ impl Graph {
                 offsets_range,
                 ..
             } => {
-                let bytes = &mmap[offsets_range.start..offsets_range.end];
-                // SAFETY: alignment and length divisibility were asserted
-                // once in `from_mapped_parts`; the mmap is immutable and
-                // outlives `self` via the Arc. Re-checking per call would
-                // put an alignment test and division in the sampler's
-                // per-node path.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        bytes.as_ptr() as *const EdgeOffset,
-                        bytes.len() / std::mem::size_of::<EdgeOffset>(),
-                    )
-                }
+                // SAFETY: `from_mapped_parts` asserted this range aligned
+                // and sized for `EdgeOffset` (see `typed_slice`'s contract);
+                // the mmap is immutable and outlives `self` via the Arc.
+                unsafe { typed_slice::<EdgeOffset>(&mmap[offsets_range.start..offsets_range.end]) }
             }
         }
     }
@@ -750,14 +803,10 @@ impl Graph {
             GraphStorage::Mapped {
                 mmap, edges_range, ..
             } => {
-                let bytes = &mmap[edges_range.start..edges_range.end];
-                // SAFETY: see `offsets_slice` — validated at construction.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        bytes.as_ptr() as *const NodeId,
-                        bytes.len() / std::mem::size_of::<NodeId>(),
-                    )
-                }
+                // SAFETY: `from_mapped_parts` asserted this range aligned
+                // and sized for `NodeId` (see `typed_slice`'s contract);
+                // the mmap is immutable and outlives `self` via the Arc.
+                unsafe { typed_slice::<NodeId>(&mmap[edges_range.start..edges_range.end]) }
             }
         }
     }
@@ -771,16 +820,48 @@ impl Graph {
                 weights_range,
                 ..
             } => weights_range.as_ref().map(|range| {
-                let bytes = &mmap[range.start..range.end];
-                // SAFETY: see `offsets_slice` — validated at construction.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        bytes.as_ptr() as *const f32,
-                        bytes.len() / std::mem::size_of::<f32>(),
-                    )
-                }
+                // SAFETY: `from_mapped_parts` asserted this range aligned
+                // and sized for `f32` (see `typed_slice`'s contract); the
+                // mmap is immutable and outlives `self` via the Arc.
+                unsafe { typed_slice::<f32>(&mmap[range.start..range.end]) }
             }),
         }
+    }
+}
+
+/// Assert that an mmap byte range starts aligned for `T` and spans a whole
+/// number of `T`s. Runs once per range at [`Graph::from_mapped_parts`] so
+/// [`typed_slice`] can skip per-call re-validation — re-checking on every
+/// access would put an alignment test and division in the sampler's
+/// per-node path.
+fn assert_range_aligned<T>(base: usize, range: &Range<usize>, what: &str) {
+    assert!(
+        (base + range.start).is_multiple_of(std::mem::align_of::<T>())
+            && range.len().is_multiple_of(std::mem::size_of::<T>()),
+        "mmap {what} range misaligned for {}",
+        std::any::type_name::<T>()
+    );
+}
+
+/// Reinterpret an mmap byte range as a typed slice.
+///
+/// # Safety
+/// - `bytes` must start aligned for `T` and its length must be a multiple of
+///   `size_of::<T>()` — [`assert_range_aligned`] establishes both, once per
+///   range, in [`Graph::from_mapped_parts`].
+/// - The backing memory must be immutable and outlive the returned slice
+///   (the `Graph` holds the mmap via `Arc`, and the slice borrows `bytes`).
+///
+/// The `bytemuck::Pod` bound guarantees every bit pattern is a valid `T`.
+#[inline(always)]
+unsafe fn typed_slice<T: bytemuck::Pod>(bytes: &[u8]) -> &[T] {
+    // SAFETY: alignment, size divisibility, immutability, and lifetime are
+    // the caller's contract, stated above.
+    unsafe {
+        std::slice::from_raw_parts(
+            bytes.as_ptr() as *const T,
+            bytes.len() / std::mem::size_of::<T>(),
+        )
     }
 }
 

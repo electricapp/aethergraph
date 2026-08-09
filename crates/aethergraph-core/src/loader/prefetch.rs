@@ -35,9 +35,13 @@
 //!    - Falls back when SQPOLL unavailable (permissions, old kernel)
 //!    - Still faster than sequential sync I/O due to batching
 
+use super::hetero_sampler::{HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig};
 use super::sampler::{NeighborSampler, SampledSubgraph, SamplingConfig};
 use crate::features::header::{FeatureDtype, parse_feature_header};
+use crate::graph::hetero::{HeteroGraph, NodeTypeId};
 use crate::graph::{Graph, NodeId};
+#[cfg(target_os = "linux")]
+use crate::internal::genstamp::WyRand;
 use crate::internal::hint;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use half::f16;
@@ -97,6 +101,15 @@ pub struct PrefetchResult {
     pub features: Option<anyhow::Result<Vec<f32>>>,
     /// Feature dimension (if a feature column is attached)
     pub feature_dim: Option<usize>,
+}
+
+/// Completed hetero prefetch result.
+#[derive(Debug)]
+pub struct HeteroPrefetchResult {
+    /// Batch index
+    pub batch_idx: usize,
+    /// Sampled heterogeneous subgraph
+    pub subgraph: HeteroSampledSubgraph,
 }
 
 /// A sampled subgraph paired with its features. The feature slot is `Some`
@@ -381,10 +394,11 @@ impl SyncFeatureStore {
         self.batch_read_sync(nodes, feature_size)
     }
 
-    /// Batch read using io_uring with proper SQPOLL and the lane's
-    /// persistent aligned buffers — no per-batch aligned allocation, one
-    /// pipelined submission for the whole batch, rows decoded straight into
-    /// the output vector.
+    /// Batch read using io_uring: bounds-checks `nodes`, then gathers and
+    /// decodes through [`crate::features::gather::uring_gather_rows`]
+    /// (shared with `AsyncFeatureStore`) — the lane's persistent buffers
+    /// land the reads, one pipelined submission covers the whole batch,
+    /// and rows decode straight into the output vector.
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     fn batch_read_uring_aligned(
@@ -398,12 +412,6 @@ impl SyncFeatureStore {
         dtype: FeatureDtype,
         feature_dim: usize,
     ) -> anyhow::Result<Vec<f32>> {
-        use crate::internal::uring::batch_read;
-
-        if nodes.is_empty() {
-            return Ok(Vec::new());
-        }
-
         // Validate all nodes first
         for &node in nodes {
             if node as usize >= num_nodes {
@@ -411,75 +419,16 @@ impl SyncFeatureStore {
             }
         }
 
-        let fd = file.as_raw_fd();
-        let mut features = vec![0f32; nodes.len() * feature_dim];
-
-        if direct_io {
-            let total_slots = nodes.len();
-            let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(total_slots);
-            {
-                let pool = lane.direct_pool(total_slots, feature_size)?;
-                for (i, &node) in nodes.iter().enumerate() {
-                    let file_offset = features_start_offset + (node as u64 * feature_size as u64);
-                    reads.push((file_offset, pool.slot_ptr(i), feature_size));
-                }
-            }
-            // SAFETY: each ptr points into the lane's pool, which outlives
-            // this call; batch_read reaps every submitted completion before
-            // returning — on success AND on error.
-            batch_read(&mut lane.handle, fd, &reads)?;
-
-            let pool = lane.direct_pool(total_slots, feature_size)?;
-            for i in 0..total_slots {
-                let row = pool.slot_slice(i, feature_size);
-                let dst = &mut features[i * feature_dim..(i + 1) * feature_dim];
-                match dtype {
-                    FeatureDtype::F32 => {
-                        dst.copy_from_slice(bytemuck::cast_slice::<u8, f32>(row));
-                    }
-                    FeatureDtype::F16 => {
-                        crate::internal::simd::f16_le_to_f32(row, dst);
-                    }
-                }
-            }
-        } else {
-            let total_size = nodes.len().checked_mul(feature_size).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "buffer size overflow: {} nodes * {} bytes",
-                    nodes.len(),
-                    feature_size
-                )
-            })?;
-            let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
-            {
-                let scratch = lane.scratch(total_size);
-                let base = scratch.as_mut_ptr();
-                for (i, &node) in nodes.iter().enumerate() {
-                    let file_offset = features_start_offset + (node as u64 * feature_size as u64);
-                    // SAFETY: `i < nodes.len()` and the scratch spans
-                    // `nodes.len() * feature_size` bytes.
-                    let buf_ptr = unsafe { base.add(i * feature_size) };
-                    reads.push((file_offset, buf_ptr, feature_size));
-                }
-            }
-            // SAFETY: every ptr points into the lane's scratch, which
-            // outlives this call; batch_read reaps every submitted
-            // completion before returning.
-            batch_read(&mut lane.handle, fd, &reads)?;
-
-            let scratch = lane.scratch(total_size);
-            match dtype {
-                FeatureDtype::F32 => {
-                    bytemuck::cast_slice_mut::<f32, u8>(&mut features)
-                        .copy_from_slice(&scratch[..total_size]);
-                }
-                FeatureDtype::F16 => {
-                    crate::internal::simd::f16_le_to_f32(&scratch[..total_size], &mut features);
-                }
-            }
-        }
-
-        Ok(features)
+        crate::features::gather::uring_gather_rows(
+            lane,
+            file.as_raw_fd(),
+            nodes,
+            features_start_offset,
+            feature_size,
+            direct_io,
+            dtype,
+            feature_dim,
+        )
     }
 
     /// Sync batch read fallback.
@@ -602,6 +551,58 @@ fn worker_loop_sampler(
     }
 
     debug!("Sampler thread stopped");
+}
+
+/// Sampler worker loop for the hetero pool.
+///
+/// Each worker owns its own [`HeteroNeighborSampler`] (the sampler's scratch
+/// buffers are per-instance) over the shared `Arc<HeteroGraph>` and drains
+/// the MPMC work channel until it closes or shutdown is requested.
+fn worker_loop_hetero(
+    graph: Arc<HeteroGraph>,
+    config: HeteroSamplingConfig,
+    seed_type: NodeTypeId,
+    work_rx: Receiver<PrefetchWork>,
+    result_tx: Sender<HeteroPrefetchResult>,
+    shutdown: Arc<AtomicBool>,
+    stats: Arc<PrefetchStats>,
+) {
+    debug!("Hetero sampler thread started");
+    let mut sampler = HeteroNeighborSampler::new(&graph, config);
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let work = match work_rx.recv() {
+            Ok(w) => w,
+            Err(_) => break,
+        };
+
+        trace!(
+            batch_idx = work.batch_idx,
+            seeds = work.seeds.len(),
+            "hetero sampling"
+        );
+        let t0 = std::time::Instant::now();
+        let subgraph = sampler.sample_neighbors(seed_type, &work.seeds);
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        stats
+            .sample_time_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        let result = HeteroPrefetchResult {
+            batch_idx: work.batch_idx,
+            subgraph,
+        };
+
+        if result_tx.send(result).is_err() {
+            break;
+        }
+    }
+
+    debug!("Hetero sampler thread stopped");
 }
 
 /// Feature-loader worker loop for the two-thread pipeline.
@@ -1516,6 +1517,275 @@ impl Drop for NeighborLoader {
     }
 }
 
+/// Prefetching heterogeneous neighbor sampler.
+///
+/// Same pipeline shape as [`NeighborLoader`]: `sampler_threads` worker
+/// threads pull seed batches from a bounded MPMC work channel, sample with
+/// their own [`HeteroNeighborSampler`], and deliver results tagged with
+/// their `batch_idx` — unordered across the pool, no reorder buffer. The
+/// seed node type is fixed at construction; every submitted batch is rooted
+/// at it.
+pub struct HeteroNeighborLoader {
+    /// Send work to the sampler pool (Option so we can take it on shutdown)
+    work_tx: Option<Sender<PrefetchWork>>,
+    /// Receive results from the pool (Option so shutdown can drop it and
+    /// unblock a worker mid-`send` on a full result channel)
+    result_rx: Option<Receiver<HeteroPrefetchResult>>,
+    /// Shutdown signal
+    shutdown: Arc<AtomicBool>,
+    /// Sampler thread handles
+    handles: Vec<JoinHandle<()>>,
+    /// Statistics
+    stats: Arc<PrefetchStats>,
+    /// Prefetch depth
+    prefetch_depth: usize,
+    /// Why a worker exited on its own (captured panic or error), if it did
+    worker_fault: Arc<Mutex<Option<String>>>,
+}
+
+impl HeteroNeighborLoader {
+    /// Create a prefetching sampler over an in-memory [`HeteroGraph`].
+    ///
+    /// # Arguments
+    /// * `graph` - Arc to the heterogeneous graph (shared with the workers)
+    /// * `config` - Sampling configuration (per-edge-type fanout per hop)
+    /// * `seed_type` - Node type every submitted seed batch is rooted at
+    /// * `prefetch_depth` - How many batches to keep ready (default: 2-3)
+    /// * `sampler_threads` - Sampler worker count (0 is treated as 1). The
+    ///   work channel is MPMC and results carry their `batch_idx`, so extra
+    ///   workers scale sampling throughput with no ordering machinery —
+    ///   consumers must already match results by content, not arrival order.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if `prefetch_depth` is 0 or `seed_type` is not
+    /// a node type of `graph`, and an error if a sampler thread cannot be
+    /// spawned.
+    #[tracing::instrument(
+        skip(graph, config),
+        fields(node_types = graph.node_type_count(), prefetch_depth)
+    )]
+    pub fn new(
+        graph: Arc<HeteroGraph>,
+        config: HeteroSamplingConfig,
+        seed_type: NodeTypeId,
+        prefetch_depth: usize,
+        sampler_threads: usize,
+    ) -> std::io::Result<Self> {
+        if prefetch_depth == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prefetch_depth must be >= 1",
+            ));
+        }
+        if (seed_type as usize) >= graph.node_type_count() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "seed_type {} out of range ({} node types)",
+                    seed_type,
+                    graph.node_type_count()
+                ),
+            ));
+        }
+        let sampler_threads = sampler_threads.max(1);
+
+        // Same bounding strategy as `NeighborLoader::new`:
+        //   - work channel  : producer blocks when the workers fall behind
+        //                     by more than `prefetch_depth * 8` submitted
+        //                     batches, preventing unbounded RAM growth.
+        //   - result channel: workers block when the consumer falls behind;
+        //                     at least one slot per sampler so a burst of
+        //                     simultaneous completions doesn't immediately
+        //                     block the pool.
+        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
+        let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
+        let (result_tx, result_rx) =
+            bounded::<HeteroPrefetchResult>(prefetch_depth.max(sampler_threads));
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(PrefetchStats::default());
+        let worker_fault = Arc::new(Mutex::new(None));
+
+        let mut handles = Vec::with_capacity(sampler_threads);
+        for t in 0..sampler_threads {
+            let shutdown = shutdown.clone();
+            let stats = stats.clone();
+            let fault = worker_fault.clone();
+            let graph = Arc::clone(&graph);
+            let config = config.clone();
+            let work_rx = work_rx.clone();
+            let result_tx = result_tx.clone();
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("aethergraph-hetero-sampler-{t}"))
+                    .spawn(move || {
+                        run_worker(&fault, move || {
+                            worker_loop_hetero(
+                                graph, config, seed_type, work_rx, result_tx, shutdown, stats,
+                            );
+                            Ok(())
+                        });
+                    })?,
+            );
+        }
+        // The workers own the only result senders after this point, so the
+        // consumer's recv disconnects when they all exit.
+        drop(result_tx);
+
+        debug!(
+            prefetch_depth,
+            sampler_threads, "HeteroNeighborLoader started (sampler pool)"
+        );
+
+        Ok(Self {
+            work_tx: Some(work_tx),
+            result_rx: Some(result_rx),
+            shutdown,
+            handles,
+            stats,
+            prefetch_depth,
+            worker_fault,
+        })
+    }
+
+    /// Submit a batch to be sampled.
+    pub fn submit(&self, batch_idx: usize, seeds: Vec<NodeId>) -> Result<(), SubmitError> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(SubmitError::Shutdown);
+        }
+        match &self.work_tx {
+            Some(tx) => tx
+                .send(PrefetchWork { batch_idx, seeds })
+                .map_err(|_| SubmitError::ChannelClosed),
+            None => Err(SubmitError::Shutdown),
+        }
+    }
+
+    /// Get next sampled subgraph (blocking).
+    ///
+    /// Returns:
+    /// - `Ok(Some(_))` when a batch is ready.
+    /// - `Ok(None)` after `shutdown()` — the clean end-of-stream state.
+    /// - `Err(PrefetchError::Timeout { .. })` when no result arrived within
+    ///   30s (logged at warn); the workers may just be slow, so the caller
+    ///   may call again.
+    /// - `Err(PrefetchError::WorkerExited { .. })` when the workers exited
+    ///   without `shutdown()` being requested (panic or internal error).
+    pub fn next(&self) -> Result<Option<HeteroSampledSubgraph>, PrefetchError> {
+        Ok(self.next_timeout(RECV_TIMEOUT)?.map(|r| r.subgraph))
+    }
+
+    /// Blocking receive with an explicit wait window (shared by the
+    /// `next*` methods).
+    fn next_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<HeteroPrefetchResult>, PrefetchError> {
+        let Some(result_rx) = self.result_rx.as_ref() else {
+            return Ok(None);
+        };
+        self.stats.total.fetch_add(1, Ordering::Relaxed);
+
+        // Try non-blocking first to track hit rate
+        match result_rx.try_recv() {
+            Ok(result) => {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                trace!(batch_idx = result.batch_idx, "hetero prefetch hit");
+                Ok(Some(result))
+            }
+            Err(TryRecvError::Empty) => {
+                // Cache miss - need to wait (with timeout to detect issues)
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                trace!("hetero prefetch miss - blocking");
+                match result_rx.recv_timeout(timeout) {
+                    Ok(r) => Ok(Some(r)),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        warn!(
+                            "Hetero prefetch timeout after {:?} - workers may have deadlocked or are very slow",
+                            timeout
+                        );
+                        Err(PrefetchError::Timeout { waited: timeout })
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => self.disconnected(),
+                }
+            }
+            Err(TryRecvError::Disconnected) => self.disconnected(),
+        }
+    }
+
+    /// Maps a disconnected result channel to its meaning: clean end of
+    /// stream when shutdown was requested, worker death otherwise.
+    fn disconnected(&self) -> Result<Option<HeteroPrefetchResult>, PrefetchError> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            debug!("hetero prefetch channel disconnected - loader shut down");
+            Ok(None)
+        } else {
+            Err(PrefetchError::WorkerExited {
+                message: self
+                    .worker_fault
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            })
+        }
+    }
+
+    /// Try to get next without blocking.
+    ///
+    /// Returns `Ok(None)` when no batch is ready yet or the loader has been
+    /// shut down, and `Err(PrefetchError::WorkerExited { .. })` when the
+    /// workers exited without `shutdown()` being requested.
+    pub fn try_next(&self) -> Result<Option<HeteroSampledSubgraph>, PrefetchError> {
+        let Some(result_rx) = self.result_rx.as_ref() else {
+            return Ok(None);
+        };
+        match result_rx.try_recv() {
+            Ok(result) => {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.total.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(result.subgraph))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => self.disconnected().map(|r| r.map(|r| r.subgraph)),
+        }
+    }
+
+    /// Get statistics.
+    pub fn stats(&self) -> &PrefetchStats {
+        &self.stats
+    }
+
+    /// Get prefetch depth.
+    pub fn prefetch_depth(&self) -> usize {
+        self.prefetch_depth
+    }
+
+    /// Shutdown the sampler pool.
+    ///
+    /// Closes the work channel, drops the result receiver so a worker blocked
+    /// mid-`send` on a full result channel unblocks, then joins the workers.
+    /// Undelivered results are discarded; subsequent consumer calls return
+    /// `Ok(None)`.
+    #[tracing::instrument(skip(self), fields(num_handles = self.handles.len()))]
+    pub fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        // Drop sender to unblock workers waiting for work (take it so the
+        // channel actually closes)
+        drop(self.work_tx.take());
+        // Drop receiver to unblock workers waiting to deliver a result
+        drop(self.result_rx.take());
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for HeteroNeighborLoader {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// io_uring-based k-hop sampling for NVMe graphs.
 ///
 /// This path honors `fanout`, `replace`, `cumulative`, and `seed`. Edge ids
@@ -1683,27 +1953,6 @@ fn batch_read_neighbors_uring(
     Ok((flat, spans))
 }
 
-/// Fast PRNG (same as in sampler.rs)
-#[cfg(target_os = "linux")]
-#[derive(Clone)]
-struct WyRand {
-    state: u64,
-}
-
-#[cfg(target_os = "linux")]
-impl WyRand {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    #[inline(always)]
-    fn next_u32(&mut self) -> u32 {
-        self.state = self.state.wrapping_add(0xa0761d6478bd642f);
-        let t = (self.state as u128).wrapping_mul((self.state ^ 0xe7037ed1a0b428db) as u128);
-        ((t >> 64) ^ t) as u32
-    }
-}
-
 /// Sample k neighbor indices using Lemire's method.
 /// Returns indices into the neighbors array, not the actual neighbor values.
 #[cfg(target_os = "linux")]
@@ -1840,6 +2089,56 @@ mod tests {
             assert!(!seen[r.batch_idx], "batch {} delivered twice", r.batch_idx);
             seen[r.batch_idx] = true;
             assert_eq!(r.subgraph.num_seeds(), 1);
+        }
+        assert!(seen.iter().all(|&s| s), "missing batches: {seen:?}");
+    }
+
+    fn create_test_hetero_graph() -> Arc<HeteroGraph> {
+        let mut edges = Vec::new();
+        for user in 0u32..50 {
+            for post in 0u32..4 {
+                edges.push((user, post));
+            }
+        }
+        let csr = Graph::from_edges(100, &edges, None).unwrap();
+        Arc::new(HeteroGraph::from_parts(
+            vec![("user".into(), 100), ("post".into(), 100)],
+            vec![("user".into(), "votes".into(), "post".into(), csr)],
+        ))
+    }
+
+    #[test]
+    fn hetero_multi_thread_sampler_pool_delivers_every_batch() {
+        let graph = create_test_hetero_graph();
+        let config = HeteroSamplingConfig {
+            fanout: vec![vec![2]],
+            replace: false,
+            seed: Some(7),
+            max_degree: None,
+            num_hops: 1,
+        };
+        let user_type: NodeTypeId = 0;
+
+        let loader = HeteroNeighborLoader::new(graph, config, user_type, 4, 4).unwrap();
+        // Stay inside the bounded work channel (prefetch_depth * 8): the
+        // producer here is also the consumer, so overfilling would just be
+        // backpressure deadlocking the test, not a pool property.
+        let n = 24usize;
+        for i in 0..n {
+            loader.submit(i, vec![(i % 50) as u32]).unwrap();
+        }
+
+        // Results may arrive in any order across the pool; every batch
+        // index must arrive exactly once with a valid subgraph.
+        let mut seen = vec![false; n];
+        for _ in 0..n {
+            let r = loader
+                .next_timeout(Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            assert!(!seen[r.batch_idx], "batch {} delivered twice", r.batch_idx);
+            seen[r.batch_idx] = true;
+            assert_eq!(r.subgraph.seeds, vec![(r.batch_idx % 50) as u32]);
         }
         assert!(seen.iter().all(|&s| s), "missing batches: {seen:?}");
     }

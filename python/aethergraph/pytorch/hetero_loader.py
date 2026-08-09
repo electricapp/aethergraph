@@ -7,10 +7,7 @@ sampling backend.
 
 from __future__ import annotations
 
-import queue
-import threading
 import time
-import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -34,33 +31,16 @@ except ImportError as e:
         "Install with: pip install aethergraph[pytorch-geometric]"
     ) from e
 
-from aethergraph._core import HeteroNeighborSampler as RustHeteroSampler
+from aethergraph._core import HeteroNeighborLoader as RustHeteroLoader
 from aethergraph._core import HeteroSampledSubgraph as RustHeteroSubgraph
 from aethergraph._core import HeteroSamplingConfig as RustHeteroSamplingConfig
-from aethergraph.pytorch.loader import make_batch_getter, normalize_input_nodes
+from aethergraph.pytorch.loader import _parse_features, make_batch_getter, normalize_input_nodes
 from aethergraph.tracing import get_tracer
 
 if TYPE_CHECKING:
     from aethergraph.hetero_graph import HeteroGraph
 
 __all__ = ["HeteroLoaderMetrics", "HeteroNeighborLoader"]
-
-
-@dataclass(frozen=True)
-class _WorkerDone:
-    """The sampling thread produced every batch it was asked for."""
-
-
-@dataclass(frozen=True)
-class _WorkerError:
-    """The sampling thread died; the consumer re-raises its exception."""
-
-    exc: Exception
-
-
-_WorkerMessage = RustHeteroSubgraph | _WorkerDone | _WorkerError
-"""One message on the prefetch queue, discriminated by type — the consumer
-dispatches with ``match``, so a malformed message cannot be expressed."""
 
 
 @dataclass
@@ -93,12 +73,14 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
     Drop-in replacement for PyG's NeighborLoader with HeteroData.
     Uses AetherGraph's Rust sampling backend for multi-relational graphs.
 
-    Sampling runs on a background thread with a bounded queue: the Rust
-    sampler releases the GIL, so batch N+1 through N+prefetch_factor are
-    sampled while Python converts and trains on batch N.
+    Sampling runs in the Rust ``HeteroNeighborLoader`` pipeline — the same
+    worker pool behind bounded channels the homogeneous loader uses — so
+    batch N+1 through N+prefetch_factor are sampled while Python converts
+    and trains on batch N.
 
-    The loader handles parallelism internally via Rust, so num_workers
-    must be 0.
+    Parallelism lives in Rust: ``num_workers`` sizes the sampler thread
+    pool (PyG-compatible semantics, but threads in the Rust backend instead
+    of DataLoader worker processes).
 
     Attributes:
         graph: The heterogeneous graph to sample from.
@@ -169,10 +151,14 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
             batch_size: Number of seed nodes per batch.
             shuffle: Whether to shuffle seed nodes between epochs.
             replace: Whether to sample neighbors with replacement.
-            num_workers: Must be 0. AetherGraph handles parallelism internally.
+            num_workers: Number of Rust sampler threads feeding the
+                prefetch pipeline (PyG-compatible semantics, but threads in
+                the Rust backend instead of DataLoader worker processes).
+                0 and 1 both mean a single sampler thread; higher values
+                scale sampling throughput when sampling is the bottleneck.
             pin_memory: If True, tensors are allocated in pinned memory for
                 faster async GPU transfers.
-            prefetch_factor: Number of batches the background sampling thread
+            prefetch_factor: Number of batches the Rust prefetch pipeline
                 keeps ready ahead of the consumer.
             seed: Random seed for sampling reproducibility (passed to Rust).
             max_degree: Maximum degree cap for hub nodes.
@@ -182,17 +168,18 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                 re-converts dtypes.
 
         Raises:
-            ValueError: If input_nodes is None or has invalid format.
-            UserWarning: If num_workers is non-zero.
+            ValueError: If input_nodes is None or has invalid format, or if
+                ``num_workers`` is negative.
         """
         super().__init__()
 
-        if num_workers != 0:
-            warnings.warn(
-                "num_workers must be 0 for AetherGraph (Rust handles parallelism)",
-                UserWarning,
-                stacklevel=2,
-            )
+        if num_workers < 0:
+            raise ValueError(f"num_workers must be >= 0, got {num_workers}")
+        # PyG semantics, Rust execution: instead of forking DataLoader
+        # worker processes, num_workers sizes the Rust sampler thread pool
+        # feeding the prefetch pipeline. 0 keeps the single-threaded
+        # pipeline (sampling still overlaps training).
+        self._sampler_threads: int = max(1, num_workers)
 
         if input_nodes is None:
             raise ValueError(
@@ -220,14 +207,12 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         self._max_degree = max_degree
 
         # Parse features once into their canonical form: zero-copy torch
-        # views over contiguous float32 arrays — the one representation the
-        # per-batch gather consumes. Without this, a float64 input would
-        # silently pay a full astype on every batch for every node type.
+        # views over contiguous float32 arrays, shape-checked against each
+        # type's node count — the one representation the per-batch gather
+        # consumes. `_parse_features` is the same edge parser the
+        # homogeneous loader uses.
         self._feat_torch: dict[str, torch.Tensor] | None = (
-            {
-                k: torch.from_numpy(np.ascontiguousarray(v, dtype=np.float32))
-                for k, v in features.items()
-            }
+            {k: _parse_features(v, data.num_nodes(k)) for k, v in features.items()}
             if features is not None
             else None
         )
@@ -268,9 +253,11 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
     def __iter__(self) -> Iterator[HeteroData]:
         """Iterate over batches of sampled heterogeneous subgraphs.
 
-        Sampling runs on a background thread: `RustHeteroSampler.sample`
-        releases the GIL, so up to ``prefetch_factor`` batches are sampled
-        ahead while the consumer converts and trains on the current one.
+        Uses the same sliding-window prefetch strategy as the homogeneous
+        loader: ``prefetch_factor`` batches are primed into the Rust
+        ``HeteroNeighborLoader`` pipeline, then each received batch is
+        replaced by the next submission, so the Rust worker pool samples
+        ahead while the consumer converts and trains on the current batch.
 
         Yields:
             PyG HeteroData objects with per-type attributes:
@@ -290,17 +277,24 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         rng = self._rng.spawn(1)[0]
         get_batch = make_batch_getter(self._input_nodes, num_nodes, batch_size, self.shuffle, rng)
 
-        # Build Rust config and sampler
+        # Build Rust config and prefetching loader
         rust_config = RustHeteroSamplingConfig(
             num_neighbors=self.num_neighbors,
             replace=self.replace,
             seed=self._seed,
             max_degree=self._max_degree,
         )
-        sampler = RustHeteroSampler(self.graph.csr, rust_config)
+        loader = RustHeteroLoader(
+            self.graph.csr,
+            rust_config,
+            self._seed_type,
+            prefetch_depth=self.prefetch_factor,
+            sampler_threads=self._sampler_threads,
+        )
 
         in_memory_features = self._feat_torch
         epoch_start = time.perf_counter()
+        submitted = 0
         received = 0
 
         tracer = get_tracer()
@@ -311,56 +305,31 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
             epoch_span.set_attribute("seed_type", self._seed_type)
             epoch_span.set_attribute("prefetch_factor", self.prefetch_factor)
 
-        # Background sampling: bounded queue keeps prefetch_factor batches
-        # in flight. The worker thread spends its time inside the GIL-free
-        # Rust sample call, so it genuinely overlaps the consumer.
-        results: queue.Queue[_WorkerMessage] = queue.Queue(maxsize=self.prefetch_factor)
-        stop = threading.Event()
-
-        def put_message(msg: _WorkerMessage) -> None:
-            while not stop.is_set():
-                try:
-                    results.put(msg, timeout=0.1)
-                    return
-                except queue.Full:
-                    continue
-
-        def sample_worker() -> None:
-            try:
-                for batch_idx in range(num_batches):
-                    if stop.is_set():
-                        return
-                    put_message(sampler.sample(self._seed_type, get_batch(batch_idx)))
-                put_message(_WorkerDone())
-            # Any worker failure must reach the consumer as the raised
-            # exception rather than dying silently on this thread.
-            except Exception as exc:  # noqa: BLE001
-                put_message(_WorkerError(exc))
-
-        worker = threading.Thread(
-            target=sample_worker, name="aethergraph-hetero-prefetch", daemon=True
-        )
-        worker.start()
-
         try:
+            while submitted < min(self.prefetch_factor, num_batches):
+                loader.submit(submitted, get_batch(submitted))
+                submitted += 1
+
             while received < num_batches:
-                match results.get():
-                    case _WorkerError(exc=exc):
-                        raise exc
-                    case _WorkerDone():
-                        raise RuntimeError(
-                            f"hetero sampler stopped early: received {received} "
-                            f"of {num_batches} batches"
-                        )
-                    case subgraph:
-                        received += 1
-                        data = self._to_pyg_hetero_data(subgraph, in_memory_features)
-                        if self.transform is not None:
-                            data = self.transform(data)
-                        yield data
+                subgraph = loader.next()
+                if subgraph is None:
+                    raise RuntimeError(
+                        f"hetero sampler stopped early: received {received} "
+                        f"of {num_batches} batches"
+                    )
+                received += 1
+
+                if submitted < num_batches:
+                    loader.submit(submitted, get_batch(submitted))
+                    submitted += 1
+
+                data = self._to_pyg_hetero_data(subgraph, in_memory_features)
+                if self.transform is not None:
+                    data = self.transform(data)
+                yield data
         finally:
-            stop.set()
-            worker.join()
+            stats = loader.stats()
+            loader.shutdown()
 
             total_time_ms = (time.perf_counter() - epoch_start) * 1000
             self._metrics = HeteroLoaderMetrics(
@@ -372,6 +341,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
             if epoch_span:
                 epoch_span.set_attribute("batches_processed", received)
                 epoch_span.set_attribute("total_time_ms", total_time_ms)
+                epoch_span.set_attribute("prefetch_hit_rate", stats.hit_rate)
                 epoch_span.end()
 
     def _to_pyg_hetero_data(

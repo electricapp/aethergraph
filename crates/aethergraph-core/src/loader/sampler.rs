@@ -7,6 +7,7 @@
 //! are assigned during sampling — no post-sort, no binary search.
 
 use crate::graph::{Graph, NodeId};
+use crate::internal::genstamp::{FRONTIER_PREFETCH_DIST, FloydStamps, GenDedup, GenSlots, WyRand};
 use crate::internal::telemetry::{SamplingTelemetry, SamplingTimer};
 
 /// Temporal sampling strategy.
@@ -35,31 +36,6 @@ pub enum SubgraphType {
     Bidirectional,
 }
 
-/// Ultra-fast wyrand PRNG - simpler and faster than xoshiro for our use case.
-/// Based on wyhash: https://github.com/wangyi-fudan/wyhash
-#[derive(Clone)]
-struct WyRand {
-    state: u64,
-}
-
-impl WyRand {
-    #[inline(always)]
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    #[inline(always)]
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0xa0761d6478bd642f);
-        let t = (self.state as u128).wrapping_mul((self.state ^ 0xe7037ed1a0b428db) as u128);
-        ((t >> 64) ^ t) as u64
-    }
-
-    #[inline(always)]
-    fn next_u32(&mut self) -> u32 {
-        self.next_u64() as u32
-    }
-}
 /// Exact `-ln(u)` for a random u64 mapped to a uniform `u` in (0, 1].
 ///
 /// The top 53 bits of `bits` form a uniform integer in `[0, 2^53)`; adding 1
@@ -76,6 +52,7 @@ fn fast_neg_ln_u64(bits: u64) -> f64 {
 
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::trace;
 
@@ -220,17 +197,10 @@ pub struct NeighborSampler<'a> {
     graph: &'a Graph,
     config: SamplingConfig,
     rng: WyRand,
-    /// Direct array path (selected by `use_direct`: <= 100K nodes, or a
-    /// sample estimated to touch > 1% of the graph). Each entry packs the
-    /// generation tag in the high 32 bits and the local index in the low 32,
-    /// so a dedup probe touches exactly one cache line instead of two
-    /// parallel arrays.
-    node_slot: Vec<u64>,
-    current_gen: u32,
-    /// HashMap path (large graphs).
-    local_index: FxHashMap<NodeId, u32>,
-    /// Whether to use direct array (true) or HashMap (false).
-    use_direct: bool,
+    /// Node dedup: dense generation-stamped slots (<= 100K nodes, or a
+    /// sample estimated to touch > 1% of the graph — one cache line per
+    /// probe) or an FxHashMap for sparser sampling patterns.
+    dedup: GenDedup,
     /// Nodes in discovery order.
     node_vec: Vec<NodeId>,
     /// Edge source nodes (global IDs, for subgraph filtering).
@@ -253,8 +223,7 @@ pub struct NeighborSampler<'a> {
     sample_buf: Vec<(NodeId, usize)>,
     /// Reusable Floyd scratch (small degree <= 256): generation stamps, so
     /// per-node reuse is a counter bump instead of an O(n) clear.
-    floyd_stamp: [u32; 256],
-    floyd_gen: u32,
+    floyd: FloydStamps,
     /// Reusable Floyd set (large degree > 256).
     seen_set: FxHashSet<usize>,
     /// Temporal: per-node time constraints (parallel to node_vec).
@@ -266,12 +235,6 @@ pub struct NeighborSampler<'a> {
     /// Weighted with-replace: reusable cumulative-distribution buffer.
     cumsum_buf: Vec<f64>,
 }
-
-/// How many frontier entries ahead the hop loop prefetches the CSR offsets
-/// (and, at half this distance, the first edge line). The dedup probes and
-/// neighbor-list reads are random-access and serially dependent without
-/// these hints.
-const FRONTIER_PREFETCH_DIST: usize = 4;
 
 impl<'a> NeighborSampler<'a> {
     /// Creates a new neighbor sampler.
@@ -303,14 +266,11 @@ impl<'a> NeighborSampler<'a> {
             graph,
             config,
             rng,
-            node_slot: if use_direct {
-                vec![0u64; num_nodes]
+            dedup: if use_direct {
+                GenDedup::Dense(GenSlots::new(num_nodes))
             } else {
-                Vec::new()
+                GenDedup::Map(FxHashMap::with_capacity_and_hasher(512, Default::default()))
             },
-            current_gen: 0,
-            local_index: FxHashMap::with_capacity_and_hasher(512, Default::default()),
-            use_direct,
             node_vec: Vec::with_capacity(512),
             edge_src_buf: Vec::with_capacity(2048),
             edge_dst_buf: Vec::with_capacity(2048),
@@ -321,8 +281,7 @@ impl<'a> NeighborSampler<'a> {
             frontier: Vec::with_capacity(512),
             next_frontier: Vec::with_capacity(4096),
             sample_buf: Vec::with_capacity(max_fanout),
-            floyd_stamp: [0u32; 256],
-            floyd_gen: 0,
+            floyd: FloydStamps::new(),
             seen_set: FxHashSet::with_capacity_and_hasher(max_fanout * 2, Default::default()),
             node_times: Vec::new(),
             temporal_filtered: Vec::with_capacity(max_fanout),
@@ -331,36 +290,13 @@ impl<'a> NeighborSampler<'a> {
         }
     }
 
-    /// Pack a generation tag and local index into one dedup-slot word.
-    #[inline(always)]
-    const fn pack_slot(generation: u32, idx: u32) -> u64 {
-        ((generation as u64) << 32) | idx as u64
-    }
-
     #[inline(always)]
     fn insert_node(&mut self, id: NodeId) -> u32 {
-        if self.use_direct {
-            let i = id as usize;
-            let slot = self.node_slot[i];
-            if (slot >> 32) as u32 == self.current_gen {
-                slot as u32
-            } else {
-                let idx = self.node_vec.len() as u32;
-                self.node_slot[i] = Self::pack_slot(self.current_gen, idx);
-                self.node_vec.push(id);
-                idx
-            }
-        } else {
-            let next_idx = self.node_vec.len() as u32;
-            match self.local_index.entry(id) {
-                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(next_idx);
-                    self.node_vec.push(id);
-                    next_idx
-                }
-            }
+        let (idx, is_new) = self.dedup.probe_or_insert(id, self.node_vec.len() as u32);
+        if is_new {
+            self.node_vec.push(id);
         }
+        idx
     }
 
     /// Register `id`, pushing it onto the next frontier when new. Returns
@@ -368,29 +304,12 @@ impl<'a> NeighborSampler<'a> {
     /// endpoint without any later lookup.
     #[inline(always)]
     fn insert_node_frontier(&mut self, id: NodeId) -> (u32, bool) {
-        if self.use_direct {
-            let i = id as usize;
-            let slot = self.node_slot[i];
-            if (slot >> 32) as u32 == self.current_gen {
-                return (slot as u32, false);
-            }
-            let idx = self.node_vec.len() as u32;
-            self.node_slot[i] = Self::pack_slot(self.current_gen, idx);
+        let (idx, is_new) = self.dedup.probe_or_insert(id, self.node_vec.len() as u32);
+        if is_new {
             self.node_vec.push(id);
             self.next_frontier.push((id, idx));
-            (idx, true)
-        } else {
-            let next_idx = self.node_vec.len() as u32;
-            match self.local_index.entry(id) {
-                std::collections::hash_map::Entry::Occupied(e) => (*e.get(), false),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(next_idx);
-                    self.node_vec.push(id);
-                    self.next_frontier.push((id, next_idx));
-                    (next_idx, true)
-                }
-            }
         }
+        (idx, is_new)
     }
 
     /// Sample k-hop neighborhoods for a batch of seed nodes.
@@ -456,21 +375,14 @@ impl<'a> NeighborSampler<'a> {
         let mut batch = Vec::with_capacity(est);
         let mut all_src_local = Vec::with_capacity(est);
         let mut all_dst_local = Vec::with_capacity(est);
+        let mut all_seed_locals = Vec::with_capacity(seeds.len());
         // Per-hop counts accumulated across every seed (PyG compatibility).
         let mut num_sampled_nodes = vec![0usize; num_hops];
         let mut num_sampled_edges = vec![0usize; num_hops];
 
         for (seed_idx, &seed) in seeds.iter().enumerate() {
             // Reset dedup state per seed (cheap: no dealloc, just counter bump or clear)
-            if self.use_direct {
-                self.current_gen = self.current_gen.wrapping_add(1);
-                if self.current_gen == 0 {
-                    self.node_slot.fill(0);
-                    self.current_gen = 1;
-                }
-            } else {
-                self.local_index.clear();
-            }
+            self.dedup.begin();
             self.node_vec.clear();
             self.edge_src_buf.clear();
             self.edge_dst_buf.clear();
@@ -496,8 +408,11 @@ impl<'a> NeighborSampler<'a> {
             });
 
             // Endpoint locals were recorded at emit time; only the per-seed
-            // block offset needs applying while concatenating.
+            // block offset needs applying while concatenating. The seed is
+            // the first node registered in its block, so its combined-array
+            // local index is the block offset plus its within-block index.
             let node_offset = all_nodes.len() as u32;
+            all_seed_locals.push(node_offset + seed_local);
             all_src_local.extend(self.src_local_buf.iter().map(|&l| l + node_offset));
             all_dst_local.extend(self.dst_local_buf.iter().map(|&l| l + node_offset));
 
@@ -518,17 +433,19 @@ impl<'a> NeighborSampler<'a> {
             seeds: seeds.to_vec(),
             num_sampled_nodes,
             num_sampled_edges,
-            local_index: FxHashMap::default(),
+            locals: Locals::Recorded {
+                src: all_src_local,
+                dst: all_dst_local,
+                seeds: all_seed_locals,
+            },
             batch: Some(batch),
-            precomputed_local: Some((all_src_local, all_dst_local)),
-            seed_locals: None,
         }
     }
 
     /// Run the hop loop over the current frontier, invoking `record` with
     /// `(hop, new_frontier_nodes, new_edges)` after each hop.
     ///
-    /// CSR slices are hoisted once per call so the inner loop indexes raw
+    /// A `CsrView` is hoisted once per call so the inner loop indexes raw
     /// arrays (no per-node storage dispatch), and upcoming frontier entries'
     /// offset words and first edge lines are prefetched ahead of use — the
     /// probes are random-access and otherwise serially dependent.
@@ -540,9 +457,10 @@ impl<'a> NeighborSampler<'a> {
     ) {
         use crate::internal::prefetch::prefetch_read;
 
-        let offsets = self.graph.offsets();
-        let edges = self.graph.edges();
-        let num_nodes = self.graph.num_nodes();
+        let csr = self.graph.csr_view();
+        let offsets = csr.offsets();
+        let edges = csr.edges();
+        let num_nodes = csr.num_nodes();
         let num_edges = edges.len();
         let weights = if self.config.weighted {
             self.graph.weights()
@@ -579,15 +497,11 @@ impl<'a> NeighborSampler<'a> {
                 }
 
                 let (node, node_local) = self.frontier[fi];
-                let i = node as usize;
-                if i >= num_nodes {
+                let range = csr.neighbor_range(node);
+                if range.is_empty() {
                     continue;
                 }
-                let start = offsets[i] as usize;
-                let end = offsets[i + 1] as usize;
-                if start >= end || end > num_edges {
-                    continue;
-                }
+                let (start, end) = (range.start, range.end);
                 let neighbors = &edges[start..end];
                 let edge_offset = start as u64;
 
@@ -642,15 +556,7 @@ impl<'a> NeighborSampler<'a> {
             is_temporal,
         );
 
-        if self.use_direct {
-            self.current_gen = self.current_gen.wrapping_add(1);
-            if self.current_gen == 0 {
-                self.node_slot.fill(0);
-                self.current_gen = 1;
-            }
-        } else {
-            self.local_index.clear();
-        }
+        self.dedup.begin();
         self.node_vec.clear();
         self.edge_src_buf.clear();
         self.edge_dst_buf.clear();
@@ -711,100 +617,73 @@ impl<'a> NeighborSampler<'a> {
 
         // Apply subgraph_type post-processing. Local endpoint indices were
         // recorded at emit time, so no per-edge map lookup happens on any
-        // path; the Induced filter builds its membership map alone.
-        let (edge_src, edge_dst, edge_ids, src_local, dst_local, local_index) =
-            match self.config.subgraph_type {
-                SubgraphType::Directional => (
-                    edge_src,
-                    edge_dst,
-                    edge_ids,
-                    src_local,
-                    dst_local,
-                    FxHashMap::default(),
-                ),
-                SubgraphType::Induced => {
-                    // Filter to only edges where both endpoints are in the
-                    // node set. local_index serves as the node set — O(1)
-                    // lookup. The local arrays are filtered in lockstep.
-                    let local_index: FxHashMap<NodeId, u32> = node_vec
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, &id)| (id, idx as u32))
-                        .collect();
+        // path; the Induced filter builds a transient membership map for
+        // itself alone and drops it once the edges are filtered.
+        let (edge_src, edge_dst, edge_ids, src_local, dst_local) = match self.config.subgraph_type {
+            SubgraphType::Directional => (edge_src, edge_dst, edge_ids, src_local, dst_local),
+            SubgraphType::Induced => {
+                // Filter to only edges where both endpoints are in the
+                // node set. `member` serves as the node set — O(1)
+                // lookup. The local arrays are filtered in lockstep.
+                let member: FxHashSet<NodeId> = node_vec.iter().copied().collect();
 
-                    let mut new_src = Vec::with_capacity(edge_src.len());
-                    let mut new_dst = Vec::with_capacity(edge_dst.len());
-                    let mut new_ids = if self.config.track_edge_ids {
-                        Vec::with_capacity(edge_ids.len())
-                    } else {
-                        Vec::new()
-                    };
-                    let mut new_src_local = Vec::with_capacity(src_local.len());
-                    let mut new_dst_local = Vec::with_capacity(dst_local.len());
+                let mut new_src = Vec::with_capacity(edge_src.len());
+                let mut new_dst = Vec::with_capacity(edge_dst.len());
+                let mut new_ids = if self.config.track_edge_ids {
+                    Vec::with_capacity(edge_ids.len())
+                } else {
+                    Vec::new()
+                };
+                let mut new_src_local = Vec::with_capacity(src_local.len());
+                let mut new_dst_local = Vec::with_capacity(dst_local.len());
 
-                    for i in 0..edge_src.len() {
-                        if local_index.contains_key(&edge_src[i])
-                            && local_index.contains_key(&edge_dst[i])
-                        {
-                            new_src.push(edge_src[i]);
-                            new_dst.push(edge_dst[i]);
-                            if self.config.track_edge_ids {
-                                new_ids.push(edge_ids[i]);
-                            }
-                            new_src_local.push(src_local[i]);
-                            new_dst_local.push(dst_local[i]);
+                for i in 0..edge_src.len() {
+                    if member.contains(&edge_src[i]) && member.contains(&edge_dst[i]) {
+                        new_src.push(edge_src[i]);
+                        new_dst.push(edge_dst[i]);
+                        if self.config.track_edge_ids {
+                            new_ids.push(edge_ids[i]);
                         }
+                        new_src_local.push(src_local[i]);
+                        new_dst_local.push(dst_local[i]);
                     }
-
-                    (
-                        new_src,
-                        new_dst,
-                        new_ids,
-                        new_src_local,
-                        new_dst_local,
-                        local_index,
-                    )
                 }
-                SubgraphType::Bidirectional => {
-                    // Add reverse edges
-                    let mut new_src = Vec::with_capacity(edge_src.len() * 2);
-                    let mut new_dst = Vec::with_capacity(edge_dst.len() * 2);
-                    let mut new_ids = if self.config.track_edge_ids {
-                        Vec::with_capacity(edge_ids.len() * 2)
-                    } else {
-                        Vec::new()
-                    };
-                    let mut new_src_local = Vec::with_capacity(src_local.len() * 2);
-                    let mut new_dst_local = Vec::with_capacity(dst_local.len() * 2);
 
-                    // Original edges
-                    new_src.extend_from_slice(&edge_src);
-                    new_dst.extend_from_slice(&edge_dst);
-                    if self.config.track_edge_ids {
-                        new_ids.extend_from_slice(&edge_ids);
-                    }
-                    new_src_local.extend_from_slice(&src_local);
-                    new_dst_local.extend_from_slice(&dst_local);
+                (new_src, new_dst, new_ids, new_src_local, new_dst_local)
+            }
+            SubgraphType::Bidirectional => {
+                // Add reverse edges
+                let mut new_src = Vec::with_capacity(edge_src.len() * 2);
+                let mut new_dst = Vec::with_capacity(edge_dst.len() * 2);
+                let mut new_ids = if self.config.track_edge_ids {
+                    Vec::with_capacity(edge_ids.len() * 2)
+                } else {
+                    Vec::new()
+                };
+                let mut new_src_local = Vec::with_capacity(src_local.len() * 2);
+                let mut new_dst_local = Vec::with_capacity(dst_local.len() * 2);
 
-                    // Reverse edges (edge_id for reverse is same as forward)
-                    new_src.extend_from_slice(&edge_dst);
-                    new_dst.extend_from_slice(&edge_src);
-                    if self.config.track_edge_ids {
-                        new_ids.extend_from_slice(&edge_ids);
-                    }
-                    new_src_local.extend_from_slice(&dst_local);
-                    new_dst_local.extend_from_slice(&src_local);
-
-                    (
-                        new_src,
-                        new_dst,
-                        new_ids,
-                        new_src_local,
-                        new_dst_local,
-                        FxHashMap::default(),
-                    )
+                // Original edges
+                new_src.extend_from_slice(&edge_src);
+                new_dst.extend_from_slice(&edge_dst);
+                if self.config.track_edge_ids {
+                    new_ids.extend_from_slice(&edge_ids);
                 }
-            };
+                new_src_local.extend_from_slice(&src_local);
+                new_dst_local.extend_from_slice(&dst_local);
+
+                // Reverse edges (edge_id for reverse is same as forward)
+                new_src.extend_from_slice(&edge_dst);
+                new_dst.extend_from_slice(&edge_src);
+                if self.config.track_edge_ids {
+                    new_ids.extend_from_slice(&edge_ids);
+                }
+                new_src_local.extend_from_slice(&dst_local);
+                new_dst_local.extend_from_slice(&src_local);
+
+                (new_src, new_dst, new_ids, new_src_local, new_dst_local)
+            }
+        };
 
         let subgraph = SampledSubgraph {
             nodes: node_vec,
@@ -814,10 +693,12 @@ impl<'a> NeighborSampler<'a> {
             seeds: seeds.to_vec(),
             num_sampled_nodes,
             num_sampled_edges,
-            local_index,
+            locals: Locals::Recorded {
+                src: src_local,
+                dst: dst_local,
+                seeds: seed_locals,
+            },
             batch: None,
-            precomputed_local: Some((src_local, dst_local)),
-            seed_locals: Some(seed_locals),
         };
 
         // Record telemetry if enabled (opt-in, zero overhead if None)
@@ -1066,21 +947,15 @@ impl<'a> NeighborSampler<'a> {
 
         if n <= 256 {
             // Stamp reuse is a counter bump, not an O(n) clear per node.
-            self.floyd_gen = self.floyd_gen.wrapping_add(1);
-            if self.floyd_gen == 0 {
-                self.floyd_stamp.fill(0);
-                self.floyd_gen = 1;
-            }
-            let stamp = self.floyd_gen;
+            self.floyd.begin();
             for i in (n - k)..n {
                 let s = (i + 1) as u64;
                 let x = self.rng.next_u32();
                 let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
-                let pick = if self.floyd_stamp[j] != stamp {
-                    self.floyd_stamp[j] = stamp;
+                let pick = if self.floyd.test_and_set(j) {
                     j
                 } else {
-                    self.floyd_stamp[i] = stamp;
+                    self.floyd.test_and_set(i);
                     i
                 };
                 self.emit_edge(src, src_local, neighbors[pick], edge_offset, pick, track);
@@ -1185,10 +1060,41 @@ impl<'a> NeighborSampler<'a> {
     }
 }
 
+/// Local endpoint index pair returned by
+/// [`SampledSubgraph::edge_index_local`]: `(src, dst)`, parallel to
+/// `edge_src`/`edge_dst`. Recorded indices are borrowed from the subgraph;
+/// indices derived for [`SampledSubgraph::from_parts`] subgraphs are owned.
+pub type LocalEdgeIndex<'a> = (Cow<'a, [u32]>, Cow<'a, [u32]>);
+
+/// Local-index data carried by a [`SampledSubgraph`], discriminated by
+/// provenance.
+///
+/// Every sampler path (directional, induced, bidirectional, disjoint)
+/// records local indices at emit time and produces [`Locals::Recorded`];
+/// [`SampledSubgraph::from_parts`] produces [`Locals::Lazy`], whose
+/// accessors derive the indices transiently per call from the `nodes`
+/// array. Accessors behave identically on repeated calls for both variants.
+#[derive(Debug, Clone)]
+enum Locals {
+    /// Local indices recorded during sampling: per-edge endpoint indices
+    /// (`src`/`dst`, parallel to `edge_src`/`edge_dst`) and per-seed
+    /// indices (`seeds`, parallel to the public `seeds` array).
+    Recorded {
+        src: Vec<u32>,
+        dst: Vec<u32>,
+        seeds: Vec<u32>,
+    },
+    /// No recorded indices; accessors build the global-to-local mapping
+    /// inside the call and store nothing.
+    Lazy,
+}
+
 /// A sampled subgraph containing nodes and edges.
 ///
-/// Nodes are stored in discovery order (not sorted). Local index lookups
-/// use an O(1) HashMap instead of O(log N) binary search.
+/// Nodes are stored in discovery order (not sorted). Sampler-produced
+/// subgraphs carry local endpoint and seed indices recorded at emit time;
+/// subgraphs rebuilt via [`SampledSubgraph::from_parts`] derive them on
+/// demand.
 #[derive(Debug, Clone)]
 pub struct SampledSubgraph {
     /// All nodes in the subgraph (discovery order)
@@ -1212,29 +1118,19 @@ pub struct SampledSubgraph {
     /// Number of edges sampled at each hop (for PyG compatibility)
     pub num_sampled_edges: Vec<usize>,
 
-    /// Local index map: global NodeId → position in `nodes` vec. Only
-    /// populated for subgraphs built via [`SampledSubgraph::from_parts`]
-    /// (external reconstruction) — sampler-produced subgraphs carry
-    /// pre-computed local indices instead.
-    local_index: FxHashMap<NodeId, u32>,
+    /// Local-index data, discriminated by provenance (see [`Locals`]).
+    locals: Locals,
 
     /// Per-node batch assignment (disjoint mode only). Maps each node to its seed index.
     pub batch: Option<Vec<u32>>,
-
-    /// Pre-computed local edge indices, recorded at emit time during
-    /// sampling. Always present on sampler-produced subgraphs.
-    precomputed_local: Option<(Vec<u32>, Vec<u32>)>,
-
-    /// Local indices of the seeds, captured at registration. Present on
-    /// non-disjoint sampler-produced subgraphs.
-    seed_locals: Option<Vec<u32>>,
 }
 
 impl SampledSubgraph {
-    /// Construct a SampledSubgraph, building the local_index from the nodes vec.
+    /// Construct a SampledSubgraph from its public fields.
     ///
-    /// This is intended for external callers (e.g., PyO3 round-trip) that need
-    /// to reconstruct a SampledSubgraph from its public fields.
+    /// This is intended for external callers (e.g., PyO3 round-trip) that
+    /// need to reconstruct a SampledSubgraph. The result carries no recorded
+    /// local indices ([`Locals::Lazy`]); accessors derive them per call.
     pub fn from_parts(
         nodes: Vec<NodeId>,
         edge_src: Vec<NodeId>,
@@ -1244,10 +1140,6 @@ impl SampledSubgraph {
         num_sampled_nodes: Vec<usize>,
         num_sampled_edges: Vec<usize>,
     ) -> Self {
-        let mut local_index = FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
-        for (i, &id) in nodes.iter().enumerate() {
-            local_index.insert(id, i as u32);
-        }
         Self {
             nodes,
             edge_src,
@@ -1256,10 +1148,8 @@ impl SampledSubgraph {
             seeds,
             num_sampled_nodes,
             num_sampled_edges,
-            local_index,
+            locals: Locals::Lazy,
             batch: None,
-            precomputed_local: None,
-            seed_locals: None,
         }
     }
 
@@ -1281,69 +1171,90 @@ impl SampledSubgraph {
         self.seeds.len()
     }
 
-    /// No-op for backward compatibility. Local indices are pre-computed during sampling.
+    /// No-op for backward compatibility. Nodes are in discovery order and
+    /// local indices are recorded at emit time (or derived on demand for
+    /// [`SampledSubgraph::from_parts`] subgraphs). Kept for API compatibility.
     pub fn sort_nodes(&mut self) {
-        // Intentionally empty — nodes are in discovery order and local_index
-        // provides O(1) lookups. Kept for API compatibility.
+        // Intentionally empty.
     }
 
-    /// Compute edge indices with local (remapped) node IDs in [0, num_nodes).
+    /// Transient global-to-local map for [`Locals::Lazy`] subgraphs, built
+    /// inside the accessor call and dropped with it.
+    fn lazy_local_index(&self) -> FxHashMap<NodeId, u32> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i as u32))
+            .collect()
+    }
+
+    /// Edge indices with local (remapped) node IDs in `[0, num_nodes)`.
     ///
-    /// Sampler-produced subgraphs carry local indices recorded at emit time,
-    /// so this is a zero-copy move; the per-edge HashMap fallback only runs
-    /// for subgraphs reconstructed via [`SampledSubgraph::from_parts`].
+    /// Sampler-produced subgraphs return borrowed slices of the indices
+    /// recorded at emit time; subgraphs reconstructed via
+    /// [`SampledSubgraph::from_parts`] derive owned vectors from a transient
+    /// per-call map. Repeated calls return the same answer on every
+    /// provenance.
     ///
     /// # Errors
-    /// Returns an error if any edge endpoint is not found in the local index,
-    /// which indicates a bug in the sampling algorithm.
-    pub fn edge_index_local(&mut self) -> Result<(Vec<u32>, Vec<u32>), String> {
-        // Fast path: local indices were recorded during sampling — take them
-        // (zero-copy move).
-        if let Some(precomputed) = self.precomputed_local.take() {
-            return Ok(precomputed);
-        }
+    /// Only [`SampledSubgraph::from_parts`] subgraphs can fail, when an edge
+    /// endpoint is missing from `nodes` — inconsistent reconstruction input.
+    pub fn edge_index_local(&self) -> Result<LocalEdgeIndex<'_>, String> {
+        match &self.locals {
+            Locals::Recorded { src, dst, .. } => {
+                Ok((Cow::Borrowed(&src[..]), Cow::Borrowed(&dst[..])))
+            }
+            Locals::Lazy => {
+                let local_index = self.lazy_local_index();
 
-        let mut src_local = Vec::with_capacity(self.edge_src.len());
-        for src in &self.edge_src {
-            match self.local_index.get(src) {
-                Some(&idx) => src_local.push(idx),
-                None => return Err(format!("edge src {} not in local_index", src)),
+                let mut src_local = Vec::with_capacity(self.edge_src.len());
+                for src in &self.edge_src {
+                    match local_index.get(src) {
+                        Some(&idx) => src_local.push(idx),
+                        None => return Err(format!("edge src {} not in subgraph nodes", src)),
+                    }
+                }
+
+                let mut dst_local = Vec::with_capacity(self.edge_dst.len());
+                for dst in &self.edge_dst {
+                    match local_index.get(dst) {
+                        Some(&idx) => dst_local.push(idx),
+                        None => return Err(format!("edge dst {} not in subgraph nodes", dst)),
+                    }
+                }
+
+                Ok((Cow::Owned(src_local), Cow::Owned(dst_local)))
             }
         }
-
-        let mut dst_local = Vec::with_capacity(self.edge_dst.len());
-        for dst in &self.edge_dst {
-            match self.local_index.get(dst) {
-                Some(&idx) => dst_local.push(idx),
-                None => return Err(format!("edge dst {} not in local_index", dst)),
-            }
-        }
-
-        Ok((src_local, dst_local))
     }
 
-    /// Compute local seed indices (position of each seed in the nodes array).
+    /// Local seed indices (position of each seed in the nodes array).
     /// Useful for identifying which nodes in the subgraph were the original seeds.
     ///
-    /// Sampler-produced subgraphs return the indices captured at seed
-    /// registration; the HashMap fallback only runs for subgraphs built via
-    /// [`SampledSubgraph::from_parts`].
+    /// Sampler-produced subgraphs (disjoint included) return the indices
+    /// recorded at seed registration; subgraphs built via
+    /// [`SampledSubgraph::from_parts`] derive them from a transient per-call
+    /// map. Repeated calls return the same answer on every provenance.
     ///
     /// # Errors
-    /// Returns an error if any seed is not found in the local index.
+    /// Only [`SampledSubgraph::from_parts`] subgraphs can fail, when a seed
+    /// is missing from `nodes` — inconsistent reconstruction input.
     pub fn seed_indices_local(&self) -> Result<Vec<u32>, String> {
-        if let Some(ref locals) = self.seed_locals {
-            return Ok(locals.clone());
+        match &self.locals {
+            Locals::Recorded { seeds, .. } => Ok(seeds.clone()),
+            Locals::Lazy => {
+                let local_index = self.lazy_local_index();
+                self.seeds
+                    .iter()
+                    .map(|id| {
+                        local_index
+                            .get(id)
+                            .copied()
+                            .ok_or_else(|| format!("seed {} not in subgraph nodes", id))
+                    })
+                    .collect()
+            }
         }
-        self.seeds
-            .iter()
-            .map(|id| {
-                self.local_index
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| format!("seed {} not in local_index", id))
-            })
-            .collect()
     }
 }
 
@@ -1678,17 +1589,17 @@ mod tests {
         };
 
         let mut sampler = NeighborSampler::new(&graph, config);
-        let mut subgraph = sampler.sample_neighbors(&[0]);
+        let subgraph = sampler.sample_neighbors(&[0]);
 
         let (src_local, dst_local) = subgraph.edge_index_local().unwrap();
         assert_eq!(src_local.len(), subgraph.num_edges());
         assert_eq!(dst_local.len(), subgraph.num_edges());
 
         // All local indices should be < num_nodes
-        for &s in &src_local {
+        for &s in src_local.iter() {
             assert!((s as usize) < subgraph.num_nodes());
         }
-        for &d in &dst_local {
+        for &d in dst_local.iter() {
             assert!((d as usize) < subgraph.num_nodes());
         }
 
@@ -1750,8 +1661,8 @@ mod tests {
         };
 
         let mut sampler = NeighborSampler::new(&graph, config);
-        let mut sub1 = sampler.sample_neighbors(&[0]);
-        let mut sub2 = sampler.sample_neighbors(&[1, 2]);
+        let sub1 = sampler.sample_neighbors(&[0]);
+        let sub2 = sampler.sample_neighbors(&[1, 2]);
 
         assert!(sub1.num_nodes() >= 1);
         assert!(sub2.num_nodes() >= 2);
@@ -1760,6 +1671,95 @@ mod tests {
         // Both should produce valid local indices
         sub1.edge_index_local().unwrap();
         sub2.edge_index_local().unwrap();
+    }
+
+    #[test]
+    fn test_edge_index_local_repeated_calls_directional() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            fanout: vec![3, 2],
+            seed: Some(42),
+            subgraph_type: SubgraphType::Directional,
+            ..Default::default()
+        };
+
+        let mut sampler = NeighborSampler::new(&graph, config);
+        let subgraph = sampler.sample_neighbors(&[0]);
+
+        let first = subgraph.edge_index_local().unwrap();
+        let first = (first.0.into_owned(), first.1.into_owned());
+        let second = subgraph.edge_index_local().unwrap();
+        let second = (second.0.into_owned(), second.1.into_owned());
+        assert_eq!(
+            first, second,
+            "edge_index_local must return the same answer on every call"
+        );
+        assert_eq!(first.0.len(), subgraph.num_edges());
+    }
+
+    #[test]
+    fn test_edge_index_local_repeated_calls_from_parts() {
+        let subgraph = SampledSubgraph::from_parts(
+            vec![10, 20, 30], // nodes
+            vec![10, 10, 20], // edge_src
+            vec![20, 30, 30], // edge_dst
+            vec![0, 1, 2],    // edge_ids
+            vec![10],         // seeds
+            vec![2],
+            vec![3],
+        );
+
+        let first = subgraph.edge_index_local().unwrap();
+        let first = (first.0.into_owned(), first.1.into_owned());
+        let second = subgraph.edge_index_local().unwrap();
+        let second = (second.0.into_owned(), second.1.into_owned());
+        assert_eq!(
+            first, second,
+            "edge_index_local must return the same answer on every call"
+        );
+        assert_eq!(first.0, vec![0, 0, 1]);
+        assert_eq!(first.1, vec![1, 2, 2]);
+
+        // Seed indices are likewise repeatable and correct.
+        assert_eq!(subgraph.seed_indices_local().unwrap(), vec![0]);
+        assert_eq!(subgraph.seed_indices_local().unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn test_disjoint_recorded_seed_locals_match_batch() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            fanout: vec![2],
+            seed: Some(42),
+            disjoint: true,
+            ..Default::default()
+        };
+
+        let mut sampler = NeighborSampler::new(&graph, config);
+        let seeds = [0u32, 1, 2];
+        let subgraph = sampler.sample_neighbors_disjoint(&seeds, None);
+        let batch = subgraph.batch.as_ref().unwrap();
+
+        let seed_locals = subgraph.seed_indices_local().unwrap();
+        assert_eq!(seed_locals.len(), seeds.len());
+        for (i, &idx) in seed_locals.iter().enumerate() {
+            assert_eq!(
+                subgraph.nodes[idx as usize], seeds[i],
+                "recorded seed local must point at the seed's node entry"
+            );
+            assert_eq!(
+                batch[idx as usize], i as u32,
+                "recorded seed local must land in the seed's own batch block"
+            );
+            let first_in_block = batch
+                .iter()
+                .position(|&b| b == i as u32)
+                .expect("every seed has a batch block");
+            assert_eq!(
+                idx as usize, first_in_block,
+                "seed must be the first node of its batch block"
+            );
+        }
     }
 
     // =========================================================================
@@ -2247,19 +2247,14 @@ mod tests {
         let mut sampler = NeighborSampler::new(&graph, config);
         let subgraph = sampler.sample_neighbors_disjoint(&[0, 1], None);
 
-        // precomputed_local should be Some in disjoint mode
-        assert!(
-            subgraph.precomputed_local.is_some(),
-            "disjoint mode should produce precomputed_local"
-        );
-        let (src_local, dst_local) = subgraph.precomputed_local.as_ref().unwrap();
+        let (src_local, dst_local) = subgraph.edge_index_local().unwrap();
 
         assert_eq!(src_local.len(), subgraph.num_edges());
         assert_eq!(dst_local.len(), subgraph.num_edges());
 
         // All local indices should be valid (< total nodes in combined subgraph)
         let num_nodes = subgraph.nodes.len() as u32;
-        for &s in src_local {
+        for &s in src_local.iter() {
             assert!(
                 s < num_nodes,
                 "local src index {} should be < {}",
@@ -2267,7 +2262,7 @@ mod tests {
                 num_nodes
             );
         }
-        for &d in dst_local {
+        for &d in dst_local.iter() {
             assert!(
                 d < num_nodes,
                 "local dst index {} should be < {}",
@@ -2344,7 +2339,7 @@ mod tests {
         // Map edges to their seed based on source node's batch assignment
         // In disjoint mode edges are concatenated: first seed0's edges then seed1's
         // We can identify them by looking at the batch of the source local index
-        let (src_local, _dst_local) = subgraph.precomputed_local.as_ref().unwrap();
+        let (src_local, _dst_local) = subgraph.edge_index_local().unwrap();
         for (i, &sl) in src_local.iter().enumerate() {
             let seed_idx = batch[sl as usize];
             if seed_idx == 0 {

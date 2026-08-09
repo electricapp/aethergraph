@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, get_args
 
 import numpy as np
 import numpy.typing as npt
@@ -108,17 +108,15 @@ class SamplingConfig:
             raise ValueError(f"num_neighbors values must be non-negative, got {self.num_neighbors}")
         if self.max_degree is not None and self.max_degree <= 0:
             raise ValueError(f"max_degree must be > 0 if specified, got {self.max_degree}")
-        if self.subgraph_type not in {"directional", "induced", "bidirectional"}:
+        subgraph_types = get_args(SubgraphType)
+        if self.subgraph_type not in subgraph_types:
             raise ValueError(
-                "subgraph_type must be one of {'directional', 'induced', 'bidirectional'}, "
-                f"got '{self.subgraph_type}'"
+                f"subgraph_type must be one of {subgraph_types}, got '{self.subgraph_type}'"
             )
-        if self.temporal_strategy is not None and self.temporal_strategy not in {
-            "uniform",
-            "last",
-        }:
+        temporal_strategies = get_args(TemporalStrategy)
+        if self.temporal_strategy is not None and self.temporal_strategy not in temporal_strategies:
             raise ValueError(
-                "temporal_strategy must be 'uniform', 'last', or None, "
+                f"temporal_strategy must be one of {temporal_strategies} or None, "
                 f"got '{self.temporal_strategy}'"
             )
 

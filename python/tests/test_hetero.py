@@ -440,6 +440,37 @@ class TestHeteroNeighborLoader:
         )
         assert any_different
 
+    def test_num_workers_pool_delivers_every_batch(self, reddit_hetero_graph: HeteroGraph) -> None:
+        """num_workers=4 sizes the Rust sampler pool; every batch arrives exactly once."""
+        import torch
+
+        from aethergraph.pytorch import HeteroNeighborLoader
+
+        loader = HeteroNeighborLoader(
+            reddit_hetero_graph,
+            num_neighbors={
+                ("user", "votes", "post"): [5],
+                ("user", "writes", "comment"): [3],
+                ("comment", "reply_to", "comment"): [2],
+                ("post", "belongs_to", "subreddit"): [1],
+            },
+            input_nodes=("user", torch.arange(60)),
+            batch_size=10,
+            shuffle=False,
+            num_workers=4,
+        )
+
+        batches = list(loader)
+        assert len(batches) == 6
+
+        # Delivery order across the pool is unordered; each subgraph carries
+        # its own seeds, so collecting every batch's seeds must reproduce the
+        # input set exactly once each.
+        seen: list[int] = []
+        for batch in batches:
+            seen.extend(batch["user"].input_id.tolist())
+        assert sorted(seen) == list(range(60))
+
     def test_pin_memory(self, reddit_hetero_graph: HeteroGraph) -> None:
         import torch
 

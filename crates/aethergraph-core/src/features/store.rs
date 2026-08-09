@@ -613,15 +613,7 @@ impl FeatureStore {
         let start = node_idx * row_bytes;
         let row = &raw[start..start + row_bytes];
 
-        match self.dtype {
-            FeatureDtype::F32 => {
-                let src: &[f32] = bytemuck::cast_slice(row);
-                out[..self.feature_dim].copy_from_slice(src);
-            }
-            FeatureDtype::F16 => {
-                crate::internal::simd::f16_le_to_f32(row, &mut out[..self.feature_dim]);
-            }
-        }
+        self.dtype.decode_row(row, &mut out[..self.feature_dim]);
         Ok(())
     }
 
@@ -743,14 +735,7 @@ impl FeatureStore {
             let byte_start = node as usize * row_bytes;
             let row = &raw[byte_start..byte_start + row_bytes];
             let dst = &mut out[i * self.feature_dim..(i + 1) * self.feature_dim];
-            match self.dtype {
-                FeatureDtype::F32 => {
-                    dst.copy_from_slice(bytemuck::cast_slice::<u8, f32>(row));
-                }
-                FeatureDtype::F16 => {
-                    crate::internal::simd::f16_le_to_f32(row, dst);
-                }
-            }
+            self.dtype.decode_row(row, dst);
         }
 
         if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {

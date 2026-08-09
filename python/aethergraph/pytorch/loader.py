@@ -447,9 +447,9 @@ class NeighborLoader(IterableDataset[Data]):
                 Mutually exclusive with ``features``.
 
         Raises:
-            UserWarning: If num_workers is non-zero.
-            ValueError: If both ``features`` and ``feature_path`` are set, or
-                if ``features.shape[0]`` does not match the graph's node count.
+            ValueError: If ``num_workers`` is negative, if both ``features``
+                and ``feature_path`` are set, or if ``features.shape[0]``
+                does not match the graph's node count.
         """
         super().__init__()
 
@@ -632,8 +632,19 @@ class NeighborLoader(IterableDataset[Data]):
                 self.gpu_id,
                 max_batch_nodes=max_batch_nodes,
                 prefetch_depth=self.prefetch_factor,
+                sampler_threads=self._sampler_threads,
             )
-            yield from self._iter_rdma(sampler, num_batches, get_batch)
+
+            def next_gpu_data(s: RustNeighborLoader) -> Data | None:
+                result = s.next_with_gpu_features()
+                if result is None:
+                    return None
+                subgraph, dlpack_capsule = result
+                return self._to_pyg_data_gpu(subgraph, torch.from_dlpack(dlpack_capsule))
+
+            yield from self._drive_epoch(
+                sampler, num_batches, get_batch, next_gpu_data, "epoch_rdma"
+            )
             return
 
         feature_path = self._feature_path
@@ -654,12 +665,38 @@ class NeighborLoader(IterableDataset[Data]):
                 self._sampler_threads,
             )
 
+        def next_cpu_data(s: RustNeighborLoader) -> Data | None:
+            result = s.next_with_features()
+            if result is None:
+                return None
+            subgraph, features = result
+            return self._to_pyg_data(subgraph, features)
+
+        yield from self._drive_epoch(sampler, num_batches, get_batch, next_cpu_data, "epoch")
+
+    def _drive_epoch(
+        self,
+        sampler: RustNeighborLoader,
+        num_batches: int,
+        get_batch: Callable[[int], npt.NDArray[np.int64]],
+        next_data: Callable[[RustNeighborLoader], Data | None],
+        span_name: str,
+    ) -> Iterator[Data]:
+        """Run one epoch through the Rust prefetch pipeline.
+
+        Primes the sliding window, then interleaves receive and resubmit so
+        ``prefetch_factor`` batches are always in flight. ``next_data``
+        pulls one finished batch from the sampler and converts it to a PyG
+        ``Data`` object (``None`` means the backend stopped early). Metrics
+        and the tracing span are finalized in all exit paths, including
+        early ``break`` by the consumer.
+        """
         submitted = 0
         received = 0
         epoch_start = time.perf_counter()
 
         tracer = get_tracer()
-        epoch_span = tracer.start_span("epoch") if tracer else None
+        epoch_span = tracer.start_span(span_name) if tracer else None
         if epoch_span:
             epoch_span.set_attribute("num_batches", num_batches)
             epoch_span.set_attribute("batch_size", self.batch_size)
@@ -672,21 +709,18 @@ class NeighborLoader(IterableDataset[Data]):
                 submitted += 1
 
             while received < num_batches:
-                result = sampler.next_with_features()
-                if result is None:
+                data = next_data(sampler)
+                if data is None:
                     raise RuntimeError(
                         f"NeighborLoader backend stopped early: received {received} "
                         f"of {num_batches} batches"
                     )
-
-                subgraph, features = result
                 received += 1
 
                 if submitted < num_batches:
                     sampler.submit(submitted, get_batch(submitted))
                     submitted += 1
 
-                data = self._to_pyg_data(subgraph, features)
                 if self.transform is not None:
                     data = self.transform(data)
                 yield data
@@ -789,79 +823,6 @@ class NeighborLoader(IterableDataset[Data]):
             data.batch = batch_tensor
 
         return data
-
-    def _iter_rdma(
-        self,
-        sampler: RustNeighborLoader,
-        num_batches: int,
-        get_batch: Callable[[int], npt.NDArray[np.int64]],
-    ) -> Iterator[Data]:
-        """Yield batches with RDMA-gathered GPU features.
-
-        Features are gathered via GPUDirect RDMA directly into VRAM and
-        returned as CUDA tensors via DLPack (zero-copy, never touches CPU).
-        Uses the same sliding-window prefetch strategy as the standard path.
-
-        Args:
-            sampler: Rust NeighborLoader configured with RDMA feature source.
-            num_batches: Total batches to yield this epoch.
-            get_batch: Callable returning seed node IDs for a given batch index.
-
-        Yields:
-            PyG Data objects with ``x`` as a CUDA tensor and all metadata
-            on the same device.
-        """
-        submitted = 0
-        received = 0
-        epoch_start = time.perf_counter()
-
-        tracer = get_tracer()
-        epoch_span = tracer.start_span("epoch_rdma") if tracer else None
-
-        try:
-            while submitted < min(self.prefetch_factor, num_batches):
-                sampler.submit(submitted, get_batch(submitted))
-                submitted += 1
-
-            while received < num_batches:
-                result = sampler.next_with_gpu_features()
-                if result is None:
-                    raise RuntimeError(
-                        f"RDMA sampler stopped early: received {received} of {num_batches} batches"
-                    )
-
-                subgraph, dlpack_capsule = result
-                received += 1
-
-                if submitted < num_batches:
-                    sampler.submit(submitted, get_batch(submitted))
-                    submitted += 1
-
-                x = torch.from_dlpack(dlpack_capsule)
-
-                data = self._to_pyg_data_gpu(subgraph, x)
-                if self.transform is not None:
-                    data = self.transform(data)
-                yield data
-        finally:
-            stats = sampler.stats()
-            sampler.shutdown()
-
-            total_time_ms = (time.perf_counter() - epoch_start) * 1000
-            self._metrics = LoaderMetrics(
-                batches_processed=received,
-                total_time_ms=total_time_ms,
-                avg_batch_time_ms=total_time_ms / received if received > 0 else 0.0,
-                prefetch_hit_rate=stats.hit_rate,
-                prefetch_hits=stats.hits,
-                prefetch_misses=stats.misses,
-            )
-
-            if epoch_span:
-                epoch_span.set_attribute("batches_processed", received)
-                epoch_span.set_attribute("total_time_ms", total_time_ms)
-                epoch_span.set_attribute("prefetch_hit_rate", stats.hit_rate)
-                epoch_span.end()
 
     def _to_pyg_data_gpu(
         self,

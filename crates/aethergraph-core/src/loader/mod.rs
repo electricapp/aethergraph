@@ -9,10 +9,10 @@ mod sampler;
 
 pub use hetero_sampler::{HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig};
 pub use prefetch::{
-    NeighborLoader, PrefetchError, PrefetchResult, PrefetchStats, PrefetchWork,
-    SubgraphWithFeatures, SubmitError, SyncFeatureStore,
+    HeteroNeighborLoader, HeteroPrefetchResult, NeighborLoader, PrefetchError, PrefetchResult,
+    PrefetchStats, PrefetchWork, SubgraphWithFeatures, SubmitError, SyncFeatureStore,
 };
 pub use sampler::{
-    NeighborSampler, ParallelBatchSampler, SampledSubgraph, SamplingConfig, SubgraphType,
-    TemporalSamplingError, TemporalStrategy,
+    LocalEdgeIndex, NeighborSampler, ParallelBatchSampler, SampledSubgraph, SamplingConfig,
+    SubgraphType, TemporalSamplingError, TemporalStrategy,
 };
