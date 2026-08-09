@@ -1,4 +1,4 @@
-//! Lock-free slab allocator with pre-allocated, page-aligned slots.
+//! Lock-free slab allocator with pre-allocated, aligned slots.
 //!
 //! Provides a [`SharedMemoryRing`] backed by an ABA-tagged Treiber stack free
 //! list, optional HugePages, and pluggable [`MemoryHook`]s for registering

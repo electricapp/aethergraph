@@ -141,6 +141,50 @@ fn free_list_aba_tag_blocks_stale_cas() {
     });
 }
 
+/// A batched release must splice its private chain onto the stack in one
+/// tagged CAS. An acquirer racing the splice contends on the same head —
+/// its own CAS carries the ABA tag, so a stale head observed across the
+/// splice fails instead of installing a spliced-away index. The acquirer
+/// releases via the singleton path (itself a one-element `release_many`),
+/// so both entry points hit the shared machinery in one model.
+#[test]
+fn release_many_splice_races_acquire() {
+    loom::model(|| {
+        let fl = Arc::new(FreeList::new(4));
+        // Lease two slots up front; the releaser splices both back at once.
+        let a = fl.acquire().expect("slot free at init");
+        let b = fl.acquire().expect("slot free at init");
+
+        let releaser = {
+            let fl = Arc::clone(&fl);
+            thread::spawn(move || fl.release_many(&[a, b]))
+        };
+        let acquirer = {
+            let fl = Arc::clone(&fl);
+            thread::spawn(move || {
+                // Two slots sit outside the batch, so this acquire must
+                // succeed whichever side of the splice CAS it lands on.
+                let i = fl.acquire().expect("a slot is free");
+                fl.release(i);
+            })
+        };
+        releaser.join().unwrap();
+        acquirer.join().unwrap();
+
+        // The stack must hold each index exactly once afterwards — a torn
+        // splice (lost tail, self-loop, duplicated head) would surface here.
+        let mut all: Vec<usize> = (0..4)
+            .map(|_| fl.acquire().expect("slot missing from free list"))
+            .collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3]);
+        assert!(fl.acquire().is_none());
+        for i in all {
+            fl.release(i);
+        }
+    });
+}
+
 /// One payload cell per slot. `Sync` because the free-list lease protocol
 /// guarantees one holder at a time — exactly the property loom verifies.
 struct SlotPayload(UnsafeCell<u64>);

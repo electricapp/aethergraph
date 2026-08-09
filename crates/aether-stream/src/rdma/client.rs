@@ -261,7 +261,7 @@ impl RdmaFeatureClient {
         // Window size: combined S2(k) + S1(k+1) chains must fit the send
         // queue, and even small batches split in two so the pipeline has
         // an overlap step.
-        let cap = (crate::rdma::qp::DEFAULT_QP_CAP.max_send_wr as usize) / 2;
+        let cap = (self.qp.max_send_wr() as usize) / 2;
         let window = indices.len().div_ceil(2).clamp(1, cap);
         let windows: Vec<&[usize]> = indices.chunks(window).collect();
 
@@ -316,12 +316,12 @@ impl RdmaFeatureClient {
     ///
     /// Batches larger than the QP send-queue depth stream through in
     /// windows: post one window (one WR per read, only the last signaled),
-    /// drain its signaled completion, post the next. The QP's send queue
-    /// holds `DEFAULT_QP_CAP.max_send_wr` WRs, so any batch size works
-    /// without over-posting `ENOMEM`.
+    /// drain its signaled completion, post the next. The window is the QP's
+    /// own `max_send_wr`, so any batch size works without over-posting
+    /// `ENOMEM`.
     fn post_and_wait(&self, reads: &[RdmaRead]) -> Result<(), Box<dyn std::error::Error>> {
-        const WINDOW: usize = crate::rdma::qp::DEFAULT_QP_CAP.max_send_wr as usize;
-        for window in reads.chunks(WINDOW) {
+        let window_size = self.qp.max_send_wr() as usize;
+        for window in reads.chunks(window_size) {
             self.post_and_wait_window(window)?;
         }
         Ok(())

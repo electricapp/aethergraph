@@ -15,6 +15,7 @@
 
 use aether_mem::hooks::MlockHook;
 use aether_mem::{MemoryHook, SharedMemoryRing};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Feature offset within a slot (immediately after head_version u64).
@@ -125,15 +126,18 @@ unsafe fn volatile_store_payload(src: &[f32], dst: *mut f32) {
     for i in 0..pairs {
         let lo = src[2 * i].to_bits() as u64;
         let hi = src[2 * i + 1].to_bits() as u64;
-        // SAFETY: `i < pairs`, so the word lies within the payload; `dst`
-        // is 8-aligned per the contract.
-        unsafe { dst64.add(i).write_volatile(lo | (hi << 32)) };
+        // SAFETY: `i < pairs`, so the word lies within the payload.
+        let word = unsafe { dst64.add(i) };
+        // SAFETY: `dst` is valid and 8-aligned per the contract.
+        unsafe { word.write_volatile(lo | (hi << 32)) };
     }
     if src.len() % 2 == 1 {
         let last = src.len() - 1;
-        // SAFETY: `last < src.len()`, within the payload; 4-byte access
-        // needs only 4-byte alignment.
-        unsafe { (dst.add(last) as *mut u32).write_volatile(src[last].to_bits()) };
+        // SAFETY: `last < src.len()`, within the payload.
+        let tail = unsafe { dst.add(last) } as *mut u32;
+        // SAFETY: a 4-byte access needs only 4-byte alignment, which every
+        // f32 lane of an 8-aligned payload has.
+        unsafe { tail.write_volatile(src[last].to_bits()) };
     }
 }
 
@@ -148,16 +152,20 @@ unsafe fn volatile_load_payload(src: *const f32, dst: &mut [f32]) {
     let pairs = dst.len() / 2;
     let src64 = src as *const u64;
     for i in 0..pairs {
-        // SAFETY: `i < pairs`, so the word lies within the payload; `src`
-        // is 8-aligned per the contract.
-        let word = unsafe { src64.add(i).read_volatile() };
+        // SAFETY: `i < pairs`, so the word lies within the payload.
+        let p = unsafe { src64.add(i) };
+        // SAFETY: `src` is valid and 8-aligned per the contract.
+        let word = unsafe { p.read_volatile() };
         dst[2 * i] = f32::from_bits(word as u32);
         dst[2 * i + 1] = f32::from_bits((word >> 32) as u32);
     }
     if dst.len() % 2 == 1 {
         let last = dst.len() - 1;
         // SAFETY: `last < dst.len()`, within the payload.
-        let bits = unsafe { (src.add(last) as *const u32).read_volatile() };
+        let tail = unsafe { src.add(last) } as *const u32;
+        // SAFETY: a 4-byte access needs only 4-byte alignment, which every
+        // f32 lane of an 8-aligned payload has.
+        let bits = unsafe { tail.read_volatile() };
         dst[last] = f32::from_bits(bits);
     }
 }
@@ -190,8 +198,13 @@ impl FeatureTable {
         // registers one MR and addresses slots by offset, so per-slot page
         // alignment would only round a 3088-byte dim-768 slot up to 4096 —
         // ~25% of table DRAM spent on dead padding.
-        let (ring, hook_failures) =
-            SharedMemoryRing::new_with_slot_align(slot_count, slot_size, 64, hooks).ok()?;
+        let (ring, hook_failures) = SharedMemoryRing::new_with_slot_align(
+            slot_count,
+            slot_size,
+            NonZeroUsize::new(64),
+            hooks,
+        )
+        .ok()?;
         for failure in &hook_failures {
             tracing::warn!(error = %failure, "feature table memory hook failed");
         }

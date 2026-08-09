@@ -143,7 +143,7 @@ fn t1_7_xdp_socket_create_on_veth() {
     };
 
     match socket_result {
-        Ok(socket) => {
+        Ok(mut socket) => {
             // FFI sanity: socket has a valid fd and all four rings constructed.
             assert!(socket.fd() > 0, "socket fd must be valid");
             let free = socket.fill.free_slots();

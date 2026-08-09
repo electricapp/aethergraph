@@ -1,4 +1,4 @@
-//! Lock-free slab allocator with pre-allocated, page-aligned slots.
+//! Lock-free slab allocator with pre-allocated, aligned slots.
 //!
 //! # Architecture
 //! Pre-allocates a contiguous memory region divided into fixed-size slots.
@@ -10,13 +10,15 @@
 //! - Backpressure prevents data races (slot reuse only after completion)
 //! - Static lifetime — allocated at startup, freed at shutdown
 //! - `slot_count` must be a power of two
-//! - `slot_size` is page-aligned for DMA
+//! - `slot_size` is a multiple of the ring's slot alignment (the page size
+//!   by default, which the UMEM/DMA callers use)
 //!
 //! # Extensibility
 //! Post-allocation hooks ([`MemoryHook`]) allow callers to register memory
 //! with external systems (e.g. CUDA host pinning, mlock) without coupling
 //! the allocator to any specific domain.
 
+use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 // The free-list atomics are aliased to loom's under `--cfg loom` so the
 // `loom_lockfree` test model-checks the real `FreeList` code rather than a copy.
@@ -87,6 +89,7 @@ impl std::error::Error for HookError {}
 pub enum RingBuilderError {
     InvalidSlotCount(&'static str),
     InvalidSlotSize(&'static str),
+    InvalidSlotAlign(&'static str),
     SizeOverflow,
     AllocationFailed,
 }
@@ -94,7 +97,9 @@ pub enum RingBuilderError {
 impl std::fmt::Display for RingBuilderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidSlotCount(msg) | Self::InvalidSlotSize(msg) => f.write_str(msg),
+            Self::InvalidSlotCount(msg)
+            | Self::InvalidSlotSize(msg)
+            | Self::InvalidSlotAlign(msg) => f.write_str(msg),
             Self::SizeOverflow => f.write_str("slot_count * aligned_slot_size overflows usize"),
             Self::AllocationFailed => f.write_str("page allocation failed"),
         }
@@ -329,8 +334,11 @@ impl FreeList {
 
     /// Release a slot index back to the free list.
     ///
-    /// Out-of-range indices are ignored in both debug and release builds; the
-    /// runtime check protects against silent memory corruption.
+    /// The singleton case of [`release_many`](Self::release_many): the
+    /// one-element chain degenerates to `first == last`, so it shares the
+    /// validate + splice-CAS machinery. Out-of-range indices are skipped
+    /// (with a debug assertion); the runtime check protects against silent
+    /// memory corruption.
     ///
     /// # Panics
     /// Panics if the slot is not currently leased — a double release, or an
@@ -340,37 +348,7 @@ impl FreeList {
     /// instead.
     #[inline]
     pub fn release(&self, index: usize) {
-        if index >= self.slot_count {
-            debug_assert!(
-                false,
-                "release: index {index} >= slot_count {}",
-                self.slot_count
-            );
-            return;
-        }
-        let slot = &self.next[index];
-        assert_eq!(
-            slot.load(Ordering::Relaxed),
-            FREE_LIST_LEASED,
-            "release: slot {index} is not leased (double release or foreign index)"
-        );
-
-        let mut backoff = Backoff::new();
-        loop {
-            let state = self.head.load(Ordering::Acquire);
-            let (head, tag) = unpack_free_head(state);
-            slot.store(head, Ordering::Relaxed);
-            let new_state = pack_free_head(index as u32, tag.wrapping_add(1));
-
-            if self
-                .head
-                .compare_exchange_weak(state, new_state, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-            backoff.spin();
-        }
+        self.release_many(std::slice::from_ref(&index));
     }
 
     /// Release a batch of leased indices with one head CAS.
@@ -442,7 +420,10 @@ impl FreeList {
 ///
 /// # Invariants
 /// - `slot_count` is always a power of two (for correct overflow handling)
-/// - `slot_size` is always page-aligned (for DMA alignment)
+/// - `slot_size` is always a multiple of the slot alignment the ring was
+///   built with: the page size for [`SharedMemoryRing::new`] (the default,
+///   which UMEM/DMA callers rely on), or the caller's power-of-two stride
+///   for [`SharedMemoryRing::new_with_slot_align`]
 /// - `total_size` reflects the actual byte count passed to mmap/alloc, which
 ///   may exceed `slot_count * slot_size` on the huge-page path due to the
 ///   2 MiB rounding. Callers using `total_size` for FFI registration must
@@ -461,7 +442,8 @@ pub struct SharedMemoryRing {
     total_size: usize,
     /// Bytes covered by addressable slots. Always == `slot_count * slot_size`.
     addressable_size: usize,
-    /// Actual slot size after alignment (>= requested size, page-aligned)
+    /// Actual slot size after alignment (>= requested size, a multiple of
+    /// the ring's slot alignment)
     slot_size: usize,
     /// Page alignment used for the allocation (`max(sysconf page, PAGE_SIZE)`).
     /// Stored so `Drop` reconstructs the exact `Layout` passed to `alloc`.
@@ -503,7 +485,7 @@ impl SharedMemoryRing {
         slot_size: usize,
         hooks: Vec<Box<dyn MemoryHook>>,
     ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
-        Self::new_with_slot_align(slot_count, slot_size, 0, hooks)
+        Self::new_with_slot_align(slot_count, slot_size, None, hooks)
     }
 
     /// Create a ring whose slots are packed at `slot_align` stride instead
@@ -513,13 +495,13 @@ impl SharedMemoryRing {
     /// whole chunks (AF_XDP UMEM); a table that registers the region once
     /// and addresses slots by offset (the RDMA feature table) only wastes
     /// memory on it — a 3088-byte slot page-rounds to 4096, ~25% of DRAM
-    /// spent on dead padding. Pass a power-of-two `slot_align` (e.g. 64
-    /// for cache-line slots), or 0 to use the page size. The backing
-    /// allocation base remains page-aligned either way.
+    /// spent on dead padding. Pass `Some` power-of-two `slot_align` (e.g.
+    /// 64 for cache-line slots), or `None` to use the page size. The
+    /// backing allocation base remains page-aligned either way.
     pub fn new_with_slot_align(
         slot_count: usize,
         slot_size: usize,
-        slot_align: usize,
+        slot_align: Option<NonZeroUsize>,
         hooks: Vec<Box<dyn MemoryHook>>,
     ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
         if slot_count == 0 {
@@ -538,9 +520,11 @@ impl SharedMemoryRing {
         if slot_size == 0 {
             return Err(RingBuilderError::InvalidSlotSize("slot_size must be > 0"));
         }
-        if slot_align != 0 && !slot_align.is_power_of_two() {
-            return Err(RingBuilderError::InvalidSlotSize(
-                "slot_align must be a power of two (or 0 for page alignment)",
+        if let Some(align) = slot_align
+            && !align.get().is_power_of_two()
+        {
+            return Err(RingBuilderError::InvalidSlotAlign(
+                "slot_align must be a power of two",
             ));
         }
 
@@ -549,11 +533,7 @@ impl SharedMemoryRing {
         // weaker than 4 KiB); the per-slot stride uses `slot_align` when
         // given.
         let page_align = runtime_page_size();
-        let stride_align = if slot_align == 0 {
-            page_align
-        } else {
-            slot_align
-        };
+        let stride_align = slot_align.map_or(page_align, NonZeroUsize::get);
 
         // Align slot_size to the stride boundary using checked arithmetic.
         let aligned_slot_size = slot_size
@@ -787,8 +767,8 @@ impl SharedMemoryRing {
 
     /// Release a slot index back to the free list.
     ///
-    /// Out-of-range indices are ignored both in debug and release builds;
-    /// the runtime check protects against silent memory corruption.
+    /// Out-of-range indices are skipped (with a debug assertion); the
+    /// runtime check protects against silent memory corruption.
     ///
     /// # Panics
     /// Panics if the slot is not currently leased — a double release, or an
@@ -864,7 +844,8 @@ impl SharedMemoryRing {
         self.addressable_size
     }
 
-    /// Size of each slot (page-aligned, may be larger than requested).
+    /// Size of each slot (rounded up to the ring's slot alignment, may be
+    /// larger than requested).
     pub fn slot_size(&self) -> usize {
         self.slot_size
     }
@@ -1376,6 +1357,22 @@ mod tests {
     }
 
     #[test]
+    fn slot_align_packs_at_requested_stride() {
+        let (ring, failures) =
+            SharedMemoryRing::new_with_slot_align(4, 100, NonZeroUsize::new(64), vec![]).unwrap();
+        assert!(failures.is_empty());
+        // A 100-byte request rounds up to the 64-byte stride, not a page.
+        assert_eq!(ring.slot_size(), 128);
+        assert_eq!(ring.addressable_size(), 4 * 128);
+    }
+
+    #[test]
+    fn rejects_non_power_of_two_slot_align() {
+        let r = SharedMemoryRing::new_with_slot_align(4, 100, NonZeroUsize::new(48), vec![]);
+        assert!(matches!(r, Err(RingBuilderError::InvalidSlotAlign(_))));
+    }
+
+    #[test]
     fn power_of_two_accepted() {
         for &count in &[1, 2, 4, 8, 16, 32, 64, 128, 256] {
             let ring = build(count, 1024);
@@ -1401,6 +1398,67 @@ mod tests {
         drop(slot0);
         let slot2 = ring.acquire_slot().unwrap();
         assert!(slot2.index() < 2);
+    }
+
+    #[test]
+    fn batch_release_roundtrip() {
+        let ring = build(4, 1024);
+        let leased: Vec<usize> = (0..4).map(|_| ring.acquire_index().unwrap()).collect();
+        assert!(ring.acquire_index().is_none());
+        ring.release_indices(&leased);
+        // Every index is back on the free list, exactly once.
+        let mut reacquired: Vec<usize> = (0..4).map(|_| ring.acquire_index().unwrap()).collect();
+        reacquired.sort_unstable();
+        assert_eq!(reacquired, vec![0, 1, 2, 3]);
+        assert!(ring.acquire_index().is_none());
+        for idx in reacquired {
+            ring.release_index(idx);
+        }
+    }
+
+    #[test]
+    fn batch_release_empty_slice_is_noop() {
+        let ring = build(2, 1024);
+        ring.release_indices(&[]);
+        // Both slots still lease normally afterwards.
+        let a = ring.acquire_index().unwrap();
+        let b = ring.acquire_index().unwrap();
+        assert!(ring.acquire_index().is_none());
+        ring.release_indices(&[a, b]);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn batch_release_skips_out_of_range_index() {
+        let ring = build(2, 1024);
+        let a = ring.acquire_index().unwrap();
+        let b = ring.acquire_index().unwrap();
+        // The out-of-range entry is skipped; the in-range indices around it
+        // are still spliced back.
+        ring.release_indices(&[a, 99, b]);
+        let mut reacquired = vec![ring.acquire_index().unwrap(), ring.acquire_index().unwrap()];
+        reacquired.sort_unstable();
+        assert_eq!(reacquired, vec![0, 1]);
+        for idx in reacquired {
+            ring.release_index(idx);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "release_many: index")]
+    fn batch_release_out_of_range_debug_asserts() {
+        let ring = build(2, 1024);
+        let a = ring.acquire_index().unwrap();
+        ring.release_indices(&[a, 99]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not leased")]
+    fn batch_release_duplicate_index_panics() {
+        let ring = build(2, 1024);
+        let a = ring.acquire_index().unwrap();
+        ring.release_indices(&[a, a]);
     }
 
     #[test]

@@ -31,7 +31,6 @@ use std::ffi::CStr;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ptr;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Default SRD QP capabilities. `max_send_sge` is capped at 2 on current
@@ -696,8 +695,9 @@ pub struct SrdFeatureClient {
 }
 
 // SAFETY: all ibverbs handles inside are thread-safe to share read-only;
-// mutation on the hot path happens inside the worker thread that owns the
-// `Arc<SrdFeatureClient>` dispatched by `SrdShardedFeatureClient`.
+// hot-path mutation (posting and draining a gather) is driven by one
+// thread at a time — `SrdShardedFeatureClient::gather` runs every shard's
+// post and drain on the calling thread.
 unsafe impl Send for SrdFeatureClient {}
 // SAFETY: see Send impl above.
 unsafe impl Sync for SrdFeatureClient {}
@@ -965,9 +965,11 @@ impl SrdFeatureClient {
 /// Multi-QP SRD pool. Each shard is an independent `SrdFeatureClient`
 /// (its own context, QP, AH, MR) assembled via its own TCP + bidirectional
 /// endpoint exchange with the server. `gather(nodes)` splits `nodes` evenly
-/// across shards and runs each shard's post+drain on its own OS thread.
+/// across shards, then runs a two-phase post-then-drain on the calling
+/// thread: every shard's batch is posted before any shard's CQ is drained,
+/// so all shards' DMA is on the wire concurrently.
 pub struct SrdShardedFeatureClient {
-    shards: Vec<Arc<SrdFeatureClient>>,
+    shards: Vec<SrdFeatureClient>,
     max_inflight_per_shard: usize,
 }
 
@@ -983,8 +985,11 @@ impl SrdShardedFeatureClient {
         assert!(num_shards > 0);
         let mut shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            let client = SrdFeatureClient::connect(addr, gid_index, max_inflight_per_shard)?;
-            shards.push(Arc::new(client));
+            shards.push(SrdFeatureClient::connect(
+                addr,
+                gid_index,
+                max_inflight_per_shard,
+            )?);
         }
         Ok(Self {
             shards,
@@ -1009,10 +1014,9 @@ impl SrdShardedFeatureClient {
 
     /// Split `nodes` evenly across shards, post every shard's batch, then
     /// drain each shard's CQ. Posting is non-blocking, so all shards' DMA
-    /// runs concurrently — the same parallel wire time the old
-    /// thread-per-shard version bought, without paying an OS thread
-    /// spawn/join (tens of microseconds) per gather call that rivaled the
-    /// gather itself. Panics if any single shard's slice exceeds
+    /// runs concurrently from the calling thread — no per-gather OS thread
+    /// spawn/join, which costs tens of microseconds and is on the order of
+    /// the gather itself. Panics if any single shard's slice exceeds
     /// `max_inflight_per_shard`.
     pub fn gather(&self, nodes: &[usize]) -> io::Result<()> {
         if nodes.is_empty() {

@@ -129,6 +129,13 @@ impl RdmaQp {
         })
     }
 
+    /// Send-queue depth this QP was created with (`IbvQpCap::max_send_wr`).
+    /// Callers size posting windows against it so pipelining follows the
+    /// QP's actual capability.
+    pub fn max_send_wr(&self) -> u32 {
+        self.max_send_wr
+    }
+
     /// Get local endpoint for exchange over TCP control plane.
     pub fn endpoint(&self, ctx: &RdmaContext) -> QpEndpoint {
         // SAFETY: `self.qp` is alive for this RdmaQp's lifetime.

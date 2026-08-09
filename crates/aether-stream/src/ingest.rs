@@ -263,6 +263,13 @@ impl std::error::Error for SpawnError {
     }
 }
 
+/// A running ingest pool: the frame receiver plus one join handle per
+/// spawned thread.
+pub type IngestHandles = (
+    crossbeam_channel::Receiver<Vec<InboundFrame>>,
+    Vec<std::thread::JoinHandle<()>>,
+);
+
 /// Spawn ingestion threads — one per socket, each pinned to a core.
 ///
 /// Returns the crossbeam receiver for inbound frames along with the join
@@ -274,13 +281,7 @@ pub fn spawn_ingest_threads(
     umem: Arc<Umem>,
     core_ids: &[usize],
     config: IngestConfig,
-) -> Result<
-    (
-        crossbeam_channel::Receiver<Vec<InboundFrame>>,
-        Vec<std::thread::JoinHandle<()>>,
-    ),
-    SpawnError,
-> {
+) -> Result<IngestHandles, SpawnError> {
     let (tx, rx) = crossbeam_channel::bounded(sockets.len() * 1024);
     let mut handles = Vec::with_capacity(sockets.len());
 
