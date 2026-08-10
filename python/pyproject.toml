@@ -116,7 +116,7 @@ dev = [
     "opentelemetry-sdk>=1.44.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.1",
+    "ruff>=0.16.2",
 ]
 test = [
     "torch>=2.13.0",
