@@ -14,5 +14,7 @@ pub mod prefetch;
 pub mod simd;
 pub mod telemetry;
 
+#[cfg(all(target_os = "linux", feature = "uffd"))]
+pub mod uffd;
 #[cfg(target_os = "linux")]
 pub mod uring;

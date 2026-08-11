@@ -55,3 +55,5 @@ pub use internal::mmap_hetero::{load_hetero_graph, save_hetero_graph};
 #[cfg(feature = "parquet")]
 pub use internal::parquet_import::{from_parquet, from_parquet_files};
 pub use internal::telemetry::{SamplingTelemetry, TelemetrySummary};
+#[cfg(all(target_os = "linux", feature = "uffd"))]
+pub use internal::uffd::{FileSource, PageSource, PageWeights, PagedRegion};
