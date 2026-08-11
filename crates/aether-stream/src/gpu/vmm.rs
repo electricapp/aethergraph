@@ -86,6 +86,21 @@ impl GrowableVram {
         self.base
     }
 
+    /// The physical allocation handle backing the first committed chunk,
+    /// or `None` before the first [`Self::grow_to`].
+    ///
+    /// Chunks are created with the POSIX-fd handle type requested, so this
+    /// can be handed to
+    /// [`export_handle_to_fd`](super::ipc::export_handle_to_fd) for a peer
+    /// process to map. Only the first chunk is exportable as a unit: a
+    /// grown pool is several physical allocations behind one contiguous
+    /// VA range, so a peer importing "the pool" would need each handle and
+    /// its own reservation. Reserve enough up front, and grow once, when
+    /// the pool is meant to be shared.
+    pub fn first_chunk(&self) -> Option<(sys::CUmemGenericAllocationHandle, usize)> {
+        self.chunks.first().map(|&(handle, _, len)| (handle, len))
+    }
+
     /// Bytes currently backed by physical VRAM.
     pub fn committed(&self) -> usize {
         self.committed

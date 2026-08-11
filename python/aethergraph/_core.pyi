@@ -332,8 +332,25 @@ class NeighborLoader:
         prefetch_depth: int = 2,
         gid_index: int = 1,
         sampler_threads: int = 1,
-    ) -> NeighborLoader: ...
+        pooled: bool = False,
+        staging_rows: int = 0,
+    ) -> NeighborLoader:
+        """`pooled=True` serves gathers from one reusable VRAM pool instead
+        of allocating per batch, taking the CUDA allocator off the per-batch
+        critical path; the consumer must then finish with a batch before
+        requesting the next. `staging_rows` attaches a managed-memory tier
+        for `prefetch_upcoming()`."""
+
     def next_with_gpu_features(self) -> tuple[SampledSubgraph, Any] | None: ...
+    def prefetch_upcoming(self, nodes: npt.NDArray[np.uint32]) -> bool:
+        """Migrate an upcoming batch's rows to the GPU so the transfer
+        overlaps the current batch's compute. False when the loader has no
+        pool or staging tier."""
+
+    def export_pool_fd(self) -> tuple[int, int]:
+        """`(fd, bytes)` for a peer process to map the same VRAM. Send the
+        descriptor over a Unix socket with SCM_RIGHTS. Requires
+        `pooled=True`."""
     @property
     def feature_dim(self) -> int | None: ...
     @property
