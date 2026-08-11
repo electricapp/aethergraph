@@ -31,7 +31,11 @@ doctest = false
 bench = false
 
 [dependencies]
-aethergraph-core = { path = "../aethergraph-core", version = "0.1" }
+# `nvme-passthru` is always requested: its code is additionally gated on
+# Linux, so mac builds are unaffected, while Linux wheels probe /dev/ng* at
+# store-open and silently fall back to the O_DIRECT io_uring gather when
+# passthrough isn't available.
+aethergraph-core = { path = "../aethergraph-core", version = "0.1", features = ["nvme-passthru"] }
 # `wal` is always on so the Python `DynamicGraph.open_with_wal` constructor is
 # present on every wheel build — durability is a runtime opt-in (pass a path or
 # don't), not a compile-time one.

@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use tracing::trace;
 
 /// NVMe read opcode (`nvme_cmd_read`).
 const NVME_CMD_READ: u8 = 0x02;
@@ -347,16 +348,14 @@ impl NvmeReader {
     pub fn open_path(dev_path: &Path, store_file: &File) -> Result<Option<Self>> {
         let dev = match File::open(dev_path) {
             Ok(f) => f,
-            // EACCES/ENOENT/ENXIO all mean "not usable here" — fall back.
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::EACCES) | Some(libc::ENOENT) | Some(libc::ENXIO)
-                ) =>
-            {
+            // Whatever the reason (EACCES, ENOENT, ENXIO, ENOTDIR, …), a
+            // char device we cannot open means "passthrough unavailable
+            // here" — this is a probe with a guaranteed fs-path fallback,
+            // never a hard error.
+            Err(e) => {
+                trace!("NVMe char device {} not usable: {e}", dev_path.display());
                 return Ok(None);
             }
-            Err(e) => return Err(e).context("opening NVMe char device"),
         };
 
         let Some((nsid, lba_bytes)) = ns_geometry(&dev) else {
