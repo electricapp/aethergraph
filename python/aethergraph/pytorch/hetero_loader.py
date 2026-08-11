@@ -34,6 +34,7 @@ except ImportError as e:
 from aethergraph._core import HeteroNeighborLoader as RustHeteroLoader
 from aethergraph._core import HeteroSampledSubgraph as RustHeteroSubgraph
 from aethergraph._core import HeteroSamplingConfig as RustHeteroSamplingConfig
+from aethergraph.pytorch.device_pipeline import DeviceTransferPipeline
 from aethergraph.pytorch.loader import _parse_features, make_batch_getter, normalize_input_nodes
 from aethergraph.tracing import get_tracer
 
@@ -130,6 +131,8 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         replace: bool = False,
         num_workers: int = 0,
         pin_memory: bool = False,
+        device: str | None = None,
+        transfer_depth: int = 2,
         prefetch_factor: int = 2,
         seed: int | None = None,
         max_degree: int | None = None,
@@ -158,6 +161,12 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                 scale sampling throughput when sampling is the bottleneck.
             pin_memory: If True, tensors are allocated in pinned memory for
                 faster async GPU transfers.
+            device: Optional CUDA device (e.g. ``"cuda"``). When set, each
+                batch is moved to it on a dedicated copy stream, double-
+                buffered so batch N+1's transfer overlaps batch N's
+                training; implies pinning. A no-op passthrough without CUDA.
+            transfer_depth: Batches kept in flight on the copy stream when
+                ``device`` is set (default 2 = double buffering).
             prefetch_factor: Number of batches the Rust prefetch pipeline
                 keeps ready ahead of the consumer.
             seed: Random seed for sampling reproducibility (passed to Rust).
@@ -221,6 +230,15 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         # pinning decision once instead of per tensor per type per batch.
         self._pin: bool = bool(pin_memory and torch.cuda.is_available())
 
+        # Optional stream-pipelined device transfer, matching NeighborLoader:
+        # each batch moves to the device on a dedicated copy stream, double-
+        # buffered so batch N+1 crosses PCIe while batch N trains. Moving to
+        # a CUDA device implies pinning the host source.
+        self._device: torch.device | None = torch.device(device) if device is not None else None
+        self._transfer_depth = transfer_depth
+        if self._device is not None and self._device.type == "cuda":
+            self._pin = self._pin or torch.cuda.is_available()
+
         # Type lists are graph-wide and immutable: resolved here once, so
         # batch conversion never asks Rust to rebuild the string lists.
         self._node_types: list[str] = data.node_types
@@ -251,6 +269,19 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         return self._metrics
 
     def __iter__(self) -> Iterator[HeteroData]:
+        """Iterate over batches, optionally pipelined onto a CUDA device.
+
+        Delegates to :meth:`_iter_batches` for sampling; when ``device`` was
+        given, wraps the batches in a :class:`DeviceTransferPipeline` so each
+        one's host-to-device copy overlaps the consumer's compute on the
+        previous batch. Without a device, host batches are yielded directly.
+        """
+        batches = self._iter_batches()
+        if self._device is not None:
+            return iter(DeviceTransferPipeline(batches, self._device, depth=self._transfer_depth))
+        return batches
+
+    def _iter_batches(self) -> Iterator[HeteroData]:
         """Iterate over batches of sampled heterogeneous subgraphs.
 
         Uses the same sliding-window prefetch strategy as the homogeneous

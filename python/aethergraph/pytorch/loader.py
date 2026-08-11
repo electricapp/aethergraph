@@ -38,6 +38,7 @@ from aethergraph._core import SampledSubgraph as RustSampledSubgraph
 from aethergraph._core import SamplingConfig as RustSamplingConfig
 from aethergraph._types import SubgraphType, TemporalStrategy
 from aethergraph.dynamic_graph import DynamicGraph
+from aethergraph.pytorch.device_pipeline import DeviceTransferPipeline
 from aethergraph.tracing import get_tracer
 
 if TYPE_CHECKING:
@@ -359,6 +360,8 @@ class NeighborLoader(IterableDataset[Data]):
         num_workers: int = 0,
         prefetch_factor: int = 3,
         pin_memory: bool = False,
+        device: str | None = None,
+        transfer_depth: int = 2,
         transform: Callable[[Data], Data] | None = None,
         feature_source: str | None = None,
         gpu_id: int = 0,
@@ -403,6 +406,14 @@ class NeighborLoader(IterableDataset[Data]):
                 more memory.
             pin_memory: If True, tensors are allocated in pinned (page-locked)
                 memory, enabling faster async GPU transfers with non_blocking=True.
+            device: Optional CUDA device (e.g. ``"cuda"`` or ``"cuda:1"``).
+                When set, each batch is moved to it on a dedicated copy
+                stream, double-buffered so batch N+1's transfer overlaps
+                batch N's training. Implies pinning the host tensors. A
+                non-CUDA device or a machine without CUDA makes this a no-op
+                passthrough (batches stay on the host).
+            transfer_depth: Batches kept in flight on the copy stream when
+                ``device`` is set (default 2 = classic double buffering).
             transform: Optional callable to apply to each batch after sampling.
                 Receives a PyG Data object and should return a Data object.
             feature_source: RDMA feature server address as "rdma://host:port".
@@ -524,6 +535,15 @@ class NeighborLoader(IterableDataset[Data]):
         # the pinning decision once instead of per tensor per batch.
         self._pin: bool = bool(pin_memory and torch.cuda.is_available())
 
+        # Optional device transfer: when a CUDA device is requested, each
+        # yielded batch is moved to it on a dedicated copy stream, double-
+        # buffered so batch N+1 crosses PCIe while batch N trains. Moving to
+        # the device implies pinning the host source (async H2D needs it).
+        self._device: torch.device | None = torch.device(device) if device is not None else None
+        self._transfer_depth = transfer_depth
+        if self._device is not None and self._device.type == "cuda":
+            self._pin = self._pin or torch.cuda.is_available()
+
         # Master generator for seed-node shuffling. An explicit `generator`
         # wins; otherwise seed from `seed` (reproducible) or OS entropy.
         # `__iter__` spawns a fresh child from this per epoch so iteration is
@@ -542,6 +562,20 @@ class NeighborLoader(IterableDataset[Data]):
         return self._metrics
 
     def __iter__(self) -> Iterator[Data]:
+        """Iterate over batches, optionally pipelined onto a CUDA device.
+
+        Delegates to :meth:`_iter_batches` for sampling. When ``device`` was
+        given, the batches are wrapped in a :class:`DeviceTransferPipeline`
+        so each one's host-to-device copy runs on a dedicated stream and
+        overlaps the consumer's compute on the previous batch. Without a
+        device, the sampled (host) batches are yielded directly.
+        """
+        batches = self._iter_batches()
+        if self._device is not None:
+            return iter(DeviceTransferPipeline(batches, self._device, depth=self._transfer_depth))
+        return batches
+
+    def _iter_batches(self) -> Iterator[Data]:
         """Iterate over batches of sampled subgraphs.
 
         Each iteration yields a PyG Data object containing the sampled
