@@ -54,4 +54,6 @@ pub use internal::mmap::{
 pub use internal::mmap_hetero::{load_hetero_graph, save_hetero_graph};
 #[cfg(feature = "parquet")]
 pub use internal::parquet_import::{from_parquet, from_parquet_files};
+#[cfg(all(target_os = "linux", feature = "shm"))]
+pub use internal::shm::{SharedRegion, recv_fd, send_fd, socket_pair};
 pub use internal::telemetry::{SamplingTelemetry, TelemetrySummary};

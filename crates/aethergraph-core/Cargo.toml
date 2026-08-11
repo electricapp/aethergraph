@@ -15,6 +15,9 @@ bench = false
 default = []
 io-uring = []
 gds = []
+# Cross-process shared feature cache: a sealed memfd mapped MAP_SHARED,
+# its fd passed to peer processes over SCM_RIGHTS. Linux-only.
+shm = []
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 # Enables loom-backed model checking of the lock-free union-find. Run with:
 #   cargo test -p aethergraph-core --features loom --test loom_union_find
