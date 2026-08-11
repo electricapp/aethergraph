@@ -100,6 +100,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang libbpf-dev pkg-config libibverbs-dev libnuma-dev
 
+      - name: Load SoftRoCE (rxe) on loopback
+        if: matrix.run_rdma
+        run: |
+          sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+          if sudo modprobe rdma_rxe 2>/dev/null && sudo rdma link add rxe0 type rxe netdev lo; then
+            rdma link show
+          else
+            echo "rxe unavailable on this runner; RDMA e2e tests self-skip"
+          fi
+
       - name: rustfmt
         run: cargo fmt --all -- --check
 
@@ -115,6 +125,10 @@ jobs:
       - name: xdp_bpf compile check
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p aether-stream --tests --features xdp_bpf
+
+      - name: mlx5dv compile check
+        if: matrix.run_rdma
+        run: cargo check -p aether-stream --tests --features mlx5dv
 
       - name: cargo test --lib
         run: |
@@ -401,6 +415,42 @@ jobs:
           name: aethergraph-wheel-${{ matrix.level }}
           path: python/${{ matrix.out_dir }}/*.whl
 
+  python-wheel-pgo:
+    name: wheel x86-64 pgo
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: llvm-tools
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: wheel-pgo
+      - name: Install BOLT
+        run: |
+          sudo apt-get update
+          if sudo apt-get install -y bolt-18; then
+            sudo ln -sf "$(command -v llvm-bolt-18)" /usr/local/bin/llvm-bolt
+            sudo ln -sf "$(command -v merge-fdata-18)" /usr/local/bin/merge-fdata
+          else
+            echo "bolt-18 unavailable; building PGO-only wheel"
+          fi
+      - name: Build PGO wheel
+        run: scripts/pgo-wheel.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aethergraph-wheel-x86-64-pgo
+          path: python/dist-pgo/*.whl
+
   rdma-hardware:
     name: rdma hardware (self-hosted)
     # TODO(infra): wire to a self-hosted Linux runner with rdma_rxe loaded
@@ -461,7 +511,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, supply-chain, unused-deps, python, python-wheel]
+    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, supply-chain, unused-deps, python, python-wheel, python-wheel-pgo]
     if: always()
     steps:
       - name: Render summary
@@ -483,6 +533,7 @@ jobs:
             echo "| python macos | macOS arm64 | test group | ${{ needs.python.result }} |"
             echo "| wheel x86-64 | Linux x86_64 | portable baseline | ${{ needs.python-wheel.result }} |"
             echo "| wheel x86-64-v3 | Linux x86_64 | target-cpu=x86-64-v3 | ${{ needs.python-wheel.result }} |"
+            echo "| wheel x86-64 pgo | Linux x86_64 | PGO + BOLT | ${{ needs.python-wheel-pgo.result }} |"
             echo ""
             echo "Hardware-gated tests (SoftRoCE micro-bench, SRD loopback,"
             echo "billion-node scale) run only on the self-hosted \`rdma-hardware\`"

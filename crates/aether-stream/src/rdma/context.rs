@@ -23,12 +23,63 @@ pub struct RdmaContext {
     /// Index of `port_gid` in the device's GID table — must be passed to the
     /// remote QP's address handle (sgid_index) so packets carry the right SGID.
     pub gid_index: u8,
+    /// NUMA node of the opened device, read from sysfs at open time.
+    /// `None` when sysfs doesn't expose it (VMs, SoftRoCE).
+    numa_node: Option<i32>,
 }
 
 // SAFETY: ibverbs resources are thread-safe after creation.
 unsafe impl Send for RdmaContext {}
 // SAFETY: see Send impl above.
 unsafe impl Sync for RdmaContext {}
+
+/// Device atomic capabilities, from `ibv_query_device`.
+#[derive(Debug, Clone, Copy)]
+pub struct AtomicCaps {
+    /// One of `IBV_ATOMIC_NONE` / `IBV_ATOMIC_HCA` / `IBV_ATOMIC_GLOB`.
+    pub atomic_cap: i32,
+    /// Max outstanding READ/atomic operations per QP as initiator.
+    pub max_qp_rd_atom: i32,
+}
+
+/// Device on-demand-paging capabilities, from `ibv_query_device_ex`.
+#[derive(Debug, Clone, Copy)]
+pub struct OdpCaps {
+    /// `IBV_ODP_SUPPORT` / `IBV_ODP_SUPPORT_IMPLICIT` mask.
+    pub general_caps: u64,
+    /// Per-verb `IBV_ODP_SUPPORT_*` mask for RC transport.
+    pub rc_odp_caps: u32,
+}
+
+impl OdpCaps {
+    /// Whether ODP registration works at all.
+    pub fn supported(&self) -> bool {
+        self.general_caps & IBV_ODP_SUPPORT != 0
+    }
+
+    /// Whether whole-address-space registration works
+    /// ([`RdmaContext::reg_mr_implicit_odp`]).
+    pub fn implicit(&self) -> bool {
+        self.general_caps & IBV_ODP_SUPPORT_IMPLICIT != 0
+    }
+
+    /// Whether RC RDMA READ may target an ODP MR — the bit the gather
+    /// path needs.
+    pub fn rc_read(&self) -> bool {
+        self.rc_odp_caps & IBV_ODP_SUPPORT_READ != 0
+    }
+}
+
+/// mlx5 direct-verbs capabilities, from `mlx5dv_query_device`.
+#[cfg(feature = "mlx5dv")]
+#[derive(Debug, Clone, Copy)]
+pub struct Mlx5Caps {
+    /// Dynamic BlueFlame doorbell registers available; 0 when the device
+    /// (or provider build) has none.
+    pub max_dynamic_bfregs: u32,
+    /// `MLX5DV_CONTEXT_FLAGS_*` word.
+    pub flags: u64,
+}
 
 impl RdmaContext {
     /// Open the first available RDMA device.
@@ -91,6 +142,16 @@ impl RdmaContext {
         let device_slot = unsafe { device_list.add(device_index) };
         // SAFETY: `device_slot` is in-bounds; the list is non-null.
         let device = unsafe { *device_slot };
+        // SAFETY: `device` is a valid device pointer from the list.
+        let name_ptr = unsafe { ibv_get_device_name(device) };
+        let numa_node = if name_ptr.is_null() {
+            None
+        } else {
+            // SAFETY: `name_ptr` is a NUL-terminated string owned by
+            // ibverbs, valid until the list is freed below.
+            let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+            read_numa_node(&name)
+        };
         // SAFETY: `device` is a valid device pointer from the list.
         let context = unsafe { ibv_open_device(device) };
         // SAFETY: `device_list` is non-null and not yet freed.
@@ -176,6 +237,106 @@ impl RdmaContext {
             port_lid: port_attr.lid,
             port_gid: gid,
             gid_index,
+            numa_node,
+        })
+    }
+
+    /// NUMA node of this device, as sysfs reported it at open time.
+    ///
+    /// Use it to co-locate served memory (`NumaBindHook`) and worker
+    /// threads with the NIC; `None` when the platform doesn't expose
+    /// placement (VMs, SoftRoCE).
+    pub fn device_numa_node(&self) -> Option<i32> {
+        self.numa_node
+    }
+
+    /// On-demand-paging capabilities of the opened device.
+    ///
+    /// ODP registration (`IBV_ACCESS_ON_DEMAND`) skips pinning: the HCA
+    /// faults pages as it touches them, trading first-touch latency for
+    /// instant registration of arbitrarily large ranges. Check the
+    /// per-verb bits before relying on a path — a device may fault READs
+    /// but not atomics.
+    pub fn odp_caps(&self) -> io::Result<OdpCaps> {
+        let mut general_caps: u64 = 0;
+        let mut rc_odp_caps: u32 = 0;
+        // SAFETY: `self.context` is open; both out-pointers are valid.
+        let ret =
+            unsafe { aether_ibv_query_odp_caps(self.context, &mut general_caps, &mut rc_odp_caps) };
+        if ret != 0 {
+            return Err(io::Error::other(format!(
+                "ibv_query_device_ex failed: {ret}"
+            )));
+        }
+        Ok(OdpCaps {
+            general_caps,
+            rc_odp_caps,
+        })
+    }
+
+    /// Register the process's entire address space as one on-demand MR.
+    ///
+    /// Nothing is pinned; the HCA faults pages in as work requests touch
+    /// them, so one registration covers every buffer the process will
+    /// ever expose — no per-buffer `reg_mr` calls, no registration cache.
+    /// Requires [`OdpCaps::implicit`]; the device rejects the call
+    /// otherwise. Same Drop-order contract as [`Self::reg_mr`].
+    pub fn reg_mr_implicit_odp(&self, access: i32) -> io::Result<RegisteredMr> {
+        // SAFETY: null addr + SIZE_MAX length is the documented implicit-
+        // ODP registration form; no memory is pinned or aliased by it.
+        let mr = unsafe {
+            ibv_reg_mr(
+                self.pd,
+                ptr::null_mut(),
+                usize::MAX,
+                access | IBV_ACCESS_ON_DEMAND,
+            )
+        };
+        if mr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(RegisteredMr { mr })
+    }
+
+    /// mlx5 direct-verbs capabilities, `Err` on non-mlx5 devices.
+    ///
+    /// A nonzero `max_dynamic_bfregs` means the device exposes BlueFlame
+    /// doorbell registers — the MMIO fast-post path small WQEs can take
+    /// on ConnectX hardware (mapped per-QP via `mlx5dv_init_obj`).
+    #[cfg(feature = "mlx5dv")]
+    pub fn mlx5_caps(&self) -> io::Result<Mlx5Caps> {
+        let mut max_dynamic_bfregs: u32 = 0;
+        let mut flags: u64 = 0;
+        // SAFETY: `self.context` is open; both out-pointers are valid.
+        let ret = unsafe { aether_mlx5dv_query(self.context, &mut max_dynamic_bfregs, &mut flags) };
+        if ret != 0 {
+            return Err(io::Error::other(format!("mlx5dv_query_device: {ret}")));
+        }
+        Ok(Mlx5Caps {
+            max_dynamic_bfregs,
+            flags,
+        })
+    }
+
+    /// Atomic capabilities of the opened device.
+    ///
+    /// Consult before using `post_fetch_add` / `post_compare_swap`:
+    /// `IBV_ATOMIC_NONE` devices (EFA among them) reject atomic WRs, and
+    /// `IBV_ATOMIC_HCA` guarantees atomicity only against other HCA
+    /// operations — CPU stores on the responder can still tear.
+    pub fn device_atomic_caps(&self) -> io::Result<AtomicCaps> {
+        let mut atomic_cap: i32 = 0;
+        let mut max_qp_rd_atom: i32 = 0;
+        // SAFETY: `self.context` is open; both out-pointers are valid.
+        let ret = unsafe {
+            aether_ibv_query_atomic_caps(self.context, &mut atomic_cap, &mut max_qp_rd_atom)
+        };
+        if ret != 0 {
+            return Err(io::Error::other(format!("ibv_query_device failed: {ret}")));
+        }
+        Ok(AtomicCaps {
+            atomic_cap,
+            max_qp_rd_atom,
         })
     }
 
@@ -325,6 +486,31 @@ impl Drop for RdmaContext {
 pub fn create_cq(ctx: &RdmaContext, cq_size: i32) -> io::Result<RegisteredCq> {
     // SAFETY: `ctx.context` is alive for as long as `ctx` is borrowed.
     let cq = unsafe { ibv_create_cq(ctx.context, cq_size, ptr::null_mut(), ptr::null_mut(), 0) };
+    if cq.is_null() {
+        return Err(io::Error::other("ibv_create_cq failed"));
+    }
+    Ok(RegisteredCq { cq })
+}
+
+/// A CQ whose completions raise events on `channel` (see
+/// [`super::event::CompletionChannel`]). Same Drop contract as
+/// [`create_cq`], plus: drop the CQ before the channel.
+pub fn create_cq_on_channel(
+    ctx: &RdmaContext,
+    cq_size: i32,
+    channel: *mut IbvCompChannel,
+) -> io::Result<RegisteredCq> {
+    // SAFETY: `ctx.context` and `channel` are alive for the call; the
+    // channel pointer type matches the void* parameter's real ABI type.
+    let cq = unsafe {
+        ibv_create_cq(
+            ctx.context,
+            cq_size,
+            ptr::null_mut(),
+            channel as *mut libc::c_void,
+            0,
+        )
+    };
     if cq.is_null() {
         return Err(io::Error::other("ibv_create_cq failed"));
     }

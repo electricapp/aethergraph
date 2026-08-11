@@ -37,6 +37,39 @@ pub struct IbvCq {
     _opaque: [u8; 0],
 }
 
+/// ibverbs shared receive queue.
+#[repr(C)]
+pub struct IbvSrq {
+    _opaque: [u8; 0],
+}
+
+/// ibverbs completion event channel.
+///
+/// Non-opaque: `struct ibv_comp_channel` is public ABI in verbs.h, and
+/// the `fd` field is the whole point — it's what event loops poll.
+#[repr(C)]
+pub struct IbvCompChannel {
+    pub context: *mut IbvContext,
+    pub fd: i32,
+    pub refcnt: i32,
+}
+
+/// SRQ attributes (matches `struct ibv_srq_attr`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IbvSrqAttr {
+    pub max_wr: u32,
+    pub max_sge: u32,
+    pub srq_limit: u32,
+}
+
+/// SRQ creation attributes (matches `struct ibv_srq_init_attr`).
+#[repr(C)]
+pub struct IbvSrqInitAttr {
+    pub srq_context: *mut libc::c_void,
+    pub attr: IbvSrqAttr,
+}
+
 /// ibverbs queue pair — non-opaque layout through `qp_num`.
 ///
 /// The fields before `qp_num` must match `struct ibv_qp` in rdma-core
@@ -182,6 +215,21 @@ pub struct IbvSendWrRdma {
     pub rkey: u32,
 }
 
+/// Atomic-specific work request fields (union member of `wr`).
+///
+/// For FETCH_ADD, `compare_add` is the addend and `swap` is ignored; for
+/// CMP_AND_SWP, `compare_add` is the expected value and `swap` replaces
+/// it on match. Both operate on exactly 8 bytes at an 8-byte-aligned
+/// `remote_addr`, and the original remote value lands in the WR's SGE.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IbvSendWrAtomic {
+    pub remote_addr: u64,
+    pub compare_add: u64,
+    pub swap: u64,
+    pub rkey: u32,
+}
+
 /// Send work request.
 ///
 /// Layout matches `struct ibv_send_wr` in <infiniband/verbs.h> exactly. The
@@ -216,6 +264,7 @@ pub struct IbvSendWr {
 #[derive(Clone, Copy)]
 pub union IbvSendWrUnion {
     pub rdma: IbvSendWrRdma,
+    pub atomic: IbvSendWrAtomic,
     /// Pad to the size of the largest variant (atomic: remote_addr + rkey + compare_add + swap).
     _atomic_pad: [u8; 32],
 }
@@ -227,6 +276,24 @@ pub union IbvSendWrUnion {
 const _: () = assert!(core::mem::size_of::<IbvSendWr>() == 128);
 // The wr union must cover the largest variant (atomic = 28 bytes, padded to 32).
 const _: () = assert!(core::mem::size_of::<IbvSendWrUnion>() == 32);
+
+/// Receive work request.
+///
+/// Layout matches `struct ibv_recv_wr` in <infiniband/verbs.h>. A
+/// zero-SGE recv (`num_sge = 0`, null `sg_list`) is the sentinel shape
+/// used to consume WRITE_WITH_IMM notifications — the payload arrives
+/// via RDMA, only the immediate needs a queued recv.
+#[repr(C)]
+pub struct IbvRecvWr {
+    pub wr_id: u64,
+    pub next: *mut IbvRecvWr,
+    pub sg_list: *mut IbvSge,
+    pub num_sge: i32,
+}
+
+// ABI drift guard: `struct ibv_recv_wr` is 32 bytes on rdma-core (LP64) —
+// 28 bytes of fields padded to pointer alignment.
+const _: () = assert!(core::mem::size_of::<IbvRecvWr>() == 32);
 
 // ---------------------------------------------------------------------------
 // Work completion
@@ -332,6 +399,25 @@ pub const IBV_WR_RDMA_WRITE_WITH_IMM: u32 = 1;
 pub const IBV_WR_SEND: u32 = 2;
 pub const IBV_WR_SEND_WITH_IMM: u32 = 3;
 pub const IBV_WR_RDMA_READ: u32 = 4;
+pub const IBV_WR_ATOMIC_CMP_AND_SWP: u32 = 5;
+pub const IBV_WR_ATOMIC_FETCH_AND_ADD: u32 = 6;
+
+// Work completion opcodes (matches enum ibv_wc_opcode). Send-side
+// completions mirror the WR kind; receive-side completions have the
+// IBV_WC_RECV bit (1 << 7) set.
+pub const IBV_WC_RDMA_WRITE: u32 = 1;
+pub const IBV_WC_RDMA_READ: u32 = 2;
+pub const IBV_WC_COMP_SWAP: u32 = 3;
+pub const IBV_WC_FETCH_ADD: u32 = 4;
+pub const IBV_WC_RECV: u32 = 1 << 7;
+pub const IBV_WC_RECV_RDMA_WITH_IMM: u32 = (1 << 7) | 1;
+
+// Device atomic capability levels (matches enum ibv_atomic_cap).
+// HCA = atomic w.r.t. other HCA operations only; GLOB = also atomic
+// w.r.t. CPU accesses on the responder.
+pub const IBV_ATOMIC_NONE: i32 = 0;
+pub const IBV_ATOMIC_HCA: i32 = 1;
+pub const IBV_ATOMIC_GLOB: i32 = 2;
 
 // Send flags (matches enum ibv_send_flags). SIGNALED must be bit 1 (=2);
 // using IBV_SEND_SOLICITED (bit 2) here instead suppresses completion
@@ -348,6 +434,19 @@ pub const IBV_ACCESS_LOCAL_WRITE: i32 = 1 << 0;
 pub const IBV_ACCESS_REMOTE_WRITE: i32 = 1 << 1;
 pub const IBV_ACCESS_REMOTE_READ: i32 = 1 << 2;
 pub const IBV_ACCESS_REMOTE_ATOMIC: i32 = 1 << 3;
+/// On-demand paging: the MR faults pages as the HCA touches them instead
+/// of pinning the whole range at registration.
+pub const IBV_ACCESS_ON_DEMAND: i32 = 1 << 6;
+
+// ODP capability masks from `ibv_query_device_ex` (enum
+// ibv_odp_general_caps and enum ibv_odp_transport_cap_bits).
+pub const IBV_ODP_SUPPORT: u64 = 1 << 0;
+pub const IBV_ODP_SUPPORT_IMPLICIT: u64 = 1 << 1;
+pub const IBV_ODP_SUPPORT_SEND: u32 = 1 << 0;
+pub const IBV_ODP_SUPPORT_RECV: u32 = 1 << 1;
+pub const IBV_ODP_SUPPORT_WRITE: u32 = 1 << 2;
+pub const IBV_ODP_SUPPORT_READ: u32 = 1 << 3;
+pub const IBV_ODP_SUPPORT_ATOMIC: u32 = 1 << 4;
 
 // QP attribute masks for ibv_modify_qp
 pub const IBV_QP_STATE: i32 = 1 << 0;
@@ -436,6 +535,42 @@ unsafe extern "C" {
     pub fn ibv_post_send(qp: *mut IbvQp, wr: *mut IbvSendWr, bad_wr: *mut *mut IbvSendWr) -> i32;
     #[link_name = "aether_ibv_poll_cq"]
     pub fn ibv_poll_cq(cq: *mut IbvCq, num_entries: i32, wc: *mut IbvWc) -> i32;
+    #[link_name = "aether_ibv_post_recv"]
+    pub fn ibv_post_recv(qp: *mut IbvQp, wr: *mut IbvRecvWr, bad_wr: *mut *mut IbvRecvWr) -> i32;
+    // Shimmed so Rust never mirrors the large `struct ibv_device_attr`.
+    pub fn aether_ibv_query_atomic_caps(
+        context: *mut IbvContext,
+        atomic_cap: *mut i32,
+        max_qp_rd_atom: *mut i32,
+    ) -> i32;
+    // Shimmed so Rust never mirrors `struct ibv_device_attr_ex`.
+    pub fn aether_ibv_query_odp_caps(
+        context: *mut IbvContext,
+        general_caps: *mut u64,
+        rc_odp_caps: *mut u32,
+    ) -> i32;
+
+    // Shared receive queue (real ABI symbols apart from the inline post).
+    pub fn ibv_create_srq(pd: *mut IbvPd, attr: *mut IbvSrqInitAttr) -> *mut IbvSrq;
+    pub fn ibv_destroy_srq(srq: *mut IbvSrq) -> i32;
+    #[link_name = "aether_ibv_post_srq_recv"]
+    pub fn ibv_post_srq_recv(
+        srq: *mut IbvSrq,
+        wr: *mut IbvRecvWr,
+        bad_wr: *mut *mut IbvRecvWr,
+    ) -> i32;
+
+    // Completion event channel (real ABI symbols apart from req_notify).
+    pub fn ibv_create_comp_channel(context: *mut IbvContext) -> *mut IbvCompChannel;
+    pub fn ibv_destroy_comp_channel(channel: *mut IbvCompChannel) -> i32;
+    pub fn ibv_get_cq_event(
+        channel: *mut IbvCompChannel,
+        cq: *mut *mut IbvCq,
+        cq_context: *mut *mut libc::c_void,
+    ) -> i32;
+    pub fn ibv_ack_cq_events(cq: *mut IbvCq, nevents: u32);
+    #[link_name = "aether_ibv_req_notify_cq"]
+    pub fn ibv_req_notify_cq(cq: *mut IbvCq, solicited_only: i32) -> i32;
 
     // Port / GID queries
     pub fn ibv_query_port(
@@ -448,5 +583,16 @@ unsafe extern "C" {
         port_num: u8,
         index: i32,
         gid: *mut IbvGid,
+    ) -> i32;
+}
+
+#[cfg(feature = "mlx5dv")]
+unsafe extern "C" {
+    // mlx5 direct-verbs capability probe (csrc/mlx5dv_shim.c). Returns
+    // ENOTSUP on non-mlx5 devices.
+    pub fn aether_mlx5dv_query(
+        context: *mut IbvContext,
+        max_dynamic_bfregs: *mut u32,
+        flags: *mut u64,
     ) -> i32;
 }

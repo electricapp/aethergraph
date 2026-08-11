@@ -124,6 +124,12 @@ impl UringLane {
 
     /// The aligned pool, rebuilt only when the requested geometry outgrows
     /// the cached one.
+    ///
+    /// A (re)built pool's region is registered with the ring as a fixed
+    /// buffer, so reads landing in it use `ReadFixed` — the kernel skips
+    /// the per-op page pin/unpin cycle. Registration failure (typically
+    /// the locked-memory rlimit) is non-fatal: reads fall back to plain
+    /// `Read` on the same buffers.
     pub fn direct_pool(
         &mut self,
         num_slots: usize,
@@ -134,7 +140,22 @@ impl UringLane {
             None => true,
         };
         if rebuild {
-            self.pool = Some(AlignedBufferPool::try_new(num_slots, slot_size)?);
+            // The live registration references the allocation replaced
+            // below; the kernel must let go of it before it frees.
+            self.handle.unregister_buffer_region();
+            let mut pool = AlignedBufferPool::try_new(num_slots, slot_size)?;
+            // SAFETY: the region lives in `self.pool` beside the handle;
+            // this method unregisters before every rebuild, and on drop
+            // the handle (declared first) closes the ring before the pool
+            // field frees.
+            let registered = unsafe {
+                self.handle
+                    .register_buffer_region(pool.region_ptr(), pool.region_len())
+            };
+            if let Err(e) = registered {
+                warn!("io_uring buffer registration failed ({e}); reads stay unregistered");
+            }
+            self.pool = Some(pool);
         }
         Ok(self.pool.as_mut().expect("pool populated above"))
     }
@@ -177,6 +198,8 @@ pub struct UringHandle {
     iopoll_enabled: bool,
     /// Registered file descriptor index (if any)
     registered_fd: Option<u32>,
+    /// Registered fixed-buffer region as (base address, length), if any.
+    registered_buf: Option<(usize, usize)>,
 }
 
 impl UringHandle {
@@ -204,6 +227,7 @@ impl UringHandle {
                     sqpoll_enabled: true,
                     iopoll_enabled: true,
                     registered_fd: None,
+                    registered_buf: None,
                 })
             }
             Err(e) => {
@@ -238,6 +262,7 @@ impl UringHandle {
                     sqpoll_enabled: true,
                     iopoll_enabled: false,
                     registered_fd: None,
+                    registered_buf: None,
                 })
             }
             Err(e) => {
@@ -250,6 +275,7 @@ impl UringHandle {
                     sqpoll_enabled: false,
                     iopoll_enabled: false,
                     registered_fd: None,
+                    registered_buf: None,
                 })
             }
         }
@@ -279,6 +305,44 @@ impl UringHandle {
     /// Check if we have a registered file descriptor.
     pub fn registered_fd_index(&self) -> Option<u32> {
         self.registered_fd
+    }
+
+    /// Register one contiguous memory region as fixed buffer index 0.
+    ///
+    /// Reads targeting memory inside the region can then use `ReadFixed`,
+    /// which skips the kernel's per-op get_user_pages pin/unpin cycle.
+    /// Any prior registration is replaced.
+    ///
+    /// # Safety
+    /// The region must stay allocated until it is unregistered (via
+    /// [`Self::unregister_buffer_region`] or a replacing registration) or
+    /// the ring is closed, whichever comes first.
+    pub unsafe fn register_buffer_region(&mut self, ptr: *mut u8, len: usize) -> Result<()> {
+        self.unregister_buffer_region();
+        let iov = libc::iovec {
+            iov_base: ptr as *mut libc::c_void,
+            iov_len: len,
+        };
+        // SAFETY: caller guarantees the region outlives the registration.
+        unsafe { self.ring.submitter().register_buffers(&[iov]) }
+            .context("failed to register fixed buffer region")?;
+        self.registered_buf = Some((ptr as usize, len));
+        debug!("Registered {len}-byte fixed buffer region");
+        Ok(())
+    }
+
+    /// Drop the fixed-buffer registration, if any. Idempotent.
+    pub fn unregister_buffer_region(&mut self) {
+        if self.registered_buf.take().is_some()
+            && let Err(e) = self.ring.submitter().unregister_buffers()
+        {
+            warn!("Failed to unregister fixed buffers: {e}");
+        }
+    }
+
+    /// Registered fixed-buffer region as (base address, length), if any.
+    pub fn registered_buf_range(&self) -> Option<(usize, usize)> {
+        self.registered_buf
     }
 
     /// Check if SQPOLL is enabled.
@@ -370,6 +434,7 @@ impl UringHandle {
 
 impl Drop for UringHandle {
     fn drop(&mut self) {
+        self.unregister_buffer_region();
         // Unregister file descriptor if registered
         if self.registered_fd.is_some() {
             if let Err(e) = self.ring.submitter().unregister_files() {
@@ -496,6 +561,16 @@ pub fn batch_read(
     // mode. Callers must pass the same file they registered — there is no
     // per-call fd override once a fd is registered on the handle.
     let registered_idx = handle.registered_fd_index();
+    // Reads landing entirely inside the registered fixed-buffer region use
+    // `ReadFixed` (no per-op page pinning); anything else takes plain `Read`
+    // on the same ring.
+    let registered_buf = handle.registered_buf_range();
+    let in_registered_buf = |ptr: *mut u8, len: usize| {
+        registered_buf.is_some_and(|(base, region_len)| {
+            let p = ptr as usize;
+            p >= base && len <= region_len && p - base <= region_len - len
+        })
+    };
     let is_sqpoll = handle.is_sqpoll();
     // During the push phase, hand accumulated SQEs to the kernel and reap
     // available completions at this cadence — the device starts working
@@ -549,12 +624,22 @@ pub fn batch_read(
         let (submitter, mut sq, mut cq) = handle.split();
 
         'push: for (i, &(offset, buf_ptr, len)) in reads.iter().enumerate() {
-            let entry = match registered_idx {
-                Some(idx) => opcode::Read::new(types::Fixed(idx), buf_ptr, len as u32),
-                None => opcode::Read::new(types::Fd(fd), buf_ptr, len as u32),
+            let entry = match (registered_idx, in_registered_buf(buf_ptr, len)) {
+                (Some(idx), true) => {
+                    opcode::ReadFixed::new(types::Fixed(idx), buf_ptr, len as u32, 0)
+                        .offset(offset)
+                        .build()
+                }
+                (Some(idx), false) => opcode::Read::new(types::Fixed(idx), buf_ptr, len as u32)
+                    .offset(offset)
+                    .build(),
+                (None, true) => opcode::ReadFixed::new(types::Fd(fd), buf_ptr, len as u32, 0)
+                    .offset(offset)
+                    .build(),
+                (None, false) => opcode::Read::new(types::Fd(fd), buf_ptr, len as u32)
+                    .offset(offset)
+                    .build(),
             }
-            .offset(offset)
-            .build()
             .user_data(i as u64);
 
             // Push to SQ, submitting if full. A submit failure stops the
@@ -762,6 +847,50 @@ mod tests {
         batch_read(&mut handle, fd, &reads2).unwrap();
         assert_eq!(&buf_a[..], &data[..4096]);
         assert_eq!(&buf_b[..], &data[4096..8192]);
+    }
+
+    #[test]
+    fn registered_buffer_reads_and_pool_rebuild() {
+        // Reads landing in the registered pool region take the ReadFixed
+        // path; growing the pool must re-register the new region; reads
+        // outside the region in the same batch take the plain path. All
+        // must return correct data on one lane.
+        let mut temp = NamedTempFile::new().unwrap();
+        let data: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+
+        let Some(handle) = create_feature_uring(false) else {
+            println!("io_uring not available; skipping");
+            return;
+        };
+        let mut lane = UringLane::new(handle);
+        let file = File::open(temp.path()).unwrap();
+        let fd = file.as_raw_fd();
+
+        // Two geometries: the second forces a pool rebuild + re-register.
+        for (num_slots, slot_size) in [(4usize, 4096usize), (16, 8192)] {
+            let pool = lane.direct_pool(num_slots, slot_size).unwrap();
+            let mut reads: Vec<(u64, *mut u8, usize)> = Vec::new();
+            for i in 0..4 {
+                reads.push(((i * 4096) as u64, pool.slot_ptr(i), 4096));
+            }
+            // One destination outside the registered region.
+            let mut outside = vec![0u8; 4096];
+            reads.push(((4 * 4096) as u64, outside.as_mut_ptr(), 4096));
+
+            batch_read(&mut lane.handle, fd, &reads).unwrap();
+
+            let pool = lane.direct_pool(num_slots, slot_size).unwrap();
+            for i in 0..4 {
+                assert_eq!(
+                    pool.slot_slice(i, 4096),
+                    &data[i * 4096..(i + 1) * 4096],
+                    "slot {i} at geometry {num_slots}x{slot_size}"
+                );
+            }
+            assert_eq!(&outside[..], &data[4 * 4096..5 * 4096]);
+        }
     }
 
     #[test]

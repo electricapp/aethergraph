@@ -7,6 +7,7 @@
 mod ring;
 
 pub mod hooks;
+pub mod numa;
 
 pub use ring::{
     DetachedSlot, FreeList, HookError, MemoryHook, RingBuilderError, RingSlot, SharedMemoryRing,

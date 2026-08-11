@@ -22,6 +22,48 @@ int aether_ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc) {
     return ibv_poll_cq(cq, num_entries, wc);
 }
 
+int aether_ibv_post_recv(struct ibv_qp *qp,
+                         struct ibv_recv_wr *wr,
+                         struct ibv_recv_wr **bad_wr) {
+    return ibv_post_recv(qp, wr, bad_wr);
+}
+
+/* Device capabilities the atomic paths need. Probing lives here so the
+ * Rust side never mirrors the large, drift-prone `struct ibv_device_attr`. */
+int aether_ibv_query_atomic_caps(struct ibv_context *ctx,
+                                 int *atomic_cap,
+                                 int *max_qp_rd_atom) {
+    struct ibv_device_attr attr;
+    int rc = ibv_query_device(ctx, &attr);
+    if (rc != 0) return rc;
+    *atomic_cap = (int)attr.atomic_cap;
+    *max_qp_rd_atom = attr.max_qp_rd_atom;
+    return 0;
+}
+
+int aether_ibv_post_srq_recv(struct ibv_srq *srq,
+                             struct ibv_recv_wr *wr,
+                             struct ibv_recv_wr **bad_wr) {
+    return ibv_post_srq_recv(srq, wr, bad_wr);
+}
+
+int aether_ibv_req_notify_cq(struct ibv_cq *cq, int solicited_only) {
+    return ibv_req_notify_cq(cq, solicited_only);
+}
+
+/* On-demand-paging capabilities via the extended device query; shimmed to
+ * keep `struct ibv_device_attr_ex` on the C side. */
+int aether_ibv_query_odp_caps(struct ibv_context *ctx,
+                              uint64_t *general_caps,
+                              uint32_t *rc_odp_caps) {
+    struct ibv_device_attr_ex attr = {0};
+    int rc = ibv_query_device_ex(ctx, NULL, &attr);
+    if (rc != 0) return rc;
+    *general_caps = attr.odp_caps.general_caps;
+    *rc_odp_caps = attr.odp_caps.per_transport_caps.rc_odp_caps;
+    return 0;
+}
+
 #ifdef AETHER_EFA_SHIM
 
 /* ------------------------------------------------------------------ */

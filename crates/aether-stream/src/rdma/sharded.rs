@@ -108,6 +108,11 @@ impl ShardedQpPool {
         let mut cqs = Vec::with_capacity(cfg.num_shards);
         let mut handles = Vec::with_capacity(cfg.num_shards);
 
+        // Workers prefer the NIC's NUMA node for their allocations so
+        // per-shard scratch lands where the device DMAs. Preference, not
+        // bind: an overfull node spills instead of failing.
+        let nic_node = ctx.device_numa_node().and_then(|n| u32::try_from(n).ok());
+
         for shard_idx in 0..cfg.num_shards {
             let cq = Arc::new(create_cq(ctx, cfg.cq_size)?);
             let qp = Arc::new(RdmaQp::create_with_cqs(
@@ -130,6 +135,9 @@ impl ShardedQpPool {
                 .spawn(move || {
                     if let Some(id) = core_id {
                         let _ = core_affinity::set_for_current(core_affinity::CoreId { id });
+                    }
+                    if let Some(node) = nic_node {
+                        let _ = aether_mem::numa::prefer_current_thread(node);
                     }
                     worker_loop(qp_for_worker, cq_for_worker, work_rx);
                 })

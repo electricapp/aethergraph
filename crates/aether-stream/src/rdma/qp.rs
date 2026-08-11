@@ -37,6 +37,32 @@ pub struct RdmaRead {
     pub length: u32,
 }
 
+/// A single RDMA WRITE descriptor for batch posting.
+pub struct RdmaWrite {
+    /// Local address the payload is written from.
+    pub local_addr: u64,
+    /// Local key from ibv_reg_mr.
+    pub local_lkey: u32,
+    /// Remote address the payload lands at.
+    pub remote_addr: u64,
+    /// Remote key from the target's advertisement (its MR must grant
+    /// `IBV_ACCESS_REMOTE_WRITE`, and its QP `connect_with_access` must
+    /// include it).
+    pub remote_rkey: u32,
+    /// Number of bytes to write.
+    pub length: u32,
+    /// When set, the WR becomes WRITE_WITH_IMM: the 32 bits are delivered
+    /// verbatim with the receiver's recv completion, consuming one posted
+    /// recv WR (see [`RdmaQp::post_recv_sentinels`]). `None` writes
+    /// silently — no receiver-side completion at all.
+    pub imm: Option<u32>,
+}
+
+/// The default QP access mask [`RdmaQp::connect`] applies: remote peers
+/// may READ, nothing else. Protocols that accept incoming WRITEs or
+/// atomics opt in via [`RdmaQp::connect_with_access`].
+pub const DEFAULT_QP_ACCESS: u32 = IBV_ACCESS_REMOTE_READ as u32 | IBV_ACCESS_LOCAL_WRITE as u32;
+
 /// Reusable SGE/WR arrays for batch posting. An `IbvSendWr` is ~128 bytes,
 /// so building a 1024-read chain allocated ~132 KB per post; the scratch
 /// amortizes that to steady state. Behind a Mutex only for interior
@@ -129,6 +155,44 @@ impl RdmaQp {
         })
     }
 
+    /// [`Self::create_with_cqs`] with receives drawn from a shared
+    /// receive queue instead of a private one.
+    ///
+    /// The QP's own receive queue goes unused — sentinels are posted on
+    /// the SRQ (`Srq::post_recv_sentinels`) and consumed by
+    /// WRITE_WITH_IMM arrivals on *any* QP attached to it. Completions
+    /// still land on this QP's `recv_cq`. Drop the QP before the SRQ.
+    pub fn create_with_cqs_srq(
+        ctx: &RdmaContext,
+        cap: &IbvQpCap,
+        send_cq: *mut IbvCq,
+        recv_cq: *mut IbvCq,
+        srq: &super::srq::Srq,
+    ) -> io::Result<Self> {
+        // SAFETY: zeroed init of a POD ibverbs struct is sound.
+        let mut init_attr: IbvQpInitAttr = unsafe { std::mem::zeroed() };
+        init_attr.send_cq = send_cq;
+        init_attr.recv_cq = recv_cq;
+        init_attr.srq = srq.as_ptr() as *mut libc::c_void;
+        init_attr.qp_type = IBV_QPT_RC;
+        init_attr.cap = *cap;
+
+        // SAFETY: `ctx.pd` and the SRQ are alive; `init_attr` is valid.
+        let qp = unsafe { ibv_create_qp(ctx.pd, &mut init_attr) };
+        if qp.is_null() {
+            return Err(io::Error::other("ibv_create_qp failed"));
+        }
+
+        Ok(Self {
+            qp,
+            max_send_wr: cap.max_send_wr,
+            post_scratch: std::sync::Mutex::new(PostScratch {
+                sges: Vec::new(),
+                wrs: Vec::new(),
+            }),
+        })
+    }
+
     /// Send-queue depth this QP was created with (`IbvQpCap::max_send_wr`).
     /// Callers size posting windows against it so pipelining follows the
     /// QP's actual capability.
@@ -157,7 +221,23 @@ impl RdmaQp {
     /// `ibv_modify_qp` rejects the RTR/RTS transition and `connect` returns the
     /// underlying error — feed a smaller value here if you target such hardware.
     pub fn connect(&self, ctx: &RdmaContext, remote: &QpEndpoint) -> io::Result<()> {
-        self.to_init(ctx)?;
+        self.connect_with_access(ctx, remote, DEFAULT_QP_ACCESS)
+    }
+
+    /// [`Self::connect`] with an explicit responder access mask.
+    ///
+    /// `qp_access_flags` bounds what the *remote* peer may do to local
+    /// memory through this QP; each MR's own access mask still applies on
+    /// top. Pass `DEFAULT_QP_ACCESS | IBV_ACCESS_REMOTE_WRITE as u32` for
+    /// push-mode publication, `| IBV_ACCESS_REMOTE_ATOMIC as u32` for
+    /// one-sided claim/reservation protocols.
+    pub fn connect_with_access(
+        &self,
+        ctx: &RdmaContext,
+        remote: &QpEndpoint,
+        qp_access_flags: u32,
+    ) -> io::Result<()> {
+        self.to_init(ctx, qp_access_flags)?;
         self.to_rtr(ctx, remote)?;
         self.to_rts()?;
         Ok(())
@@ -289,6 +369,217 @@ impl RdmaQp {
         Ok(())
     }
 
+    /// Post a batch of RDMA WRITEs as a chained WR linked list (single
+    /// doorbell). The last WR is signaled; caller drains one completion.
+    ///
+    /// Writes with `imm: Some(_)` additionally deliver the 32-bit
+    /// immediate to the receiver, consuming one of its posted recv WRs
+    /// and generating a `IBV_WC_RECV_RDMA_WITH_IMM` completion there —
+    /// push-mode publication where the consumer learns of the payload
+    /// from its CQ instead of polling memory.
+    pub fn post_writes(&self, writes: &[RdmaWrite]) -> io::Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        if writes.len() > self.max_send_wr as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "writes.len() {} exceeds QP max_send_wr {}",
+                    writes.len(),
+                    self.max_send_wr
+                ),
+            ));
+        }
+
+        let mut scratch = self.post_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let PostScratch { sges, wrs } = &mut *scratch;
+        sges.clear();
+        wrs.clear();
+        sges.reserve(writes.len());
+        wrs.reserve(writes.len());
+
+        for write in writes {
+            sges.push(IbvSge {
+                addr: write.local_addr,
+                length: write.length,
+                lkey: write.local_lkey,
+            });
+        }
+
+        let last = writes.len() - 1;
+        for (i, write) in writes.iter().enumerate() {
+            // SAFETY: zeroed init of a POD ibverbs struct is sound.
+            let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
+            wr.wr_id = i as u64;
+            wr.sg_list = &mut sges[i] as *mut IbvSge;
+            wr.num_sge = 1;
+            match write.imm {
+                Some(imm) => {
+                    wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+                    wr.imm_data = imm;
+                }
+                None => wr.opcode = IBV_WR_RDMA_WRITE,
+            }
+            wr.send_flags = if i == last { IBV_SEND_SIGNALED } else { 0 };
+            wr.wr = IbvSendWrUnion {
+                rdma: IbvSendWrRdma {
+                    remote_addr: write.remote_addr,
+                    rkey: write.remote_rkey,
+                },
+            };
+            wrs.push(wr);
+        }
+
+        for i in 0..wrs.len() - 1 {
+            let next_ptr = &mut wrs[i + 1] as *mut IbvSendWr;
+            wrs[i].next = next_ptr;
+        }
+
+        let mut bad_wr: *mut IbvSendWr = ptr::null_mut();
+        // SAFETY: `self.qp` is alive; `wrs[0]` is the head of a valid WR chain.
+        let ret = unsafe { ibv_post_send(self.qp, &mut wrs[0], &mut bad_wr) };
+        if ret != 0 {
+            return Err(io::Error::other(format!("ibv_post_send failed: {ret}")));
+        }
+        Ok(())
+    }
+
+    /// One-sided FETCH_AND_ADD: atomically add `add` to the 8 bytes at
+    /// `remote.0` and deposit the *original* value into the 8 bytes at
+    /// `local.0`. Signaled; caller drains one `IBV_WC_FETCH_ADD`
+    /// completion.
+    ///
+    /// The canonical use is remote cursor reservation — FETCH_ADD on a
+    /// ring tail hands this side an exclusive slot index with zero
+    /// responder CPU. Both addresses must be 8-byte aligned; the target
+    /// MR must grant `IBV_ACCESS_REMOTE_ATOMIC` and the responder QP must
+    /// be connected with it. Check the device's
+    /// [`super::context::RdmaContext::device_atomic_caps`] before relying
+    /// on this path.
+    pub fn post_fetch_add(
+        &self,
+        wr_id: u64,
+        local: (u64, u32),
+        remote: (u64, u32),
+        add: u64,
+    ) -> io::Result<()> {
+        self.post_atomic(wr_id, local, remote, IBV_WR_ATOMIC_FETCH_AND_ADD, add, 0)
+    }
+
+    /// One-sided CMP_AND_SWP: if the 8 bytes at `remote.0` equal
+    /// `expect`, replace them with `swap`; either way deposit the
+    /// original value into `local.0` — equality with `expect` is the
+    /// success test. Signaled; caller drains one `IBV_WC_COMP_SWAP`
+    /// completion.
+    ///
+    /// The canonical use is a one-sided seqlock write claim: CAS the
+    /// slot's `head_version` from even `v` to odd `v + 1`; the original
+    /// value shows whether the claim won. Alignment and access
+    /// requirements match [`Self::post_fetch_add`].
+    pub fn post_compare_swap(
+        &self,
+        wr_id: u64,
+        local: (u64, u32),
+        remote: (u64, u32),
+        expect: u64,
+        swap: u64,
+    ) -> io::Result<()> {
+        self.post_atomic(
+            wr_id,
+            local,
+            remote,
+            IBV_WR_ATOMIC_CMP_AND_SWP,
+            expect,
+            swap,
+        )
+    }
+
+    fn post_atomic(
+        &self,
+        wr_id: u64,
+        (local_addr, local_lkey): (u64, u32),
+        (remote_addr, remote_rkey): (u64, u32),
+        opcode: u32,
+        compare_add: u64,
+        swap: u64,
+    ) -> io::Result<()> {
+        if local_addr % 8 != 0 || remote_addr % 8 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "atomic addresses must be 8-byte aligned",
+            ));
+        }
+        let mut sge = IbvSge {
+            addr: local_addr,
+            length: 8,
+            lkey: local_lkey,
+        };
+        // SAFETY: zeroed init of a POD ibverbs struct is sound.
+        let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
+        wr.wr_id = wr_id;
+        wr.sg_list = &mut sge as *mut IbvSge;
+        wr.num_sge = 1;
+        wr.opcode = opcode;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr = IbvSendWrUnion {
+            atomic: IbvSendWrAtomic {
+                remote_addr,
+                compare_add,
+                swap,
+                rkey: remote_rkey,
+            },
+        };
+
+        let mut bad_wr: *mut IbvSendWr = ptr::null_mut();
+        // SAFETY: `self.qp` is alive; `wr` and `sge` outlive the call, and
+        // the responder writes only the 8 SGE bytes before the CQE.
+        let ret = unsafe { ibv_post_send(self.qp, &mut wr, &mut bad_wr) };
+        if ret != 0 {
+            return Err(io::Error::other(format!(
+                "ibv_post_send (atomic) failed: {ret}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Post `count` zero-length recv WRs whose only job is to absorb
+    /// incoming WRITE_WITH_IMM notifications; WR `i` gets
+    /// `wr_id = base_wr_id + i`.
+    ///
+    /// Each arriving immediate consumes one sentinel and surfaces as an
+    /// `IBV_WC_RECV_RDMA_WITH_IMM` completion carrying the sender's 32
+    /// bits in `imm_data`. The receive queue must be sized for the
+    /// outstanding window — `DEFAULT_QP_CAP.max_recv_wr` is 1, so
+    /// imm-notified consumers create their QP with a deeper receive
+    /// queue.
+    pub fn post_recv_sentinels(&self, base_wr_id: u64, count: u32) -> io::Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let mut wrs: Vec<IbvRecvWr> = (0..count)
+            .map(|i| IbvRecvWr {
+                wr_id: base_wr_id + u64::from(i),
+                next: ptr::null_mut(),
+                sg_list: ptr::null_mut(),
+                num_sge: 0,
+            })
+            .collect();
+        for i in 0..wrs.len() - 1 {
+            let next_ptr = &mut wrs[i + 1] as *mut IbvRecvWr;
+            wrs[i].next = next_ptr;
+        }
+
+        let mut bad_wr: *mut IbvRecvWr = ptr::null_mut();
+        // SAFETY: `self.qp` is alive; `wrs[0]` heads a valid chain and the
+        // zero-SGE WRs reference no memory the kernel could write.
+        let ret = unsafe { ibv_post_recv(self.qp, &mut wrs[0], &mut bad_wr) };
+        if ret != 0 {
+            return Err(io::Error::other(format!("ibv_post_recv failed: {ret}")));
+        }
+        Ok(())
+    }
+
     /// Poll the context's shared CQ for completions. Use `poll_cq_on` if this
     /// QP was created with a dedicated CQ via `create_with_cqs`.
     pub fn poll_cq(&self, ctx: &RdmaContext, wcs: &mut [IbvWc]) -> io::Result<usize> {
@@ -315,13 +606,13 @@ impl RdmaQp {
     // -----------------------------------------------------------------------
 
     /// RESET → INIT
-    fn to_init(&self, ctx: &RdmaContext) -> io::Result<()> {
+    fn to_init(&self, ctx: &RdmaContext, qp_access_flags: u32) -> io::Result<()> {
         // SAFETY: zeroed init of a POD ibverbs struct is sound.
         let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
         attr.qp_state = IBV_QPS_INIT;
         attr.pkey_index = 0;
         attr.port_num = 1;
-        attr.qp_access_flags = IBV_ACCESS_REMOTE_READ as u32 | IBV_ACCESS_LOCAL_WRITE as u32;
+        attr.qp_access_flags = qp_access_flags;
 
         let mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
         // SAFETY: `self.qp` is alive; `attr` is a valid in-param.

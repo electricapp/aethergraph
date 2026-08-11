@@ -9,6 +9,7 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let rdma = std::env::var("CARGO_FEATURE_RDMA").is_ok();
     let efa = std::env::var("CARGO_FEATURE_EFA").is_ok();
+    let mlx5dv = std::env::var("CARGO_FEATURE_MLX5DV").is_ok();
     let xdp_bpf = std::env::var("CARGO_FEATURE_XDP_BPF").is_ok();
 
     if target_os == "linux" && rdma {
@@ -16,6 +17,11 @@ fn main() {
         build.file("csrc/ibv_shim.c").flag("-O2");
         if efa {
             build.define("AETHER_EFA_SHIM", None);
+        }
+        if mlx5dv {
+            build.file("csrc/mlx5dv_shim.c");
+            println!("cargo:rustc-link-lib=mlx5");
+            println!("cargo:rerun-if-changed=csrc/mlx5dv_shim.c");
         }
         build.compile("aether_ibv_shim");
         println!("cargo:rerun-if-changed=csrc/ibv_shim.c");

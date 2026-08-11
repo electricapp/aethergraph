@@ -218,6 +218,16 @@ impl AlignedBufferPool {
         &self.buffer.as_slice()[offset..end]
     }
 
+    /// Base pointer of the contiguous region holding every slot.
+    pub fn region_ptr(&mut self) -> *mut u8 {
+        self.buffer.as_mut_ptr()
+    }
+
+    /// Byte length of the contiguous region holding every slot.
+    pub fn region_len(&self) -> usize {
+        self.buffer.len
+    }
+
     /// Get the slot size (may be larger than requested due to alignment).
     pub fn slot_size(&self) -> usize {
         self.slot_size

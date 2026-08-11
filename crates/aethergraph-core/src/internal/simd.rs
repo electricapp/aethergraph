@@ -4,6 +4,10 @@
 //! compile-time-gated path would never run for most users. Detection
 //! happens at runtime instead (std caches the CPUID result), and the
 //! scalar fallback stays fully portable.
+//!
+//! aarch64 needs no detection: the f16→f32 vector convert (`fcvtl`) is
+//! baseline NEON, present on every aarch64 CPU, so that path dispatches
+//! unconditionally.
 
 /// Convert little-endian f16 bytes into f32 values.
 ///
@@ -11,7 +15,8 @@
 ///
 /// On x86-64 with F16C (any CPU from ~2013 on), eight elements convert per
 /// `vcvtph2ps` — order-of-magnitude faster than the per-element software
-/// conversion the scalar path performs.
+/// conversion the scalar path performs. On aarch64, `fcvtl`/`fcvtl2`
+/// convert eight elements per iteration unconditionally.
 pub fn f16_le_to_f32(src: &[u8], dst: &mut [f32]) {
     assert_eq!(
         src.len(),
@@ -32,6 +37,15 @@ pub fn f16_le_to_f32(src: &[u8], dst: &mut [f32]) {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `neon` is baseline for every aarch64 target, so the
+        // feature requirement holds statically; slice lengths were
+        // asserted at entry.
+        unsafe { f16_le_to_f32_neon(src, dst) }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     f16_le_to_f32_scalar(src, dst);
 }
 
@@ -67,6 +81,47 @@ unsafe fn f16_le_to_f32_f16c(src: &[u8], dst: &mut [f32]) {
         // SAFETY: `dst_p` points at 8 in-range floats; the unaligned store
         // variant tolerates any alignment.
         unsafe { _mm256_storeu_ps(dst_p, f) };
+        i += 8;
+    }
+    f16_le_to_f32_scalar(&src[i * 2..], &mut dst[i..]);
+}
+
+/// # Safety
+/// Caller must guarantee `src.len() == 2 * dst.len()`. The `neon` target
+/// feature is baseline on aarch64, so the feature requirement is met by
+/// construction.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn f16_le_to_f32_neon(src: &[u8], dst: &mut [f32]) {
+    use std::arch::aarch64::{
+        float32x4_t, uint16x8_t, vcvt_f32_f16, vcvt_high_f32_f16, vget_low_f16,
+        vreinterpretq_f16_u16,
+    };
+
+    let n = dst.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        // SAFETY: `i + 8 <= n` and `src.len() == 2 * n` keep byte offset
+        // `2 * i` plus 16 bytes in range.
+        let src_p = unsafe { src.as_ptr().add(i * 2) } as *const uint16x8_t;
+        // SAFETY: `src_p` points at 16 in-range bytes; `read_unaligned`
+        // tolerates any alignment.
+        let raw = unsafe { src_p.read_unaligned() };
+        // Safe under target-feature 1.1: the enclosing fn statically
+        // enables neon and these intrinsics take no pointers.
+        let h = vreinterpretq_f16_u16(raw);
+        let lo = vcvt_f32_f16(vget_low_f16(h));
+        let hi = vcvt_high_f32_f16(h);
+        // SAFETY: `i + 8 <= n` keeps offset `i` plus 8 floats in range.
+        let dst_p = unsafe { dst.as_mut_ptr().add(i) } as *mut float32x4_t;
+        // SAFETY: `dst_p` points at the first 4 of 8 in-range floats;
+        // `write_unaligned` tolerates any alignment.
+        unsafe { dst_p.write_unaligned(lo) };
+        // SAFETY: one `float32x4_t` past `dst_p` is still within the 8
+        // in-range floats.
+        let dst_hi = unsafe { dst_p.add(1) };
+        // SAFETY: `dst_hi` points at the last 4 of 8 in-range floats.
+        unsafe { dst_hi.write_unaligned(hi) };
         i += 8;
     }
     f16_le_to_f32_scalar(&src[i * 2..], &mut dst[i..]);

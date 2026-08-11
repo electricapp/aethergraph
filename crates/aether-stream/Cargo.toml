@@ -15,6 +15,7 @@ bench = false
 [features]
 default = []
 rdma = ["aether-mem/rdma"]
+mlx5dv = ["rdma"]
 cuda = ["aether-mem/cuda"]
 gpudirect = ["rdma", "cuda", "dep:cudarc"]
 # EFA SRD path — skeleton only; see crates/aether-stream/src/rdma/srd.rs for

@@ -13,7 +13,7 @@
 //! When RDMA is enabled, the memory is registered with the HCA so GPU nodes
 //! can do one-sided reads at <5μs without waking the CPU.
 
-use aether_mem::hooks::MlockHook;
+use aether_mem::hooks::{MlockHook, NumaInterleaveHook};
 use aether_mem::{MemoryHook, SharedMemoryRing};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,7 +191,16 @@ impl FeatureTable {
         let tail_offset = compute_tail_offset(feature_dim);
         let slot_size = compute_slot_size(feature_dim);
 
-        let mut hooks: Vec<Box<dyn MemoryHook>> = vec![Box::new(MlockHook::new())];
+        // Interleave first, then lock: the table is read by every worker,
+        // so spreading pages across memory controllers beats piling them
+        // on the allocating thread's node (single-node machines no-op).
+        // `extra_hooks` run last, so a caller-supplied placement hook
+        // (e.g. `NumaBindHook` on the NIC's node for a DMA-served table)
+        // overrides the interleave.
+        let mut hooks: Vec<Box<dyn MemoryHook>> = vec![
+            Box::new(NumaInterleaveHook::all_nodes()),
+            Box::new(MlockHook::new()),
+        ];
         hooks.extend(extra_hooks);
 
         // Slots pack at cache-line stride, not page stride: the table

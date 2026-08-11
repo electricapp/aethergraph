@@ -17,7 +17,13 @@ pub mod qp;
 pub mod control;
 
 #[cfg(feature = "rdma")]
+pub mod event;
+
+#[cfg(feature = "rdma")]
 pub mod sharded;
+
+#[cfg(feature = "rdma")]
+pub mod srq;
 
 #[cfg(feature = "efa")]
 pub mod efa_ffi;
