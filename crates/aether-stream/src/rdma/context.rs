@@ -7,6 +7,7 @@ use super::ffi::*;
 use std::ffi::CStr;
 use std::io;
 use std::ptr;
+use tracing::debug;
 
 /// Owns an ibverbs device context, protection domain, and completion queue.
 ///
@@ -230,7 +231,7 @@ impl RdmaContext {
             )));
         }
 
-        Ok(Self {
+        let ctx = Self {
             context,
             pd,
             cq,
@@ -238,7 +239,34 @@ impl RdmaContext {
             port_gid: gid,
             gid_index,
             numa_node,
-        })
+        };
+
+        // Report the device's fast-path capabilities once, at open. Which
+        // of these a fabric offers decides whether the atomic, ODP, and
+        // BlueFlame paths are usable at all, and a wrong assumption
+        // otherwise only surfaces as a failed work request much later.
+        if let Ok(caps) = ctx.device_atomic_caps() {
+            debug!(
+                "RDMA device atomics: atomic_cap={}, max_qp_rd_atom={}",
+                caps.atomic_cap, caps.max_qp_rd_atom
+            );
+        }
+        #[cfg(feature = "mlx5dv")]
+        match ctx.mlx5_caps() {
+            Ok(caps) => debug!(
+                "mlx5 direct verbs: max_dynamic_bfregs={} (BlueFlame {}), flags={:#x}",
+                caps.max_dynamic_bfregs,
+                if caps.max_dynamic_bfregs > 0 {
+                    "available"
+                } else {
+                    "unavailable"
+                },
+                caps.flags
+            ),
+            Err(e) => debug!("mlx5 direct verbs unavailable (non-mlx5 device?): {e}"),
+        }
+
+        Ok(ctx)
     }
 
     /// NUMA node of this device, as sysfs reported it at open time.
