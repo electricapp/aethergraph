@@ -660,7 +660,7 @@ impl FeatureStore {
                     result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(row));
                 }
             }
-            FeatureDtype::F16 => {
+            half => {
                 result.resize(nodes.len() * self.feature_dim, 0.0);
                 for (i, &byte_start) in row_starts.iter().enumerate() {
                     if let Some(&ahead) = row_starts.get(i + Self::GATHER_PREFETCH_ROWS) {
@@ -668,7 +668,7 @@ impl FeatureStore {
                     }
                     let row = &raw[byte_start..byte_start + row_bytes];
                     let out = &mut result[i * self.feature_dim..(i + 1) * self.feature_dim];
-                    crate::internal::simd::f16_le_to_f32(row, out);
+                    half.decode_row(row, out);
                 }
             }
         }
@@ -925,6 +925,84 @@ pub fn save_features_f16(
     let file_size = data_offset as usize + buf.len();
     debug!("F16 features saved ({:.2} GB)", file_size as f64 / 1e9);
     Ok(())
+}
+
+/// Save features as bf16 — half the bytes of f32 with f32's exponent
+/// range, so magnitudes that would flush to zero in f16 survive.
+///
+/// Conversion is round-to-nearest-even on the truncated mantissa, the
+/// same rounding the hardware bf16 converters use, so a value stored here
+/// and read back matches what a bf16-native producer would have written.
+pub fn save_features_bf16(
+    path: impl AsRef<Path>,
+    features: &[f32],
+    num_nodes: usize,
+    feature_dim: usize,
+) -> Result<()> {
+    let path = path.as_ref();
+    debug!(
+        "Saving bf16 features to {}: {} nodes, {} dims",
+        path.display(),
+        num_nodes,
+        feature_dim
+    );
+
+    let expected = num_nodes
+        .checked_mul(feature_dim)
+        .ok_or_else(|| anyhow::anyhow!("num_nodes * feature_dim overflows usize"))?;
+    anyhow::ensure!(
+        features.len() == expected,
+        "feature array size mismatch: expected {}, got {}",
+        expected,
+        features.len()
+    );
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .context("failed to create feature file")?;
+
+    let data_offset = ALIGNED_DATA_OFFSET;
+    file.write_all(MAGIC)?;
+    file.write_all(&(num_nodes as u64).to_le_bytes())?;
+    file.write_all(&(feature_dim as u64).to_le_bytes())?;
+    file.write_all(&data_offset.to_le_bytes())?;
+
+    let padding = data_offset as usize - HEADER_SIZE;
+    let mut pad = vec![0u8; padding];
+    pad[0] = FeatureDtype::BF16 as u8;
+    file.write_all(&pad)?;
+
+    let mut buf = Vec::with_capacity(features.len() * 2);
+    for &v in features {
+        buf.extend_from_slice(&f32_to_bf16_le(v));
+    }
+    file.write_all(&buf)?;
+    file.sync_all().context("failed to sync feature file")?;
+
+    let file_size = data_offset as usize + buf.len();
+    debug!("BF16 features saved ({:.2} GB)", file_size as f64 / 1e9);
+    Ok(())
+}
+
+/// Truncate an `f32` to bf16's top 16 bits, rounding to nearest even.
+///
+/// NaN is preserved as a quiet NaN rather than rounded: adding the round
+/// bias to a NaN's payload can clear every mantissa bit and turn it into
+/// an infinity.
+#[inline]
+fn f32_to_bf16_le(v: f32) -> [u8; 2] {
+    let bits = v.to_bits();
+    let truncated = if v.is_nan() {
+        (bits >> 16) as u16 | 0x0040
+    } else {
+        // Round-to-nearest-even on the discarded low 16 bits.
+        let rounding_bias = 0x7FFF + ((bits >> 16) & 1);
+        ((bits + rounding_bias) >> 16) as u16
+    };
+    truncated.to_le_bytes()
 }
 
 /// Create an empty feature file for incremental writing.
@@ -1345,6 +1423,78 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn bf16_round_trips_through_the_store() {
+        let (num_nodes, feature_dim) = (300usize, 16usize);
+        let features: Vec<f32> = (0..num_nodes * feature_dim)
+            .map(|i| (i as f32 - 2400.0) * 0.125)
+            .collect();
+
+        let temp_file = NamedTempFile::new().unwrap();
+        save_features_bf16(temp_file.path(), &features, num_nodes, feature_dim).unwrap();
+
+        let store = FeatureStore::load(temp_file.path()).unwrap();
+        assert_eq!(store.dtype(), FeatureDtype::BF16);
+        assert_eq!(store.num_nodes(), num_nodes);
+        assert_eq!(store.feature_dim(), feature_dim);
+
+        // bf16 keeps 8 mantissa bits, so ~2^-8 relative error.
+        let nodes: Vec<NodeId> = vec![0, 7, 150, 299];
+        let batch = store.get_batch(&nodes).unwrap();
+        for (i, &node) in nodes.iter().enumerate() {
+            for j in 0..feature_dim {
+                let expected = features[node as usize * feature_dim + j];
+                let got = batch[i * feature_dim + j];
+                let tol = expected.abs() * 0.01 + 1e-3;
+                assert!(
+                    (got - expected).abs() <= tol,
+                    "node {node} dim {j}: got {got}, expected {expected}"
+                );
+            }
+        }
+
+        // The single-row path decodes identically to the batch path.
+        let mut row = vec![0f32; feature_dim];
+        store.get_into(150, &mut row).unwrap();
+        assert_eq!(&row[..], &batch[2 * feature_dim..3 * feature_dim]);
+    }
+
+    #[test]
+    fn bf16_preserves_f32_exponent_range() {
+        // The reason bf16 exists here: values that underflow f16 (min
+        // normal ~6.1e-5) and values that overflow it (max ~65504) both
+        // survive, because bf16 shares f32's exponent field.
+        let features = vec![1e-30f32, 1e30, -1e-30, -1e30, 0.0, 1.0];
+        let temp_file = NamedTempFile::new().unwrap();
+        save_features_bf16(temp_file.path(), &features, 1, features.len()).unwrap();
+
+        let store = FeatureStore::load(temp_file.path()).unwrap();
+        let mut row = vec![0f32; features.len()];
+        store.get_into(0, &mut row).unwrap();
+
+        for (got, want) in row.iter().zip(&features) {
+            assert!(got.is_finite(), "{want} decoded to {got}");
+            if *want == 0.0 {
+                assert_eq!(*got, 0.0);
+            } else {
+                let rel = (got - want).abs() / want.abs();
+                assert!(rel < 0.01, "{want} decoded to {got} (rel err {rel})");
+            }
+        }
+
+        // Same values through f16 would saturate or flush.
+        let f16_file = NamedTempFile::new().unwrap();
+        save_features_f16(f16_file.path(), &features, 1, features.len()).unwrap();
+        let f16_store = FeatureStore::load(f16_file.path()).unwrap();
+        let mut f16_row = vec![0f32; features.len()];
+        f16_store.get_into(0, &mut f16_row).unwrap();
+        assert!(
+            f16_row[0] == 0.0 && f16_row[1].is_infinite(),
+            "f16 should flush 1e-30 and overflow 1e30, got {:?}",
+            &f16_row[..2]
+        );
     }
 
     #[test]

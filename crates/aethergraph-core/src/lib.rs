@@ -43,7 +43,8 @@ pub use features::{
 #[cfg(feature = "gds")]
 pub use features::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
 pub use features::{
-    create_features, save_feature_data, save_features, save_features_f16, save_features_ndarray,
+    create_features, save_feature_data, save_features, save_features_bf16, save_features_f16,
+    save_features_ndarray,
 };
 
 // Graph (de)serialization entry points — public API surface; the `internal`

@@ -17,11 +17,18 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 
 /// Data type for stored features.
+///
+/// `BF16` trades mantissa bits for f32's exponent range: it truncates to
+/// the top 16 bits of an f32, so upcasting is a shift rather than a
+/// format conversion and no value ever overflows to infinity. That makes
+/// it the natural half-width choice for embeddings trained in bf16, where
+/// F16's narrower exponent would flush small magnitudes to zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FeatureDtype {
     F32 = 0,
     F16 = 1,
+    BF16 = 2,
 }
 
 impl FeatureDtype {
@@ -29,7 +36,7 @@ impl FeatureDtype {
     pub const fn element_size(self) -> usize {
         match self {
             Self::F32 => 4,
-            Self::F16 => 2,
+            Self::F16 | Self::BF16 => 2,
         }
     }
 
@@ -37,14 +44,15 @@ impl FeatureDtype {
     /// from `src` into `dst`.
     ///
     /// F32 payloads are a straight byte copy into the `f32` destination
-    /// (no source-alignment requirement); F16 payloads upcast through the
-    /// SIMD-dispatched converter. `src.len()` must equal
-    /// `dst.len() * self.element_size()` — both branches panic otherwise.
+    /// (no source-alignment requirement); the half-width payloads upcast
+    /// through their SIMD-dispatched converters. `src.len()` must equal
+    /// `dst.len() * self.element_size()` — every branch panics otherwise.
     #[inline]
     pub(crate) fn decode_row(self, src: &[u8], dst: &mut [f32]) {
         match self {
             Self::F32 => bytemuck::cast_slice_mut::<f32, u8>(dst).copy_from_slice(src),
             Self::F16 => crate::internal::simd::f16_le_to_f32(src, dst),
+            Self::BF16 => crate::internal::simd::bf16_le_to_f32(src, dst),
         }
     }
 
@@ -52,6 +60,7 @@ impl FeatureDtype {
         match v {
             0 => Ok(Self::F32),
             1 => Ok(Self::F16),
+            2 => Ok(Self::BF16),
             other => anyhow::bail!("unknown feature dtype tag: {}", other),
         }
     }

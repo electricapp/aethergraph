@@ -513,6 +513,22 @@ impl Graph {
             .collect()
     }
 
+    /// Returns the degree of each node in `nodes`, in input order.
+    ///
+    /// Unlike [`Self::degrees`], this touches only the requested nodes —
+    /// the right shape for a sampling frontier or any batch of scattered
+    /// IDs, where materializing all `num_nodes` degrees would dominate the
+    /// work. The offsets lookups are a hardware gather where the CPU
+    /// supports one, so the batch's cache misses overlap instead of
+    /// serializing.
+    ///
+    /// Out-of-range nodes report degree 0, matching [`Self::degree`].
+    pub fn degrees_of(&self, nodes: &[NodeId]) -> Vec<u32> {
+        let mut out = vec![0u32; nodes.len()];
+        crate::internal::simd::gather_degrees(self.offsets_slice(), nodes, &mut out);
+        out
+    }
+
     /// Returns the neighbor IDs for a given node as a slice.
     ///
     /// # Performance

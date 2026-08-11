@@ -239,6 +239,124 @@ unsafe fn bf16_le_to_f32_avx2(src: &[u8], dst: &mut [f32]) {
     bf16_le_to_f32_scalar(&src[i * 2..], &mut dst[i..]);
 }
 
+/// Gather `offsets[node+1] - offsets[node]` for each node in `nodes`.
+///
+/// This is the CSR degree lookup for a sampling frontier: the node IDs
+/// are scattered, so each pair of reads is an independent random access
+/// into a large array. Hardware gather (`vpgatherdq`) issues the whole
+/// vector's worth of loads as one instruction, letting the memory system
+/// overlap the cache misses instead of serializing them behind a scalar
+/// loop's dependent address computations.
+///
+/// `nodes` must be in bounds for `offsets` (`node + 1 < offsets.len()`);
+/// out-of-range nodes yield degree 0. Non-monotonic offsets — possible on
+/// a file loaded with less than full validation — saturate to 0 rather
+/// than wrapping.
+pub fn gather_degrees(offsets: &[u64], nodes: &[u32], dst: &mut [u32]) {
+    assert_eq!(
+        nodes.len(),
+        dst.len(),
+        "node count {} != destination length {}",
+        nodes.len(),
+        dst.len()
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: `avx2` verified at runtime; lengths asserted above,
+            // and the kernel bounds-checks every index it gathers.
+            unsafe { gather_degrees_avx2(offsets, nodes, dst) };
+            return;
+        }
+    }
+
+    gather_degrees_scalar(offsets, nodes, dst);
+}
+
+/// Portable degree gather — the reference the vector paths must match.
+fn gather_degrees_scalar(offsets: &[u64], nodes: &[u32], dst: &mut [u32]) {
+    for (out, &node) in dst.iter_mut().zip(nodes) {
+        let idx = node as usize;
+        *out = match (offsets.get(idx), offsets.get(idx + 1)) {
+            (Some(&start), Some(&end)) => end.saturating_sub(start) as u32,
+            _ => 0,
+        };
+    }
+}
+
+/// AVX2 degree gather: four u64 offsets per `vpgatherdq`.
+///
+/// Each iteration gathers `offsets[node]` and `offsets[node+1]` for four
+/// nodes as two gathers, subtracts, and narrows to u32. Nodes near the
+/// end of the array fall to the scalar tail so the gather never reads
+/// past `offsets`.
+///
+/// # Safety
+/// The caller must have verified `avx2` support at runtime.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gather_degrees_avx2(offsets: &[u64], nodes: &[u32], dst: &mut [u32]) {
+    use std::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm256_i32gather_epi64, _mm256_storeu_si256, _mm256_sub_epi64,
+    };
+
+    // A gathered index must satisfy `idx + 1 < offsets.len()`, so any node
+    // at or above this bound takes the scalar path.
+    let Some(max_node) = offsets.len().checked_sub(1) else {
+        dst.fill(0);
+        return;
+    };
+
+    let base = offsets.as_ptr() as *const i64;
+    let mut i = 0usize;
+    while i + 4 <= nodes.len() {
+        let chunk = &nodes[i..i + 4];
+        // The vector path assumes every lane is in range; a chunk with any
+        // out-of-range or offset-inverting node goes scalar instead of
+        // needing a masked gather plus a saturating vector subtract.
+        if chunk.iter().any(|&n| (n as usize) >= max_node) {
+            gather_degrees_scalar(offsets, chunk, &mut dst[i..i + 4]);
+            i += 4;
+            continue;
+        }
+
+        // SAFETY: `chunk` is 4 u32s = 16 bytes; loadu has no alignment
+        // requirement.
+        let idx = unsafe { _mm_loadu_si128(chunk.as_ptr() as *const __m128i) };
+        // SAFETY: every lane of `idx` is < max_node, so both `base[idx]`
+        // and `base[idx + 1]` are within `offsets`. Scale 8 = size_of::<u64>().
+        let starts = unsafe { _mm256_i32gather_epi64::<8>(base, idx) };
+        // SAFETY: `max_node = offsets.len() - 1` and every lane is below
+        // it, so `base + 1` is in bounds and one past it is at worst the
+        // final element.
+        let ends_base = unsafe { base.add(1) };
+        // SAFETY: see above — every gathered address is within `offsets`.
+        let ends = unsafe { _mm256_i32gather_epi64::<8>(ends_base, idx) };
+        // `_mm256_sub_epi64` is safe under the enclosing target_feature.
+        let diff = _mm256_sub_epi64(ends, starts);
+
+        // Narrow four u64 degrees to four u32. Degrees fit u32 by the
+        // format's edge-count bound, so the low half of each lane is the
+        // whole value. `max(0)` reproduces the scalar path's saturating
+        // subtract: non-monotonic offsets can slip past HeaderOnly
+        // validation, and a wrapped difference would report a nonsense
+        // multi-billion degree instead of 0.
+        let mut lanes = [0i64; 4];
+        // SAFETY: `lanes` is 4 i64s = 32 bytes, matching the register.
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), diff) };
+        dst[i..i + 4].copy_from_slice(&[
+            lanes[0].max(0) as u32,
+            lanes[1].max(0) as u32,
+            lanes[2].max(0) as u32,
+            lanes[3].max(0) as u32,
+        ]);
+        i += 4;
+    }
+
+    gather_degrees_scalar(offsets, &nodes[i..], &mut dst[i..]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +414,73 @@ mod tests {
                 assert_eq!(v.to_f32(), o, "bf16 lane {i} of {len}");
             }
         }
+    }
+
+    /// The dispatched gather must agree with the scalar reference on
+    /// every input shape, including the ones that take the in-kernel
+    /// scalar fallbacks (short tails, near-end nodes).
+    #[test]
+    fn gather_degrees_matches_scalar() {
+        // Irregular degrees so no lane pattern is accidentally uniform.
+        let num_nodes = 500usize;
+        let mut offsets = vec![0u64];
+        for n in 0..num_nodes {
+            let degree = (n * 7 + 3) % 23;
+            offsets.push(offsets[n] + degree as u64);
+        }
+
+        let cases: Vec<Vec<u32>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 1, 2],
+            vec![0, 1, 2, 3],
+            (0..num_nodes as u32).collect(),
+            (0..num_nodes as u32).rev().collect(),
+            (0..num_nodes as u32).step_by(37).collect(),
+            // Nodes at and past the end: the last valid node is
+            // num_nodes-1, and anything beyond reports 0.
+            vec![498, 499, 500, 501, 9999],
+            vec![499; 9],
+        ];
+
+        for nodes in cases {
+            let mut dispatched = vec![0u32; nodes.len()];
+            gather_degrees(&offsets, &nodes, &mut dispatched);
+
+            let mut scalar = vec![0u32; nodes.len()];
+            gather_degrees_scalar(&offsets, &nodes, &mut scalar);
+
+            assert_eq!(dispatched, scalar, "gather mismatch for {nodes:?}");
+
+            // And both must match the definition.
+            for (i, &n) in nodes.iter().enumerate() {
+                let want = if (n as usize) < num_nodes {
+                    (offsets[n as usize + 1] - offsets[n as usize]) as u32
+                } else {
+                    0
+                };
+                assert_eq!(dispatched[i], want, "node {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn gather_degrees_handles_degenerate_offsets() {
+        // Empty and single-element offsets arrays have no valid node.
+        for offsets in [vec![], vec![0u64]] {
+            let nodes = [0u32, 1, 2, 3, 4];
+            let mut out = vec![9u32; nodes.len()];
+            gather_degrees(&offsets, &nodes, &mut out);
+            assert_eq!(out, vec![0; nodes.len()], "offsets {offsets:?}");
+        }
+
+        // Non-monotonic offsets (possible under partial validation)
+        // saturate rather than wrapping to a huge degree.
+        let offsets = vec![0u64, 10, 5, 20, 25];
+        let nodes = [0u32, 1, 2, 3];
+        let mut out = vec![0u32; 4];
+        gather_degrees(&offsets, &nodes, &mut out);
+        assert_eq!(out, vec![10, 0, 15, 5]);
     }
 
     #[test]
