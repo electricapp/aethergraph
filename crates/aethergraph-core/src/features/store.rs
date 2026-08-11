@@ -279,7 +279,7 @@ impl FeatureLoadTelemetry {
 /// - bytemuck used for safe zero-copy slice casting
 #[derive(Clone)]
 pub struct FeatureStore {
-    mmap: Arc<Mmap>,
+    backing: StoreBacking,
     num_nodes: usize,
     feature_dim: usize,
     features_start_offset: usize,
@@ -289,10 +289,34 @@ pub struct FeatureStore {
     telemetry: Option<Arc<TelemetryCells>>,
 }
 
-// No hand-written `unsafe impl Send/Sync`: every field (`Arc<Mmap>`,
+// No hand-written `unsafe impl Send/Sync`: every field (`StoreBacking`,
 // counters, plain data) is already Send + Sync, so the compiler derives
 // both. Writing the impls by hand would silently suppress that checking
 // if a non-thread-safe field were ever added.
+
+/// Where a store's bytes live. Both variants present the whole file as
+/// one flat byte span, so every reader above this enum is identical: the
+/// difference is who decides residency — the kernel for a mapping, the
+/// caller's budget and weights for a paged region.
+#[derive(Clone)]
+enum StoreBacking {
+    /// Page-cache-backed mapping; the kernel owns residency.
+    Mapped(Arc<Mmap>),
+    /// Demand-paged region with a caller-set residency budget.
+    #[cfg(all(target_os = "linux", feature = "uffd"))]
+    Paged(Arc<crate::internal::uffd::PagedRegion>),
+}
+
+impl StoreBacking {
+    #[inline(always)]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Mapped(m) => m,
+            #[cfg(all(target_os = "linux", feature = "uffd"))]
+            Self::Paged(r) => r.as_slice(),
+        }
+    }
+}
 
 impl FeatureStore {
     /// Load features from memory-mapped file.
@@ -433,7 +457,7 @@ impl FeatureStore {
         crate::internal::hint::advise_mmap_hugepage(payload.as_ptr(), payload.len());
 
         Ok(Self {
-            mmap,
+            backing: StoreBacking::Mapped(mmap),
             num_nodes,
             feature_dim,
             features_start_offset: data_offset,
@@ -441,6 +465,79 @@ impl FeatureStore {
             dtype,
             telemetry: None,
         })
+    }
+
+    /// Load a store whose payload is demand-paged from the file rather
+    /// than mapped, holding at most `budget_pages` pages resident.
+    ///
+    /// This is the out-of-core path: the region presents as one flat span
+    /// the gather code indexes exactly like a mapping, but residency is
+    /// bounded by the caller instead of by kernel policy, and eviction
+    /// follows `weights` — pass node degrees (see
+    /// [`PageWeights::from_node_degrees`]) so a hot hub node's pages
+    /// outlive a cold leaf's.
+    ///
+    /// Requires `vm.unprivileged_userfaultfd=1` or `CAP_SYS_PTRACE`;
+    /// returns an error otherwise, and the caller falls back to
+    /// [`FeatureStore::load`].
+    #[cfg(all(target_os = "linux", feature = "uffd"))]
+    pub fn load_paged(
+        path: impl AsRef<Path>,
+        budget_pages: usize,
+        weights: Arc<crate::internal::uffd::PageWeights>,
+    ) -> Result<Self> {
+        use crate::internal::uffd::{FileSource, PagedRegion};
+
+        let path = path.as_ref();
+        debug!(
+            "Loading paged feature store from {} ({} page budget)",
+            path.display(),
+            budget_pages
+        );
+
+        let file = File::open(path).context("failed to open feature file")?;
+        let header = super::header::parse_feature_header(&file)?;
+        let file_len = usize::try_from(file.metadata()?.len()).context("file length")?;
+
+        // The region covers the whole file, so a region offset is a file
+        // offset and the header's `features_start_offset` indexes it
+        // directly — same arithmetic as the mapped path.
+        let region = PagedRegion::new(
+            file_len,
+            budget_pages,
+            Arc::new(FileSource::new(file)),
+            weights,
+        )?;
+
+        let payload_bytes = header
+            .num_nodes
+            .checked_mul(header.feature_size)
+            .context("feature payload size overflows usize")?;
+        let start = usize::try_from(header.features_start_offset).context("payload offset")?;
+        anyhow::ensure!(
+            start + payload_bytes <= file_len,
+            "feature payload ({payload_bytes} bytes at {start}) exceeds file length {file_len}"
+        );
+
+        Ok(Self {
+            backing: StoreBacking::Paged(Arc::new(region)),
+            num_nodes: header.num_nodes,
+            feature_dim: header.feature_dim,
+            features_start_offset: start,
+            feature_data_len_bytes: payload_bytes,
+            dtype: header.dtype,
+            telemetry: None,
+        })
+    }
+
+    /// Pager statistics — `(faults, evictions)` — for a store opened with
+    /// [`FeatureStore::load_paged`]. `None` for a mapped store.
+    #[cfg(all(target_os = "linux", feature = "uffd"))]
+    pub fn pager_stats(&self) -> Option<(u64, u64)> {
+        match &self.backing {
+            StoreBacking::Paged(r) => Some((r.fault_count(), r.eviction_count())),
+            StoreBacking::Mapped(_) => None,
+        }
     }
 
     /// How many rows ahead the batch gathers prefetch. Random rows on a
@@ -466,7 +563,7 @@ impl FeatureStore {
     #[inline(always)]
     fn feature_data_raw(&self) -> &[u8] {
         let end = self.features_start_offset + self.feature_data_len_bytes;
-        &self.mmap[self.features_start_offset..end]
+        &self.backing.bytes()[self.features_start_offset..end]
     }
 
     /// Get the raw feature data as f32 slice (zero-copy, f32 dtype only).
@@ -1363,5 +1460,63 @@ mod tests {
         let node_features = store.get(0).unwrap();
         assert_eq!(node_features.len(), feature_dim);
         assert!(node_features.iter().all(|&x| x == 42.0));
+    }
+
+    /// The out-of-core path must be indistinguishable from the mapped one
+    /// at the API, and must actually be paging (faults > 0) under a budget
+    /// far smaller than the store.
+    #[cfg(all(target_os = "linux", feature = "uffd"))]
+    #[test]
+    fn paged_store_gathers_identically_to_mapped() {
+        use crate::internal::uffd::PageWeights;
+
+        let (num_nodes, feature_dim) = (4096usize, 32usize);
+        let features: Vec<f32> = (0..num_nodes * feature_dim)
+            .map(|i| i as f32 * 0.5)
+            .collect();
+        let temp_file = NamedTempFile::new().unwrap();
+        save_features(temp_file.path(), features.clone(), num_nodes, feature_dim).unwrap();
+
+        let mapped = FeatureStore::load(temp_file.path()).unwrap();
+
+        // Degree-weighted retention over a budget holding ~1/16th of the
+        // store, so the gather genuinely evicts and re-faults.
+        let degrees: Vec<u32> = (0..num_nodes as u32).map(|n| n % 97).collect();
+        let page_size = crate::internal::uffd::page_size();
+        let weights = Arc::new(PageWeights::from_node_degrees(
+            &degrees,
+            mapped.features_start_offset as u64,
+            feature_dim * 4,
+            page_size,
+        ));
+        let paged = match FeatureStore::load_paged(temp_file.path(), 32, weights) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("userfaultfd unavailable ({e}); skipping");
+                return;
+            }
+        };
+
+        assert_eq!(paged.num_nodes(), mapped.num_nodes());
+        assert_eq!(paged.feature_dim(), mapped.feature_dim());
+        assert_eq!(paged.dtype(), mapped.dtype());
+
+        // Scattered gather across the whole store, well past the budget.
+        let nodes: Vec<NodeId> = (0..num_nodes as u32).step_by(7).collect();
+        let from_paged = paged.get_batch(&nodes).unwrap();
+        let from_mapped = mapped.get_batch(&nodes).unwrap();
+        assert_eq!(from_paged, from_mapped, "paged gather must match mapped");
+
+        let (faults, _evictions) = paged
+            .pager_stats()
+            .expect("paged store reports pager stats");
+        assert!(faults > 0, "a paged gather must have serviced faults");
+        assert!(
+            mapped.pager_stats().is_none(),
+            "a mapped store has no pager"
+        );
+
+        // Single-row reads take the same path.
+        assert_eq!(paged.get(1234).unwrap(), mapped.get(1234).unwrap());
     }
 }

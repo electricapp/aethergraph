@@ -252,15 +252,20 @@ jobs:
           key: uffd
       - name: Enable unprivileged userfaultfd
         run: sudo sysctl -w vm.unprivileged_userfaultfd=1
-      - run: cargo test -p aethergraph-core --features uffd internal::uffd
+      - run: |
+          cargo clippy -p aethergraph-core -p aethergraph-py --all-targets \
+            --features uffd -- -D warnings
+          cargo test -p aethergraph-core --features uffd internal::uffd
+          cargo test -p aethergraph-core --features uffd features::store
       - name: Summary
         if: always()
         run: |
           {
             echo "## userfaultfd pager"
             echo ""
-            echo "Demand-paging round-trip from a backing file and"
-            echo "degree-weighted retention under a residency budget."
+            echo "Demand-paging round-trip from a backing file,"
+            echo "degree-weighted retention under a residency budget, and"
+            echo "a paged FeatureStore gathering identically to a mapped one."
           } >> "$GITHUB_STEP_SUMMARY"
 
   loom:

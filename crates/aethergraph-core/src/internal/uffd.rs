@@ -319,6 +319,40 @@ impl PageWeights {
         Self { weights }
     }
 
+    /// Build page weights from per-node degrees for a feature store whose
+    /// payload starts at `payload_offset` with `row_bytes` per node.
+    ///
+    /// A page's weight is the highest degree among the rows it holds: one
+    /// hub node is enough to keep its page resident, which is the point —
+    /// pages are evicted by their most valuable occupant, not an average
+    /// that a hub's cold neighbors would dilute.
+    ///
+    /// Rows straddling a page boundary contribute to both pages.
+    pub fn from_node_degrees(
+        degrees: &[u32],
+        payload_offset: u64,
+        row_bytes: usize,
+        page_size: usize,
+    ) -> Self {
+        if row_bytes == 0 || page_size == 0 {
+            return Self::default();
+        }
+        let end_byte = payload_offset + (degrees.len() as u64) * (row_bytes as u64);
+        let num_pages = usize::try_from(end_byte.div_ceil(page_size as u64)).unwrap_or(usize::MAX);
+        let mut weights = vec![0u32; num_pages];
+
+        for (node, &degree) in degrees.iter().enumerate() {
+            let start = payload_offset + (node as u64) * (row_bytes as u64);
+            let last = start + row_bytes as u64 - 1;
+            let first_page = (start / page_size as u64) as usize;
+            let last_page = (last / page_size as u64) as usize;
+            for w in &mut weights[first_page..=last_page.min(num_pages - 1)] {
+                *w = (*w).max(degree);
+            }
+        }
+        Self { weights }
+    }
+
     fn weight(&self, page: usize) -> u32 {
         self.weights.get(page).copied().unwrap_or(0)
     }
@@ -450,7 +484,10 @@ impl Pager {
     }
 }
 
-fn page_size() -> usize {
+/// The system page size — the granularity of both faulting and eviction,
+/// so callers sizing a residency budget or building [`PageWeights`] need
+/// the same number the region uses.
+pub fn page_size() -> usize {
     // SAFETY: sysconf with a constant name is always valid.
     let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if v > 0 { v as usize } else { 4096 }
@@ -583,5 +620,33 @@ mod tests {
             after, before,
             "high-weight page 0 must not have been evicted"
         );
+    }
+
+    #[test]
+    fn degree_weights_follow_hub_nodes() {
+        let ps = 4096usize;
+        let row_bytes = 1024usize; // 4 rows per page
+        // Node 5 is a hub; it shares page 1 with three cold nodes.
+        let mut degrees = vec![1u32; 12];
+        degrees[5] = 9_000;
+
+        let w = PageWeights::from_node_degrees(&degrees, 0, row_bytes, ps);
+
+        assert_eq!(w.weight(0), 1, "page of four cold rows stays low");
+        assert_eq!(w.weight(1), 9_000, "the hub sets its whole page's weight");
+        assert_eq!(w.weight(2), 1);
+        assert_eq!(w.weight(99), 0, "pages past the payload weigh 0");
+    }
+
+    #[test]
+    fn degree_weights_span_rows_crossing_pages() {
+        let ps = 4096usize;
+        let row_bytes = 3000usize; // rows straddle page boundaries
+        let degrees = [1u32, 500, 1];
+
+        // Row 1 covers bytes 3000..6000, so it lands on pages 0 and 1.
+        let w = PageWeights::from_node_degrees(&degrees, 0, row_bytes, ps);
+        assert_eq!(w.weight(0), 500);
+        assert_eq!(w.weight(1), 500);
     }
 }

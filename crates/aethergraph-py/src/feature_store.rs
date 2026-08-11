@@ -72,6 +72,72 @@ impl PyFeatureStore {
         Ok(Self { inner })
     }
 
+    /// Load features demand-paged from disk with a bounded resident set.
+    ///
+    /// Unlike `load`, which maps the file and lets the kernel decide what
+    /// stays in RAM, this registers the region with `userfaultfd` and
+    /// pages it in on demand, holding at most `budget_pages` pages. Pass
+    /// `degrees` (one entry per node) to make eviction degree-weighted, so
+    /// a hub node's pages outlive a leaf's.
+    ///
+    /// # Arguments
+    /// - path: Path to feature file created with save_features()
+    /// - budget_pages: Maximum resident pages (page size is typically 4096)
+    /// - degrees: Optional per-node degrees driving retention
+    /// - telemetry: Enable telemetry tracking (default: False)
+    ///
+    /// Requires Linux with `vm.unprivileged_userfaultfd=1` or
+    /// CAP_SYS_PTRACE; raises OSError elsewhere, where `load` is the
+    /// fallback.
+    #[cfg(all(target_os = "linux", feature = "uffd"))]
+    #[staticmethod]
+    #[pyo3(signature = (path, budget_pages, degrees=None, telemetry=false))]
+    fn load_paged(
+        path: std::path::PathBuf,
+        budget_pages: usize,
+        degrees: Option<numpy::PyReadonlyArray1<'_, u32>>,
+        telemetry: bool,
+    ) -> PyResult<Self> {
+        use aethergraph_core::{PageWeights, uffd_page_size};
+
+        let weights = match &degrees {
+            Some(d) => {
+                let file = std::fs::File::open(&path).map_err(|e| {
+                    pyo3::exceptions::PyIOError::new_err(format!("Failed to open features: {e}"))
+                })?;
+                let header = aethergraph_core::parse_feature_header(&file).map_err(|e| {
+                    pyo3::exceptions::PyIOError::new_err(format!("Failed to read header: {e}"))
+                })?;
+                PageWeights::from_node_degrees(
+                    d.as_slice()?,
+                    header.features_start_offset,
+                    header.feature_size,
+                    uffd_page_size(),
+                )
+            }
+            None => PageWeights::default(),
+        };
+
+        let mut inner =
+            CoreFeatureStore::load_paged(&path, budget_pages, std::sync::Arc::new(weights))
+                .map_err(|e| {
+                    pyo3::exceptions::PyOSError::new_err(format!("Failed to page features: {e}"))
+                })?;
+
+        if telemetry {
+            inner = inner.with_telemetry();
+        }
+
+        Ok(Self { inner })
+    }
+
+    /// Pager counters as `(faults, evictions)`, or None for a store opened
+    /// with `load` rather than `load_paged`.
+    #[cfg(all(target_os = "linux", feature = "uffd"))]
+    fn pager_stats(&self) -> Option<(u64, u64)> {
+        self.inner.pager_stats()
+    }
+
     /// Get telemetry statistics (if enabled).
     ///
     /// Returns None if telemetry not enabled.
