@@ -60,7 +60,14 @@ use sampler::{
 ///     >>> sampler = ag.NeighborSampler(graph, config)
 ///     >>> subgraph = sampler.sample([0, 1, 2])
 ///     >>> print(f"Sampled {subgraph.num_nodes()} nodes")
-#[pymodule]
+// `gil_used = false` marks the module as safe to import into a
+// free-threaded (no-GIL) CPython without re-enabling the GIL. Every
+// pyclass here is `Send` and guards its interior state with Rust locks
+// (parking_lot mutexes, atomics, the single-writer graph guard), so no
+// class relies on the GIL for synchronization. On a regular GIL build the
+// attribute is a no-op. The cp314t CI leg exercises N threads driving one
+// loader concurrently to keep this claim honest.
+#[pymodule(gil_used = false)]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
 

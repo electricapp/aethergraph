@@ -15,7 +15,14 @@ workspace = true
 # which turns this on via `[tool.maturin].features` in python/pyproject.toml.
 # Plain `cargo test` omits it so unit tests can link against libpython
 # normally and run as a standalone test binary.
-default = []
+# `abi3` is on by default: the shipped wheel targets the stable ABI
+# (CPython 3.10+), one wheel for every interpreter. It is a feature rather
+# than a hardcoded pyo3 flag so the free-threaded (cp314t) wheel can turn
+# it off — the free-threaded ABI is not part of abi3, and pyo3 rejects
+# `abi3` + a free-threaded interpreter. Build that variant with
+# `--no-default-features --features extension-module`.
+default = ["abi3"]
+abi3 = ["pyo3/abi3-py38"]
 extension-module = ["pyo3/extension-module"]
 gpudirect = ["aether-stream/gpudirect"]
 
@@ -37,10 +44,11 @@ aethergraph-core = { path = "../aethergraph-core", version = "0.1" }
 # don't), not a compile-time one.
 aether-graph = { path = "../aether-graph", version = "0.1", features = ["wal"] }
 
-# PyO3 for Python bindings. `extension-module` is conditionally enabled via
-# this crate's `extension-module` feature (above) so `cargo test` links
-# normally while `maturin build` still skips libpython linking.
-pyo3 = { version = "0.29", features = ["abi3-py38"] }
+# PyO3 for Python bindings. `extension-module` and `abi3-py38` are both
+# enabled via this crate's own features (above) — abi3 through the default
+# `abi3` feature, extension-module through maturin — so `cargo test` links
+# libpython normally and the free-threaded wheel can drop abi3.
+pyo3 = { version = "0.29", features = [] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 
 # Apache Arrow for zero-copy data transfer

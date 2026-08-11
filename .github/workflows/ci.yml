@@ -415,6 +415,46 @@ jobs:
           name: aethergraph-wheel-${{ matrix.level }}
           path: python/${{ matrix.out_dir }}/*.whl
 
+  python-wheel-freethreaded:
+    name: wheel free-threaded (cp313t)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce4d2f6 # v6.0.0
+        with:
+          python-version: "3.13t"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: wheel-freethreaded
+      - name: Confirm free-threaded interpreter
+        run: python -c "import sys; assert not sys._is_gil_enabled(), 'GIL still on'; print(sys.version)"
+      - name: Build free-threaded wheel
+        working-directory: python
+        # No abi3: the free-threaded ABI is version-specific, so this is a
+        # cp313t wheel built directly against the no-GIL interpreter.
+        run: |
+          pip install maturin
+          maturin build --release --out dist-ft \
+            --interpreter python3.13t \
+            --no-default-features --features extension-module
+      - name: Install + parallel smoke test
+        working-directory: python
+        run: |
+          pip install --no-index --find-links dist-ft aethergraph
+          python tests/free_threaded_smoke.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aethergraph-wheel-cp313t
+          path: python/dist-ft/*.whl
+
   python-wheel-pgo:
     name: wheel x86-64 pgo
     runs-on: ubuntu-latest
