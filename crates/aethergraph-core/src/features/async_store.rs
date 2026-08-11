@@ -86,6 +86,13 @@ pub struct AsyncFeatureStore {
     #[cfg(target_os = "linux")]
     direct_io: bool,
 
+    /// Optional NVMe passthrough backend. `Some` only when the feature is
+    /// built, the store lives on an `/dev/ng*`-backed namespace, and its
+    /// extents are stably mapped; consulted before the io_uring gather and
+    /// silently skipped otherwise.
+    #[cfg(all(target_os = "linux", feature = "nvme-passthru"))]
+    nvme: Option<Arc<parking_lot::Mutex<super::gather::NvmeGather>>>,
+
     /// Optional telemetry collector
     telemetry: Option<Arc<TelemetryCells>>,
 }
@@ -164,6 +171,26 @@ impl AsyncFeatureStore {
         #[cfg(target_os = "linux")]
         let uring_pool = Self::setup_uring(&file_arc, direct_io);
 
+        // Try the NVMe passthrough backend (feature-gated, runtime-probed).
+        // Only meaningful for the O_DIRECT layout: the device reads share
+        // the same LBA-alignment the direct path already guarantees.
+        #[cfg(all(target_os = "linux", feature = "nvme-passthru"))]
+        let nvme = if direct_io {
+            match super::gather::NvmeGather::build(&file_arc) {
+                Ok(Some(g)) => {
+                    debug!("NVMe passthrough gather enabled");
+                    Some(Arc::new(parking_lot::Mutex::new(g)))
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    debug!("NVMe passthrough unavailable: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             file: file_arc,
             path: path.to_path_buf(),
@@ -177,6 +204,8 @@ impl AsyncFeatureStore {
             uring_next: AtomicUsize::new(0),
             #[cfg(target_os = "linux")]
             direct_io,
+            #[cfg(all(target_os = "linux", feature = "nvme-passthru"))]
+            nvme,
             telemetry: None,
         })
     }
@@ -428,10 +457,33 @@ impl AsyncFeatureStore {
         let direct_io = self.direct_io;
         let dtype = self.dtype;
         let feature_dim = self.feature_dim;
+        #[cfg(feature = "nvme-passthru")]
+        let nvme = self.nvme.clone();
 
         // Run io_uring operations in spawn_blocking to not block tokio runtime
         let features = tokio::task::spawn_blocking(move || {
             let mut lane = uring_arc.lock();
+
+            // NVMe passthrough first when available: it lands rows in the
+            // lane's own aligned pool, so a fall-through to the io_uring
+            // gather reuses the same buffers. `Ok(None)` means a row wasn't
+            // LBA-resolvable — take the io_uring path for the whole batch.
+            #[cfg(feature = "nvme-passthru")]
+            if direct_io && let Some(nvme) = &nvme {
+                let pool = lane.direct_pool(nodes.len(), feature_size)?;
+                let mut backend = nvme.lock();
+                if let Some(features) = backend.gather(
+                    pool,
+                    &nodes,
+                    features_start_offset,
+                    feature_size,
+                    dtype,
+                    feature_dim,
+                )? {
+                    return Ok(features);
+                }
+            }
+
             super::gather::uring_gather_rows(
                 &mut lane,
                 file.as_raw_fd(),

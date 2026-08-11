@@ -14,6 +14,10 @@ bench = false
 [features]
 default = []
 io-uring = []
+# NVMe passthrough gather: FIEMAP-mapped, block-layer-bypassing reads over
+# IORING_OP_URING_CMD against /dev/ng*. Linux-only; the live path is
+# runtime-probed and falls back to the O_DIRECT/IOPOLL gather.
+nvme-passthru = []
 gds = []
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 # Enables loom-backed model checking of the lock-free union-find. Run with:
