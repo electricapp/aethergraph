@@ -154,6 +154,28 @@ pub struct WalWriter {
     /// Bytes appended since the last `sync()`. Used by the
     /// [`DynamicGraph`] integration to skip no-op fsyncs.
     pending: u64,
+    /// Lazily-built ring for the linked write→fdatasync group commit.
+    /// `None` before first use or after ring setup failed (the portable
+    /// two-syscall path serves those cases).
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    ring: Option<UringCommit>,
+    /// Set once ring construction has been attempted, so a kernel
+    /// without io_uring is probed exactly once.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    ring_probed: bool,
+}
+
+/// Wrapper existing solely because `io_uring::IoUring` has no `Debug`.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+struct UringCommit {
+    ring: io_uring::IoUring,
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl std::fmt::Debug for UringCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UringCommit { .. }")
+    }
 }
 
 impl WalWriter {
@@ -231,6 +253,10 @@ impl WalWriter {
         Ok(Self {
             inner: BufWriter::with_capacity(BUF_CAPACITY, file),
             pending: 0,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            ring: None,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            ring_probed: false,
         })
     }
 
@@ -251,13 +277,126 @@ impl WalWriter {
     /// Flush the BufWriter to the file and fsync — every record durably
     /// written before this call survives a crash. No-op if nothing has
     /// been appended since the last sync.
+    ///
+    /// With the `io-uring` feature on Linux, the buffered bytes and the
+    /// fdatasync go to the kernel as one linked SQE chain — a single
+    /// `io_uring_enter` replaces the write + fdatasync syscall pair, and
+    /// the link makes the kernel enforce write-before-sync ordering.
     pub fn sync(&mut self) -> Result<(), WalError> {
         if self.pending == 0 {
+            return Ok(());
+        }
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        if self.sync_uring()? {
             return Ok(());
         }
         self.inner.flush()?;
         self.inner.get_ref().sync_data()?;
         self.pending = 0;
+        Ok(())
+    }
+
+    /// Group commit over io_uring. Returns `Ok(true)` when the commit
+    /// completed here, `Ok(false)` to route to the portable path (ring
+    /// unavailable), `Err` on a real I/O failure.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn sync_uring(&mut self) -> Result<bool, WalError> {
+        use io_uring::{IoUring, opcode, types};
+        use std::os::unix::io::AsRawFd;
+
+        if !self.ring_probed {
+            self.ring_probed = true;
+            match IoUring::new(4) {
+                Ok(ring) => self.ring = Some(UringCommit { ring }),
+                Err(e) => {
+                    tracing::debug!(error = %e, "io_uring unavailable; WAL uses write+fdatasync");
+                }
+            }
+        }
+        let Some(commit) = self.ring.as_mut() else {
+            return Ok(false);
+        };
+
+        let buffered = self.inner.buffer();
+        let len = buffered.len();
+        debug_assert!(len > 0, "pending > 0 implies buffered bytes");
+        let fd = types::Fd(self.inner.get_ref().as_raw_fd());
+
+        // Offset -1: append at the file's own cursor and advance it,
+        // exactly like the write(2) the BufWriter flush would issue.
+        let write_sqe = opcode::Write::new(fd, buffered.as_ptr(), len as u32)
+            .offset(u64::MAX)
+            .build()
+            .flags(io_uring::squeue::Flags::IO_LINK)
+            .user_data(1);
+        let fsync_sqe = opcode::Fsync::new(fd)
+            .flags(types::FsyncFlags::DATASYNC)
+            .build()
+            .user_data(2);
+
+        {
+            let mut sq = commit.ring.submission();
+            // SAFETY: `buffered` stays untouched (no writes through
+            // `self.inner`) until both CQEs are reaped below.
+            let pushed = unsafe { sq.push(&write_sqe) };
+            pushed.expect("empty 4-entry ring accepts the write SQE");
+            // SAFETY: the fsync SQE references only the fd, which stays
+            // open for the life of `self.inner`.
+            let pushed = unsafe { sq.push(&fsync_sqe) };
+            pushed.expect("4-entry ring accepts the linked fsync SQE");
+        }
+        commit.ring.submit_and_wait(2).map_err(WalError::Io)?;
+
+        let mut written: Option<i32> = None;
+        let mut synced: Option<i32> = None;
+        for cqe in commit.ring.completion() {
+            match cqe.user_data() {
+                1 => written = Some(cqe.result()),
+                2 => synced = Some(cqe.result()),
+                _ => {}
+            }
+        }
+        let (written, synced) = (
+            written.expect("write CQE present after submit_and_wait(2)"),
+            synced.expect("fsync CQE present after submit_and_wait(2)"),
+        );
+
+        if written < 0 {
+            return Err(WalError::Io(io::Error::from_raw_os_error(-written)));
+        }
+        let written = written as usize;
+        if written < len {
+            // Rare (disk full mid-write): the linked fsync covered only
+            // the short prefix. Finish the tail through the portable
+            // path so its own fdatasync provides the guarantee.
+            self.drop_buffered_prefix(written)?;
+            self.inner.flush()?;
+            self.inner.get_ref().sync_data()?;
+            self.pending = 0;
+            return Ok(true);
+        }
+        // A canceled link (-ECANCELED) cannot happen here: the write
+        // completed fully, so the chain proceeded to the fsync.
+        if synced < 0 {
+            return Err(WalError::Io(io::Error::from_raw_os_error(-synced)));
+        }
+
+        self.drop_buffered_prefix(len)?;
+        self.pending = 0;
+        Ok(true)
+    }
+
+    /// Discard the first `n` buffered bytes — they are already in the
+    /// file via the ring write, so a later flush must not re-emit them.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn drop_buffered_prefix(&mut self, n: usize) -> Result<(), WalError> {
+        let remainder = self.inner.buffer()[n..].to_vec();
+        let file = self.inner.get_ref().try_clone()?;
+        let mut fresh = BufWriter::with_capacity(self.inner.capacity(), file);
+        if !remainder.is_empty() {
+            fresh.write_all(&remainder)?;
+        }
+        let _ = std::mem::replace(&mut self.inner, fresh).into_parts();
         Ok(())
     }
 

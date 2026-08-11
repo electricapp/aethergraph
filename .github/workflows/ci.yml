@@ -225,13 +225,16 @@ jobs:
         with:
           key: wal
       - run: cargo test -p aether-graph --features wal
+      - name: wal over io_uring group commit
+        run: cargo test -p aether-graph --features "wal io-uring"
       - name: Summary
         if: always()
         run: |
           {
             echo "## wal"
             echo ""
-            echo "Round-trip + crash-recovery tests for the append-only WAL."
+            echo "Round-trip + crash-recovery tests for the append-only WAL,"
+            echo "portable path and linked-SQE io_uring group-commit path."
           } >> "$GITHUB_STEP_SUMMARY"
 
   loom:
