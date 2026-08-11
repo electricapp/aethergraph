@@ -34,8 +34,10 @@ bench = false
 aethergraph-core = { path = "../aethergraph-core", version = "0.1" }
 # `wal` is always on so the Python `DynamicGraph.open_with_wal` constructor is
 # present on every wheel build — durability is a runtime opt-in (pass a path or
-# don't), not a compile-time one.
-aether-graph = { path = "../aether-graph", version = "0.1", features = ["wal"] }
+# don't), not a compile-time one. `io-uring` rides along: its dependency is
+# Linux-target-gated, so Linux wheels get the linked-SQE group commit (with a
+# runtime fallback) while mac builds compile the portable path only.
+aether-graph = { path = "../aether-graph", version = "0.1", features = ["wal", "io-uring"] }
 
 # PyO3 for Python bindings. `extension-module` is conditionally enabled via
 # this crate's `extension-module` feature (above) so `cargo test` links
