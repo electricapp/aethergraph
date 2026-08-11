@@ -15,6 +15,10 @@ bench = false
 default = []
 io-uring = []
 gds = []
+# Self-profiling hardware counters via perf_event_open (cycles, LLC-miss,
+# dTLB-miss, task-clock) wrapped around hot loops. Linux-only; counters
+# degrade to absent when the PMU or paranoid setting forbids them.
+perf = []
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 # Enables loom-backed model checking of the lock-free union-find. Run with:
 #   cargo test -p aethergraph-core --features loom --test loom_union_find
