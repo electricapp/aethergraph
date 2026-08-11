@@ -126,6 +126,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p aether-stream --tests --features xdp_bpf
 
+      - name: zstd cold-tier tests
+        run: cargo test -p aethergraph-core --features zstd-tier features::cold_tier
+
       - name: mlx5dv compile check
         if: matrix.run_rdma
         run: cargo check -p aether-stream --tests --features mlx5dv

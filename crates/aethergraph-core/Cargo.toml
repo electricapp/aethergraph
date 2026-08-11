@@ -15,6 +15,9 @@ bench = false
 default = []
 io-uring = []
 gds = []
+# zstd-compressed, dictionary-trained cold feature tier: rarely touched
+# rows compressed in fixed-size blocks, decompressed per-block on gather.
+zstd-tier = ["dep:zstd"]
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 # Enables loom-backed model checking of the lock-free union-find. Run with:
 #   cargo test -p aethergraph-core --features loom --test loom_union_find
@@ -40,6 +43,7 @@ libc = "0.2"
 parquet = { version = "59", optional = true, default-features = false, features = ["arrow"] }
 arrow-array = { version = "59", optional = true }
 arrow-schema = { version = "59", optional = true }
+zstd = { version = "0.13", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5"
