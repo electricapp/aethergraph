@@ -556,7 +556,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, supply-chain, unused-deps, python, python-wheel, python-wheel-pgo]
+    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, supply-chain, unused-deps, python, python-wheel, python-wheel-pgo, python-wheel-freethreaded]
     if: always()
     steps:
       - name: Render summary
@@ -579,6 +579,7 @@ jobs:
             echo "| wheel x86-64 | Linux x86_64 | portable baseline | ${{ needs.python-wheel.result }} |"
             echo "| wheel x86-64-v3 | Linux x86_64 | target-cpu=x86-64-v3 | ${{ needs.python-wheel.result }} |"
             echo "| wheel x86-64 pgo | Linux x86_64 | PGO + BOLT | ${{ needs.python-wheel-pgo.result }} |"
+            echo "| wheel cp313t | Linux x86_64 | free-threaded, no abi3 | ${{ needs.python-wheel-freethreaded.result }} |"
             echo ""
             echo "Hardware-gated tests (SoftRoCE micro-bench, SRD loopback,"
             echo "billion-node scale) run only on the self-hosted \`rdma-hardware\`"
