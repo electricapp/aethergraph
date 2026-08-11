@@ -52,9 +52,6 @@ rustc-hash = "2.1"  # Faster hashing than std HashMap
 ahash = "0.8"       # Alternative fast hasher
 crc32fast = "1.5"   # SIMD CRC32 with runtime dispatch (integrity checksums)
 
-# SIMD
-wide = "1.5"
-
 # Lock-free channels for prefetching
 crossbeam-channel = "0.5"
 

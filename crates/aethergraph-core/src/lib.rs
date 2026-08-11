@@ -54,4 +54,7 @@ pub use internal::mmap::{
 pub use internal::mmap_hetero::{load_hetero_graph, save_hetero_graph};
 #[cfg(feature = "parquet")]
 pub use internal::parquet_import::{from_parquet, from_parquet_files};
+// Vectorized half-precision → f32 conversions with runtime SIMD dispatch
+// (AVX-512 / F16C / NEON for f16, AVX2 for bf16, scalar fallback).
+pub use internal::simd::{bf16_le_to_f32, f16_le_to_f32};
 pub use internal::telemetry::{SamplingTelemetry, TelemetrySummary};
