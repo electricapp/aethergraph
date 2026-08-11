@@ -174,11 +174,29 @@ impl CounterSet {
     /// readings bracket exactly `f`'s work (plus a fixed few syscalls of
     /// enable/disable overhead, identical across calls).
     pub fn measure<R>(&self, f: impl FnOnce() -> R) -> (R, CounterReadings) {
+        self.start();
+        let out = f();
+        (out, self.stop())
+    }
+
+    /// Zero every counter and begin counting.
+    ///
+    /// Paired with [`Self::stop`] for callers that can't wrap their work
+    /// in a closure — a Python `with` block, or a region spanning an
+    /// `await`. [`Self::measure`] is the safer choice where it fits, since
+    /// it cannot leave counters running.
+    pub fn start(&self) {
         for (_, fd) in &self.fds {
             ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_RESET);
             ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_ENABLE);
         }
-        let out = f();
+    }
+
+    /// Stop counting and read every counter.
+    ///
+    /// Reading without a preceding [`Self::start`] yields whatever the
+    /// counters hold — zero for a freshly opened set.
+    pub fn stop(&self) -> CounterReadings {
         let mut readings = CounterReadings::default();
         for (c, fd) in &self.fds {
             ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_DISABLE);
@@ -191,7 +209,31 @@ impl CounterSet {
                 Counter::TaskClockNs => readings.task_clock_ns = value,
             }
         }
-        (out, readings)
+        readings
+    }
+}
+
+impl CounterReadings {
+    /// Instructions per cycle, when both counters were available.
+    ///
+    /// The headline efficiency number: below ~1.0 on this workload means
+    /// the core is stalled on memory rather than retiring work.
+    pub fn ipc(&self) -> Option<f64> {
+        match (self.instructions, self.cycles) {
+            (Some(i), Some(c)) if c > 0 => Some(i as f64 / c as f64),
+            _ => None,
+        }
+    }
+
+    /// LLC misses per thousand instructions, when both were available.
+    ///
+    /// The cache-behaviour number to watch when changing layout or
+    /// prefetch distance.
+    pub fn llc_misses_per_kilo_instruction(&self) -> Option<f64> {
+        match (self.llc_misses, self.instructions) {
+            (Some(m), Some(i)) if i > 0 => Some(m as f64 * 1000.0 / i as f64),
+            _ => None,
+        }
     }
 }
 

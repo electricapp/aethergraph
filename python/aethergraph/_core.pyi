@@ -10,7 +10,8 @@ Path-accepting APIs declare `str | os.PathLike[str]` since PyO3's
 
 import os
 from collections.abc import Sequence
-from typing import Any, TypeAlias
+from types import TracebackType
+from typing import Any, Self, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
@@ -25,6 +26,10 @@ __author__: str
 # was built with `--features gpudirect`. Callers should test this before
 # constructing RDMA-backed loaders rather than probing for method names.
 HAS_GPUDIRECT: bool
+
+# True on Linux builds carrying perf_event_open counters. `PerfCounters`
+# is absent entirely when this is False.
+HAS_PERF_COUNTERS: bool
 
 # Test-only helper, only present in `gpudirect` builds. Wraps a raw CUDA
 # device pointer in a DLPack capsule so `torch.from_dlpack` can ingest it.
@@ -372,6 +377,31 @@ class FeatureStore:
     def get_batch(self, nodes: npt.NDArray[np.int64]) -> npt.NDArray[np.float32]: ...
     def features(self) -> npt.NDArray[np.float32]: ...
     def telemetry(self) -> FeatureLoadTelemetry | None: ...
+
+class PerfCounters:
+    """Hardware performance counters around a block of work.
+
+    Counters are thread-scoped and count user space only. Hosts that
+    withhold PMU access grant fewer counters; those readings come back
+    None rather than raising, so `active` reports what was granted.
+
+    Linux only — present only when `HAS_PERF_COUNTERS` is True."""
+
+    def __init__(self, counters: list[str] | None = None) -> None: ...
+    @property
+    def active(self) -> int: ...
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+    def readings(self) -> dict[str, Any] | None:
+        """Latest readings, or None before the first `stop()`."""
+
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool: ...
 
 class FeatureData:
     """Mutable feature builder."""

@@ -24,6 +24,8 @@ mod feature_telemetry;
 mod graph;
 mod hetero;
 mod metrics;
+#[cfg(all(target_os = "linux", feature = "perf"))]
+mod perf;
 mod prefetch;
 mod sampler;
 
@@ -107,6 +109,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // directly instead of probing for method existence (`hasattr`), keeping
     // capability detection out of the structural-typing world.
     m.add("HAS_GPUDIRECT", cfg!(feature = "gpudirect"))?;
+    m.add(
+        "HAS_PERF_COUNTERS",
+        cfg!(all(target_os = "linux", feature = "perf")),
+    )?;
+
+    #[cfg(all(target_os = "linux", feature = "perf"))]
+    m.add_class::<perf::PyPerfCounters>()?;
 
     #[cfg(feature = "gpudirect")]
     m.add_function(wrap_pyfunction!(

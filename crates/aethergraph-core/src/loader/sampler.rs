@@ -710,6 +710,15 @@ impl<'a> NeighborSampler<'a> {
             );
         }
 
+        // Unlike the telemetry above, this fires whether or not anything
+        // is configured: an unattached probe is one nop.
+        crate::probe!(
+            sample_batch_done,
+            subgraph.num_seeds(),
+            subgraph.num_nodes(),
+            subgraph.num_edges(),
+        );
+
         subgraph
     }
 
@@ -857,6 +866,7 @@ impl<'a> NeighborSampler<'a> {
                     if let Some(ref telemetry) = self.config.telemetry {
                         telemetry.record_hub_node();
                     }
+                    crate::probe!(hub_node_capped, neighbors.len(), max_deg);
                     &neighbors[..max_deg]
                 } else {
                     neighbors

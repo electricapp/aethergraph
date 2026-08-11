@@ -13,6 +13,7 @@ pub mod parquet_import;
 #[cfg(all(target_os = "linux", feature = "perf"))]
 pub mod perf;
 pub mod prefetch;
+pub mod probe;
 pub mod simd;
 pub mod telemetry;
 

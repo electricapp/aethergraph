@@ -691,6 +691,8 @@ impl FeatureStore {
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
+        crate::probe!(feature_gather_done, nodes.len(), row_bytes * nodes.len());
+
         Ok(result)
     }
 

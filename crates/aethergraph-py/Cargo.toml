@@ -15,9 +15,14 @@ workspace = true
 # which turns this on via `[tool.maturin].features` in python/pyproject.toml.
 # Plain `cargo test` omits it so unit tests can link against libpython
 # normally and run as a standalone test binary.
-default = []
+#
+# `perf` is on by default: its code is additionally Linux-gated, and on
+# Linux an unavailable PMU simply yields a counter set with zero active
+# counters rather than an error.
+default = ["perf"]
 extension-module = ["pyo3/extension-module"]
 gpudirect = ["aether-stream/gpudirect"]
+perf = ["aethergraph-core/perf"]
 
 [lib]
 name = "_core"
