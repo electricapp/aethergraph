@@ -26,6 +26,8 @@ mod hetero;
 mod metrics;
 mod prefetch;
 mod sampler;
+#[cfg(all(target_os = "linux", feature = "shm"))]
+mod shared_store;
 
 use pyo3::prelude::*;
 
@@ -107,6 +109,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // directly instead of probing for method existence (`hasattr`), keeping
     // capability detection out of the structural-typing world.
     m.add("HAS_GPUDIRECT", cfg!(feature = "gpudirect"))?;
+    m.add(
+        "HAS_SHARED_STORE",
+        cfg!(all(target_os = "linux", feature = "shm")),
+    )?;
+
+    #[cfg(all(target_os = "linux", feature = "shm"))]
+    m.add_class::<shared_store::PySharedFeatureStore>()?;
 
     #[cfg(feature = "gpudirect")]
     m.add_function(wrap_pyfunction!(

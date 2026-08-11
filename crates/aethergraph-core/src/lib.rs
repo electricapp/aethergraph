@@ -40,8 +40,11 @@ pub use features::{
     AsyncFeatureStore, FeatureData, FeatureDtype, FeatureLoadTelemetry, FeatureStore,
     NodeFeatureSource,
 };
+pub use features::{FeatureHeader, parse_feature_header};
 #[cfg(feature = "gds")]
 pub use features::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
+#[cfg(all(target_os = "linux", feature = "shm"))]
+pub use features::{ShareHandle, SharedFeatureStore};
 pub use features::{
     create_features, save_feature_data, save_features, save_features_f16, save_features_ndarray,
 };

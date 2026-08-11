@@ -10,6 +10,8 @@ pub(crate) mod gather;
 #[cfg(feature = "gds")]
 mod gds;
 pub(crate) mod header;
+#[cfg(all(target_os = "linux", feature = "shm"))]
+mod shared_store;
 mod store;
 
 use crate::graph::NodeId;
@@ -18,7 +20,9 @@ pub use async_store::AsyncFeatureStore;
 pub use cache::{CacheStats, FeatureCache, FeatureCacheConfig, count_node_frequencies};
 #[cfg(feature = "gds")]
 pub use gds::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
-pub use header::FeatureDtype;
+pub use header::{FeatureDtype, FeatureHeader, parse_feature_header};
+#[cfg(all(target_os = "linux", feature = "shm"))]
+pub use shared_store::{ShareHandle, SharedFeatureStore};
 pub(crate) use store::PaddedAtomicU64;
 pub use store::{
     FeatureData, FeatureLoadTelemetry, FeatureStore, create_features, save_feature_data,

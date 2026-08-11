@@ -15,9 +15,14 @@ workspace = true
 # which turns this on via `[tool.maturin].features` in python/pyproject.toml.
 # Plain `cargo test` omits it so unit tests can link against libpython
 # normally and run as a standalone test binary.
-default = []
+#
+# `shm` is on by default: its code is additionally Linux-gated, so mac
+# builds are unaffected, and SharedFeatureStore is simply absent there
+# (check the module's HAS_SHARED_STORE flag).
+default = ["shm"]
 extension-module = ["pyo3/extension-module"]
 gpudirect = ["aether-stream/gpudirect"]
+shm = ["aethergraph-core/shm"]
 
 [lib]
 name = "_core"
