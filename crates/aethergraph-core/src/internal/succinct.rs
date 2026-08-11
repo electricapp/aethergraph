@@ -1,20 +1,23 @@
-//! Succinct integer sequence codecs for neighbor lists.
+//! Succinct integer sequence codecs backing the compressed CSR format.
 //!
-//! CSR neighbor lists are sorted, so they compress far below 32 bits per
-//! edge without giving up random access. Two codecs live here, each right
-//! for a different access pattern:
+//! The version-2 graph file (see `internal::compressed_graph`) stores the
+//! two CSR arrays through these codecs:
 //!
 //! - [`EliasFano`] stores a monotone sequence in ~`2 + ceil(log2(u/n))`
-//!   bits per element with O(1) [`EliasFano::get`] — the encoding for a
-//!   node's sorted neighbor IDs, where the reader indexes individual
-//!   neighbors.
+//!   bits per element — the encoding for the offsets array, which is a
+//!   prefix-sum and therefore always monotone.
 //! - [`StreamVByte`] delta-encodes a sequence into a control stream plus a
-//!   byte stream, decoded sequentially at GB/s — the encoding for edge
-//!   deltas in the WAL and ingest paths, where the reader wants the whole
-//!   list back.
+//!   byte stream, decoded sequentially at GB/s — the encoding for the
+//!   edges array, where sorted neighbor lists delta down to mostly
+//!   single-byte values.
 //!
 //! Both are pure integer algorithms with no platform or hardware
-//! dependency; they run and are tested everywhere.
+//! dependency; they run and are tested everywhere. Each type also defines
+//! its own little-endian wire format ([`EliasFano::write_into`] /
+//! [`EliasFano::read_from`], and the [`StreamVByte`] equivalents) so the
+//! file format has exactly one serializer per codec.
+
+use anyhow::Context;
 
 /// Elias-Fano encoding of a monotone non-decreasing `u64` sequence.
 ///
@@ -122,16 +125,100 @@ impl EliasFano {
     }
 
     /// Decode every element into a freshly allocated vector.
+    ///
+    /// Sequential: one pass over the high-bits words plus one low-bits
+    /// read per element — O(n + words), unlike a loop over [`Self::get`]
+    /// whose per-call select would make full decode quadratic.
     pub fn to_vec(&self) -> Vec<u64> {
-        (0..self.len)
-            .map(|i| self.get(i).expect("i < len"))
-            .collect()
+        let mut out = Vec::with_capacity(self.len);
+        let mut i = 0usize;
+        'words: for (word_idx, &word) in self.high.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let set_pos = word_idx * 64 + w.trailing_zeros() as usize;
+                w &= w - 1;
+                let high_part = (set_pos - i) as u64;
+                let low_part = if self.low_bits == 0 {
+                    0
+                } else {
+                    self.read_low(i)
+                };
+                out.push((high_part << self.low_bits) | low_part);
+                i += 1;
+                if i == self.len {
+                    break 'words;
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), self.len, "high bit count matches len");
+        out
     }
 
     /// Total heap bytes of the two backing arrays — for reporting the
     /// achieved bits-per-element.
     pub fn heap_bytes(&self) -> usize {
         self.low.len() * 8 + self.high.len() * 8
+    }
+
+    /// Serialize into `out` as little-endian:
+    /// `len u64 | universe u64 | low_bits u32 | low word count u64 |
+    /// low words | high word count u64 | high words`.
+    pub fn write_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.len as u64).to_le_bytes());
+        out.extend_from_slice(&self.universe.to_le_bytes());
+        out.extend_from_slice(&self.low_bits.to_le_bytes());
+        out.extend_from_slice(&(self.low.len() as u64).to_le_bytes());
+        for w in &self.low {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.high.len() as u64).to_le_bytes());
+        for w in &self.high {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    /// Parse one serialized sequence from the front of `bytes`, returning
+    /// it and the number of bytes consumed. Validates structural
+    /// consistency (word counts sized for `len`/`universe`, set-bit count
+    /// equal to `len`) so a decoded value can be trusted downstream.
+    pub fn read_from(bytes: &[u8]) -> anyhow::Result<(Self, usize)> {
+        let mut r = ByteReader::new(bytes);
+        let len = usize::try_from(r.u64()?).context("EF len")?;
+        let universe = r.u64()?;
+        let low_bits = r.u32()?;
+        anyhow::ensure!(low_bits < 64, "EF low_bits {low_bits} out of range");
+        let low = r.u64_vec().context("EF low words")?;
+        let high = r.u64_vec().context("EF high words")?;
+
+        let expect_low_words = (len * low_bits as usize).div_ceil(64);
+        anyhow::ensure!(
+            low.len() >= expect_low_words,
+            "EF low array truncated: {} words, need {expect_low_words}",
+            low.len()
+        );
+        if len > 0 {
+            let last_pos = (universe >> low_bits) as usize + len - 1;
+            anyhow::ensure!(
+                high.len() * 64 > last_pos,
+                "EF high array truncated for universe {universe}"
+            );
+        }
+        let ones: usize = high.iter().map(|w| w.count_ones() as usize).sum();
+        anyhow::ensure!(
+            ones == len,
+            "EF high array has {ones} set bits for {len} elements"
+        );
+
+        Ok((
+            Self {
+                len,
+                low_bits,
+                low,
+                high,
+                universe,
+            },
+            r.consumed(),
+        ))
     }
 
     /// Position of the `(rank+1)`-th set bit in `high`.
@@ -225,13 +312,11 @@ pub struct StreamVByte {
 }
 
 impl StreamVByte {
-    /// Delta-encode `values`. The sequence may be arbitrary `u32`s, but
-    /// gains most on sorted input where consecutive deltas are small.
-    ///
-    /// # Panics
-    /// Panics if a delta would exceed `u32::MAX` (only possible for a
-    /// non-monotone sequence with a huge backward step); callers encoding
-    /// neighbor lists pass sorted input, where deltas are non-negative.
+    /// Delta-encode `values`. Deltas are wrapping (`v.wrapping_sub(prev)`),
+    /// so any `u32` sequence round-trips exactly through [`Self::decode`]'s
+    /// wrapping running sum; sorted input is where the encoding gains,
+    /// because forward deltas are small. A backward step encodes as a
+    /// large wrapping delta (4 bytes) — correct, merely uncompressed.
     pub fn encode_deltas(values: &[u32]) -> Self {
         if values.is_empty() {
             return Self::default();
@@ -243,10 +328,7 @@ impl StreamVByte {
 
         let mut prev = first;
         for (i, &v) in values[1..].iter().enumerate() {
-            let delta = v
-                .checked_sub(prev)
-                .or_else(|| prev.checked_sub(v))
-                .expect("delta fits in u32");
+            let delta = v.wrapping_sub(prev);
             let (nbytes, tag) = svb_len(delta);
             let le = delta.to_le_bytes();
             data.extend_from_slice(&le[..nbytes]);
@@ -299,6 +381,107 @@ impl StreamVByte {
             pos += nbytes;
         }
         out
+    }
+}
+
+impl StreamVByte {
+    /// Serialize into `out` as little-endian:
+    /// `len u64 | first u32 | control byte count u64 | control bytes |
+    /// data byte count u64 | data bytes`.
+    pub fn write_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.len as u64).to_le_bytes());
+        out.extend_from_slice(&self.first.to_le_bytes());
+        out.extend_from_slice(&(self.control.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.control);
+        out.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.data);
+    }
+
+    /// Parse one serialized sequence from the front of `bytes`, returning
+    /// it and the number of bytes consumed. Validates that the control
+    /// stream covers `len - 1` deltas and that the data stream holds
+    /// exactly the bytes the control tags call for, so [`Self::decode`]
+    /// can run unchecked.
+    pub fn read_from(bytes: &[u8]) -> anyhow::Result<(Self, usize)> {
+        let mut r = ByteReader::new(bytes);
+        let len = usize::try_from(r.u64()?).context("SVB len")?;
+        let first = r.u32()?;
+        let control = r.byte_vec().context("SVB control stream")?;
+        let data = r.byte_vec().context("SVB data stream")?;
+
+        let n_deltas = len.saturating_sub(1);
+        anyhow::ensure!(
+            control.len() == n_deltas.div_ceil(4),
+            "SVB control stream is {} bytes for {n_deltas} deltas",
+            control.len()
+        );
+        let need: usize = (0..n_deltas)
+            .map(|i| (((control[i / 4] >> ((i % 4) * 2)) & 0b11) as usize) + 1)
+            .sum();
+        anyhow::ensure!(
+            data.len() == need,
+            "SVB data stream is {} bytes, control tags call for {need}",
+            data.len()
+        );
+
+        Ok((
+            Self {
+                len,
+                first,
+                control,
+                data,
+            },
+            r.consumed(),
+        ))
+    }
+}
+
+/// Bounds-checked little-endian cursor for the codec wire formats.
+struct ByteReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> anyhow::Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&e| e <= self.bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("truncated: need {n} bytes at {}", self.pos))?;
+        let s = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(s)
+    }
+
+    fn u32(&mut self) -> anyhow::Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4")))
+    }
+
+    fn u64(&mut self) -> anyhow::Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8")))
+    }
+
+    fn byte_vec(&mut self) -> anyhow::Result<Vec<u8>> {
+        let n = usize::try_from(self.u64()?).context("length prefix")?;
+        Ok(self.take(n)?.to_vec())
+    }
+
+    fn u64_vec(&mut self) -> anyhow::Result<Vec<u64>> {
+        let n = usize::try_from(self.u64()?).context("length prefix")?;
+        let raw = self.take(n.checked_mul(8).context("word count overflow")?)?;
+        Ok(raw
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().expect("8")))
+            .collect())
+    }
+
+    fn consumed(&self) -> usize {
+        self.pos
     }
 }
 
@@ -397,6 +580,74 @@ mod tests {
             "expected < 2 bytes/value, got {}",
             svb.heap_bytes() as f64 / values.len() as f64
         );
+    }
+
+    #[test]
+    fn streamvbyte_round_trips_non_monotone() {
+        // Wrapping deltas make arbitrary sequences exact — backward steps
+        // and large jumps included.
+        let cases: Vec<Vec<u32>> = vec![
+            vec![5, 3],
+            vec![10, 0, u32::MAX, 1, 2, 1],
+            vec![u32::MAX, 0, u32::MAX],
+            (0..500)
+                .map(|i| (i * 2_654_435_761u64 % 4_294_967_291) as u32)
+                .collect(),
+        ];
+        for values in cases {
+            let svb = StreamVByte::encode_deltas(&values);
+            assert_eq!(svb.decode(), values, "round-trip for {values:?}");
+        }
+    }
+
+    #[test]
+    fn elias_fano_serialization_round_trips() {
+        let cases: Vec<Vec<u64>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0, 7, 7, 1_000_000],
+            (0..2048).map(|i| i * 13).collect(),
+        ];
+        for values in cases {
+            let ef = EliasFano::encode(&values);
+            let mut buf = vec![0xAA; 3]; // leading noise the reader must skip past
+            let start = buf.len();
+            ef.write_into(&mut buf);
+            buf.extend_from_slice(&[0xBB; 5]); // trailing bytes beyond one record
+            let (back, consumed) = EliasFano::read_from(&buf[start..]).unwrap();
+            assert_eq!(consumed, buf.len() - start - 5, "consumed for {values:?}");
+            assert_eq!(back.to_vec(), values, "round-trip for {values:?}");
+        }
+    }
+
+    #[test]
+    fn streamvbyte_serialization_round_trips() {
+        let values: Vec<u32> = (0..3000).map(|i| i * 3 + (i % 7)).collect();
+        let svb = StreamVByte::encode_deltas(&values);
+        let mut buf = Vec::new();
+        svb.write_into(&mut buf);
+        let (back, consumed) = StreamVByte::read_from(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back.decode(), values);
+    }
+
+    #[test]
+    fn serialization_rejects_corruption() {
+        let ef = EliasFano::encode(&[1, 5, 9, 200]);
+        let mut buf = Vec::new();
+        ef.write_into(&mut buf);
+        // Truncation.
+        assert!(EliasFano::read_from(&buf[..buf.len() - 1]).is_err());
+        // A cleared high word breaks the set-bit count invariant.
+        let mut tampered = buf.clone();
+        let last8 = tampered.len() - 8;
+        tampered[last8..].fill(0);
+        assert!(EliasFano::read_from(&tampered).is_err());
+
+        let svb = StreamVByte::encode_deltas(&[1, 500, 9]);
+        let mut buf = Vec::new();
+        svb.write_into(&mut buf);
+        assert!(StreamVByte::read_from(&buf[..buf.len() - 1]).is_err());
     }
 
     #[test]

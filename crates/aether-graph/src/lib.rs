@@ -17,7 +17,6 @@ mod graph;
 mod historical;
 pub mod ingest;
 mod pad;
-pub mod succinct;
 #[cfg(feature = "wal")]
 pub mod wal;
 mod writer;
@@ -29,7 +28,6 @@ pub use ctree::{CTree, InsertResult};
 pub use embedding_cache::EmbeddingCache;
 pub use graph::DynamicGraph;
 pub use historical::{HistoricalBatch, HistoricalSampler};
-pub use succinct::{EliasFano, StreamVByte};
 #[cfg(feature = "wal")]
 pub use wal::{EdgeRecord, ReplayOutcome, WalError, WalWriter, replay as replay_wal};
 pub use writer::{InsertError, Writer, WriterError};

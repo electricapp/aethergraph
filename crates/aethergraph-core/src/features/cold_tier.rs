@@ -13,6 +13,8 @@
 
 use anyhow::{Context, Result, bail};
 
+use super::header::{FeatureDtype, parse_feature_header};
+
 /// Rows per compression block. A block is the decompression unit: bigger
 /// blocks compress better but force more waste when a gather wants one
 /// row. 512 rows balances the two for typical feature dimensions.
@@ -162,6 +164,73 @@ impl ColdTier {
     }
 }
 
+/// A [`ColdTier`] built from a feature-store file, decoding gathered raw
+/// rows through the store's dtype into `f32`.
+///
+/// This is the compressed in-memory backing tier of
+/// [`FeatureCache`](super::cache — see `FeatureCacheConfig::cold_store_path`):
+/// the whole feature matrix held resident at a fraction of its raw size,
+/// so a node absent from every cache tier is a block decompression away
+/// instead of an error.
+#[derive(Debug)]
+pub struct ColdStore {
+    tier: ColdTier,
+    dtype: FeatureDtype,
+    feature_dim: usize,
+}
+
+impl ColdStore {
+    /// Read the feature file at `path` and compress its payload into a
+    /// resident cold store. `level` is the zstd compression level.
+    pub fn build_from_store(path: &std::path::Path, level: i32) -> Result<Self> {
+        use std::os::unix::fs::FileExt;
+
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open feature store {}", path.display()))?;
+        let header = parse_feature_header(&file)?;
+        let row_bytes = header.feature_dim * header.dtype.element_size();
+        let mut payload = vec![0u8; header.num_nodes * row_bytes];
+        file.read_exact_at(&mut payload, header.features_start_offset)
+            .context("failed to read feature payload")?;
+
+        let tier = ColdTier::build(&payload, row_bytes, level)?;
+        Ok(Self {
+            tier,
+            dtype: header.dtype,
+            feature_dim: header.feature_dim,
+        })
+    }
+
+    /// Rows (nodes) held by the store.
+    pub fn num_rows(&self) -> usize {
+        self.tier.num_rows()
+    }
+
+    /// Feature dimension of every row.
+    pub fn feature_dim(&self) -> usize {
+        self.feature_dim
+    }
+
+    /// Compression ratio vs the raw payload.
+    pub fn ratio(&self) -> f64 {
+        self.tier.ratio()
+    }
+
+    /// Gather `nodes` into one contiguous decoded `f32` buffer in input
+    /// order — `nodes.len() * feature_dim` values.
+    pub fn gather(&self, nodes: &[u32]) -> Result<Vec<f32>> {
+        let raw = self.tier.gather_rows(nodes)?;
+        let mut out = vec![0f32; nodes.len() * self.feature_dim];
+        for (i, chunk) in raw.chunks_exact(self.tier.row_bytes()).enumerate() {
+            self.dtype.decode_row(
+                chunk,
+                &mut out[i * self.feature_dim..(i + 1) * self.feature_dim],
+            );
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +303,32 @@ mod tests {
     fn rejects_ragged_data() {
         let data = vec![0u8; 100];
         assert!(ColdTier::build(&data, 33, 3).is_err());
+    }
+
+    #[test]
+    fn cold_store_matches_feature_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feat.bin");
+        let (num_nodes, dim) = (1200usize, 32usize);
+        let features: Vec<f32> = (0..num_nodes * dim)
+            .map(|i| (i % 251) as f32 * 0.25)
+            .collect();
+        crate::features::save_features(&path, features.clone(), num_nodes, dim).unwrap();
+
+        let store = ColdStore::build_from_store(&path, 9).unwrap();
+        assert_eq!(store.num_rows(), num_nodes);
+        assert_eq!(store.feature_dim(), dim);
+
+        // Scattered gather with a repeat, crossing block boundaries.
+        let nodes = [0u32, 7, 511, 512, 1199, 7];
+        let got = store.gather(&nodes).unwrap();
+        for (i, &n) in nodes.iter().enumerate() {
+            assert_eq!(
+                &got[i * dim..(i + 1) * dim],
+                &features[n as usize * dim..(n as usize + 1) * dim],
+                "node {n} at position {i}"
+            );
+        }
     }
 
     #[test]

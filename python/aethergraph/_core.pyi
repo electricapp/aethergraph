@@ -62,9 +62,13 @@ class CsrGraph:
         storage: str = "auto",
         validation: str = "auto",
     ) -> CsrGraph:
-        """Load a graph from disk. `storage` is one of
-        ``"auto" | "mmap" | "owned"``; `validation` is one of
-        ``"auto" | "header_only" | "offsets_only" | "full"``."""
+        """Load a graph from disk, in either the flat or the compressed
+        format. `storage` is one of ``"auto" | "mmap" | "owned"``;
+        `validation` is one of
+        ``"auto" | "header_only" | "offsets_only" | "full"``.
+
+        A compressed file always decodes into owned arrays, so
+        ``storage="mmap"`` raises on one."""
 
     @staticmethod
     def from_edges(
@@ -73,7 +77,10 @@ class CsrGraph:
         dst: npt.NDArray[np.uint32],
         weights: npt.NDArray[np.float32] | None = ...,
     ) -> CsrGraph: ...
-    def save(self, path: PathLike) -> None: ...
+    def save(self, path: PathLike, *, compressed: bool = False) -> None:
+        """Write the graph. `compressed` selects the succinct-coded format
+        (Elias-Fano offsets, StreamVByte edges), typically 2-4x smaller at
+        rest and readable by `load`."""
 
     # The next 4 are #[getter]s — attribute access, no parens.
     @property
@@ -508,7 +515,14 @@ class FeatureCacheConfig:
         cpu_capacity: int = 1_000_000,
         feature_dim: int = 128,
         nvme_path: PathLike | None = None,
-    ) -> None: ...
+        cold_store_path: PathLike | None = None,
+        cold_level: int = 12,
+    ) -> None:
+        """`cold_store_path` points at an AETHFEAT file to compress into a
+        resident backing tier, making the cache a complete feature source:
+        a node in no other tier is served from its zstd block instead of
+        raising. Requires a build with the `zstd-tier` feature."""
+
     @property
     def gpu_capacity(self) -> int: ...
     @property
@@ -517,6 +531,10 @@ class FeatureCacheConfig:
     def feature_dim(self) -> int: ...
     @property
     def nvme_path(self) -> str | None: ...
+    @property
+    def cold_store_path(self) -> str | None: ...
+    @property
+    def cold_level(self) -> int: ...
 
 class FeatureCache:
     """Tiered (GPU/CPU/NVMe) feature cache. Async API."""

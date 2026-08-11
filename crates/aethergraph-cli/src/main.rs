@@ -1,4 +1,4 @@
-use aethergraph_core::{Graph, NodeId, load_graph, save_graph};
+use aethergraph_core::{Graph, NodeId, load_graph, save_graph, save_graph_compressed};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -46,6 +46,12 @@ enum Commands {
         /// Skip first N lines (for headers)
         #[arg(long, default_value = "0")]
         skip_lines: usize,
+
+        /// Write the succinct-coded format (Elias-Fano offsets,
+        /// StreamVByte edges) instead of flat arrays — typically 2-4x
+        /// smaller at rest, and loaded into owned storage rather than mmap
+        #[arg(long)]
+        compressed: bool,
     },
 
     /// Display information about a binary graph file
@@ -82,7 +88,10 @@ fn main() -> Result<()> {
             num_nodes,
             delimiter,
             skip_lines,
-        } => convert_edge_list(&input, &output, num_nodes, delimiter, skip_lines),
+            compressed,
+        } => convert_edge_list(
+            &input, &output, num_nodes, delimiter, skip_lines, compressed,
+        ),
 
         Commands::Info { path } => show_info(&path),
 
@@ -143,6 +152,7 @@ fn convert_edge_list(
     num_nodes: usize,
     delimiter: Option<String>,
     skip_lines: usize,
+    compressed: bool,
 ) -> Result<()> {
     info!("Converting edge list to AetherGraph format");
     debug!("Input: {}", input.display());
@@ -263,7 +273,11 @@ fn convert_edge_list(
 
     // Save to binary format
     debug!("Writing binary file");
-    save_graph(&graph, output).context("failed to save graph")?;
+    if compressed {
+        save_graph_compressed(&graph, output).context("failed to save graph")?;
+    } else {
+        save_graph(&graph, output).context("failed to save graph")?;
+    }
 
     info!("Conversion complete");
     info!("  Nodes: {}", graph.num_nodes());

@@ -48,10 +48,12 @@ pub use features::{
 
 // Graph (de)serialization entry points — public API surface; the `internal`
 // module path is an implementation detail.
+pub use internal::compressed_graph::{load_graph_compressed, save_graph_compressed};
 pub use internal::mmap::{
     load_graph, load_graph_mmap, load_graph_owned, load_graph_with_validation, save_graph,
 };
 pub use internal::mmap_hetero::{load_hetero_graph, save_hetero_graph};
 #[cfg(feature = "parquet")]
 pub use internal::parquet_import::{from_parquet, from_parquet_files};
+pub use internal::succinct::{EliasFano, StreamVByte};
 pub use internal::telemetry::{SamplingTelemetry, TelemetrySummary};

@@ -19,7 +19,7 @@ use crate::graph::NodeId;
 pub use async_store::AsyncFeatureStore;
 pub use cache::{CacheStats, FeatureCache, FeatureCacheConfig, count_node_frequencies};
 #[cfg(feature = "zstd-tier")]
-pub use cold_tier::{ColdTier, ROWS_PER_BLOCK};
+pub use cold_tier::{ColdStore, ColdTier, ROWS_PER_BLOCK};
 #[cfg(feature = "gds")]
 pub use gds::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
 pub use header::FeatureDtype;

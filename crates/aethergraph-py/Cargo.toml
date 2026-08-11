@@ -31,7 +31,9 @@ doctest = false
 bench = false
 
 [dependencies]
-aethergraph-core = { path = "../aethergraph-core", version = "0.1" }
+# zstd is portable, so the compressed backing tier ships on every wheel; it
+# stays inert unless a `cold_store_path` is configured.
+aethergraph-core = { path = "../aethergraph-core", version = "0.1", features = ["zstd-tier"] }
 # `wal` is always on so the Python `DynamicGraph.open_with_wal` constructor is
 # present on every wheel build — durability is a runtime opt-in (pass a path or
 # don't), not a compile-time one.

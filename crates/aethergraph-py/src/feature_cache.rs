@@ -25,20 +25,27 @@ impl PyFeatureCacheConfig {
     ///     feature_dim: Feature vector dimension
     ///     nvme_path: Path to NVMe storage for cold features. Required —
     ///         the cache always spills cold features to this directory.
+    ///     cold_store_path: Optional feature-store file to compress into a
+    ///         resident backing tier. With it, a node in no other tier
+    ///         decompresses out of its block instead of raising, so the
+    ///         cache becomes a complete feature source.
+    ///     cold_level: zstd level for that tier (1-22, default 12).
     ///
     /// Returns:
     ///     FeatureCacheConfig: Configuration object
     ///
     /// Raises:
-    ///     ValueError: If nvme_path is missing, feature_dim is 0, or both
-    ///         capacities are 0.
+    ///     ValueError: If nvme_path is missing, feature_dim is 0, both
+    ///         capacities are 0, or cold_level is out of range.
     #[new]
-    #[pyo3(signature = (gpu_capacity=10_000, cpu_capacity=1_000_000, feature_dim=128, nvme_path=None))]
+    #[pyo3(signature = (gpu_capacity=10_000, cpu_capacity=1_000_000, feature_dim=128, nvme_path=None, cold_store_path=None, cold_level=12))]
     fn new(
         gpu_capacity: usize,
         cpu_capacity: usize,
         feature_dim: usize,
         nvme_path: Option<&str>,
+        cold_store_path: Option<&str>,
+        cold_level: i32,
     ) -> PyResult<Self> {
         if feature_dim == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -56,6 +63,11 @@ impl PyFeatureCacheConfig {
                  e.g. FeatureCacheConfig(nvme_path=\"/tmp/feature_cache\")",
             ));
         };
+        if !(1..=22).contains(&cold_level) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "cold_level must be in 1..=22",
+            ));
+        }
         Ok(Self {
             inner: FeatureCacheConfig {
                 gpu_capacity,
@@ -64,6 +76,8 @@ impl PyFeatureCacheConfig {
                 nvme_path: Some(PathBuf::from(nvme_path)),
                 warmup_frequencies: None,
                 pin_ratio: 0.8,
+                cold_store_path: cold_store_path.map(PathBuf::from),
+                cold_level,
             },
         })
     }
@@ -89,6 +103,19 @@ impl PyFeatureCacheConfig {
             .nvme_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
+    }
+
+    #[getter]
+    fn cold_store_path(&self) -> Option<String> {
+        self.inner
+            .cold_store_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+    }
+
+    #[getter]
+    fn cold_level(&self) -> i32 {
+        self.inner.cold_level
     }
 
     fn __repr__(&self) -> String {
@@ -249,6 +276,7 @@ impl PyFeatureCache {
     ///         - gpu_hits: Number of GPU cache hits
     ///         - cpu_hits: Number of CPU cache hits
     ///         - nvme_hits: Number of NVMe cache hits
+    ///         - cold_hits: Number of compressed backing-tier hits
     ///         - misses: Number of cache misses
     ///         - evictions: Number of evictions
     ///         - gpu_hit_rate: GPU hit rate percentage
@@ -257,7 +285,8 @@ impl PyFeatureCache {
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let stats = self.inner.stats();
 
-        let total_requests = stats.gpu_hits + stats.cpu_hits + stats.nvme_hits + stats.misses;
+        let total_requests =
+            stats.gpu_hits + stats.cpu_hits + stats.nvme_hits + stats.cold_hits + stats.misses;
 
         let gpu_hit_rate = if total_requests > 0 {
             (stats.gpu_hits as f64 / total_requests as f64) * 100.0
@@ -275,6 +304,7 @@ impl PyFeatureCache {
         dict.set_item("gpu_hits", stats.gpu_hits)?;
         dict.set_item("cpu_hits", stats.cpu_hits)?;
         dict.set_item("nvme_hits", stats.nvme_hits)?;
+        dict.set_item("cold_hits", stats.cold_hits)?;
         dict.set_item("misses", stats.misses)?;
         dict.set_item("evictions", stats.evictions)?;
         dict.set_item("gpu_hit_rate", gpu_hit_rate)?;

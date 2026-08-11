@@ -1,7 +1,7 @@
 use aethergraph_core::Graph;
 use aethergraph_core::{
     GraphValidationMode, load_graph, load_graph_mmap, load_graph_owned, load_graph_with_validation,
-    save_graph,
+    save_graph, save_graph_compressed,
 };
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -178,10 +178,22 @@ impl PyCsrGraph {
     ///
     /// Args:
     ///     path: Path to save the binary graph file
-    fn save(&self, py: Python<'_>, path: std::path::PathBuf) -> PyResult<()> {
+    ///     compressed: Write the succinct-coded format (Elias-Fano offsets,
+    ///         StreamVByte edges) instead of flat arrays. Typically 2-4x
+    ///         smaller at rest. `load` reads either format automatically,
+    ///         but a compressed file always loads into owned storage, so
+    ///         `storage="mmap"` rejects it.
+    #[pyo3(signature = (path, *, compressed = false))]
+    fn save(&self, py: Python<'_>, path: std::path::PathBuf, compressed: bool) -> PyResult<()> {
         // The O(E) file write touches no Python state; release the GIL.
-        py.detach(|| save_graph(self.inner.as_ref(), &path))
-            .map_err(|e| graph_load_error(format!("Failed to save graph: {}", e)))
+        py.detach(|| {
+            if compressed {
+                save_graph_compressed(self.inner.as_ref(), &path)
+            } else {
+                save_graph(self.inner.as_ref(), &path)
+            }
+        })
+        .map_err(|e| graph_load_error(format!("Failed to save graph: {}", e)))
     }
 
     /// Number of nodes in the graph.

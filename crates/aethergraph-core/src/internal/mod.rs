@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod aligned;
+pub mod compressed_graph;
 pub mod genstamp;
 pub mod hint;
 pub mod mmap;
@@ -12,6 +13,7 @@ pub mod mmap_hetero;
 pub mod parquet_import;
 pub mod prefetch;
 pub mod simd;
+pub mod succinct;
 pub mod telemetry;
 
 #[cfg(target_os = "linux")]
