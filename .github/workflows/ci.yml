@@ -428,9 +428,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
-      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce4d2f6 # v6.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          python-version: "3.13t"
+          enable-cache: true
+      - name: Provision free-threaded 3.13t venv
+        run: |
+          uv venv --python 3.13t "$RUNNER_TEMP/ft-venv"
+          echo "$RUNNER_TEMP/ft-venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/ft-venv" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: wheel-freethreaded
@@ -441,14 +446,14 @@ jobs:
         # No abi3: the free-threaded ABI is version-specific, so this is a
         # cp313t wheel built directly against the no-GIL interpreter.
         run: |
-          pip install maturin
+          uv pip install maturin
           maturin build --release --out dist-ft \
-            --interpreter python3.13t \
+            --interpreter "$(command -v python)" \
             --no-default-features --features extension-module
       - name: Install + parallel smoke test
         working-directory: python
         run: |
-          pip install --no-index --find-links dist-ft aethergraph
+          uv pip install --no-index --find-links dist-ft aethergraph
           python tests/free_threaded_smoke.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
