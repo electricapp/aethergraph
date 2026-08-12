@@ -14,6 +14,14 @@ use std::ptr;
 /// Owns an `ibv_srq`. Attach QPs at creation via
 /// [`super::qp::RdmaQp::create_with_cqs_srq`]; drop those QPs before the
 /// SRQ, and the SRQ before its context.
+///
+/// TODO(deferred): the whole module has no product caller yet — it is
+/// exercised only by `tests/softroce_e2e.rs`. An SRQ earns its keep on
+/// the server side, where one receive queue backs many client QPs so
+/// buffer memory scales with concurrent arrivals instead of with
+/// connection count. The in-tree feature server is examples-only, so
+/// there is nothing to attach this to; revisit when it becomes a product
+/// component, together with the WRITE_WITH_IMM push path it pairs with.
 pub struct Srq {
     srq: *mut IbvSrq,
 }
