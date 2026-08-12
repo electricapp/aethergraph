@@ -81,6 +81,7 @@ fn main_preregisters_mrs_ships_to_caller_threads() {
                 cq_size: 256,
                 qp_cap: DEFAULT_QP_CAP,
                 worker_cores: vec![],
+                ..Default::default()
             },
         )
         .expect("pool"),
