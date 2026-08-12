@@ -7,6 +7,7 @@ use super::ffi::*;
 use std::ffi::CStr;
 use std::io;
 use std::ptr;
+use tracing::debug;
 
 /// Owns an ibverbs device context, protection domain, and completion queue.
 ///
@@ -230,7 +231,7 @@ impl RdmaContext {
             )));
         }
 
-        Ok(Self {
+        let ctx = Self {
             context,
             pd,
             cq,
@@ -238,7 +239,34 @@ impl RdmaContext {
             port_gid: gid,
             gid_index,
             numa_node,
-        })
+        };
+
+        // Report the device's fast-path capabilities once, at open. Which
+        // of these a fabric offers decides whether the atomic, ODP, and
+        // BlueFlame paths are usable at all, and a wrong assumption
+        // otherwise only surfaces as a failed work request much later.
+        if let Ok(caps) = ctx.device_atomic_caps() {
+            debug!(
+                "RDMA device atomics: atomic_cap={}, max_qp_rd_atom={}",
+                caps.atomic_cap, caps.max_qp_rd_atom
+            );
+        }
+        #[cfg(feature = "mlx5dv")]
+        match ctx.mlx5_caps() {
+            Ok(caps) => debug!(
+                "mlx5 direct verbs: max_dynamic_bfregs={} (BlueFlame {}), flags={:#x}",
+                caps.max_dynamic_bfregs,
+                if caps.max_dynamic_bfregs > 0 {
+                    "available"
+                } else {
+                    "unavailable"
+                },
+                caps.flags
+            ),
+            Err(e) => debug!("mlx5 direct verbs unavailable (non-mlx5 device?): {e}"),
+        }
+
+        Ok(ctx)
     }
 
     /// NUMA node of this device, as sysfs reported it at open time.
@@ -257,6 +285,11 @@ impl RdmaContext {
     /// instant registration of arbitrarily large ranges. Check the
     /// per-verb bits before relying on a path — a device may fault READs
     /// but not atomics.
+    ///
+    /// TODO(deferred): queried only by `tests/softroce_e2e.rs` today.
+    /// Fold into the capability report in `open_on_device` once
+    /// [`Self::reg_mr_implicit_odp`] has a product caller, so the log line
+    /// reflects a path the process can actually take.
     pub fn odp_caps(&self) -> io::Result<OdpCaps> {
         let mut general_caps: u64 = 0;
         let mut rc_odp_caps: u32 = 0;
@@ -281,6 +314,14 @@ impl RdmaContext {
     /// ever expose — no per-buffer `reg_mr` calls, no registration cache.
     /// Requires [`OdpCaps::implicit`]; the device rejects the call
     /// otherwise. Same Drop-order contract as [`Self::reg_mr`].
+    ///
+    /// TODO(deferred): no product caller yet — exercised only by
+    /// `tests/softroce_e2e.rs`. Switching the feature server to implicit
+    /// ODP would drop its registration cache entirely, but it trades
+    /// pinned-memory cost for HCA page faults on first touch, so it needs
+    /// measurement on real ConnectX (rxe reports the capability without
+    /// the fault behaviour that makes the trade real) before becoming the
+    /// default registration path.
     pub fn reg_mr_implicit_odp(&self, access: i32) -> io::Result<RegisteredMr> {
         // SAFETY: null addr + SIZE_MAX length is the documented implicit-
         // ODP registration form; no memory is pinned or aliased by it.
