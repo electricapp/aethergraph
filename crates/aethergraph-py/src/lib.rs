@@ -65,7 +65,7 @@ use sampler::{
 // pyclass here is `Send` and guards its interior state with Rust locks
 // (parking_lot mutexes, atomics, the single-writer graph guard), so no
 // class relies on the GIL for synchronization. On a regular GIL build the
-// attribute is a no-op. The cp313t CI leg exercises N threads driving one
+// attribute is a no-op. The cp314t CI leg exercises N threads driving one
 // loader concurrently to keep this claim honest.
 #[pymodule(gil_used = false)]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

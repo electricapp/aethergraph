@@ -1,6 +1,6 @@
 """Free-threaded (no-GIL) smoke test for the aethergraph extension.
 
-Run under a free-threaded CPython (``python3.13t``). It proves two things:
+Run under a free-threaded CPython (``python3.14t``). It proves two things:
 
 1. Importing ``aethergraph._core`` does NOT re-enable the GIL — i.e. the
    ``#[pymodule(gil_used = false)]`` declaration took effect. A module that
@@ -58,7 +58,7 @@ def main() -> None:
             barrier.wait()  # maximize real overlap under no-GIL
             for _ in range(iters):
                 sub = sampler.sample(seeds)
-                n = sub.num_nodes()
+                n = sub.num_nodes
                 # Every seed is always present, so the subgraph is never
                 # smaller than the seed set.
                 if n < len(seeds):

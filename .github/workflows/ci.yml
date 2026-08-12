@@ -416,7 +416,7 @@ jobs:
           path: python/${{ matrix.out_dir }}/*.whl
 
   python-wheel-freethreaded:
-    name: wheel free-threaded (cp313t)
+    name: wheel free-threaded (cp314t)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -431,9 +431,9 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
-      - name: Provision free-threaded 3.13t venv
+      - name: Provision free-threaded 3.14t venv
         run: |
-          uv venv --python 3.13t "$RUNNER_TEMP/ft-venv"
+          uv venv --python 3.14t "$RUNNER_TEMP/ft-venv"
           echo "$RUNNER_TEMP/ft-venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$RUNNER_TEMP/ft-venv" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -444,7 +444,8 @@ jobs:
       - name: Build free-threaded wheel
         working-directory: python
         # No abi3: the free-threaded ABI is version-specific, so this is a
-        # cp313t wheel built directly against the no-GIL interpreter.
+        # cp314t wheel built directly against the no-GIL interpreter.
+        # 3.14 is the floor pyo3 0.29 supports for free-threaded builds.
         run: |
           uv pip install maturin
           maturin build --release --out dist-ft \
@@ -452,12 +453,16 @@ jobs:
             --no-default-features --features extension-module
       - name: Install + parallel smoke test
         working-directory: python
+        # The smoke test imports aethergraph._core directly, so numpy is the
+        # only runtime dependency it needs; --no-deps keeps the CLI's rich and
+        # typer out of a leg that exists to test the extension module.
         run: |
-          uv pip install --no-index --find-links dist-ft aethergraph
+          uv pip install numpy
+          uv pip install --no-index --find-links dist-ft --no-deps aethergraph
           python tests/free_threaded_smoke.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: aethergraph-wheel-cp313t
+          name: aethergraph-wheel-cp314t
           path: python/dist-ft/*.whl
 
   python-wheel-pgo:
@@ -579,7 +584,7 @@ jobs:
             echo "| wheel x86-64 | Linux x86_64 | portable baseline | ${{ needs.python-wheel.result }} |"
             echo "| wheel x86-64-v3 | Linux x86_64 | target-cpu=x86-64-v3 | ${{ needs.python-wheel.result }} |"
             echo "| wheel x86-64 pgo | Linux x86_64 | PGO + BOLT | ${{ needs.python-wheel-pgo.result }} |"
-            echo "| wheel cp313t | Linux x86_64 | free-threaded, no abi3 | ${{ needs.python-wheel-freethreaded.result }} |"
+            echo "| wheel cp314t | Linux x86_64 | free-threaded, no abi3 | ${{ needs.python-wheel-freethreaded.result }} |"
             echo ""
             echo "Hardware-gated tests (SoftRoCE micro-bench, SRD loopback,"
             echo "billion-node scale) run only on the self-hosted \`rdma-hardware\`"
