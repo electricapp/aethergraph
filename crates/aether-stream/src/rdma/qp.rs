@@ -162,6 +162,13 @@ impl RdmaQp {
     /// the SRQ (`Srq::post_recv_sentinels`) and consumed by
     /// WRITE_WITH_IMM arrivals on *any* QP attached to it. Completions
     /// still land on this QP's `recv_cq`. Drop the QP before the SRQ.
+    ///
+    /// TODO(deferred): no product caller yet — `ShardedQpPool` uses the
+    /// private-RQ [`Self::create_with_cqs`]. SRQ pays off on the *server*
+    /// side, where one receive queue is shared across many client QPs so
+    /// buffers scale with concurrent arrivals rather than with connection
+    /// count; the in-tree server is examples-only. Revisit when the
+    /// feature server becomes a product component.
     pub fn create_with_cqs_srq(
         ctx: &RdmaContext,
         cap: &IbvQpCap,
@@ -377,6 +384,11 @@ impl RdmaQp {
     /// and generating a `IBV_WC_RECV_RDMA_WITH_IMM` completion there —
     /// push-mode publication where the consumer learns of the payload
     /// from its CQ instead of polling memory.
+    ///
+    /// TODO(deferred): no product caller yet — exercised only by
+    /// `tests/softroce_e2e.rs`. The gather path is pull-mode (RDMA READ);
+    /// this is the push-mode half, which needs a server that publishes
+    /// updates to subscribed trainers. Wire it with that design.
     pub fn post_writes(&self, writes: &[RdmaWrite]) -> io::Result<()> {
         if writes.is_empty() {
             return Ok(());
@@ -457,6 +469,12 @@ impl RdmaQp {
     /// be connected with it. Check the device's
     /// [`super::context::RdmaContext::device_atomic_caps`] before relying
     /// on this path.
+    ///
+    /// TODO(deferred): no product caller yet — exercised only by
+    /// `tests/softroce_e2e.rs`. The consumer this is for is a
+    /// feature-server *write* path (remote ring-tail reservation), which
+    /// does not exist in this tree; the gather path is read-only. Wire it
+    /// when that path is designed rather than inventing a caller for it.
     pub fn post_fetch_add(
         &self,
         wr_id: u64,
@@ -477,6 +495,10 @@ impl RdmaQp {
     /// slot's `head_version` from even `v` to odd `v + 1`; the original
     /// value shows whether the claim won. Alignment and access
     /// requirements match [`Self::post_fetch_add`].
+    ///
+    /// TODO(deferred): no product caller yet — see the note on
+    /// [`Self::post_fetch_add`]; both wait on the same feature-server
+    /// write path.
     pub fn post_compare_swap(
         &self,
         wr_id: u64,
@@ -553,6 +575,9 @@ impl RdmaQp {
     /// outstanding window — `DEFAULT_QP_CAP.max_recv_wr` is 1, so
     /// imm-notified consumers create their QP with a deeper receive
     /// queue.
+    ///
+    /// TODO(deferred): no product caller yet — the receive half of the
+    /// push-mode path gated on [`Self::post_writes`]. Wire both together.
     pub fn post_recv_sentinels(&self, base_wr_id: u64, count: u32) -> io::Result<()> {
         if count == 0 {
             return Ok(());

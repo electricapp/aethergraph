@@ -56,12 +56,12 @@ use sampler::{
 /// - GPU/CPU/NVMe tiered feature caching
 ///
 /// Example:
-///     >>> import aethergraph_core as ag
+///     >>> from aethergraph import _core as ag
 ///     >>> graph = ag.CsrGraph.load("graph.bin")
 ///     >>> config = ag.SamplingConfig(num_neighbors=[25, 10], replace=False)
 ///     >>> sampler = ag.NeighborSampler(graph, config)
 ///     >>> subgraph = sampler.sample([0, 1, 2])
-///     >>> print(f"Sampled {subgraph.num_nodes()} nodes")
+///     >>> print(f"Sampled {subgraph.num_nodes} nodes")
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
