@@ -439,8 +439,9 @@ jobs:
         run: |
           sudo apt-get update
           if sudo apt-get install -y bolt-18; then
-            sudo ln -sf "$(command -v llvm-bolt-18)" /usr/local/bin/llvm-bolt
-            sudo ln -sf "$(command -v merge-fdata-18)" /usr/local/bin/merge-fdata
+            # Reached through the real LLVM bindir, not a symlink into another
+            # prefix: llvm-bolt finds its runtime archive relative to itself.
+            dirname "$(readlink -f "$(command -v llvm-bolt-18)")" >> "$GITHUB_PATH"
           else
             echo "bolt-18 unavailable; building PGO-only wheel"
           fi
