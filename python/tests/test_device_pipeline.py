@@ -9,13 +9,16 @@ when no CUDA device is present.
 from __future__ import annotations
 
 import pytest
-import torch
-from torch_geometric.data import Data
 
-from aethergraph.pytorch.device_pipeline import (
-    DeviceTransferPipeline,
-    move_data_to_device,
-)
+# Bound through importorskip rather than imported: torch and PyG are optional
+# extras, and a module-level import of them fails collection for the whole
+# suite in environments that install only the dev group.
+torch = pytest.importorskip("torch")
+Data = pytest.importorskip("torch_geometric.data").Data
+_device_pipeline = pytest.importorskip("aethergraph.pytorch.device_pipeline")
+
+DeviceTransferPipeline = _device_pipeline.DeviceTransferPipeline
+move_data_to_device = _device_pipeline.move_data_to_device
 
 
 def _batch(seed: int) -> Data:
