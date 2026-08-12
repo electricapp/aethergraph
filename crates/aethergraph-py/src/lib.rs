@@ -54,12 +54,12 @@ use sampler::{
 /// - GPU/CPU/NVMe tiered feature caching
 ///
 /// Example:
-///     >>> import aethergraph_core as ag
+///     >>> from aethergraph import _core as ag
 ///     >>> graph = ag.CsrGraph.load("graph.bin")
 ///     >>> config = ag.SamplingConfig(num_neighbors=[25, 10], replace=False)
 ///     >>> sampler = ag.NeighborSampler(graph, config)
 ///     >>> subgraph = sampler.sample([0, 1, 2])
-///     >>> print(f"Sampled {subgraph.num_nodes()} nodes")
+///     >>> print(f"Sampled {subgraph.num_nodes} nodes")
 // `gil_used = false` marks the module as safe to import into a
 // free-threaded (no-GIL) CPython without re-enabling the GIL. Every
 // pyclass here is `Send` and guards its interior state with Rust locks
