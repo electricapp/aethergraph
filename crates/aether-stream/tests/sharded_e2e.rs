@@ -79,6 +79,7 @@ fn sharded_concurrent_gather_correctness() {
                 cq_size: 1024,
                 qp_cap: DEFAULT_QP_CAP,
                 worker_cores: vec![],
+                ..Default::default()
             },
         )
         .expect("pool"),
@@ -240,6 +241,7 @@ fn sharded_4shard_sequential_gather() {
             cq_size: 64,
             qp_cap: DEFAULT_QP_CAP,
             worker_cores: vec![],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -313,6 +315,7 @@ fn sharded_single_shard_single_gather() {
             cq_size: 64,
             qp_cap: DEFAULT_QP_CAP,
             worker_cores: vec![],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -386,6 +389,7 @@ fn sharded_two_threads_minimal() {
                 cq_size: 64,
                 qp_cap: DEFAULT_QP_CAP,
                 worker_cores: vec![],
+                ..Default::default()
             },
         )
         .unwrap(),
@@ -443,10 +447,98 @@ fn sharded_pool_drops_cleanly() {
             cq_size: 64,
             qp_cap: DEFAULT_QP_CAP,
             worker_cores: vec![],
+            ..Default::default()
         },
     )
     .expect("pool");
     assert_eq!(pool.num_shards(), 2);
     drop(pool);
     drop(ctx);
+}
+
+/// The event-driven completion path must produce identical results to the
+/// busy-poll path.
+///
+/// `spin_before_block: Some(ZERO)` sends every wait through arm-and-block
+/// immediately, so this exercises the completion channel rather than
+/// hoping a gather happens to be slow enough to fall out of the spin.
+#[test]
+fn sharded_gather_blocks_on_completion_channel() {
+    skip_if_no_rdma!();
+
+    const NODE_COUNT: usize = 64;
+    const FEATURE_DIM: usize = 8;
+    const NUM_SHARDS: usize = 2;
+
+    let server_ctx = RdmaContext::open(256, ROCE_V2_GID_INDEX).expect("server open");
+    let server_table = FeatureTable::new(NODE_COUNT, FEATURE_DIM, vec![]).expect("alloc");
+    let mut expected: Vec<Vec<f32>> = Vec::with_capacity(NODE_COUNT);
+    for n in 0..NODE_COUNT {
+        let v: Vec<f32> = (0..FEATURE_DIM).map(|i| (n * 10 + i) as f32).collect();
+        server_table.write_node(n, &v);
+        expected.push(v);
+    }
+    let schema = server_table.schema();
+    let server_base = server_table.base_addr();
+    let server_total = server_table.total_size();
+    // SAFETY: `server_table` owns the registered range and outlives the MR.
+    let server_mr = unsafe {
+        server_ctx.reg_mr(
+            server_base as *mut u8,
+            server_total,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
+        )
+    }
+    .expect("server reg_mr");
+    let server_rkey = server_mr.rkey();
+
+    let server_qps: Vec<RdmaQp> = (0..NUM_SHARDS)
+        .map(|_| RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).expect("server qp"))
+        .collect();
+
+    let client_ctx = RdmaContext::open(256, ROCE_V2_GID_INDEX).expect("client open");
+    let pool = ShardedQpPool::new(
+        &client_ctx,
+        ShardedConfig {
+            num_shards: NUM_SHARDS,
+            cq_size: 256,
+            // Zero spin budget: every completion goes through arm + block.
+            spin_before_block: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        },
+    )
+    .expect("pool");
+
+    let client_eps = pool.endpoints(&client_ctx);
+    let server_eps: Vec<_> = server_qps.iter().map(|q| q.endpoint(&server_ctx)).collect();
+    for (sqp, cep) in server_qps.iter().zip(&client_eps) {
+        sqp.connect(&server_ctx, cep).expect("server connect");
+    }
+    pool.connect_all(&client_ctx, &server_eps)
+        .expect("client connect_all");
+
+    let slot_size = schema.slot_size;
+    let mut buf = vec![0u8; slot_size];
+    // SAFETY: `buf` outlives the MR and every gather posted against it.
+    let mr = unsafe { client_ctx.reg_mr(buf.as_mut_ptr(), buf.len(), IBV_ACCESS_LOCAL_WRITE) }
+        .expect("client reg_mr");
+
+    for node in [0usize, 7, 63] {
+        let reads = vec![RdmaRead {
+            local_addr: buf.as_mut_ptr() as u64,
+            local_lkey: mr.lkey(),
+            remote_addr: server_base + (node * slot_size) as u64,
+            remote_rkey: server_rkey,
+            length: slot_size as u32,
+        }];
+        pool.gather(reads).expect("gather via completion channel");
+
+        let feat_bytes =
+            &buf[schema.feature_offset_in_slot..schema.feature_offset_in_slot + FEATURE_DIM * 4];
+        let got: Vec<f32> = feat_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, expected[node], "node {node} through the blocking path");
+    }
 }
