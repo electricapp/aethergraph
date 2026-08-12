@@ -41,6 +41,26 @@ LLVM_PROFILE_FILE="$PROF_DIR/aethergraph-%p-%m.profraw" workload
 "$PROFDATA" merge -o "$PROF_DIR/merged.profdata" "$PROF_DIR"/*.profraw
 
 BOLT="$(command -v llvm-bolt || true)"
+if [ -n "$BOLT" ]; then
+  # -instrument links the binary against BOLT's runtime archive, which BOLT
+  # resolves as <prefix>/lib of the path it was invoked through — symlinks
+  # are not followed, so reaching it through a foreign prefix loses the
+  # archive. A miss only surfaces in stage 3, after stage 2 has already
+  # built an unstripped wheel, so settle the question before that branch.
+  BOLT_PREFIX="$(dirname "$(dirname "$BOLT")")"
+  BOLT_LIB=""
+  for cand in "$BOLT_PREFIX/lib/libbolt_rt_instr.a" \
+              "$BOLT_PREFIX/lib64/libbolt_rt_instr.a"; do
+    if [ -f "$cand" ]; then
+      BOLT_LIB="$cand"
+      break
+    fi
+  done
+  if [ -z "$BOLT_LIB" ]; then
+    echo "llvm-bolt found but no libbolt_rt_instr.a under $BOLT_PREFIX"
+    BOLT=""
+  fi
+fi
 
 echo "== stage 2: PGO-optimized wheel"
 PGO_RUSTFLAGS="-Cprofile-use=$PROF_DIR/merged.profdata"
