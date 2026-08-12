@@ -86,13 +86,29 @@ SO="$(find "$UNPACKED" -name '_core*.so' | head -1)"
 "$BOLT" "$SO" -instrument -o "$SO.inst" \
   -instrumentation-file="$PROF_DIR/bolt.fdata" -instrumentation-file-append-pid
 
-# The dev venv extension is swapped for the instrumented object so the
-# workload exercises it, then restored.
-VENV_SO="$(find .venv -name '_core*.so' | head -1)"
-cp "$VENV_SO" "$PROF_DIR/venv_so.orig"
-cp "$SO.inst" "$VENV_SO"
+# The extension the workload imports is swapped for the instrumented
+# object, then restored. `maturin develop` on this mixed project installs
+# a .pth pointing back at the source tree, so the live module is not under
+# .venv at all — ask the interpreter where it is rather than guess.
+DEV_SO="$(uv run --no-sync python -c 'import aethergraph._core as c; print(c.__file__)')"
+if [ ! -f "$DEV_SO" ]; then
+  echo "could not locate the development _core extension" >&2
+  exit 1
+fi
+cp "$DEV_SO" "$PROF_DIR/dev_so.orig"
+# Restore on any exit path; leaving the instrumented object installed
+# would otherwise break the working tree if the workload fails.
+trap 'cp "$PROF_DIR/dev_so.orig" "$DEV_SO" 2>/dev/null || true; rm -rf "$PROF_DIR"' EXIT
+cp "$SO.inst" "$DEV_SO"
 workload
-cp "$PROF_DIR/venv_so.orig" "$VENV_SO"
+cp "$PROF_DIR/dev_so.orig" "$DEV_SO"
+
+# An instrumented run that produced no profile leaves nothing to re-lay-out
+# against; keep the PGO wheel rather than failing the build over it.
+if [ "$(find "$PROF_DIR" -maxdepth 1 -name 'bolt.fdata*' | wc -l)" -eq 0 ]; then
+  echo "BOLT instrumentation produced no profile; keeping PGO-only wheel"
+  exit 0
+fi
 
 if command -v merge-fdata >/dev/null; then
   merge-fdata "$PROF_DIR"/bolt.fdata* > "$PROF_DIR/bolt.merged"
