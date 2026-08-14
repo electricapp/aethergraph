@@ -234,6 +234,39 @@ jobs:
             echo "Round-trip + crash-recovery tests for the append-only WAL."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  numa:
+    name: numa placement
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: numa
+      - run: cargo clippy -p aethergraph-core --features numa --all-targets -- -D warnings
+      - run: cargo test -p aether-mem --lib numa
+      - run: cargo test -p aethergraph-core --features numa --lib
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## numa placement"
+            echo ""
+            echo "Runners are single-node, so the mbind/affinity syscalls are"
+            echo "exercised against node 0 but the choice between nodes is not."
+            echo "Multi-socket validation needs a 2-socket host."
+            echo ""
+            printf 'nodes online: %s\n' "$(cat /sys/devices/system/node/online 2>/dev/null || echo unknown)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   loom:
     name: loom model checker
     runs-on: ubuntu-latest
@@ -512,7 +545,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, supply-chain, unused-deps, python, python-wheel, python-wheel-pgo]
+    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, numa, supply-chain, unused-deps, python, python-wheel, python-wheel-pgo]
     if: always()
     steps:
       - name: Render summary
@@ -530,6 +563,7 @@ jobs:
             echo "| miri | Linux x86_64 | nightly + miri | ${{ needs.miri.result }} |"
             echo "| loom | Linux x86_64 | loom feature | ${{ needs.loom.result }} |"
             echo "| wal  | Linux x86_64 | wal feature  | ${{ needs.wal.result }} |"
+            echo "| numa | Linux x86_64 | numa feature | ${{ needs.numa.result }} |"
             echo "| python ubuntu | Linux x86_64 | test group | ${{ needs.python.result }} |"
             echo "| python macos | macOS arm64 | test group | ${{ needs.python.result }} |"
             echo "| wheel x86-64 | Linux x86_64 | portable baseline | ${{ needs.python-wheel.result }} |"

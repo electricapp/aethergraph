@@ -238,8 +238,18 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
     // 4 KiB pages.
     let offsets_bytes = &mmap[layout.offsets_range.start..layout.offsets_range.end];
     let edges_bytes = &mmap[layout.edges_range.start..layout.edges_range.end];
+
+    // NUMA placement goes first: a memory policy only governs pages faulted
+    // in after it is set, and both the readahead below and `Full`
+    // validation's streaming read populate the body. Setting it afterwards
+    // would leave exactly the pages the load touched on the loading
+    // thread's node.
+    let body = &mmap[layout.offsets_range.start..layout.edges_range.end];
+    if crate::internal::hint::interleave_mmap_range(body.as_ptr(), body.len()) {
+        debug!("graph body interleaved across NUMA nodes");
+    }
+
     if validation == GraphValidationMode::Full {
-        let body = &mmap[layout.offsets_range.start..layout.edges_range.end];
         crate::internal::hint::prefetch_mmap_range(body.as_ptr(), body.len());
     } else {
         crate::internal::hint::prefetch_mmap_range(offsets_bytes.as_ptr(), offsets_bytes.len());

@@ -174,6 +174,44 @@ pub fn advise_mmap_hugepage(addr: *const u8, len: usize) {
 #[cfg(not(target_os = "linux"))]
 pub fn advise_mmap_hugepage(_addr: *const u8, _len: usize) {}
 
+/// Spread this mmap'd region's pages across every online NUMA node.
+///
+/// Sampling threads run on every socket and touch node offsets and edge
+/// lists with no locality worth preserving — the access pattern is random
+/// by construction. Left to the default first-touch policy the whole graph
+/// lands on whichever node happened to fault it in, usually the loader's,
+/// so every thread on the other sockets pays interconnect latency and that
+/// one memory controller carries all the traffic. Interleaving trades a
+/// share of remote accesses for bandwidth spread evenly across controllers,
+/// which is the right side of that trade for a read-mostly structure with
+/// no thread affinity.
+///
+/// Placement is set before the pages are faulted in, so it applies as they
+/// arrive. Best-effort in the same way the madvise hints above are: a
+/// refusal (no kernel support, seccomp, a cpuset that pins the process to
+/// one node) leaves the mapping working with default placement.
+///
+/// Returns whether the policy was accepted, for telemetry.
+#[cfg(all(target_os = "linux", feature = "numa"))]
+pub fn interleave_mmap_range(addr: *const u8, len: usize) -> bool {
+    let nodes = aether_mem::numa::nodes_online();
+    // One node is not a placement decision — the policy call would succeed
+    // and change nothing.
+    if nodes.len() < 2 {
+        return false;
+    }
+    let (start, span) = page_span(addr, len);
+    if span == 0 {
+        return false;
+    }
+    aether_mem::numa::interleave_region(start as *mut u8, span, &nodes).is_ok()
+}
+
+#[cfg(not(all(target_os = "linux", feature = "numa")))]
+pub fn interleave_mmap_range(_addr: *const u8, _len: usize) -> bool {
+    false
+}
+
 /// Hint: done with this region, can be evicted.
 #[cfg(target_os = "linux")]
 pub fn hint_dontneed<F: AsRawFd>(file: &F, offset: u64, len: usize) {

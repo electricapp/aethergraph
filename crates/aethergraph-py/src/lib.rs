@@ -107,6 +107,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // directly instead of probing for method existence (`hasattr`), keeping
     // capability detection out of the structural-typing world.
     m.add("HAS_GPUDIRECT", cfg!(feature = "gpudirect"))?;
+    // Whether this build can place the graph across NUMA nodes and pin the
+    // sampler pool to them. True says the code is compiled in, not that it
+    // took effect — placement is inert on a single-node machine.
+    m.add("HAS_NUMA", cfg!(target_os = "linux"))?;
 
     #[cfg(feature = "gpudirect")]
     m.add_function(wrap_pyfunction!(

@@ -15,6 +15,10 @@ bench = false
 default = []
 io-uring = []
 gds = []
+# Places the graph body across NUMA nodes and pins the sampler pool to
+# them. Off by default: on a single-socket machine it is inert, and the
+# policy syscalls are Linux-only.
+numa = ["dep:aether-mem"]
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 # Enables loom-backed model checking of the lock-free union-find. Run with:
 #   cargo test -p aethergraph-core --features loom --test loom_union_find
@@ -22,6 +26,8 @@ loom = []
 
 [dependencies]
 aether-epoch = { path = "../aether-epoch", version = "0.1" }
+# NUMA topology and memory-policy syscalls, behind the `numa` feature.
+aether-mem = { path = "../aether-mem", version = "0.1", optional = true }
 memmap2.workspace = true
 bytemuck.workspace = true
 rayon.workspace = true

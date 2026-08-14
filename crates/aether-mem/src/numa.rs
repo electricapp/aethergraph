@@ -190,6 +190,49 @@ pub fn prefer_current_thread(node: u32) -> Result<(), HookError> {
     }
 }
 
+/// Confine this thread to `node`'s cores and prefer `node` for its pages.
+///
+/// Memory policy alone only decides where a thread's pages land; without
+/// pinning, the scheduler is free to migrate the thread to another socket
+/// and every access it makes turns into a remote one. The two calls belong
+/// together: affinity keeps the thread on the node, `MPOL_PREFERRED` keeps
+/// its allocations there.
+///
+/// Fail-soft like the rest of this module. A node with no listed cores, or
+/// a restricted affinity mask (cpuset, taskset), leaves the thread
+/// scheduled wherever it already was.
+pub fn pin_current_thread(node: u32) -> Result<(), HookError> {
+    #[cfg(target_os = "linux")]
+    {
+        let cores = cores_on_node(node);
+        if cores.is_empty() {
+            return Err(HookError::new("node has no online cores"));
+        }
+        // SAFETY: an all-zero cpu_set_t is the documented empty mask; the
+        // CPU_SET calls below only set bits within it.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        for cpu in &cores {
+            if *cpu < libc::CPU_SETSIZE as usize {
+                // SAFETY: `set` is a live cpu_set_t and `cpu` is in range.
+                unsafe { libc::CPU_SET(*cpu, &mut set) };
+            }
+        }
+        // SAFETY: pid 0 is the calling thread; `set` outlives the call and
+        // the kernel reads exactly `size_of::<cpu_set_t>()` bytes from it.
+        let ret =
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+        if ret != 0 {
+            return Err(HookError::new("sched_setaffinity failed"));
+        }
+        prefer_current_thread(node)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = node;
+        Err(HookError::new("NUMA policy not supported on this platform"))
+    }
+}
+
 /// Node currently backing the page at `ptr`, if the kernel exposes it.
 /// The page must have been touched; unfaulted addresses report nothing
 /// useful.
@@ -292,6 +335,44 @@ mod tests {
         assert!(!nodes_online().is_empty());
         let _ = node_of_cpu(0);
         let _ = cores_on_node(0);
+    }
+
+    /// Exercises the affinity + policy syscalls on node 0, which is online
+    /// everywhere. A single-node CI machine still runs the whole path —
+    /// the only thing it cannot show is a *choice* between nodes — and the
+    /// thread must be left running on that node's cores afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_current_thread_confines_to_the_node_cores() {
+        let cores = cores_on_node(0);
+        if cores.is_empty() {
+            println!("no cpulist for node 0; skipping");
+            return;
+        }
+        match pin_current_thread(0) {
+            Ok(()) => {
+                // SAFETY: an all-zero cpu_set_t is a valid empty mask that
+                // sched_getaffinity overwrites.
+                let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                // SAFETY: pid 0 is this thread; the kernel writes at most
+                // `size_of::<cpu_set_t>()` bytes into `set`.
+                let ret = unsafe {
+                    libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
+                };
+                assert_eq!(ret, 0, "sched_getaffinity failed after a successful pin");
+                // Every CPU left in the mask must belong to node 0.
+                for cpu in 0..libc::CPU_SETSIZE as usize {
+                    // SAFETY: `set` is live and `cpu` is within CPU_SETSIZE.
+                    if unsafe { libc::CPU_ISSET(cpu, &set) } {
+                        assert!(
+                            cores.contains(&cpu),
+                            "cpu {cpu} is set but is not on node 0"
+                        );
+                    }
+                }
+            }
+            Err(e) => println!("pin unavailable here ({e}); skipping"),
+        }
     }
 
     #[cfg(target_os = "linux")]

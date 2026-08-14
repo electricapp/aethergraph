@@ -26,6 +26,11 @@ __author__: str
 # constructing RDMA-backed loaders rather than probing for method names.
 HAS_GPUDIRECT: bool
 
+# True when this build can interleave the graph body across NUMA nodes and
+# pin the sampler pool to them. Says the code is compiled in, not that it
+# took effect: placement is inert on a single-node machine.
+HAS_NUMA: bool
+
 # Test-only helper, only present in `gpudirect` builds. Wraps a raw CUDA
 # device pointer in a DLPack capsule so `torch.from_dlpack` can ingest it.
 def _dlpack_capsule_from_cuda_ptr(
