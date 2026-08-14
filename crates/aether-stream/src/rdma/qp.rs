@@ -4,11 +4,31 @@
 //! RESET → INIT → RTR → RTS, and provides batch RDMA READ
 //! with chained work requests (single doorbell).
 
-use super::context::RdmaContext;
+use super::context::{LinkLayer, RdmaContext};
 use super::ffi::*;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::ptr;
+
+/// Reject an endpoint the local fabric cannot address.
+///
+/// Each link layer routes on a different field, so the one it does not use
+/// is routinely zero — an IB peer reports no meaningful GID prefix on some
+/// stacks, a RoCE peer has no LID at all. Checking the field that *is* used
+/// turns an unreachable peer into an error naming the fabric, instead of an
+/// `ibv_modify_qp` failure at RTR that says only that the transition failed.
+fn validate_endpoint(link_layer: LinkLayer, remote: &QpEndpoint) -> io::Result<()> {
+    match link_layer {
+        LinkLayer::InfiniBand if remote.lid == 0 => Err(io::Error::other(
+            "InfiniBand port needs a peer LID, but the endpoint reported 0 \
+             (is a subnet manager running?)",
+        )),
+        LinkLayer::Ethernet if remote.gid.iter().all(|&b| b == 0) => Err(io::Error::other(
+            "RoCE port routes on GIDs, but the endpoint reported an all-zero GID",
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// Endpoint info exchanged over TCP for QP connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -660,14 +680,18 @@ impl RdmaQp {
         attr.max_dest_rd_atomic = 16;
         attr.min_rnr_timer = 12;
 
-        // Address handle
+        // Address handle. The port's link layer decides how a peer is
+        // reached, so the endpoint is checked against it before use —
+        // a LID of 0 on InfiniBand, or an all-zero GID on RoCE, is an
+        // unreachable address that would otherwise fail as an opaque
+        // ibv_modify_qp error at RTR.
+        validate_endpoint(ctx.link_layer, remote)?;
         attr.ah_attr.port_num = 1;
         attr.ah_attr.dlid = remote.lid;
         attr.ah_attr.sl = 0;
 
-        // Use GRH for RoCE or if GID is non-zero
-        let gid_nonzero = remote.gid.iter().any(|&b| b != 0);
-        if gid_nonzero {
+        // GRH always on RoCE; on InfiniBand only to leave the subnet.
+        if ctx.link_layer.needs_grh(&ctx.port_gid.raw, &remote.gid) {
             attr.ah_attr.is_global = 1;
             attr.ah_attr.grh.dgid = IbvGid { raw: remote.gid };
             // sgid_index must point at the local GID we advertise — using
@@ -730,6 +754,83 @@ impl Drop for RdmaQp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn endpoint(lid: u16, gid: [u8; 16]) -> QpEndpoint {
+        QpEndpoint {
+            qpn: 7,
+            lid,
+            gid,
+            psn: 0,
+        }
+    }
+
+    /// A GID whose top 8 bytes are the subnet prefix, as InfiniBand
+    /// assigns them.
+    fn ib_gid(subnet: u8, guid: u8) -> [u8; 16] {
+        let mut g = [0u8; 16];
+        g[0] = 0xfe;
+        g[1] = 0x80;
+        g[7] = subnet;
+        g[15] = guid;
+        g
+    }
+
+    /// The case the old `gid != 0` inference got wrong: an InfiniBand port
+    /// has a real GID, so inferring the fabric from it forces a GRH onto
+    /// every packet of a link that should route on its LID.
+    #[test]
+    fn infiniband_peers_on_one_subnet_route_without_a_grh() {
+        let local = ib_gid(1, 0xAA);
+        let remote = ib_gid(1, 0xBB);
+        assert!(remote.iter().any(|&b| b != 0), "an IB GID is not zero");
+        assert!(
+            !LinkLayer::InfiniBand.needs_grh(&local, &remote),
+            "same-subnet IB must route on the LID alone"
+        );
+    }
+
+    /// Crossing subnets is the one time InfiniBand does need the header.
+    #[test]
+    fn infiniband_across_subnets_needs_a_grh() {
+        assert!(LinkLayer::InfiniBand.needs_grh(&ib_gid(1, 0xAA), &ib_gid(2, 0xBB)));
+    }
+
+    /// RoCE has no LIDs, so the header is not optional.
+    #[test]
+    fn roce_always_needs_a_grh() {
+        let g = ib_gid(1, 0xAA);
+        assert!(LinkLayer::Ethernet.needs_grh(&g, &g));
+        assert!(LinkLayer::Ethernet.needs_grh(&[0u8; 16], &[0u8; 16]));
+    }
+
+    /// Only value 1 is InfiniBand; UNSPECIFIED (0), reported by some
+    /// drivers and by EFA, is GID-routed and must land on Ethernet.
+    #[test]
+    fn unspecified_link_layer_is_treated_as_ethernet() {
+        assert_eq!(LinkLayer::from_port_attr(1), LinkLayer::InfiniBand);
+        assert_eq!(LinkLayer::from_port_attr(2), LinkLayer::Ethernet);
+        assert_eq!(LinkLayer::from_port_attr(0), LinkLayer::Ethernet);
+        assert_eq!(LinkLayer::from_port_attr(99), LinkLayer::Ethernet);
+    }
+
+    /// Each fabric leaves the field it does not route on at zero, so the
+    /// check has to look at the one in use — and say which fabric it is,
+    /// rather than surfacing an opaque RTR transition failure.
+    #[test]
+    fn endpoints_are_rejected_against_the_local_fabric() {
+        let gid = ib_gid(1, 0xBB);
+
+        // IB routes on the LID.
+        assert!(validate_endpoint(LinkLayer::InfiniBand, &endpoint(0, gid)).is_err());
+        assert!(validate_endpoint(LinkLayer::InfiniBand, &endpoint(5, gid)).is_ok());
+        // A RoCE peer has no LID, and that is not an error there.
+        assert!(validate_endpoint(LinkLayer::Ethernet, &endpoint(0, gid)).is_ok());
+
+        // RoCE routes on the GID.
+        assert!(validate_endpoint(LinkLayer::Ethernet, &endpoint(0, [0u8; 16])).is_err());
+        // An IB peer may report no GID, which LID routing does not need.
+        assert!(validate_endpoint(LinkLayer::InfiniBand, &endpoint(5, [0u8; 16])).is_ok());
+    }
 
     #[test]
     fn build_wr_chain_addresses() {
