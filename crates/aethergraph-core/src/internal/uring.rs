@@ -256,8 +256,14 @@ fn sqpoll_cpu() -> Option<u32> {
 ///
 /// Each flag is dropped individually if the kernel rejects it, so an older
 /// kernel loses only the flags it lacks.
-fn build_plain_ring(entries: u32, single_issuer: bool) -> Result<io_uring::IoUring> {
-    // Most capable first; each attempt drops what the previous could not get.
+fn build_plain_ring(
+    entries: u32,
+    single_issuer: bool,
+) -> Result<(io_uring::IoUring, &'static str)> {
+    // Most capable first; each attempt drops what the previous could not
+    // get. The returned label names the rung actually reached, so a silent
+    // fall to a lesser setup is observable rather than something that has
+    // to be inferred from a benchmark that failed to improve.
     let attempts: &[&[&str]] = if single_issuer {
         &[
             &["single_issuer", "defer_taskrun", "submit_all"],
@@ -287,8 +293,9 @@ fn build_plain_ring(entries: u32, single_issuer: bool) -> Result<io_uring::IoUri
         }
         match builder.build(entries) {
             Ok(ring) => {
-                debug!(?flags, "io_uring initialized without a kernel poller");
-                return Ok(ring);
+                let tier = ring_tier(flags);
+                debug!(tier, ?flags, "io_uring initialized without a kernel poller");
+                return Ok((ring, tier));
             }
             Err(e) => last_err = Some(e),
         }
@@ -297,6 +304,21 @@ fn build_plain_ring(entries: u32, single_issuer: bool) -> Result<io_uring::IoUri
         std::io::Error::other("io_uring setup failed")
     })))
     .context("failed to create io_uring")
+}
+
+/// Name the rung a flag set corresponds to, for logging and assertions.
+fn ring_tier(flags: &[&str]) -> &'static str {
+    if flags.contains(&"defer_taskrun") {
+        "deferred"
+    } else if flags.contains(&"single_issuer") {
+        "single-issuer"
+    } else if flags.contains(&"coop_taskrun") {
+        "cooperative"
+    } else if flags.contains(&"submit_all") {
+        "submit-all"
+    } else {
+        "plain"
+    }
 }
 
 /// A job handed to a ring-owning thread.
@@ -453,6 +475,10 @@ pub struct UringHandle {
     registered_fd: Option<u32>,
     /// Registered fixed-buffer region as (base address, length), if any.
     registered_buf: Option<(usize, usize)>,
+    /// Which rung of the setup ladder this ring reached — see
+    /// [`build_plain_ring`]. `"sqpoll"` for the kernel-poller rings, which
+    /// do not use that ladder.
+    tier: &'static str,
 }
 
 impl UringHandle {
@@ -481,6 +507,7 @@ impl UringHandle {
                     iopoll_enabled: true,
                     registered_fd: None,
                     registered_buf: None,
+                    tier: "sqpoll",
                 })
             }
             Err(e) => {
@@ -516,6 +543,7 @@ impl UringHandle {
                     iopoll_enabled: false,
                     registered_fd: None,
                     registered_buf: None,
+                    tier: "sqpoll",
                 })
             }
             Err(e) => {
@@ -524,7 +552,7 @@ impl UringHandle {
                 // setup flags where the kernel has them. Not single-issuer:
                 // this constructor makes no promise about which thread
                 // submits afterwards.
-                let ring = build_plain_ring(entries, false)?;
+                let (ring, tier) = build_plain_ring(entries, false)?;
                 Ok(Self {
                     ring,
                     entries,
@@ -532,6 +560,7 @@ impl UringHandle {
                     iopoll_enabled: false,
                     registered_fd: None,
                     registered_buf: None,
+                    tier,
                 })
             }
         }
@@ -549,7 +578,7 @@ impl UringHandle {
     /// No SQPOLL: the point of deferred task-work is to avoid a kernel
     /// poller burning a core, and the two are mutually exclusive anyway.
     pub fn new_thread_owned(entries: u32) -> Result<Self> {
-        let ring = build_plain_ring(entries, true)?;
+        let (ring, tier) = build_plain_ring(entries, true)?;
         Ok(Self {
             ring,
             entries,
@@ -557,12 +586,24 @@ impl UringHandle {
             iopoll_enabled: false,
             registered_fd: None,
             registered_buf: None,
+            tier,
         })
     }
 
     /// SQ/CQ depth this ring was built with.
     pub fn entries(&self) -> u32 {
         self.entries
+    }
+
+    /// Which setup this ring actually got: `"deferred"`, `"single-issuer"`,
+    /// `"cooperative"`, `"submit-all"`, `"plain"`, or `"sqpoll"`.
+    ///
+    /// A ladder that quietly lands a rung lower still works, which is the
+    /// point — and also the risk, since the only other symptom is a
+    /// benchmark that failed to improve. Reporting the rung makes the
+    /// difference checkable.
+    pub fn tier(&self) -> &'static str {
+        self.tier
     }
 
     /// Register a file descriptor for fast access.
@@ -784,7 +825,10 @@ pub fn create_feature_uring(direct_io: bool) -> Option<UringHandle> {
 pub fn create_owned_feature_uring(direct_io: bool) -> Option<UringHandle> {
     match UringHandle::new_thread_owned(DEFAULT_RING_ENTRIES) {
         Ok(handle) => {
-            debug!("io_uring: thread-owned (single-issuer, deferred task work)");
+            // Name the rung reached, not the one asked for: the ladder
+            // degrades silently and this is the only place that difference
+            // is visible without a benchmark.
+            debug!(tier = handle.tier(), "io_uring: thread-owned lane");
             Some(handle)
         }
         Err(e) => {
@@ -1058,6 +1102,47 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// A fallback ladder is only worth having if it climbs as high as the
+    /// kernel allows. Landing a rung low still produces a working ring, so
+    /// the sole other symptom is an optimization that quietly does nothing
+    /// — exactly the failure this asserts against, without hardcoding a
+    /// kernel version: if the top rung builds when asked for directly, the
+    /// ladder must have chosen it.
+    #[test]
+    fn the_ladder_takes_the_best_setup_the_kernel_offers() {
+        let Ok((_ring, tier)) = build_plain_ring(8, true) else {
+            println!("io_uring unavailable here; skipping");
+            return;
+        };
+
+        let top_rung: std::io::Result<io_uring::IoUring> = io_uring::IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .setup_submit_all()
+            .build(8);
+        let top_rung_builds = top_rung.is_ok();
+        if top_rung_builds {
+            assert_eq!(
+                tier, "deferred",
+                "kernel accepts DEFER_TASKRUN but the ladder settled for {tier}"
+            );
+        }
+
+        let coop: std::io::Result<io_uring::IoUring> = io_uring::IoUring::builder()
+            .setup_coop_taskrun()
+            .setup_submit_all()
+            .build(8);
+        let coop_builds = coop.is_ok();
+        if coop_builds {
+            assert_ne!(
+                tier, "plain",
+                "kernel accepts COOP_TASKRUN but the ladder fell all the way to plain"
+            );
+        }
+
+        println!("io_uring setup tier reached: {tier}");
+    }
+
     /// The pool's whole reason for existing is that a lane's resource is
     /// touched by exactly one thread. If that ever stopped holding, a ring
     /// built with `SINGLE_ISSUER` would start failing submission with
@@ -1151,7 +1236,7 @@ mod tests {
     /// complete an operation is worse than one without.
     #[test]
     fn plain_ring_builds_and_completes_regardless_of_flag_support() {
-        let mut ring = match build_plain_ring(8, true) {
+        let (mut ring, _tier) = match build_plain_ring(8, true) {
             Ok(r) => r,
             // A sandbox with io_uring disabled entirely is not this test's
             // subject.
