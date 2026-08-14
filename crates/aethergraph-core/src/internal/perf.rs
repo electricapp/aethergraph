@@ -155,13 +155,23 @@ pub struct CounterReadings {
 }
 
 /// A set of opened counters, measured together around a closure.
+///
+/// **Scope: the thread that opened it.** The events are opened with
+/// `pid = 0`, so they count that one thread and nothing else — not the
+/// process, and not threads spawned later. Measuring work that runs
+/// elsewhere (the sampler pool, an io_uring lane thread) means opening a
+/// set *on* each of those threads and summing with
+/// [`CounterReadings::merge`]. A set opened on a caller that only waits
+/// will faithfully report that the caller did almost nothing, which reads
+/// like a fast path and is not one.
 pub struct CounterSet {
     fds: Vec<(Counter, OwnedFd)>,
 }
 
 impl CounterSet {
-    /// Open the default hot-loop counter set. Every counter is best-effort:
-    /// the returned set contains only those the host actually granted.
+    /// Open the default hot-loop counter set on the calling thread. Every
+    /// counter is best-effort: the returned set contains only those the
+    /// host actually granted.
     pub fn open_default() -> Self {
         Self::open(&[
             Counter::Cycles,
@@ -191,7 +201,7 @@ impl CounterSet {
     /// Reset, enable, run `f`, disable, and read every counter. The
     /// readings bracket exactly `f`'s work (plus a fixed few syscalls of
     /// enable/disable overhead, identical across calls).
-    pub fn measure<R>(&self, f: impl FnOnce() -> R) -> (R, CounterReadings) {
+    pub fn measure<R>(&mut self, f: impl FnOnce() -> R) -> (R, CounterReadings) {
         self.start();
         let out = f();
         (out, self.stop())
@@ -203,7 +213,13 @@ impl CounterSet {
     /// in a closure — a Python `with` block, or a region spanning an
     /// `await`. [`Self::measure`] is the safer choice where it fits, since
     /// it cannot leave counters running.
-    pub fn start(&self) {
+    ///
+    /// Takes `&mut self` although nothing on the Rust side is mutated: the
+    /// counters live in the kernel, and a second `start` on a set already
+    /// counting resets it, silently discarding the first region's counts.
+    /// An exclusive borrow makes two overlapping measurement windows on one
+    /// set impossible to write rather than a race to notice.
+    pub fn start(&mut self) {
         for (_, fd) in &self.fds {
             ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_RESET);
             ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_ENABLE);
@@ -214,7 +230,7 @@ impl CounterSet {
     ///
     /// Reading without a preceding [`Self::start`] yields whatever the
     /// counters hold — zero for a freshly opened set.
-    pub fn stop(&self) -> CounterReadings {
+    pub fn stop(&mut self) -> CounterReadings {
         let mut readings = CounterReadings::default();
         for (c, fd) in &self.fds {
             ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_DISABLE);
@@ -236,6 +252,46 @@ impl CounterSet {
 }
 
 impl CounterReadings {
+    /// Add another snapshot to this one.
+    ///
+    /// A counter set is opened with `pid = 0`, so it counts only the thread
+    /// that opened it. Covering a worker pool therefore means one set per
+    /// worker, opened on that worker, and summing what they return —
+    /// wrapping a multi-threaded region in a single set measures the
+    /// calling thread, which for a loader batch is the thread doing the
+    /// waiting rather than the work.
+    ///
+    /// A field survives only when *both* sides measured it. Adding a
+    /// measured value to an unmeasured one would report a subset of the
+    /// threads as though it covered all of them, which is a worse answer
+    /// than admitting the total is unknown.
+    ///
+    /// `multiplexed` is sticky: if any contributing set shared the PMU, the
+    /// total is an estimate.
+    pub fn merge(self, other: Self) -> Self {
+        fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                _ => None,
+            }
+        }
+        Self {
+            cycles: add(self.cycles, other.cycles),
+            instructions: add(self.instructions, other.instructions),
+            llc_misses: add(self.llc_misses, other.llc_misses),
+            dtlb_misses: add(self.dtlb_misses, other.dtlb_misses),
+            // Task clock sums to total CPU time across the threads, not
+            // wall time — which is what the per-thread event measures.
+            task_clock_ns: add(self.task_clock_ns, other.task_clock_ns),
+            multiplexed: self.multiplexed || other.multiplexed,
+        }
+    }
+
+    /// Sum a set of per-thread snapshots. Empty means nothing measured.
+    pub fn total(readings: impl IntoIterator<Item = Self>) -> Option<Self> {
+        readings.into_iter().reduce(Self::merge)
+    }
+
     /// Instructions per cycle, when both counters were available.
     ///
     /// The headline efficiency number: below ~1.0 on this workload means
@@ -333,11 +389,76 @@ fn ioctl(fd: RawFd, request: libc::c_ulong) {
 mod tests {
     use super::*;
 
+    /// Merging is how a caller covers a worker pool, so it has to be
+    /// arithmetically honest: totals add, and a counter missing on either
+    /// side makes the total unknown rather than silently reporting one
+    /// thread's number as the pool's.
+    #[test]
+    fn merge_sums_measured_counters_and_drops_partial_ones() {
+        let a = CounterReadings {
+            cycles: Some(100),
+            instructions: Some(200),
+            llc_misses: Some(5),
+            dtlb_misses: None,
+            task_clock_ns: Some(1_000),
+            multiplexed: false,
+        };
+        let b = CounterReadings {
+            cycles: Some(50),
+            instructions: Some(80),
+            llc_misses: None,
+            dtlb_misses: Some(3),
+            task_clock_ns: Some(500),
+            multiplexed: false,
+        };
+
+        let merged = a.merge(b);
+        assert_eq!(merged.cycles, Some(150));
+        assert_eq!(merged.instructions, Some(280));
+        assert_eq!(merged.task_clock_ns, Some(1_500));
+        // Measured on one side only: a sum would describe a subset of the
+        // threads as if it covered all of them.
+        assert_eq!(merged.llc_misses, None);
+        assert_eq!(merged.dtlb_misses, None);
+        // Aggregate IPC is the ratio of the sums, not an average of ratios.
+        assert_eq!(merged.ipc(), Some(280.0 / 150.0));
+    }
+
+    /// An estimate anywhere in the pool makes the total an estimate.
+    #[test]
+    fn merge_keeps_the_multiplexed_flag_sticky() {
+        let exact = CounterReadings {
+            cycles: Some(10),
+            ..Default::default()
+        };
+        let scaled = CounterReadings {
+            cycles: Some(10),
+            multiplexed: true,
+            ..Default::default()
+        };
+        assert!(exact.merge(scaled).multiplexed);
+        assert!(scaled.merge(exact).multiplexed);
+        assert!(!exact.merge(exact).multiplexed);
+    }
+
+    #[test]
+    fn total_of_nothing_is_nothing() {
+        assert!(CounterReadings::total(std::iter::empty()).is_none());
+        let one = CounterReadings {
+            cycles: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            CounterReadings::total([one, one]).and_then(|r| r.cycles),
+            Some(14)
+        );
+    }
+
     #[test]
     fn task_clock_always_measures_time() {
         // The software task-clock counter is available even in a VM with
         // no PMU; it must open and report a positive duration for real work.
-        let set = CounterSet::open(&[Counter::TaskClockNs]);
+        let mut set = CounterSet::open(&[Counter::TaskClockNs]);
         if set.active() == 0 {
             eprintln!("perf_event_open unavailable (paranoid setting?); skipping");
             return;
@@ -359,7 +480,7 @@ mod tests {
         // Opening HW counters must never panic; on a runner without PMU
         // access the set is simply smaller. When cycles opened, a busy
         // loop must show a nonzero count.
-        let set = CounterSet::open_default();
+        let mut set = CounterSet::open_default();
         let (_out, readings) = set.measure(|| {
             let mut s = 0u64;
             for i in 0..1_000_000u64 {

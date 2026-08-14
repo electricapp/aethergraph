@@ -6,21 +6,34 @@ use pyo3::types::PyDict;
 
 /// Hardware performance counters for a block of Python work.
 ///
-/// Wraps `perf_event_open` counters scoped to the calling thread and
-/// counting user space only, so the readings describe the measured code
-/// rather than surrounding kernel work. Every counter is best-effort:
-/// hosts that withhold PMU access (most containers, and any machine with
-/// `perf_event_paranoid > 2`) yield a set with fewer counters, and the
-/// corresponding readings come back None instead of raising.
+/// Wraps `perf_event_open` counters counting user space only, so the
+/// readings describe the measured code rather than surrounding kernel work.
+/// Every counter is best-effort: hosts that withhold PMU access (most
+/// containers, and any machine with `perf_event_paranoid > 2`) yield a set
+/// with fewer counters, and the corresponding readings come back None
+/// instead of raising.
+///
+/// **This measures the calling thread only.** The events are opened with
+/// `pid = 0`, which counts the one thread that opened them. Work the
+/// loader does on its sampler threads, and io_uring gathers running on
+/// their own lane threads, are not included — a block that mostly waits on
+/// them reports very few instructions, which looks like a fast path and is
+/// not one. Read it as "what this thread did", not "what this batch cost".
+///
+/// `readings()["multiplexed"]` being True means the PMU was shared and the
+/// counts are scaled estimates rather than exact totals; open fewer
+/// counters when a measurement has to be exact.
 ///
 /// Linux only — present only when `HAS_PERF_COUNTERS` is True.
 ///
 /// # Example
 /// ```python
+/// # Measures the training step, which runs on this thread. The loader's
+/// # sampling runs elsewhere and is deliberately not in this window.
 /// with PerfCounters() as counters:
-///     for batch in loader:
-///         train_step(batch)
-/// print(counters.readings()["ipc"])
+///     train_step(batch)
+/// r = counters.readings()
+/// print(r["ipc"], "estimated" if r["multiplexed"] else "exact")
 /// ```
 #[pyclass(name = "PerfCounters")]
 pub struct PyPerfCounters {
