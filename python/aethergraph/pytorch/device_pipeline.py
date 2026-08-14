@@ -121,9 +121,15 @@ class DeviceTransferPipeline:
             if not issue_next():
                 break
 
-        consumer = torch.cuda.current_stream(device=self._device)
         while inflight:
             data, done = inflight.popleft()
+            # Resolved per batch, not once: a consumer that iterates inside
+            # `with torch.cuda.stream(s)` — or switches streams between
+            # batches — would otherwise have every batch after the first
+            # synchronized against whichever stream happened to be current
+            # when iteration began, and read the tensors while their copy
+            # was still in flight.
+            consumer = torch.cuda.current_stream(device=self._device)
             # The consumer stream must not touch the tensors until their
             # copy has completed; then hand the allocator the dependency.
             consumer.wait_event(done)
