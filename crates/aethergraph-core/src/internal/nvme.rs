@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// NVMe read opcode (`nvme_cmd_read`).
 const NVME_CMD_READ: u8 = 0x02;
@@ -329,8 +329,20 @@ pub struct NvmeReader {
     dev: File,
     nsid: u32,
     lba_bytes: u32,
+    /// Controller's maximum single-command transfer (MDTS, surfaced by the
+    /// driver as `max_hw_sectors_kb`). Commands past it are rejected by
+    /// the drive, so requests are checked against it before submission.
+    max_transfer: u32,
     ring: io_uring::IoUring<io_uring::squeue::Entry128>,
 }
+
+/// Depth of the passthrough ring. Batches are submitted in chunks of this
+/// many commands, so one chunk is one device round-trip.
+const RING_ENTRIES: usize = 64;
+
+/// Fallback maximum transfer when the driver does not publish one. Every
+/// NVMe controller accepts at least this much in a single command.
+const DEFAULT_MAX_TRANSFER: u32 = 128 * 1024;
 
 impl NvmeReader {
     /// Open the char device backing `store_file` and prepare passthrough.
@@ -358,12 +370,14 @@ impl NvmeReader {
             }
         };
 
-        let Some((nsid, lba_bytes)) = ns_geometry(&dev) else {
+        let Some((nsid, lba_bytes, max_transfer)) = ns_geometry(&dev) else {
             return Ok(None);
         };
         let _ = store_file;
 
-        let ring = match io_uring::IoUring::<io_uring::squeue::Entry128>::builder().build(64) {
+        let ring = match io_uring::IoUring::<io_uring::squeue::Entry128>::builder()
+            .build(RING_ENTRIES as u32)
+        {
             Ok(r) => r,
             Err(_) => return Ok(None),
         };
@@ -371,6 +385,7 @@ impl NvmeReader {
             dev,
             nsid,
             lba_bytes,
+            max_transfer,
             ring,
         }))
     }
@@ -380,57 +395,148 @@ impl NvmeReader {
         self.lba_bytes
     }
 
-    /// Read `len` bytes at absolute device byte offset `device_off` into
-    /// `buf`. `device_off` and `len` must be LBA-aligned — resolve them
-    /// from an [`ExtentMap`] whose file was LBA-aligned at build time.
+    /// Largest single transfer the controller accepts, in bytes.
+    pub fn max_transfer_bytes(&self) -> u32 {
+        self.max_transfer
+    }
+
+    /// Read every `(device_off, buf, len)` request as one pipelined run of
+    /// NVMe commands. Offsets and lengths must be LBA-aligned — resolve
+    /// them from an [`ExtentMap`] whose file was LBA-aligned at build time.
+    ///
+    /// The whole batch is in flight at once, up to the ring's depth, so a
+    /// gather costs one device round-trip per chunk rather than one per
+    /// row. Every submitted command is reaped before returning, on success
+    /// and on error alike: the drive DMAs into the caller's buffers, so
+    /// returning while a command is outstanding would let it land in memory
+    /// the caller has already reclaimed.
     ///
     /// # Safety
-    /// `buf` must point to at least `len` writable bytes and stay valid
-    /// until this call returns.
-    pub unsafe fn read_at(&mut self, device_off: u64, buf: *mut u8, len: u32) -> Result<()> {
+    /// Each `buf` must point to at least `len` writable bytes and stay
+    /// valid until this call returns.
+    pub unsafe fn read_batch(&mut self, reqs: &[(u64, *mut u8, u32)]) -> Result<()> {
         use io_uring::{opcode, types};
 
-        let lba = self.lba_bytes as u64;
-        if !device_off.is_multiple_of(lba) || !u64::from(len).is_multiple_of(lba) {
-            bail!("NVMe passthrough read must be LBA-aligned ({lba} bytes)");
-        }
-        let slba = device_off / lba;
-        let nblocks = (len as u64) / lba;
-        if nblocks == 0 {
+        if reqs.is_empty() {
             return Ok(());
         }
-        let nlb =
-            u16::try_from(nblocks - 1).context("read exceeds one NVMe command's block count")?;
 
-        let cmd = NvmePassthruCmd::read(self.nsid, slba, nlb, buf, len);
-        // The uring_cmd SQE carries the 72-byte command in its cmd area.
-        let entry = opcode::UringCmd80::new(types::Fd(self.dev.as_raw_fd()), NVME_URING_CMD_IO)
-            .cmd(cmd_bytes(&cmd))
-            .build()
-            .user_data(1);
+        // Validate up front so a bad request never strands earlier
+        // commands in flight (see `command_for`).
+        let commands = reqs
+            .iter()
+            .map(|&(off, buf, len)| {
+                command_for(self.nsid, self.lba_bytes, self.max_transfer, off, buf, len)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        {
-            let mut sq = self.ring.submission();
-            // SAFETY: `buf`/`cmd` outlive the wait below; the caller
-            // guarantees `buf` is writable for `len` bytes.
-            let pushed = unsafe { sq.push(&entry) };
-            pushed.expect("64-entry ring accepts one SQE");
+        // A completion left over from an aborted batch indexes a request
+        // slice that no longer exists; counting it here would let this
+        // batch return before its own commands land.
+        let mut stale = 0usize;
+        for _cqe in self.ring.completion() {
+            stale += 1;
         }
-        self.ring
-            .submit_and_wait(1)
-            .context("io_uring submit_and_wait")?;
-
-        let cqe = self
-            .ring
-            .completion()
-            .next()
-            .context("no completion for NVMe passthrough read")?;
-        let res = cqe.result();
-        if res < 0 {
-            bail!("NVMe passthrough read failed: {}", -res);
+        if stale > 0 {
+            warn!("NVMe passthrough: discarded {stale} stale completions");
         }
-        Ok(())
+
+        let fd = types::Fd(self.dev.as_raw_fd());
+        let mut first_err: Option<anyhow::Error> = None;
+
+        for (chunk, req_chunk) in commands.chunks(RING_ENTRIES).zip(reqs.chunks(RING_ENTRIES)) {
+            let mut submitted = 0usize;
+            for (i, cmd) in chunk.iter().enumerate() {
+                let entry = opcode::UringCmd80::new(fd, NVME_URING_CMD_IO)
+                    .cmd(cmd_bytes(cmd))
+                    .build()
+                    .user_data(i as u64);
+                let mut sq = self.ring.submission();
+                // SAFETY: the destination buffers are the caller's, valid
+                // for the duration of this call, and the drain below runs
+                // before it returns. The chunk is sized to the ring, so
+                // the push cannot fail for lack of space.
+                let pushed = unsafe { sq.push(&entry) };
+                pushed.expect("chunk is sized to the ring's entry count");
+                submitted += 1;
+            }
+
+            // Drain unconditionally: `submitted` commands are visible to
+            // the kernel and each produces exactly one completion.
+            let mut completed = 0usize;
+            let mut wait_failures = 0u32;
+            while completed < submitted {
+                match self.ring.submit_and_wait(1) {
+                    Ok(_) => wait_failures = 0,
+                    Err(e) => {
+                        // Transient errnos (EINTR/EAGAIN) clear on retry.
+                        // A persistent failure means quiescence cannot be
+                        // established, and returning would hand the drive
+                        // memory the caller is free to reuse.
+                        wait_failures += 1;
+                        if wait_failures >= 1000 {
+                            tracing::error!(
+                                error = %e,
+                                completed,
+                                submitted,
+                                "NVMe passthrough drain failed persistently; aborting to \
+                                 keep the device from writing into reclaimed memory"
+                            );
+                            std::process::abort();
+                        }
+                        continue;
+                    }
+                }
+                for cqe in self.ring.completion() {
+                    completed += 1;
+                    let res = cqe.result();
+                    if res < 0 && first_err.is_none() {
+                        let idx = cqe.user_data() as usize;
+                        let off = req_chunk.get(idx).map_or(0, |&(off, _, _)| off);
+                        first_err = Some(anyhow::anyhow!(
+                            "NVMe passthrough read at device offset {off} failed with error {}",
+                            -res
+                        ));
+                    }
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
+}
+
+/// Check one request against the namespace geometry and the controller's
+/// transfer limit, returning the command it maps to.
+///
+/// Every request in a batch is checked before any of them is submitted: a
+/// rejection partway through would leave earlier commands in flight
+/// against buffers the caller is about to reclaim.
+fn command_for(
+    nsid: u32,
+    lba_bytes: u32,
+    max_transfer: u32,
+    device_off: u64,
+    buf: *mut u8,
+    len: u32,
+) -> Result<NvmePassthruCmd> {
+    let lba = u64::from(lba_bytes);
+    if !device_off.is_multiple_of(lba) || !u64::from(len).is_multiple_of(lba) {
+        bail!("NVMe passthrough read must be LBA-aligned ({lba} bytes)");
+    }
+    if len > max_transfer {
+        bail!(
+            "NVMe passthrough read of {len} bytes exceeds the controller's \
+             {max_transfer} byte maximum transfer"
+        );
+    }
+    let nblocks = u64::from(len) / lba;
+    let nlb = u16::try_from(nblocks.saturating_sub(1))
+        .context("read exceeds one NVMe command's block count")?;
+    Ok(NvmePassthruCmd::read(nsid, device_off / lba, nlb, buf, len))
 }
 
 /// Pack the command struct into the 80-byte SQE cmd array (72 used, 8 zero).
@@ -448,7 +554,7 @@ fn cmd_bytes(cmd: &NvmePassthruCmd) -> [u8; 80] {
 }
 
 /// Read a namespace's (nsid, lba_size) from sysfs, `None` if unreadable.
-fn ns_geometry(dev: &File) -> Option<(u32, u32)> {
+fn ns_geometry(dev: &File) -> Option<(u32, u32, u32)> {
     use std::os::unix::fs::MetadataExt;
     let rdev = dev.metadata().ok()?.rdev();
     let major = ((rdev >> 8) & 0xfff) as u32;
@@ -464,7 +570,16 @@ fn ns_geometry(dev: &File) -> Option<(u32, u32)> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(512);
-    Some((nsid, lba))
+    // The driver folds the controller's MDTS into max_hw_sectors_kb, so the
+    // transfer ceiling is readable from sysfs without an admin passthrough
+    // command of our own.
+    let max_transfer = std::fs::read_to_string(format!("{base}/queue/max_hw_sectors_kb"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .and_then(|kb| kb.checked_mul(1024))
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT_MAX_TRANSFER);
+    Some((nsid, lba, max_transfer))
 }
 
 #[cfg(test)]
@@ -486,6 +601,48 @@ mod tests {
         assert_eq!(cmd.cdw11, 0x1234);
         // NLB is zero-based in CDW12's low 16 bits.
         assert_eq!(cmd.cdw12 & 0xffff, 7);
+    }
+
+    #[test]
+    fn command_for_rejects_reads_past_the_controller_transfer_limit() {
+        let mut buf = [0u8; 4096];
+        let ptr = buf.as_mut_ptr();
+        // MDTS is a hard controller limit: the drive rejects an oversized
+        // command, so the batch must refuse it before anything is in
+        // flight rather than discover it from a completion.
+        let err = command_for(1, 512, 128 * 1024, 0, ptr, 256 * 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("maximum transfer"),
+            "unexpected error: {err}"
+        );
+        // Exactly at the limit is accepted.
+        assert!(command_for(1, 512, 128 * 1024, 0, ptr, 128 * 1024).is_ok());
+    }
+
+    #[test]
+    fn command_for_requires_lba_alignment() {
+        let mut buf = [0u8; 4096];
+        let ptr = buf.as_mut_ptr();
+        for (off, len) in [(511u64, 512u32), (512, 511), (0, 1)] {
+            let err = command_for(1, 512, 128 * 1024, off, ptr, len).unwrap_err();
+            assert!(
+                err.to_string().contains("LBA-aligned"),
+                "offset {off} len {len} gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_for_maps_offset_and_length_to_zero_based_blocks() {
+        let mut buf = [0u8; 4096];
+        let cmd = command_for(3, 512, 128 * 1024, 8192, buf.as_mut_ptr(), 2048).unwrap();
+        assert_eq!(cmd.nsid, 3);
+        // Byte offset 8192 over 512-byte blocks is LBA 16.
+        assert_eq!(cmd.cdw10, 16);
+        assert_eq!(cmd.cdw11, 0);
+        // 2048 bytes is 4 blocks, and NLB is zero-based.
+        assert_eq!(cmd.cdw12 & 0xffff, 3);
+        assert_eq!(cmd.data_len, 2048);
     }
 
     #[test]

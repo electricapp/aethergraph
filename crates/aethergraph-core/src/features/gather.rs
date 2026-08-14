@@ -83,13 +83,24 @@ impl NvmeGather {
             }
         }
 
-        let mut features = vec![0f32; nodes.len() * feature_dim];
-        for (i, &device_off) in device_offsets.iter().enumerate() {
-            let ptr = landing.slot_ptr(i);
-            // SAFETY: `ptr` is slot `i` of `landing`, valid for
-            // `feature_size` bytes; the reader writes exactly that.
-            unsafe { self.reader.read_at(device_off, ptr, feature_size as u32)? };
+        // A row larger than one NVMe command has to go back to the file
+        // path; splitting it here would submit two commands per row and
+        // give up the batch's single-round-trip property.
+        if feature_size as u64 > u64::from(self.reader.max_transfer_bytes()) {
+            return Ok(None);
         }
+
+        let mut features = vec![0f32; nodes.len() * feature_dim];
+        let reqs: Vec<(u64, *mut u8, u32)> = device_offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &device_off)| (device_off, landing.slot_ptr(i), feature_size as u32))
+            .collect();
+        // SAFETY: each ptr is slot `i` of `landing`, valid for
+        // `feature_size` bytes and kept alive by the exclusive borrow
+        // until this call returns; `read_batch` reaps every submitted
+        // command before returning, on success and on error.
+        unsafe { self.reader.read_batch(&reqs)? };
         for i in 0..nodes.len() {
             let row = landing.slot_slice(i, feature_size);
             dtype.decode_row(row, &mut features[i * feature_dim..(i + 1) * feature_dim]);
