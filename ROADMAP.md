@@ -12,6 +12,7 @@ Outstanding work only. Delete rows from these tables as they land.
 | H3  | NUMA placement chooses a node | Yes           | A 2-socket host                       |
 | H4  | USDT probe arguments          | Yes           | Linux + `bpftrace`                    |
 | H5  | io_uring setup wins           | Bench only    | NVMe host under load                  |
+| H6  | Native InfiniBand addressing  | Yes           | IB fabric + subnet manager            |
 
 All test code is written and gated. What's left is _running_ it on the right
 hardware.
@@ -26,18 +27,27 @@ because every one of these is a path where the code can look finished and do
 nothing: a fallback that silently degrades, a placement call that is inert on
 one socket, a probe that fires without its arguments.
 
-| ID  | Never executed                                                                                           | Why CI cannot cover it                                                                                           | Rig                   |
-| --- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------- |
-| H1  | `gpu/gdrcopy.rs` BAR1 stores, `gpu/kernel.rs` seqlock validation, the CUDA half of `gpu/uvm.rs` prefetch | `gpudirect-check` runs `cargo check` in a CUDA container with no device — type-checked, never run                | Any CUDA GPU          |
-| H2  | `NvmeReader::read_batch` submission and completion; MDTS rejection of an oversized command               | Runners have no NVMe character device, so `NvmeReader::open_for` returns `None` and the gather takes the fs path | Drive with `/dev/ng*` |
-| H3  | `interleave_region` spreading pages, `pin_current_thread` binding a worker to one socket's cores         | Runners are single-node: `nodes_online().len() < 2`, so both calls short-circuit before the syscall              | 2-socket host         |
-| H4  | A tracer reading `arg1`…`arg4` off a probe                                                               | CI asserts the ELF note carries descriptors; nothing attaches to confirm a consumer resolves them                | Linux + `bpftrace`    |
-| H5  | Whether `DEFER_TASKRUN` and the coalesced UVM prefetch are actually faster, not merely selected          | The tier assertion proves the setup was chosen; it says nothing about throughput                                 | NVMe host, GPU host   |
+| ID  | Never executed                                                                                           | Why CI cannot cover it                                                                                           | Rig                        |
+| --- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| H1  | `gpu/gdrcopy.rs` BAR1 stores, `gpu/kernel.rs` seqlock validation, the CUDA half of `gpu/uvm.rs` prefetch | `gpudirect-check` runs `cargo check` in a CUDA container with no device — type-checked, never run                | Any CUDA GPU               |
+| H2  | `NvmeReader::read_batch` submission and completion; MDTS rejection of an oversized command               | Runners have no NVMe character device, so `NvmeReader::open_for` returns `None` and the gather takes the fs path | Drive with `/dev/ng*`      |
+| H3  | `interleave_region` spreading pages, `pin_current_thread` binding a worker to one socket's cores         | Runners are single-node: `nodes_online().len() < 2`, so both calls short-circuit before the syscall              | 2-socket host              |
+| H4  | A tracer reading `arg1`…`arg4` off a probe                                                               | CI asserts the ELF note carries descriptors; nothing attaches to confirm a consumer resolves them                | Linux + `bpftrace`         |
+| H5  | Whether `DEFER_TASKRUN` and the coalesced UVM prefetch are actually faster, not merely selected          | The tier assertion proves the setup was chosen; it says nothing about throughput                                 | NVMe host, GPU host        |
+| H6  | A QP reaching a peer over LID routing, and `LinkLayer::InfiniBand` being taken at all                    | Every fabric available is Ethernet-link-layer — SoftRoCE, ConnectX-6 RoCE, EFA — so the IB branch never runs     | IB fabric + subnet manager |
 
 **H3 is not covered by the Lambda A10** — that instance is single-socket, so it
 exercises H1 and H2 but leaves NUMA placement inert exactly as CI does. A
 separate 2-socket box is the only thing that shows `interleave_region` choosing
 between nodes.
+
+H6 is worth stating precisely, because "uses libibverbs" reads as "supports
+InfiniBand" and does not mean it. The verbs API is common to IB, RoCE, iWARP,
+and EFA, and `/sys/class/infiniband/` is Linux's name for every RDMA device
+including pure Ethernet ones. What runs here is RoCE and EFA/SRD. The IB
+addressing path is written and its decision logic is unit tested — same subnet
+routes on the LID, crossing subnets adds a GRH — but no IB fabric has executed
+it.
 
 For H5, the numbers worth capturing are per-tier: run the feature gather with
 the ring forced down each rung (`UringHandle::tier()` reports which one took
