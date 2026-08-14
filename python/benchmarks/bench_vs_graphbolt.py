@@ -7,9 +7,9 @@ batch size, replacement policy, and thread count. The graph is symmetrized
 because GraphBolt samples in-edges over CSC and we sample out-edges over
 CSR — on a directed graph the two sample different neighbourhoods.
 
-Not equal: GraphBolt compacts node IDs inside `sample_neighbors`, so its
-number includes work our raw `sample()` defers. Treat the sample-only row
-as directional.
+Both sides do raw sampling without ID compaction: `sample_neighbors`
+returns original IDs in `sampled_csc.indices` and leaves compaction to a
+later datapipe stage, same as our `sample()`.
 
 Keep `--threads 1`. A single `sample()` is serial here (raising the flag
 moves the number by less than noise), so above 1 the setting only frees
@@ -19,6 +19,14 @@ Note this runs entirely in memory, which is where we have the least to
 offer — io_uring, O_DIRECT, hugepages and the rest only matter once the
 graph outgrows page cache. Read a loss here as "competitive on table
 stakes", not as the headline.
+
+Treat the ratio as provisional. Three ways of driving GraphBolt's API gave
+4.4x, 8.4x and 4.6x on the same graph: no dedup between layers samples every
+duplicate, `torch.unique` costs more than it saves, and `unique_and_compact`
+is the one its datapipe actually uses. One asymmetry remains — our
+`sample()` does every layer in a single call, while this loop crosses the
+Python boundary once per layer. Closing it means driving `gb.NeighborSampler`
+end to end, which is the next thing to do here.
 
 Requires: aethergraph; torch and dgl for the GraphBolt side.
 
@@ -180,7 +188,16 @@ def bench_graphbolt(
     def run() -> None:
         seeds = torch.from_numpy(next(feed).astype(np.int64))
         for f in fanout_t:
-            seeds = graph.sample_neighbors(seeds, f).indices
+            # `sampled_csc.indices` are original node IDs — this call does
+            # not compact, so it is the same work our `sample()` does.
+            sampled = graph.sample_neighbors(seeds, f).sampled_csc.indices
+            # Deduplicate with GraphBolt's own compaction, which is what its
+            # datapipe uses. Feeding the raw neighbour list forward makes the
+            # next layer sample every duplicate (20.9k seeds where 8.6k are
+            # distinct); doing it with `torch.unique` instead sorts in Python
+            # and costs more than it saves. Either way the benchmark would be
+            # measuring the harness rather than the sampler.
+            seeds = gb.unique_and_compact([sampled])[0]
 
     us = _timed(run, iters)
     return [
@@ -190,7 +207,7 @@ def bench_graphbolt(
             us_per_iter=us,
             batches_per_sec=1e6 / us,
             threads=threads,
-            note="includes fused ID compaction",
+            note="no ID compaction",
         )
     ]
 
