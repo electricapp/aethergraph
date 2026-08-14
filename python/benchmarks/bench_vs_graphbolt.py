@@ -1,33 +1,26 @@
 """Head-to-head benchmark: AetherGraph vs DGL-GraphBolt.
 
-GraphBolt is the closest competitor — an on-disk dataset with mmap'd CSC,
-GPU feature caching, and a sampler built around the disk path. A comparison
-against vanilla PyG flatters us and answers a question nobody asked; this is
-the one a reviewer asks first.
+GraphBolt is the closest competitor, so it's the comparison worth running.
 
-**What is held equal**, because a sampling benchmark is mostly an argument
-about what was held equal:
+Held equal: the edge list, the seed batches and their order, the fanout,
+batch size, replacement policy, and thread count. The graph is symmetrized
+because GraphBolt samples in-edges over CSC and we sample out-edges over
+CSR — on a directed graph the two sample different neighbourhoods.
 
-- *The graph.* Both frameworks read the same edge list. It is symmetrized
-  first: GraphBolt samples in-edges over CSC, AetherGraph out-edges over
-  CSR, and those coincide only on a symmetric graph. Comparing them on a
-  directed graph measures the orientation, not the sampler.
-- *The seeds.* One seed array, drawn once, replayed to both in the same
-  order — not each framework's own shuffler.
-- *The fanout, batch size, and replacement policy.*
-- *The thread count*, pinned on both sides. Left alone, the two libraries
-  pick different defaults and the result reports that instead.
-- *The stage.* Raw sampling and full pipeline are timed separately, because
-  GraphBolt fuses sampling with compaction and prefetches in a datapipe.
-  Timing our bare `sample()` against their prefetched pipeline would be a
-  favourable mismatch in one direction and an unfavourable one in the other.
+Not equal: GraphBolt compacts node IDs inside `sample_neighbors`, so its
+number includes work our raw `sample()` defers. Treat the sample-only row
+as directional.
 
-**What is not held equal**, and is reported rather than hidden: GraphBolt's
-`FusedCSCSamplingGraph` compacts node IDs inside the sampling call, so its
-"sample only" number includes work our raw path defers. The pipeline row is
-the honest like-for-like; the sample-only row is directional.
+Keep `--threads 1`. A single `sample()` is serial here (raising the flag
+moves the number by less than noise), so above 1 the setting only frees
+GraphBolt's threads and the comparison tilts the other way.
 
-Requires: torch, dgl (with graphbolt), aethergraph
+Note this runs entirely in memory, which is where we have the least to
+offer — io_uring, O_DIRECT, hugepages and the rest only matter once the
+graph outgrows page cache. Read a loss here as "competitive on table
+stakes", not as the headline.
+
+Requires: aethergraph; torch and dgl for the GraphBolt side.
 
 Usage::
 
@@ -38,6 +31,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
@@ -241,10 +235,15 @@ def main(
     json_out: Path | None = typer.Option(None, "--json", help="Write results as JSON."),
 ) -> None:
     """Run both frameworks over one shared graph and report the delta."""
-    # torch is GraphBolt's dependency, not ours. Importing it up front would
-    # make the AetherGraph numbers unobtainable on a machine that has only
-    # AetherGraph installed — which is the machine most likely to be running
-    # this while iterating.
+    # Pin our side too. `torch.set_num_threads` only binds GraphBolt; rayon
+    # reads this when it builds its pool, which happens on first use, so it
+    # has to be set before aethergraph is imported below. Without it a
+    # parallel sampling path would take every core while GraphBolt ran on
+    # one, and the benchmark would claim a control it never applied.
+    os.environ.setdefault("RAYON_NUM_THREADS", str(threads))
+
+    # torch is GraphBolt's dependency, not ours — importing it up front would
+    # make our own numbers unobtainable on a machine that only has us.
     try:
         import torch
 
