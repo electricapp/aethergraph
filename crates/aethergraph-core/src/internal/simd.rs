@@ -307,6 +307,12 @@ unsafe fn gather_degrees_avx2(offsets: &[u64], nodes: &[u32], dst: &mut [u32]) {
         dst.fill(0);
         return;
     };
+    // `vpgatherdq` reads its indices as *signed* 32-bit. A node id past
+    // i32::MAX would arrive as a negative index and gather from below
+    // `offsets`, so the vector path additionally stops there — reachable
+    // only on a graph with more than 2^31 nodes, which the u32 node id
+    // otherwise allows.
+    let vector_max = max_node.min(i32::MAX as usize);
 
     let base = offsets.as_ptr() as *const i64;
     let mut i = 0usize;
@@ -315,7 +321,7 @@ unsafe fn gather_degrees_avx2(offsets: &[u64], nodes: &[u32], dst: &mut [u32]) {
         // The vector path assumes every lane is in range; a chunk with any
         // out-of-range or offset-inverting node goes scalar instead of
         // needing a masked gather plus a saturating vector subtract.
-        if chunk.iter().any(|&n| (n as usize) >= max_node) {
+        if chunk.iter().any(|&n| (n as usize) >= vector_max) {
             gather_degrees_scalar(offsets, chunk, &mut dst[i..i + 4]);
             i += 4;
             continue;
