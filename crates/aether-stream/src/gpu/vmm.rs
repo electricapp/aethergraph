@@ -152,7 +152,18 @@ impl GrowableVram {
         // SAFETY: the range was just mapped; `desc` is a single valid
         // access descriptor.
         let res = unsafe { sys::cuMemSetAccess(map_at, add, &desc, 1) };
-        cuda_ok(res, "cuMemSetAccess")?;
+        if let Err(e) = cuda_ok(res, "cuMemSetAccess") {
+            // The chunk is mapped but not yet recorded, so `Drop` would
+            // not reach it: unwind it here or the physical memory leaks
+            // and the next grow_to maps over a range still held, since
+            // `committed` has not advanced either.
+            // SAFETY: `[map_at, add)` was mapped immediately above and is
+            // unmapped exactly once here.
+            unsafe { sys::cuMemUnmap(map_at, add) };
+            // SAFETY: `handle` backs that chunk and is released once.
+            unsafe { sys::cuMemRelease(handle) };
+            return Err(e);
+        }
 
         self.chunks.push((handle, map_at, add));
         self.committed = target;
