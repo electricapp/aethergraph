@@ -56,6 +56,39 @@ rather than a plausible mechanism.
 
 ---
 
+## Merge sequence
+
+Fifteen branches are green against `main` individually, which says nothing about
+landing them together — GitHub's mergeable flag compares each to `main`, not to
+its predecessors. This order was validated by replaying the cascade in a scratch
+worktree.
+
+**Zero-conflict prefix**, in order: **#110, #111, #102, #106, #97, #98.** These
+touch disjoint files or append to different regions, and merge clean one after
+another with no intervention.
+
+**Then the rest**, each conflicting only in append-only files: **#99, #100,
+#101, #104, #105, #103, #107, #108, #109.**
+
+**#109 must follow #108** — it is branched off it, and `DEFER_TASKRUN` is only
+sound once the rings are thread-owned. In that order the pair merges clean; out
+of order it does not.
+
+Every conflict in this sequence lands in one of three files, and all are "both
+sides appended":
+
+| File                                          | Resolution                                                                                          |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `.github/workflows/ci.yml`                    | Keep both job/step blocks; add both rows to the summary table                                       |
+| `crates/aethergraph-py/Cargo.toml`            | Union the `features` array of the `aethergraph-core` dependency, and keep both explanatory comments |
+| `crates/aethergraph-core/src/internal/mod.rs` | Keep both `pub mod` lines                                                                           |
+
+No conflict falls in code logic. The one that looks like it might —
+`features/async_store.rs` between #108 and #109 — is an artifact of merging them
+out of order; in sequence it does not arise.
+
+---
+
 ## R6 — T4.3 Ray Data multi-GPU
 
 Skips unless `torch.cuda.device_count() >= 2`. Builds a sampling dataset at
