@@ -20,7 +20,8 @@
 #![cfg(all(target_os = "linux", feature = "uffd"))]
 
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -247,6 +248,7 @@ impl PagedRegion {
                         source,
                         weights,
                         resident: HashMap::new(),
+                        evict_queue: BinaryHeap::new(),
                         faults,
                         evictions,
                     };
@@ -368,6 +370,14 @@ struct Pager {
     weights: Arc<PageWeights>,
     /// Resident page number → its retention weight.
     resident: HashMap<usize, u32>,
+    /// Eviction candidates ordered by weight, lowest first. Entries are
+    /// never removed on eviction — a pop whose page is no longer resident
+    /// is stale and discarded — so a page installed, evicted, and
+    /// installed again can hold several entries. They all carry the same
+    /// weight, which is a pure function of the page, so whichever survives
+    /// is the right one. The queue is rebuilt from `resident` when the
+    /// stale entries outgrow the live ones.
+    evict_queue: BinaryHeap<Reverse<(u32, usize)>>,
     faults: Arc<AtomicU64>,
     evictions: Arc<AtomicU64>,
 }
@@ -418,9 +428,15 @@ impl Pager {
         let offset = (page_start - self.base) as u64;
         let page_no = offset as usize / self.page_size;
 
-        // Evict down to budget-1 before installing the newcomer.
+        // Evict down to budget-1 before installing the newcomer. A pass
+        // that cannot free anything ends the loop: the only page left to
+        // drop is the one being installed, and retrying would spin the
+        // pager thread forever with every faulting reader blocked behind
+        // it.
         while self.resident.len() >= self.budget_pages {
-            self.evict_one(page_no)?;
+            if !self.evict_one(page_no)? {
+                break;
+            }
         }
 
         self.source.fill(offset, staging)?;
@@ -429,7 +445,10 @@ impl Pager {
         // its access complete also sees this fault reflected in the
         // counters (the copy ioctl and the thread's resume bracket the
         // store with kernel barriers).
-        self.resident.insert(page_no, self.weights.weight(page_no));
+        let weight = self.weights.weight(page_no);
+        if self.resident.insert(page_no, weight).is_none() {
+            self.evict_queue.push(Reverse((weight, page_no)));
+        }
         self.faults.fetch_add(1, Ordering::Relaxed);
         let copy = UffdioCopy {
             dst: page_start as u64,
@@ -453,18 +472,35 @@ impl Pager {
 
     /// Evict the lowest-weight resident page (never the one about to be
     /// installed). `MADV_DONTNEED` drops it and re-arms its fault.
-    fn evict_one(&mut self, keep: usize) -> Result<()> {
-        let victim = self
-            .resident
-            .iter()
-            .filter(|(p, _)| **p != keep)
-            .min_by_key(|(_, w)| **w)
-            .map(|(p, _)| *p);
+    ///
+    /// Returns whether a page was actually evicted. `false` means the only
+    /// candidate left is `keep`, and the caller must stop asking.
+    ///
+    /// Pulling the victim from a weight-ordered queue keeps this
+    /// O(log n): scanning `resident` for the minimum would make every
+    /// fault cost a pass over the whole residency budget, which for a
+    /// multi-gigabyte region is the dominant cost of servicing a fault.
+    fn evict_one(&mut self, keep: usize) -> Result<bool> {
+        let mut set_aside = Vec::new();
+        let victim = loop {
+            let Some(Reverse((weight, page))) = self.evict_queue.pop() else {
+                break None;
+            };
+            if self.resident.get(&page) != Some(&weight) {
+                // Stale: the page was evicted since this entry was pushed.
+                continue;
+            }
+            if page == keep {
+                set_aside.push(Reverse((weight, page)));
+                continue;
+            }
+            break Some(page);
+        };
+        for entry in set_aside {
+            self.evict_queue.push(entry);
+        }
         let Some(victim) = victim else {
-            // Only the keep page is resident and budget is 1: nothing to
-            // evict without dropping the newcomer, so proceed over budget
-            // for this one page rather than deadlock.
-            return Ok(());
+            return Ok(false);
         };
         let addr = self.base + victim * self.page_size;
         // SAFETY: `addr` is a page inside the registered mapping.
@@ -480,7 +516,18 @@ impl Pager {
         }
         self.resident.remove(&victim);
         self.evictions.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+
+        // Reclaim the queue when stale entries outnumber live ones, so
+        // repeated install/evict churn on the same pages cannot grow it
+        // without bound.
+        if self.evict_queue.len() > 2 * self.resident.len().max(1) {
+            self.evict_queue = self
+                .resident
+                .iter()
+                .map(|(&page, &weight)| Reverse((weight, page)))
+                .collect();
+        }
+        Ok(true)
     }
 }
 
@@ -580,6 +627,51 @@ mod tests {
             region.eviction_count() > 0,
             "touching 12 pages with budget 8 must evict"
         );
+    }
+
+    /// A one-page budget is the degenerate case for eviction: every fault
+    /// has to drop the only resident page, and several threads racing on
+    /// the same page can fault it again while it is already installed. The
+    /// eviction pass has nothing it may drop then, so it must give up
+    /// rather than retry — a pager thread spinning here blocks every
+    /// reader behind it, and the test would hang rather than fail.
+    #[test]
+    fn single_page_budget_serves_concurrent_faults() {
+        if !uffd_available() {
+            eprintln!("userfaultfd unavailable; skipping");
+            return;
+        }
+        let ps = page_size();
+        let npages = 8usize;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        for p in 0..npages {
+            tmp.write_all(&vec![(p % 251) as u8; ps]).unwrap();
+        }
+        tmp.flush().unwrap();
+        let file = tmp.reopen().unwrap();
+
+        let source = Arc::new(FileSource::new(file));
+        let weights = Arc::new(PageWeights::default());
+        let region = Arc::new(PagedRegion::new(npages * ps, 1, source, weights).unwrap());
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let region = Arc::clone(&region);
+                s.spawn(move || {
+                    let data = region.as_slice();
+                    for round in 0..16 {
+                        // Every thread hammers the same page each round, so
+                        // the second and later faults land on a page that is
+                        // already resident.
+                        let p = round % npages;
+                        assert_eq!(data[p * ps], (p % 251) as u8, "page {p} first byte");
+                    }
+                });
+            }
+        });
+
+        assert!(region.fault_count() > 0, "faults must have been served");
     }
 
     #[test]
