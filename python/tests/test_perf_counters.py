@@ -27,6 +27,8 @@ READING_KEYS = {
     "task_clock_ns",
     "ipc",
     "llc_misses_per_kilo_instruction",
+    # True when the PMU was shared and the counts are scaled estimates.
+    "multiplexed",
 }
 
 
@@ -55,6 +57,10 @@ class TestPerfCounters:
         for key in ("cycles", "instructions", "task_clock_ns"):
             value = readings[key]
             assert value is None or (isinstance(value, int) and value >= 0)
+
+        # Always present, and a plain bool either way: a caller uses it to
+        # decide whether the counts are exact or scaled estimates.
+        assert isinstance(readings["multiplexed"], bool)
 
         if readings["instructions"] and readings["cycles"]:
             assert readings["ipc"] > 0
