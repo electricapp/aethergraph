@@ -111,10 +111,20 @@ impl AsyncFeatureStore {
         // On Linux, check if layout is O_DIRECT compatible before trying O_DIRECT
         #[cfg(target_os = "linux")]
         let (std_file, direct_io) = {
-            use crate::internal::uring::is_layout_direct_io_compatible;
+            use crate::internal::uring::{
+                DIRECT_IO_OFFSET_ALIGNMENT, direct_io_offset_alignment,
+                is_layout_direct_io_compatible_with,
+            };
 
-            let layout_compatible =
-                is_layout_direct_io_compatible(header.features_start_offset, header.feature_size);
+            // The device's real requirement, not the 512-byte floor — see
+            // `direct_io_offset_alignment`.
+            let alignment =
+                direct_io_offset_alignment(&header_file).unwrap_or(DIRECT_IO_OFFSET_ALIGNMENT);
+            let layout_compatible = is_layout_direct_io_compatible_with(
+                header.features_start_offset,
+                header.feature_size,
+                alignment,
+            );
 
             if layout_compatible {
                 // Layout is aligned, try O_DIRECT

@@ -174,6 +174,38 @@ pub fn advise_mmap_hugepage(addr: *const u8, len: usize) {
 #[cfg(not(target_os = "linux"))]
 pub fn advise_mmap_hugepage(_addr: *const u8, _len: usize) {}
 
+/// Fault this read-only region in now, and report whether it worked.
+///
+/// `MADV_WILLNEED` only queues readahead: it returns before the pages are
+/// there, so the first access can still block on a major fault. Sampling
+/// hits the offsets array on the critical path of every batch, and a fault
+/// there stalls the whole frontier. `MADV_POPULATE_READ` (Linux 5.14)
+/// populates synchronously with *read* faults, so it does not force
+/// copy-on-write private copies the way `MAP_POPULATE` on a private
+/// mapping does — the pages stay shared with the page cache.
+///
+/// Returns false when the kernel does not support it, so the caller can
+/// keep the readahead hint as a fallback rather than pre-faulting nothing.
+#[cfg(target_os = "linux")]
+pub fn populate_read(addr: *const u8, len: usize) -> bool {
+    // MADV_POPULATE_READ, from <asm-generic/mman-common.h>. Not in libc's
+    // constant set on every platform the crate targets, so it is spelled
+    // out here.
+    const MADV_POPULATE_READ: libc::c_int = 22;
+    let (start, span) = page_span(addr, len);
+    if span == 0 {
+        return false;
+    }
+    // SAFETY: madvise on a mapped range; POPULATE_READ only faults pages in
+    // and never changes the mapping's contents or extent.
+    unsafe { libc::madvise(start, span, MADV_POPULATE_READ) == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn populate_read(_addr: *const u8, _len: usize) -> bool {
+    false
+}
+
 /// Hint: done with this region, can be evicted.
 #[cfg(target_os = "linux")]
 pub fn hint_dontneed<F: AsRawFd>(file: &F, offset: u64, len: usize) {
@@ -190,3 +222,42 @@ pub fn hint_dontneed<F: AsRawFd>(file: &F, offset: u64, len: usize) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn hint_dontneed<F>(_file: &F, _offset: u64, _len: usize) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Populating a real mapping must either work or report that it did
+    /// not — never a false success the caller would take as "resident",
+    /// skipping the readahead fallback for pages that were never faulted.
+    #[test]
+    fn populate_read_reports_whether_it_populated() {
+        let len = 256 * 1024;
+        // A private anonymous mapping is a valid madvise target on every
+        // platform this runs on, so the call is exercised rather than
+        // skipped.
+        let mut region = vec![0u8; len];
+        let populated = populate_read(region.as_ptr(), len);
+
+        if cfg!(target_os = "linux") {
+            // Whatever the kernel decided, the region stays readable and
+            // its contents are untouched — POPULATE_READ faults pages in
+            // and changes nothing else.
+            region[0] = 7;
+            region[len - 1] = 9;
+            assert_eq!(region[0], 7);
+            assert_eq!(region[len - 1], 9);
+        } else {
+            assert!(!populated, "no population is possible off Linux");
+        }
+    }
+
+    /// A zero-length span has no pages to fault, so it must report false
+    /// rather than passing an empty range to the kernel and taking its
+    /// success as populated.
+    #[test]
+    fn populate_read_rejects_an_empty_span() {
+        let region = [0u8; 4096];
+        assert!(!populate_read(region.as_ptr(), 0));
+    }
+}

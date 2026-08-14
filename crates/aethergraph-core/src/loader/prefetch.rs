@@ -240,10 +240,22 @@ impl SyncFeatureStore {
         // On Linux, check if layout is O_DIRECT compatible before trying O_DIRECT
         #[cfg(target_os = "linux")]
         let (file, direct_io) = {
-            use crate::internal::uring::{is_layout_direct_io_compatible, open_direct_or_fallback};
+            use crate::internal::uring::{
+                DIRECT_IO_OFFSET_ALIGNMENT, direct_io_offset_alignment,
+                is_layout_direct_io_compatible_with, open_direct_or_fallback,
+            };
 
-            let layout_compatible =
-                is_layout_direct_io_compatible(header.features_start_offset, header.feature_size);
+            // Ask the file what its device actually requires. The 512-byte
+            // default is only a floor: on a 4Kn device a layout that clears
+            // 512 but not 4096 would pass the check and then fail every
+            // read with EINVAL.
+            let alignment =
+                direct_io_offset_alignment(&header_file).unwrap_or(DIRECT_IO_OFFSET_ALIGNMENT);
+            let layout_compatible = is_layout_direct_io_compatible_with(
+                header.features_start_offset,
+                header.feature_size,
+                alignment,
+            );
 
             if layout_compatible {
                 // Layout is aligned, try O_DIRECT
@@ -251,19 +263,20 @@ impl SyncFeatureStore {
                 let (f, direct) = open_direct_or_fallback(path)?;
                 if direct {
                     debug!(
-                        "Feature layout is O_DIRECT compatible (offset={}, size={})",
-                        header.features_start_offset, header.feature_size
+                        "Feature layout is O_DIRECT compatible (offset={}, size={}, alignment={})",
+                        header.features_start_offset, header.feature_size, alignment
                     );
                 }
                 (f, direct)
             } else {
                 // Layout not aligned, O_DIRECT would fail with EINVAL
                 warn!(
-                    "Feature layout not O_DIRECT compatible: offset={} (aligned={}), size={} (aligned={})",
+                    "Feature layout not O_DIRECT compatible at {}-byte alignment: offset={} (aligned={}), size={} (aligned={})",
+                    alignment,
                     header.features_start_offset,
-                    header.features_start_offset % 512 == 0,
+                    (header.features_start_offset as usize).is_multiple_of(alignment),
                     header.feature_size,
-                    header.feature_size % 512 == 0
+                    header.feature_size.is_multiple_of(alignment)
                 );
                 (header_file, false)
             }
