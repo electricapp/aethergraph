@@ -20,6 +20,14 @@ offer — io_uring, O_DIRECT, hugepages and the rest only matter once the
 graph outgrows page cache. Read a loss here as "competitive on table
 stakes", not as the headline.
 
+Do not read a win here as "faster than GraphBolt". On macOS arm64 the
+shipped `libgraphbolt` links no OpenMP and does not scale — measured 7.6 ms
+at one thread and 8.4 ms at eight — so this compares against a baseline that
+cannot use a second core, on the platform DGL least optimizes. dgl 2.2.0 is
+also a year behind current. A real normalization needs Linux x86_64, a
+current DGL, more than one thread, and a power-law graph rather than the
+uniform-random one built here.
+
 Two stages are timed, and they agree, which is the reason to believe either.
 "sample only" drives each sampler directly; "pipeline" runs each framework's
 own loader end to end, so neither crosses the Python boundary per layer.
