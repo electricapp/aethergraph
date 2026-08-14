@@ -106,19 +106,19 @@ impl SharedRegion {
     pub fn from_fd(fd: OwnedFd, len: usize) -> Result<Self> {
         let raw = fd.as_raw_fd();
 
-        // SAFETY: `raw` is a live descriptor owned by `fd`, and `stat` is
-        // fully written by a successful fstat.
-        let actual_len = unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            if libc::fstat(raw, &mut st) != 0 {
-                bail!(
-                    "fstat on received memfd failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            st.st_size
-        };
-        let actual_len = usize::try_from(actual_len).unwrap_or(0);
+        // SAFETY: an all-zero `libc::stat` is a valid initial value; a
+        // successful fstat overwrites every field it defines.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `raw` is a live descriptor owned by `fd`, and `st` is a
+        // valid out-pointer for the duration of the call.
+        let rc = unsafe { libc::fstat(raw, &mut st) };
+        if rc != 0 {
+            bail!(
+                "fstat on received memfd failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let actual_len = usize::try_from(st.st_size).unwrap_or(0);
         if actual_len != len {
             bail!("received memfd is {actual_len} bytes, owner advertised {len}");
         }
@@ -434,7 +434,7 @@ mod tests {
         // does not produce.
         let name = c"aethergraph-unsealed";
         // SAFETY: `name` is a valid NUL-terminated C string.
-        let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING as u32) };
+        let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
         assert!(raw >= 0, "memfd_create failed");
         // SAFETY: `raw` is a fresh fd we exclusively own.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
