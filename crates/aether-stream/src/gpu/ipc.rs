@@ -14,6 +14,7 @@
 //! Compile-gated behind `cuda`; validated on hardware.
 
 use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
@@ -62,7 +63,13 @@ unsafe impl Sync for ImportedVram {}
 impl ImportedVram {
     /// Import the physical allocation referenced by `fd` (received over
     /// `SCM_RIGHTS` from the owner) and map `size` bytes of it into a fresh
-    /// reserved range, read-write from `device`. Takes ownership of `fd`.
+    /// reserved range, read-write from `device`.
+    ///
+    /// `fd` is consumed and closed here. The driver duplicates whatever it
+    /// needs during the import rather than taking the descriptor over, so
+    /// the caller's copy would otherwise leak once per imported pool —
+    /// taking an [`OwnedFd`] makes that closing automatic on every path,
+    /// including the error returns below.
     ///
     /// # Safety
     /// `fd` must be a CUDA shareable handle exported by a trusted peer via
@@ -71,7 +78,7 @@ impl ImportedVram {
     pub unsafe fn import(
         ctx: &Arc<CudaContext>,
         device: sys::CUdevice,
-        fd: RawFd,
+        fd: OwnedFd,
         size: usize,
     ) -> io::Result<Self> {
         let mut handle: sys::CUmemGenericAllocationHandle = 0;
@@ -80,7 +87,7 @@ impl ImportedVram {
         let res = unsafe {
             sys::cuMemImportFromShareableHandle(
                 &mut handle,
-                fd as *mut std::ffi::c_void,
+                fd.as_raw_fd() as *mut std::ffi::c_void,
                 sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
             )
         };
@@ -117,7 +124,19 @@ impl ImportedVram {
         };
         // SAFETY: the range was just mapped; one valid access descriptor.
         let res = unsafe { sys::cuMemSetAccess(base, size, &desc, 1) };
-        cuda_ok(res, "cuMemSetAccess")?;
+        if let Err(e) = cuda_ok(res, "cuMemSetAccess") {
+            // Nothing owns the mapping yet — `Self` is not constructed, so
+            // `Drop` never runs — and every earlier failure path unwinds
+            // its own work. Do the same here rather than strand a mapped
+            // reservation and an imported handle.
+            // SAFETY: `[base, size)` was mapped above; unmapped once.
+            unsafe { sys::cuMemUnmap(base, size) };
+            // SAFETY: `base`/`size` is this call's reservation; freed once.
+            unsafe { sys::cuMemAddressFree(base, size) };
+            // SAFETY: `handle` was imported above; released once.
+            unsafe { sys::cuMemRelease(handle) };
+            return Err(e);
+        }
 
         Ok(Self {
             ctx: ctx.clone(),
