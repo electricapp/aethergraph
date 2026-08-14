@@ -87,6 +87,14 @@ impl SeqlockValidator {
             .into());
         }
 
+        // An empty batch has nothing to validate and no torn rows to
+        // report. Falling through would compute a zero-block grid, which
+        // the driver rejects outright — an error for a request that is
+        // trivially satisfiable.
+        if batch_size == 0 {
+            return Ok(0);
+        }
+
         // Zero the retry counter from pre-allocated scratch (no cuMemAlloc)
         self.stream
             .memcpy_dtod(&self.zero_scratch, &mut self.retry_count)?;

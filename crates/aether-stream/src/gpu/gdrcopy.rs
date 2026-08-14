@@ -148,9 +148,27 @@ impl GdrMapping {
             unsafe { gdr_close(g) };
             return Err(io::Error::other(format!("gdr_get_info failed: {rc}")));
         }
-        let page_off = (dev_ptr - info.va) as usize;
-        // SAFETY: `page_off < page_size <= size`, so the offset is inside
-        // the mapping.
+        // `info.va` is the page-aligned base of the pinned region, so it
+        // should never exceed `dev_ptr` — but it comes back from a C
+        // library, and a wrapped subtraction here would put `store_ptr`
+        // arbitrarily far outside the BAR1 mapping and every later copy
+        // with it. Check rather than assume.
+        let page_off = match dev_ptr.checked_sub(info.va) {
+            Some(off) if (off as usize) < size => off as usize,
+            _ => {
+                // SAFETY: `map_base`/`size` was mapped for `handle`; unmapped once.
+                unsafe { gdr_unmap(g, handle, map_base, size) };
+                // SAFETY: `handle` is pinned on `g`; unpinned once here.
+                unsafe { gdr_unpin_buffer(g, handle) };
+                // SAFETY: `g` is live; closed once here.
+                unsafe { gdr_close(g) };
+                return Err(io::Error::other(format!(
+                    "gdr_get_info reported va {:#x} for buffer {dev_ptr:#x} of {size} bytes",
+                    info.va
+                )));
+            }
+        };
+        // SAFETY: `page_off < size`, so the offset is inside the mapping.
         let store_ptr = unsafe { (map_base as *mut u8).add(page_off) as *mut c_void };
 
         Ok(Self {
@@ -165,7 +183,11 @@ impl GdrMapping {
     /// Store `src` into the mapped VRAM at byte `offset`, via the BAR1
     /// mapping — no CUDA call, sub-µs for small writes.
     pub fn copy_to(&self, offset: usize, src: &[u8]) -> io::Result<()> {
-        if offset + src.len() > self.size {
+        // Checked: `offset + src.len()` wrapping would pass a plain
+        // comparison and then store through `store_ptr + offset` far
+        // outside the BAR1 mapping. This is a safe function, so the
+        // arithmetic is part of what makes it one.
+        if !end_within(offset, src.len(), self.size) {
             return Err(io::Error::other("gdr copy_to out of range"));
         }
         // SAFETY: `offset + src.len() <= size`, so `store_ptr + offset`
@@ -187,7 +209,7 @@ impl GdrMapping {
     /// Read `dst.len()` bytes from the mapped VRAM at byte `offset` back
     /// into `dst`.
     pub fn copy_from(&self, offset: usize, dst: &mut [u8]) -> io::Result<()> {
-        if offset + dst.len() > self.size {
+        if !end_within(offset, dst.len(), self.size) {
             return Err(io::Error::other("gdr copy_from out of range"));
         }
         // SAFETY: `offset + dst.len() <= size`, so `store_ptr + offset`
@@ -205,6 +227,12 @@ impl GdrMapping {
         }
         Ok(())
     }
+}
+
+/// Whether `[offset, offset + len)` lies inside `size`, without the
+/// wrapping a plain `offset + len` comparison admits.
+fn end_within(offset: usize, len: usize, size: usize) -> bool {
+    offset.checked_add(len).is_some_and(|end| end <= size)
 }
 
 impl Drop for GdrMapping {

@@ -99,11 +99,26 @@ impl ManagedFeatures {
     /// Prefetch the pages backing `rows` onto the device on `stream`, so
     /// they are resident before a kernel on the same stream reads them.
     ///
-    /// Each row's byte range is prefetched individually; adjacent rows the
-    /// driver coalesces at page granularity. Call this from the loader
-    /// with the *next* batch's node IDs while the current batch computes.
+    /// Rows are merged into contiguous runs and one prefetch is issued per
+    /// run. A feature row is far smaller than the migration granularity, so
+    /// a call per row would ask the driver to move the same page several
+    /// times over, and a sampled batch of thousands of rows would become
+    /// thousands of driver calls to migrate a handful of distinct pages.
+    /// Sorting first is what makes neighbouring rows adjacent; the batch is
+    /// usually near-sorted already, so it costs little.
+    ///
+    /// Call this from the loader with the *next* batch's node IDs while the
+    /// current batch computes.
     pub fn prefetch_rows(&self, rows: &[u32], stream: &Arc<CudaStream>) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let cu_stream = stream.cu_stream();
+
+        // Bounds-check every row before issuing anything: a rejection
+        // partway through would leave earlier migrations queued on the
+        // stream for a batch the caller is about to treat as failed.
+        let mut sorted: Vec<usize> = Vec::with_capacity(rows.len());
         for &row in rows {
             let row = row as usize;
             let start = row * self.row_bytes;
@@ -113,19 +128,23 @@ impl ManagedFeatures {
                     self.len
                 )));
             }
-            // SAFETY: `[ptr+start, ptr+start+row_bytes)` is inside the
-            // managed allocation; `cu_stream` belongs to this context.
-            let res = unsafe {
-                sys::cuMemPrefetchAsync(
-                    self.ptr + start as u64,
-                    self.row_bytes,
-                    self.device,
-                    cu_stream,
-                )
-            };
-            cuda_ok(res, "cuMemPrefetchAsync")?;
+            sorted.push(start);
+        }
+        for (start, len) in crate::span::coalesce_runs(&mut sorted, self.row_bytes) {
+            self.prefetch_span(start, len, cu_stream)?;
         }
         Ok(())
+    }
+
+    /// Migrate one contiguous byte span onto the device.
+    fn prefetch_span(&self, start: usize, len: usize, cu_stream: sys::CUstream) -> io::Result<()> {
+        // SAFETY: callers pass a span checked against `self.len`, so
+        // `[ptr+start, ptr+start+len)` is inside the managed allocation;
+        // `cu_stream` belongs to this context.
+        let res = unsafe {
+            sys::cuMemPrefetchAsync(self.ptr + start as u64, len, self.device, cu_stream)
+        };
+        cuda_ok(res, "cuMemPrefetchAsync")
     }
 
     fn advise(&self, advice: sys::CUmem_advise, device: sys::CUdevice) -> io::Result<()> {
