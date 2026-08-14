@@ -105,7 +105,11 @@ impl EliasFano {
         self.universe
     }
 
-    /// The `i`-th element, in O(1). Returns `None` for `i >= len`.
+    /// The `i`-th element, or `None` for `i >= len`.
+    ///
+    /// `select` walks the high-bits words from the start, so this is
+    /// O(i/64) — fine for a probe, wrong for a full decode. Use
+    /// [`Self::to_vec`], which is one linear pass, to read the sequence.
     pub fn get(&self, i: usize) -> Option<u64> {
         if i >= self.len {
             return None;

@@ -63,14 +63,22 @@ impl ColdTier {
             Vec::new()
         };
 
+        // One compressor for the whole tier: loading the dictionary digests
+        // it into the encoder's tables, and repeating that per block would
+        // dominate build time on a large store.
+        let mut encoder = if dictionary.is_empty() {
+            None
+        } else {
+            Some(
+                zstd::bulk::Compressor::with_dictionary(level, &dictionary)
+                    .context("zstd compressor")?,
+            )
+        };
         let mut blocks = Vec::with_capacity(raw_blocks.len());
         for raw in &raw_blocks {
-            let compressed = if dictionary.is_empty() {
-                zstd::bulk::compress(raw, level).context("zstd compress")?
-            } else {
-                let mut c = zstd::bulk::Compressor::with_dictionary(level, &dictionary)
-                    .context("zstd compressor")?;
-                c.compress(raw).context("zstd compress (dict)")?
+            let compressed = match encoder.as_mut() {
+                Some(c) => c.compress(raw).context("zstd compress (dict)")?,
+                None => zstd::bulk::compress(raw, level).context("zstd compress")?,
             };
             blocks.push(compressed);
         }
@@ -111,32 +119,56 @@ impl ColdTier {
     /// pays for those blocks only — not the whole tier.
     pub fn gather_rows(&self, rows: &[u32]) -> Result<Vec<u8>> {
         let mut out = vec![0u8; rows.len() * self.row_bytes];
-        // Decompress each needed block once, keyed by block index.
-        let mut cache: std::collections::HashMap<usize, Vec<u8>> = std::collections::HashMap::new();
+        if rows.is_empty() {
+            return Ok(out);
+        }
+        for &row in rows {
+            if row as usize >= self.num_rows {
+                bail!("row {row} out of range (num_rows={})", self.num_rows);
+            }
+        }
+
+        let mut needed: Vec<usize> = rows.iter().map(|&r| r as usize / ROWS_PER_BLOCK).collect();
+        needed.sort_unstable();
+        needed.dedup();
+
+        // Loading a dictionary digests it into the decoder's tables, which
+        // costs more than decoding a block does. Build the decoder once for
+        // the whole gather rather than once per block.
+        let mut decoder = if self.dictionary.is_empty() {
+            None
+        } else {
+            Some(
+                zstd::bulk::Decompressor::with_dictionary(&self.dictionary)
+                    .context("zstd decompressor")?,
+            )
+        };
+
+        let mut cache: std::collections::HashMap<usize, Vec<u8>> =
+            std::collections::HashMap::with_capacity(needed.len());
+        for &block in &needed {
+            let raw = self.decompress_block(block, decoder.as_mut())?;
+            cache.insert(block, raw);
+        }
 
         for (i, &row) in rows.iter().enumerate() {
             let row = row as usize;
-            if row >= self.num_rows {
-                bail!("row {row} out of range (num_rows={})", self.num_rows);
-            }
             let block = row / ROWS_PER_BLOCK;
             let within = row % ROWS_PER_BLOCK;
-
-            let decompressed = match cache.get(&block) {
-                Some(d) => d,
-                None => {
-                    let d = self.decompress_block(block)?;
-                    cache.entry(block).or_insert(d)
-                }
-            };
+            let decompressed = &cache[&block];
             let src = &decompressed[within * self.row_bytes..(within + 1) * self.row_bytes];
             out[i * self.row_bytes..(i + 1) * self.row_bytes].copy_from_slice(src);
         }
         Ok(out)
     }
 
-    /// Decompress one block back to its raw rows.
-    fn decompress_block(&self, block: usize) -> Result<Vec<u8>> {
+    /// Decompress one block back to its raw rows. `decoder` carries the
+    /// dictionary-loaded decompressor when the tier was built with one.
+    fn decompress_block(
+        &self,
+        block: usize,
+        decoder: Option<&mut zstd::bulk::Decompressor<'_>>,
+    ) -> Result<Vec<u8>> {
         let compressed = &self.blocks[block];
         // The final block may be short; every other block is full.
         let rows_here = if block == self.blocks.len() - 1 {
@@ -146,13 +178,11 @@ impl ColdTier {
         };
         let capacity = rows_here * self.row_bytes;
 
-        let raw = if self.dictionary.is_empty() {
-            zstd::bulk::decompress(compressed, capacity).context("zstd decompress")?
-        } else {
-            let mut d = zstd::bulk::Decompressor::with_dictionary(&self.dictionary)
-                .context("zstd decompressor")?;
-            d.decompress(compressed, capacity)
-                .context("zstd decompress (dict)")?
+        let raw = match decoder {
+            Some(d) => d
+                .decompress(compressed, capacity)
+                .context("zstd decompress (dict)")?,
+            None => zstd::bulk::decompress(compressed, capacity).context("zstd decompress")?,
         };
         if raw.len() != capacity {
             bail!(
