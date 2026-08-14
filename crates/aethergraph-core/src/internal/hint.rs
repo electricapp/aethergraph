@@ -192,6 +192,13 @@ pub fn populate_read(addr: *const u8, len: usize) -> bool {
     // constant set on every platform the crate targets, so it is spelled
     // out here.
     const MADV_POPULATE_READ: libc::c_int = 22;
+    // Guard the requested length, not the widened span: `page_span` rounds
+    // an unaligned start down and the end up, so a zero-length request at a
+    // mid-page address widens to a whole page. Populating it would fault in
+    // memory the caller never asked for and report success for a no-op.
+    if len == 0 {
+        return false;
+    }
     let (start, span) = page_span(addr, len);
     if span == 0 {
         return false;
