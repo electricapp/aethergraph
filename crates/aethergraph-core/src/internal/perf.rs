@@ -39,6 +39,12 @@ const fn cache_config(id: u64, op: u64, result: u64) -> u64 {
 }
 
 // perf_event_attr flag bits we set (bitfield word after `config`).
+// Adds `time_enabled` / `time_running` after the value in every read, so a
+// count taken while the PMU was shared can be scaled back to the full
+// measurement window.
+const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
+
 const ATTR_DISABLED: u64 = 1 << 0;
 const ATTR_EXCLUDE_KERNEL: u64 = 1 << 5;
 const ATTR_EXCLUDE_HV: u64 = 1 << 6;
@@ -117,6 +123,13 @@ impl Counter {
             type_,
             size: std::mem::size_of::<PerfEventAttr>() as u32,
             config,
+            // Ask for the enabled/running times alongside each count. A PMU
+            // has few hardware slots, so with several events open the kernel
+            // time-slices them and the raw count covers only the fraction of
+            // the window the event was scheduled. Without these two numbers
+            // that scaling is invisible and a ratio like IPC silently
+            // compares counts taken over different slices.
+            read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
             // Start disabled; count only user space so the numbers reflect
             // the measured code, not surrounding kernel/hypervisor work.
             flags: ATTR_DISABLED | ATTR_EXCLUDE_KERNEL | ATTR_EXCLUDE_HV,
@@ -134,6 +147,11 @@ pub struct CounterReadings {
     pub llc_misses: Option<u64>,
     pub dtlb_misses: Option<u64>,
     pub task_clock_ns: Option<u64>,
+    /// At least one counter shared the PMU with another event and its
+    /// value was extrapolated from the fraction of the window it ran for.
+    /// The numbers are then estimates: treat them as indicative, and open
+    /// fewer counters for a measurement that has to be exact.
+    pub multiplexed: bool,
 }
 
 /// A set of opened counters, measured together around a closure.
@@ -200,7 +218,11 @@ impl CounterSet {
         let mut readings = CounterReadings::default();
         for (c, fd) in &self.fds {
             ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_DISABLE);
-            let value = read_counter(fd.as_raw_fd());
+            let read = read_counter(fd.as_raw_fd());
+            if let Some((_, true)) = read {
+                readings.multiplexed = true;
+            }
+            let value = read.map(|(v, _)| v);
             match c {
                 Counter::Cycles => readings.cycles = value,
                 Counter::Instructions => readings.instructions = value,
@@ -263,16 +285,40 @@ fn open_counter(counter: Counter) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
-fn read_counter(fd: RawFd) -> Option<u64> {
-    let mut buf = [0u8; 8];
-    // SAFETY: reading 8 bytes into a local buffer from a perf event fd,
-    // whose default read format is a single u64 count.
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
-    if n == 8 {
-        Some(u64::from_ne_bytes(buf))
-    } else {
-        None
+/// One counter's value, scaled for PMU multiplexing.
+///
+/// Returns `None` when the read fails or the event never got scheduled at
+/// all (`time_running == 0`), which is not the same as a genuine zero.
+/// `scaled` reports whether the event shared the PMU, meaning the value is
+/// an extrapolation rather than an exact count.
+fn read_counter(fd: RawFd) -> Option<(u64, bool)> {
+    // Layout for read_format = TOTAL_TIME_ENABLED | TOTAL_TIME_RUNNING:
+    // { u64 value; u64 time_enabled; u64 time_running; }
+    let mut buf = [0u8; 24];
+    // SAFETY: reading 24 bytes into a local buffer from a perf event fd
+    // opened with both time fields in its read format.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n != buf.len() as isize {
+        return None;
     }
+    let field = |i: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&buf[i * 8..(i + 1) * 8]);
+        u64::from_ne_bytes(b)
+    };
+    let (value, enabled, running) = (field(0), field(1), field(2));
+    if running == 0 {
+        // Enabled but never scheduled — reporting 0 would read as "this
+        // never happened" rather than "this was not measured".
+        return None;
+    }
+    if running >= enabled {
+        return Some((value, false));
+    }
+    // Extrapolate to the full window: value * enabled / running, in u128 so
+    // a long measurement cannot overflow the intermediate product.
+    let scaled = (value as u128 * enabled as u128 / running as u128).min(u64::MAX as u128) as u64;
+    Some((scaled, true))
 }
 
 fn ioctl(fd: RawFd, request: libc::c_ulong) {

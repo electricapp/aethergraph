@@ -85,7 +85,9 @@ impl PyPerfCounters {
     ///
     /// Keys: cycles, instructions, llc_misses, dtlb_misses,
     /// task_clock_ns (each int or None), plus the derived ipc and
-    /// llc_misses_per_kilo_instruction (float or None).
+    /// llc_misses_per_kilo_instruction (float or None), and multiplexed
+    /// (bool) — True when the PMU was shared and the counts are scaled
+    /// estimates rather than exact totals.
     fn readings(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let Some(r) = self.last else {
             return Ok(None);
@@ -96,6 +98,7 @@ impl PyPerfCounters {
         dict.set_item("llc_misses", r.llc_misses)?;
         dict.set_item("dtlb_misses", r.dtlb_misses)?;
         dict.set_item("task_clock_ns", r.task_clock_ns)?;
+        dict.set_item("multiplexed", r.multiplexed)?;
         dict.set_item("ipc", r.ipc())?;
         dict.set_item(
             "llc_misses_per_kilo_instruction",
