@@ -89,16 +89,57 @@ impl SharedRegion {
     }
 
     /// Map an existing shared region from a received memfd, read-only.
+    /// Takes ownership of `fd`.
     ///
-    /// `fd` must be a memfd of exactly `len` bytes (as advertised by the
-    /// owner alongside the fd). Takes ownership of `fd`.
+    /// `len` is what the owner advertised alongside the fd; it is checked
+    /// against the object rather than trusted. The descriptor arrives over
+    /// a socket, so this is the edge where a shared region becomes a typed
+    /// value, and everything the mapping depends on is established here:
     ///
-    /// # Safety
-    /// `fd` must be a valid memfd received from a trusted owner and `len`
-    /// must match the size the owner created — a wrong `len` maps past the
-    /// object and faults on access.
-    pub unsafe fn from_fd(fd: OwnedFd, len: usize) -> Result<Self> {
+    /// - the object really is `len` bytes, so the mapping cannot run past
+    ///   its end;
+    /// - `F_SEAL_SHRINK` and `F_SEAL_GROW` are already set, so the owner
+    ///   cannot resize it afterwards and turn live reads into `SIGBUS`.
+    ///
+    /// Both are properties of the descriptor itself, which is why this
+    /// needs no `unsafe` obligation from the caller.
+    pub fn from_fd(fd: OwnedFd, len: usize) -> Result<Self> {
         let raw = fd.as_raw_fd();
+
+        // SAFETY: `raw` is a live descriptor owned by `fd`, and `stat` is
+        // fully written by a successful fstat.
+        let actual_len = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(raw, &mut st) != 0 {
+                bail!(
+                    "fstat on received memfd failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            st.st_size
+        };
+        let actual_len = usize::try_from(actual_len).unwrap_or(0);
+        if actual_len != len {
+            bail!("received memfd is {actual_len} bytes, owner advertised {len}");
+        }
+
+        // SAFETY: `raw` is a live descriptor; F_GET_SEALS takes no argument
+        // and returns the seal bits or -1.
+        let seals = unsafe { libc::fcntl(raw, libc::F_GET_SEALS) };
+        if seals < 0 {
+            bail!(
+                "received fd does not support seals, so it is not a memfd: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let required = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
+        if seals & required != required {
+            bail!(
+                "received memfd is not size-sealed (seals {seals:#x}); the owner \
+                 could resize it under this mapping"
+            );
+        }
+
         let base = mmap_fd(raw, len, false)?;
         Ok(Self {
             fd,
@@ -241,6 +282,15 @@ pub fn recv_fd(sock: RawFd) -> Result<OwnedFd> {
         bail!("recvmsg failed: {}", std::io::Error::last_os_error());
     }
 
+    // A peer that sent more descriptors than this buffer holds gets the
+    // excess dropped by the kernel, which flags the message MSG_CTRUNC.
+    // Reading the header out of a truncated buffer would hand back a
+    // half-copied descriptor number, and any fd the kernel did install
+    // beyond the first would leak with nothing owning it.
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        bail!("control message truncated; peer sent more than one descriptor");
+    }
+
     // SAFETY: `msg` was populated by recvmsg; walk its control messages.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
@@ -250,6 +300,15 @@ pub fn recv_fd(sock: RawFd) -> Result<OwnedFd> {
     unsafe {
         if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
             bail!("unexpected control message type");
+        }
+        // Exactly one descriptor's worth of payload: a longer message
+        // carries fds this function would never take ownership of.
+        let expected = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+        if (*cmsg).cmsg_len != expected {
+            bail!(
+                "SCM_RIGHTS payload is {} bytes, expected exactly one descriptor ({expected})",
+                (*cmsg).cmsg_len
+            );
         }
         let mut fd: RawFd = -1;
         std::ptr::copy_nonoverlapping(
@@ -337,13 +396,58 @@ mod tests {
         assert!(raw_dup >= 0, "dup failed");
         // SAFETY: `raw_dup` is a fresh fd we exclusively own.
         let dup = unsafe { OwnedFd::from_raw_fd(raw_dup) };
-        // SAFETY: `dup` is a memfd of the same 4096-byte object.
-        let peer = unsafe { SharedRegion::from_fd(dup, 4096).unwrap() };
+        let peer = SharedRegion::from_fd(dup, 4096).unwrap();
 
         assert_eq!(peer.as_slice(), owner.as_slice(), "peer sees owner writes");
         // A later owner write is visible to the peer with no copy.
         owner.as_mut_slice().unwrap()[0] = 0xAB;
         assert_eq!(peer.as_slice()[0], 0xAB, "live aliasing");
+    }
+
+    /// The advertised length is peer-supplied, so it is checked against
+    /// the object rather than believed. A too-large value would otherwise
+    /// map past the end of the memfd and fault on first touch.
+    #[test]
+    fn from_fd_rejects_a_length_the_object_does_not_have() {
+        let owner = SharedRegion::create(4096).unwrap();
+        // SAFETY: dup of a valid memfd returns a fresh fd or -1.
+        let raw_dup = unsafe { libc::dup(owner.raw_fd()) };
+        assert!(raw_dup >= 0, "dup failed");
+        // SAFETY: `raw_dup` is a fresh fd we exclusively own.
+        let dup = unsafe { OwnedFd::from_raw_fd(raw_dup) };
+
+        let Err(err) = SharedRegion::from_fd(dup, 8192) else {
+            panic!("mapping 8192 bytes of a 4096-byte object must be refused");
+        };
+        assert!(
+            err.to_string().contains("advertised"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Without the size seals the owner could shrink the object after the
+    /// peer maps it, turning every subsequent read into SIGBUS. An unsealed
+    /// descriptor must be refused at attach time.
+    #[test]
+    fn from_fd_rejects_an_unsealed_memfd() {
+        // A plain memfd with no seals added — what `create` deliberately
+        // does not produce.
+        let name = c"aethergraph-unsealed";
+        // SAFETY: `name` is a valid NUL-terminated C string.
+        let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING as u32) };
+        assert!(raw >= 0, "memfd_create failed");
+        // SAFETY: `raw` is a fresh fd we exclusively own.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: `raw` is a live memfd; sizing it is unrelated to sealing.
+        assert_eq!(unsafe { libc::ftruncate(raw, 4096) }, 0, "ftruncate failed");
+
+        let Err(err) = SharedRegion::from_fd(fd, 4096) else {
+            panic!("an unsealed memfd must be refused");
+        };
+        assert!(
+            err.to_string().contains("size-sealed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -358,8 +462,7 @@ mod tests {
 
         send_fd(a.as_raw_fd(), owner.raw_fd()).unwrap();
         let received = recv_fd(b.as_raw_fd()).unwrap();
-        // SAFETY: `received` is the owner's memfd, 8192 bytes.
-        let peer = unsafe { SharedRegion::from_fd(received, 8192).unwrap() };
+        let peer = SharedRegion::from_fd(received, 8192).unwrap();
 
         assert_eq!(peer.as_slice(), &payload[..], "received mapping matches");
 

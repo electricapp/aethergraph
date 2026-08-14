@@ -216,10 +216,10 @@ impl SharedFeatureStore {
 
         let fd: OwnedFd = recv_fd(stream.as_raw_fd())?;
         let payload_len = usize::try_from(geometry.payload_len).context("payload_len")?;
-        // SAFETY: `fd` came from the owner's `send_fd` on this socket, and
-        // `payload_len` is the size the owner sealed the memfd to — the
-        // handshake above validated it against the geometry.
-        let region = unsafe { SharedRegion::from_fd(fd, payload_len)? };
+        // `from_fd` checks the descriptor's own size and seals against the
+        // geometry the owner just sent, so a peer that misreports either is
+        // rejected here rather than at the first faulting read.
+        let region = SharedRegion::from_fd(fd, payload_len)?;
 
         debug!(
             "Attached to shared store: {} nodes x {} dims",
