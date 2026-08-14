@@ -20,13 +20,21 @@ offer — io_uring, O_DIRECT, hugepages and the rest only matter once the
 graph outgrows page cache. Read a loss here as "competitive on table
 stakes", not as the headline.
 
-Treat the ratio as provisional. Three ways of driving GraphBolt's API gave
-4.4x, 8.4x and 4.6x on the same graph: no dedup between layers samples every
+Two stages are timed, and they agree, which is the reason to believe either.
+"sample only" drives each sampler directly; "pipeline" runs each framework's
+own loader end to end, so neither crosses the Python boundary per layer.
+
+Read "sample only" as the cleaner comparison. Our loader keeps one sampler
+thread working ahead of the consumer, while the bare GraphBolt datapipe is
+synchronous — a real architectural difference, but it tilts the pipeline row
+our way. A GraphBolt user would wrap the datapipe in a DataLoader to get the
+same overlap.
+
+Getting here took three wrong harnesses, worth knowing about before writing
+another: skipping dedup between layers makes GraphBolt sample every
 duplicate, `torch.unique` costs more than it saves, and `unique_and_compact`
-is the one its datapipe actually uses. One asymmetry remains — our
-`sample()` does every layer in a single call, while this loop crosses the
-Python boundary once per layer. Closing it means driving `gb.NeighborSampler`
-end to end, which is the next thing to do here.
+is the one its datapipe actually uses. Those three gave 4.4x, 8.4x and 4.6x
+on the same graph.
 
 Requires: aethergraph; torch and dgl for the GraphBolt side.
 
@@ -212,6 +220,96 @@ def bench_graphbolt(
     ]
 
 
+def _pipeline_aethergraph(
+    src: npt.NDArray[np.uint32],
+    dst: npt.NDArray[np.uint32],
+    num_nodes: int,
+    seeds: npt.NDArray[np.uint32],
+    fanout: list[int],
+    batch_size: int,
+    threads: int,
+) -> BenchResult:
+    """One epoch through our loader, timed per batch."""
+    from aethergraph import Graph
+    from aethergraph.pytorch import NeighborLoader
+
+    graph = Graph.from_edges(num_nodes, src, dst)
+    loader = NeighborLoader(
+        graph,
+        num_neighbors=fanout,
+        input_nodes=seeds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=1,
+        prefetch_factor=1,
+    )
+
+    def epoch() -> int:
+        return sum(1 for _ in loader)
+
+    epoch()  # warm up
+    start = time.perf_counter()
+    batches = epoch()
+    elapsed = time.perf_counter() - start
+    us = (elapsed / max(batches, 1)) * 1e6
+    return BenchResult(
+        name="pipeline",
+        framework="AetherGraph",
+        us_per_iter=us,
+        batches_per_sec=1e6 / us,
+        threads=threads,
+        note="NeighborLoader -> PyG Data",
+    )
+
+
+def _pipeline_graphbolt(
+    src: npt.NDArray[np.uint32],
+    dst: npt.NDArray[np.uint32],
+    num_nodes: int,
+    seeds: npt.NDArray[np.uint32],
+    fanout: list[int],
+    batch_size: int,
+    threads: int,
+) -> BenchResult:
+    """One epoch through GraphBolt's own datapipe, timed per batch.
+
+    This is the comparison that removes the per-layer Python boundary: the
+    datapipe walks every layer inside GraphBolt, the way a real user runs it.
+    """
+    import torch
+    from dgl import graphbolt as gb
+
+    order = np.argsort(dst, kind="stable")
+    indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+    np.add.at(indptr, dst[order].astype(np.int64) + 1, 1)
+    np.cumsum(indptr, out=indptr)
+    graph = gb.fused_csc_sampling_graph(
+        torch.from_numpy(indptr),
+        torch.from_numpy(src[order].astype(np.int64)),
+    )
+
+    item_set = gb.ItemSet(torch.from_numpy(seeds.astype(np.int64)), names="seeds")
+
+    def epoch() -> int:
+        pipe = gb.ItemSampler(item_set, batch_size=batch_size)
+        pipe = gb.NeighborSampler(pipe, graph, fanout)
+        return sum(1 for _ in pipe)
+
+    epoch()  # warm up
+    start = time.perf_counter()
+    batches = epoch()
+    elapsed = time.perf_counter() - start
+    us = (elapsed / max(batches, 1)) * 1e6
+    return BenchResult(
+        name="pipeline",
+        framework="GraphBolt",
+        us_per_iter=us,
+        batches_per_sec=1e6 / us,
+        threads=threads,
+        note="ItemSampler -> NeighborSampler",
+    )
+
+
 def _render(results: list[BenchResult]) -> None:
     table = Table(title="AetherGraph vs DGL-GraphBolt")
     table.add_column("stage")
@@ -278,9 +376,18 @@ def main(
         f"{len(src):,}) batch={batch_size} fanout={fan} threads={threads}"
     )
 
+    # One epoch's worth of seeds, walked by each framework's own loader.
+    epoch_seeds = np.arange(min(cfg["nodes"], 16_384), dtype=np.uint32)
+
     results = bench_aethergraph(src, dst, cfg["nodes"], batches, fan, cfg["iters"], threads)
+    results.append(
+        _pipeline_aethergraph(src, dst, cfg["nodes"], epoch_seeds, fan, batch_size, threads)
+    )
     try:
         results += bench_graphbolt(src, dst, cfg["nodes"], batches, fan, cfg["iters"], threads)
+        results.append(
+            _pipeline_graphbolt(src, dst, cfg["nodes"], epoch_seeds, fan, batch_size, threads)
+        )
     except ImportError:
         console.print("[yellow]dgl.graphbolt not installed; AetherGraph numbers only[/]")
 
