@@ -109,8 +109,10 @@ pub struct UringLane {
     pub handle: UringHandle,
     /// Reusable O_DIRECT landing slots.
     pool: Option<AlignedBufferPool>,
-    /// Reusable buffered-I/O landing bytes.
-    scratch: Vec<u8>,
+    /// Reusable buffered-I/O landing bytes, stored as `f32` lanes so the
+    /// region is `f32`-aligned by construction and a decoded batch can be
+    /// read back as `[f32]` without a runtime alignment check.
+    scratch: Vec<f32>,
 }
 
 impl UringLane {
@@ -161,11 +163,25 @@ impl UringLane {
     }
 
     /// The buffered-I/O scratch, grown (never shrunk) to `len` bytes.
+    ///
+    /// The `f32` backing store makes the returned bytes `f32`-aligned, so
+    /// [`scratch_f32`](Self::scratch_f32) can view the same region after a
+    /// read without a fallible cast.
     pub fn scratch(&mut self, len: usize) -> &mut [u8] {
-        if self.scratch.len() < len {
-            self.scratch.resize(len, 0);
+        let lanes = len.div_ceil(std::mem::size_of::<f32>());
+        if self.scratch.len() < lanes {
+            self.scratch.resize(lanes, 0.0);
         }
-        &mut self.scratch[..len]
+        &mut bytemuck::cast_slice_mut::<f32, u8>(&mut self.scratch)[..len]
+    }
+
+    /// The first `lanes` values of the scratch, viewed as `f32`.
+    ///
+    /// Callers land a read through [`scratch`](Self::scratch) first; this
+    /// reads back the same storage. `lanes` must not exceed the lane count
+    /// backing that call.
+    pub fn scratch_f32(&self, lanes: usize) -> &[f32] {
+        &self.scratch[..lanes]
     }
 }
 
@@ -754,6 +770,38 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// The buffered gather reads an F32 batch back out of the scratch as
+    /// `[f32]`, so the byte view must stay `f32`-aligned and the two views
+    /// must describe the same storage. Byte lengths that are not multiples
+    /// of 4 are the case a naive backing store would get wrong.
+    #[test]
+    fn scratch_is_f32_aligned_and_aliases_the_lane_view() {
+        // Sandboxed CI runners can refuse io_uring entirely; the scratch
+        // invariant is unrelated to the ring, so skip rather than fail.
+        let Ok(handle) = UringHandle::new(8, 0) else {
+            eprintln!("io_uring unavailable; skipping scratch alignment check");
+            return;
+        };
+        let mut lane = UringLane::new(handle);
+
+        for len in [1usize, 4, 7, 4096, 4097] {
+            let bytes = lane.scratch(len);
+            assert_eq!(bytes.len(), len);
+            assert_eq!(
+                bytes.as_ptr() as usize % std::mem::align_of::<f32>(),
+                0,
+                "scratch of {len} bytes is not f32-aligned"
+            );
+        }
+
+        // Writing through the byte view must be visible through the lane
+        // view: they are the same allocation, not a copy.
+        let written: [f32; 3] = [-1.0, 2.5, 1024.0];
+        lane.scratch(12)
+            .copy_from_slice(bytemuck::cast_slice(&written));
+        assert_eq!(lane.scratch_f32(3), &written);
+    }
 
     #[test]
     fn test_open_fallback() {
