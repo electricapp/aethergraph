@@ -620,36 +620,16 @@ impl<'a> NeighborSampler<'a> {
         // path; the Induced filter builds a transient membership map for
         // itself alone and drops it once the edges are filtered.
         let (edge_src, edge_dst, edge_ids, src_local, dst_local) = match self.config.subgraph_type {
-            SubgraphType::Directional => (edge_src, edge_dst, edge_ids, src_local, dst_local),
-            SubgraphType::Induced => {
-                // Filter to only edges where both endpoints are in the
-                // node set. `member` serves as the node set — O(1)
-                // lookup. The local arrays are filtered in lockstep.
-                let member: FxHashSet<NodeId> = node_vec.iter().copied().collect();
-
-                let mut new_src = Vec::with_capacity(edge_src.len());
-                let mut new_dst = Vec::with_capacity(edge_dst.len());
-                let mut new_ids = if self.config.track_edge_ids {
-                    Vec::with_capacity(edge_ids.len())
-                } else {
-                    Vec::new()
-                };
-                let mut new_src_local = Vec::with_capacity(src_local.len());
-                let mut new_dst_local = Vec::with_capacity(dst_local.len());
-
-                for i in 0..edge_src.len() {
-                    if member.contains(&edge_src[i]) && member.contains(&edge_dst[i]) {
-                        new_src.push(edge_src[i]);
-                        new_dst.push(edge_dst[i]);
-                        if self.config.track_edge_ids {
-                            new_ids.push(edge_ids[i]);
-                        }
-                        new_src_local.push(src_local[i]);
-                        new_dst_local.push(dst_local[i]);
-                    }
-                }
-
-                (new_src, new_dst, new_ids, new_src_local, new_dst_local)
+            // Induced keeps edges whose endpoints are both in the sampled
+            // node set, which every emitted edge already satisfies: a source
+            // is a frontier node, and a destination is registered by
+            // `insert_node_frontier` in the same step that pushes the edge.
+            // The set membership test is therefore decided at emit time, and
+            // re-deciding it here would cost a node-set build plus two hash
+            // probes per edge to retain every edge. `induced_keeps_every_edge`
+            // pins the invariant.
+            SubgraphType::Directional | SubgraphType::Induced => {
+                (edge_src, edge_dst, edge_ids, src_local, dst_local)
             }
             SubgraphType::Bidirectional => {
                 // Add reverse edges
@@ -995,8 +975,12 @@ impl<'a> NeighborSampler<'a> {
             self.cumsum_buf.push(total);
         }
 
+        // One reciprocal for the whole node instead of a divide per draw:
+        // `total / u64::MAX` is loop-invariant, and a divide costs several
+        // times a multiply on every target here.
+        let scale = total / (u64::MAX as f64);
         for _ in 0..k {
-            let u = (self.rng.next_u64() as f64) / (u64::MAX as f64) * total;
+            let u = (self.rng.next_u64() as f64) * scale;
             let idx = self.cumsum_buf.partition_point(|&c| c <= u).min(n - 1);
             self.sample_buf.push((neighbors[idx], idx));
         }
@@ -1444,6 +1428,60 @@ mod tests {
 
         assert!(subgraph.num_edges() > 0);
         assert!(subgraph.edge_ids.is_empty());
+    }
+
+    /// Every emitted endpoint is registered in the node set as the edge is
+    /// pushed, so the Induced membership filter can never drop an edge.
+    /// `sample_neighbors_inner` relies on this to skip the filter entirely;
+    /// if an emit path ever pushes an edge without registering both
+    /// endpoints, this fails instead of silently returning stale edges.
+    #[test]
+    fn induced_keeps_every_edge() {
+        let mut edges = Vec::new();
+        for src in 0..200u32 {
+            for step in 1..=7u32 {
+                edges.push((src, (src * 7 + step * 13) % 200));
+            }
+        }
+        let graph = Graph::from_edges(200, &edges, None).unwrap();
+
+        let base = SamplingConfig {
+            fanout: vec![4, 3, 2],
+            replace: false,
+            seed: Some(7),
+            max_degree: None,
+            cumulative: false,
+            weighted: false,
+            subgraph_type: SubgraphType::Induced,
+            track_edge_ids: true,
+            temporal_strategy: None,
+            disjoint: false,
+            deterministic: false,
+            telemetry: None,
+        };
+        let seeds: Vec<NodeId> = (0..16).collect();
+
+        let mut induced = NeighborSampler::new(&graph, base.clone());
+        let induced = induced.sample_neighbors(&seeds);
+
+        let member: FxHashSet<NodeId> = induced.nodes.iter().copied().collect();
+        assert!(!induced.edge_src.is_empty());
+        for (&src, &dst) in induced.edge_src.iter().zip(induced.edge_dst.iter()) {
+            assert!(member.contains(&src), "source {src} missing from node set");
+            assert!(member.contains(&dst), "dest {dst} missing from node set");
+        }
+
+        // Same seed, same RNG stream: the two modes must agree edge for edge.
+        let directional_cfg = SamplingConfig {
+            subgraph_type: SubgraphType::Directional,
+            ..base
+        };
+        let mut directional = NeighborSampler::new(&graph, directional_cfg);
+        let directional = directional.sample_neighbors(&seeds);
+
+        assert_eq!(induced.edge_src, directional.edge_src);
+        assert_eq!(induced.edge_dst, directional.edge_dst);
+        assert_eq!(induced.edge_ids, directional.edge_ids);
     }
 
     #[test]
