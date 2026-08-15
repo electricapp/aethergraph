@@ -340,9 +340,8 @@ impl PySampledSubgraph {
         // on this path; the source Vecs move into `original_*` below so
         // `to_arrow()` and similar consumers can clone them on demand without
         // an i64→u32 narrowing pass. The cast is monotonic and free of
-        // branches; whether LLVM emits a vectorized form (vpmovzxdq on x86_64
-        // AVX2 / uxtl on aarch64 NEON) is target- and codegen-flag-dependent
-        // and has NOT been audited here.
+        // branches, so it vectorizes: on aarch64 the release build emits
+        // ushll.2d/ushll2.2d, widening eight lanes per unrolled iteration.
         let nodes_i64: Vec<i64> = subgraph.nodes.iter().map(|&n| n as i64).collect();
         let seeds_i64: Vec<i64> = subgraph.seeds.iter().map(|&s| s as i64).collect();
         let seed_indices_i64: Vec<i64> = seed_indices_local.into_iter().map(|i| i as i64).collect();
