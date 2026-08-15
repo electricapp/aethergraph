@@ -76,10 +76,10 @@ fn build_graph() -> Graph {
 }
 
 /// A sampler reused across same-shaped batches reaches a steady state where no
-/// output buffer needs to grow. The bound is not zero because the returned
-/// `SampledSubgraph` also carries small per-hop statistics vectors; it is far
-/// below the count a doubling ladder produces (roughly five reallocations per
-/// output array, six or more arrays).
+/// output buffer needs to grow at all. Sizing each replacement at an exact fit
+/// would not achieve that: sampling is randomized, so a call that produces one
+/// more element than the last would pay a full-array copy, on roughly half of
+/// all calls. The reserved headroom is what drives this to zero.
 #[test]
 fn steady_state_sampling_does_not_regrow_output_buffers() {
     let graph = build_graph();
@@ -93,15 +93,19 @@ fn steady_state_sampling_does_not_regrow_output_buffers() {
 
     let seeds: Vec<NodeId> = (0..1024).map(|i| (i * 97) % NUM_NODES as NodeId).collect();
 
-    // Two warm-up calls: the first observes the batch shape, the second is
-    // already sized for it. Both are outside the measured window.
+    // Warm up outside the measured window. The output buffers are sized from
+    // the previous call and settle after one, but the internal scratch the
+    // sampler keeps across calls (the accumulating frontier) only reaches its
+    // high-water mark after a few batches have varied around it.
     let warm = sampler.sample_neighbors(&seeds);
     assert!(
         warm.num_edges() > 50_000,
         "batch too small to exercise regrowth: {} edges",
         warm.num_edges(),
     );
-    let _ = sampler.sample_neighbors(&seeds);
+    for _ in 0..8 {
+        let _ = sampler.sample_neighbors(&seeds);
+    }
 
     COUNTING.store(true, Ordering::Relaxed);
     REALLOCS.store(0, Ordering::Relaxed);
@@ -114,9 +118,10 @@ fn steady_state_sampling_does_not_regrow_output_buffers() {
         "steady-state batch shrank unexpectedly: {} edges",
         subgraph.num_edges(),
     );
-    assert!(
-        reallocs <= 4,
+    assert_eq!(
+        reallocs, 0,
         "steady-state sampling regrew output buffers {reallocs} times; the \
-         per-call buffers are not being sized from the previous call",
+         per-call buffers are not being sized from the previous call plus \
+         headroom",
     );
 }

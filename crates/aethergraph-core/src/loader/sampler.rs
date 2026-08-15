@@ -9,6 +9,7 @@
 use crate::graph::{Graph, NodeId};
 use crate::internal::genstamp::{FRONTIER_PREFETCH_DIST, FloydStamps, GenDedup, GenSlots, WyRand};
 use crate::internal::telemetry::{SamplingTelemetry, SamplingTimer};
+use crate::loader::planned_capacity;
 
 /// Temporal sampling strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,8 +609,8 @@ impl<'a> NeighborSampler<'a> {
         // three-hop batch emits hundreds of thousands of edges, and starting
         // each of the five parallel edge arrays at a small constant climbs a
         // realloc-and-copy ladder on every call.
-        let node_capacity = self.node_vec.len().max(MIN_NODE_CAPACITY);
-        let edge_capacity = self.edge_src_buf.len().max(MIN_EDGE_CAPACITY);
+        let node_capacity = planned_capacity(self.node_vec.len(), MIN_NODE_CAPACITY);
+        let edge_capacity = planned_capacity(self.edge_src_buf.len(), MIN_EDGE_CAPACITY);
 
         let mut node_vec = Vec::with_capacity(node_capacity);
         std::mem::swap(&mut self.node_vec, &mut node_vec);

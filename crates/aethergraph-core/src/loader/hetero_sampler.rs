@@ -11,6 +11,7 @@
 use crate::graph::hetero::{EdgeTypeId, HeteroGraph, NodeTypeId};
 use crate::graph::{CsrView, NodeId};
 use crate::internal::genstamp::{FRONTIER_PREFETCH_DIST, FloydStamps, GenDedup, GenSlots, WyRand};
+use crate::loader::planned_capacity;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Node types with at most this many nodes get the dense dedup table
@@ -254,7 +255,7 @@ impl<'a> HeteroNeighborSampler<'a> {
 
         let mut nodes = Vec::with_capacity(num_nt);
         for i in 0..num_nt {
-            let mut swap = Vec::with_capacity(self.node_vecs[i].len());
+            let mut swap = Vec::with_capacity(planned_capacity(self.node_vecs[i].len(), 0));
             std::mem::swap(&mut self.node_vecs[i], &mut swap);
             nodes.push(swap);
         }
@@ -262,8 +263,8 @@ impl<'a> HeteroNeighborSampler<'a> {
         let mut edge_src = Vec::with_capacity(num_et);
         let mut edge_dst = Vec::with_capacity(num_et);
         for i in 0..num_et {
-            let produced = self.edge_src_buf[i].len();
-            let (mut s, mut d) = (Vec::with_capacity(produced), Vec::with_capacity(produced));
+            let planned = planned_capacity(self.edge_src_buf[i].len(), 0);
+            let (mut s, mut d) = (Vec::with_capacity(planned), Vec::with_capacity(planned));
             std::mem::swap(&mut self.edge_src_buf[i], &mut s);
             std::mem::swap(&mut self.edge_dst_buf[i], &mut d);
             edge_src.push(s);
