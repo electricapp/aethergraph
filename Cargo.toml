@@ -76,6 +76,14 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Same codegen as `release`, but keeping the symbol table and line tables so a
+# sampling profiler can attribute benchmark time to source lines. Debug info
+# does not reach the optimizer, so timings match `release` exactly.
+[profile.bench]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
