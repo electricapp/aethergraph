@@ -243,20 +243,18 @@ impl<'a> HeteroNeighborSampler<'a> {
         }
 
         // Build output: hand the filled per-type buffers to the caller and
-        // swap fresh ones back in — but only where something was actually
-        // produced. An empty buffer swaps for `Vec::new()` (no allocation),
-        // so wide schemas don't pay an allocation per untouched type per
-        // batch.
+        // swap fresh ones back in, each sized at the length its buffer just
+        // reached. A steady stream of same-shaped batches therefore allocates
+        // each per-type array once instead of growing into it every call, and
+        // a type left untouched asks for capacity 0 — which `Vec` serves
+        // without allocating, so wide schemas still pay nothing for the types
+        // a batch never visits.
         let num_nt = self.node_vecs.len();
         let num_et = self.edge_src_buf.len();
 
         let mut nodes = Vec::with_capacity(num_nt);
         for i in 0..num_nt {
-            let mut swap = if self.node_vecs[i].is_empty() {
-                Vec::new()
-            } else {
-                Vec::with_capacity(256)
-            };
+            let mut swap = Vec::with_capacity(self.node_vecs[i].len());
             std::mem::swap(&mut self.node_vecs[i], &mut swap);
             nodes.push(swap);
         }
@@ -264,11 +262,8 @@ impl<'a> HeteroNeighborSampler<'a> {
         let mut edge_src = Vec::with_capacity(num_et);
         let mut edge_dst = Vec::with_capacity(num_et);
         for i in 0..num_et {
-            let (mut s, mut d) = if self.edge_src_buf[i].is_empty() {
-                (Vec::new(), Vec::new())
-            } else {
-                (Vec::with_capacity(1024), Vec::with_capacity(1024))
-            };
+            let produced = self.edge_src_buf[i].len();
+            let (mut s, mut d) = (Vec::with_capacity(produced), Vec::with_capacity(produced));
             std::mem::swap(&mut self.edge_src_buf[i], &mut s);
             std::mem::swap(&mut self.edge_dst_buf[i], &mut d);
             edge_src.push(s);

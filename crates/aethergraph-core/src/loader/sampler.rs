@@ -236,6 +236,12 @@ pub struct NeighborSampler<'a> {
     cumsum_buf: Vec<f64>,
 }
 
+/// Floor capacities for the output buffers swapped in after a sampling call
+/// hands its filled ones to the caller. Above these floors the replacement is
+/// sized from the count the call just produced.
+const MIN_NODE_CAPACITY: usize = 512;
+const MIN_EDGE_CAPACITY: usize = 2048;
+
 impl<'a> NeighborSampler<'a> {
     /// Creates a new neighbor sampler.
     pub fn new(graph: &'a Graph, config: SamplingConfig) -> Self {
@@ -594,25 +600,41 @@ impl<'a> NeighborSampler<'a> {
         // endpoint indices) are therefore freshly allocated on every call;
         // only the internal scratch (frontiers, dedup arrays, sample buffers)
         // is reset and reused.
-        let mut node_vec = Vec::with_capacity(512);
+        //
+        // Each replacement is sized from what this call just produced — the
+        // buffer's own length, read before it is swapped away. A sampler is
+        // reused across batches of near-identical shape, so that count
+        // predicts the next call far better than a fixed constant does: a
+        // three-hop batch emits hundreds of thousands of edges, and starting
+        // each of the five parallel edge arrays at a small constant climbs a
+        // realloc-and-copy ladder on every call.
+        let node_capacity = self.node_vec.len().max(MIN_NODE_CAPACITY);
+        let edge_capacity = self.edge_src_buf.len().max(MIN_EDGE_CAPACITY);
+
+        let mut node_vec = Vec::with_capacity(node_capacity);
         std::mem::swap(&mut self.node_vec, &mut node_vec);
 
-        let mut edge_src = Vec::with_capacity(2048);
+        let mut edge_src = Vec::with_capacity(edge_capacity);
         std::mem::swap(&mut self.edge_src_buf, &mut edge_src);
 
-        let mut edge_dst = Vec::with_capacity(2048);
+        let mut edge_dst = Vec::with_capacity(edge_capacity);
         std::mem::swap(&mut self.edge_dst_buf, &mut edge_dst);
 
-        let mut edge_ids = Vec::with_capacity(if self.config.track_edge_ids { 2048 } else { 0 });
+        let mut edge_ids = Vec::with_capacity(if self.config.track_edge_ids {
+            edge_capacity
+        } else {
+            0
+        });
         std::mem::swap(&mut self.edge_ids_buf, &mut edge_ids);
 
-        let mut src_local = Vec::with_capacity(2048);
+        let mut src_local = Vec::with_capacity(edge_capacity);
         std::mem::swap(&mut self.src_local_buf, &mut src_local);
 
-        let mut dst_local = Vec::with_capacity(2048);
+        let mut dst_local = Vec::with_capacity(edge_capacity);
         std::mem::swap(&mut self.dst_local_buf, &mut dst_local);
 
-        let mut seed_locals = Vec::with_capacity(512);
+        // Exactly one local index per seed, so this size is known, not predicted.
+        let mut seed_locals = Vec::with_capacity(seeds.len());
         std::mem::swap(&mut self.seed_locals_buf, &mut seed_locals);
 
         // Apply subgraph_type post-processing. Local endpoint indices were
