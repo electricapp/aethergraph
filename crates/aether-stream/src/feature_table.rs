@@ -149,15 +149,17 @@ unsafe fn volatile_store_payload(src: &[f32], dst: *mut f32) {
 /// `src` must be valid for `dst.len()` f32 reads and 8-byte aligned.
 #[inline]
 unsafe fn volatile_load_payload(src: *const f32, dst: &mut [f32]) {
-    let pairs = dst.len() / 2;
     let src64 = src as *const u64;
-    for i in 0..pairs {
-        // SAFETY: `i < pairs`, so the word lies within the payload.
+    // `chunks_exact_mut` carries the pair length in the type, so the two
+    // lane stores need no bounds check and the tail is what remains.
+    for (i, lanes) in dst.chunks_exact_mut(2).enumerate() {
+        // SAFETY: the chunk iterator yields one pair per 8-byte word of the
+        // payload, so `i` stays within it.
         let p = unsafe { src64.add(i) };
         // SAFETY: `src` is valid and 8-aligned per the contract.
         let word = unsafe { p.read_volatile() };
-        dst[2 * i] = f32::from_bits(word as u32);
-        dst[2 * i + 1] = f32::from_bits((word >> 32) as u32);
+        lanes[0] = f32::from_bits(word as u32);
+        lanes[1] = f32::from_bits((word >> 32) as u32);
     }
     if dst.len() % 2 == 1 {
         let last = dst.len() - 1;
