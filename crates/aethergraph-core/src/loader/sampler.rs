@@ -243,6 +243,11 @@ pub struct NeighborSampler<'a> {
 const MIN_NODE_CAPACITY: usize = 512;
 const MIN_EDGE_CAPACITY: usize = 2048;
 
+/// Largest graph that gets the dense per-node dedup table, at one `u64` slot
+/// per node — a 64 MiB allocation at this bound. Past it the sampler switches
+/// to a hash map, whose footprint follows the sample rather than the graph.
+const DENSE_DEDUP_MAX_NODES: usize = 8 << 20;
+
 impl<'a> NeighborSampler<'a> {
     /// Creates a new neighbor sampler.
     pub fn new(graph: &'a Graph, config: SamplingConfig) -> Self {
@@ -255,20 +260,23 @@ impl<'a> NeighborSampler<'a> {
         // Pre-allocate with typical sizes
         let max_fanout = config.fanout.iter().max().copied().unwrap_or(25);
 
-        // Use direct array when the expected sample is a large fraction of the graph.
-        // Direct array: O(1) lookup, but 8 bytes/node upfront → cache pressure for small samples.
-        // HashMap: O(1) amortized, grows with sample size → better when sample << graph.
+        // Dense dedup probes one u64 slot with a single load and resets with a
+        // generation bump; the map pays a hash and a control-byte scan per
+        // probe. The dense table wins at every sample density measured,
+        // including a 16-seed one-hop batch on a 4M-node graph — the case a
+        // density rule would hand to the map, where dense tracks a few hundred
+        // nodes inside a 32 MB allocation and is still faster. The table is
+        // allocated zero-filled, so slots the sample never touches are never
+        // faulted in: what an oversized table costs is address space, not
+        // resident memory.
         //
-        // Heuristic: estimate max sample size from fanout and a typical batch.
-        // If sample/graph > 1%, direct array wins (sequential gen-tag check).
-        // Otherwise HashMap avoids polluting caches with 8MB of mostly-untouched arrays.
+        // The bound is therefore a memory decision rather than a speed one.
+        // Scattered probes into a large table fault a full page per distinct
+        // node touched, so worst-case residency is the whole table, and a
+        // sampler is constructed per rayon chunk — the table is multiplied by
+        // the thread count.
         let num_nodes = graph.num_nodes();
-        let estimated_sample: usize = config
-            .fanout
-            .iter()
-            .fold(128usize, |acc, &f| acc.saturating_mul(f).min(num_nodes));
-        let use_direct =
-            num_nodes <= 100_000 || (estimated_sample as f64 / num_nodes as f64) > 0.01;
+        let use_direct = num_nodes <= DENSE_DEDUP_MAX_NODES;
         Self {
             graph,
             config,

@@ -113,10 +113,36 @@ fn bench_scale_sampling(c: &mut Criterion, graph: &Graph) {
     group.finish();
 }
 
+/// A batch small enough that the sample touches a negligible fraction of the
+/// graph. This is the case a dense per-node dedup table is meant to lose: it
+/// reserves eight bytes for every node in the graph to track a few hundred.
+fn bench_sparse_batch(c: &mut Criterion, graph: &Graph) {
+    let mut rng = StdRng::seed_from_u64(0xD00D);
+    let seeds: Vec<NodeId> = (0..16)
+        .map(|_| rng.random_range(0..NUM_NODES as NodeId))
+        .collect();
+
+    let config = SamplingConfig {
+        fanout: vec![10],
+        replace: false,
+        seed: Some(42),
+        ..Default::default()
+    };
+
+    let mut group = c.benchmark_group("scale_sparse");
+    group.sample_size(30);
+    group.bench_function("sixteen_seeds_one_hop", |b| {
+        let mut sampler = NeighborSampler::new(graph, config.clone());
+        b.iter(|| black_box(sampler.sample_neighbors(black_box(&seeds))));
+    });
+    group.finish();
+}
+
 fn bench_all(c: &mut Criterion) {
     let graph = build_graph();
     bench_cold_probe(c, &graph);
     bench_scale_sampling(c, &graph);
+    bench_sparse_batch(c, &graph);
 }
 
 criterion_group!(benches, bench_all);
