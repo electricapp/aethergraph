@@ -72,3 +72,11 @@ harness = false
 [[bench]]
 name = "hetero_benchmarks"
 harness = false
+
+[[bench]]
+name = "feature_gather"
+harness = false
+
+[[bench]]
+name = "offset_width"
+harness = false

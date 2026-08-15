@@ -9,44 +9,74 @@
 //! baseline NEON, present on every aarch64 CPU, so that path dispatches
 //! unconditionally.
 
-/// Convert little-endian f16 bytes into f32 values.
-///
-/// `src.len()` must be exactly `2 * dst.len()`.
+/// An f16 to f32 converter with its SIMD dispatch already resolved.
 ///
 /// On x86-64 with F16C (any CPU from ~2013 on), eight elements convert per
 /// `vcvtph2ps` — order-of-magnitude faster than the per-element software
 /// conversion the scalar path performs. On aarch64, `fcvtl`/`fcvtl2`
 /// convert eight elements per iteration unconditionally.
-pub fn f16_le_to_f32(src: &[u8], dst: &mut [f32]) {
-    assert_eq!(
-        src.len(),
-        dst.len() * 2,
-        "f16 source byte length {} != 2 x destination length {}",
-        src.len(),
-        dst.len()
-    );
-
+///
+/// Choosing between those paths on x86-64 is a runtime CPU query. Asking it
+/// per row costs a cached lookup and a branch thousands of times per batch
+/// and leaves the decision opaque inside the loop; resolving once at the
+/// batch boundary reduces it to a register-held flag. On aarch64 the vector
+/// path is baseline, so this carries no state and `convert` compiles to a
+/// direct call.
+///
+/// Resolve one per batch — not per row — and pass it down.
+#[derive(Clone, Copy, Debug)]
+pub struct F16Decoder {
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("f16c") && std::arch::is_x86_feature_detected!("avx")
-        {
-            // SAFETY: the required target features were verified at runtime
-            // immediately above; slice lengths were asserted at entry.
-            unsafe { f16_le_to_f32_f16c(src, dst) };
-            return;
+    f16c: bool,
+}
+
+impl F16Decoder {
+    /// Perform the CPU feature query once.
+    #[inline]
+    pub fn resolve() -> Self {
+        Self {
+            #[cfg(target_arch = "x86_64")]
+            f16c: std::arch::is_x86_feature_detected!("f16c")
+                && std::arch::is_x86_feature_detected!("avx"),
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: `neon` is baseline for every aarch64 target, so the
-        // feature requirement holds statically; slice lengths were
-        // asserted at entry.
-        unsafe { f16_le_to_f32_neon(src, dst) }
-    }
+    /// Convert little-endian f16 bytes into f32 values.
+    ///
+    /// `src.len()` must be exactly `2 * dst.len()`.
+    #[inline(always)]
+    pub fn convert(self, src: &[u8], dst: &mut [f32]) {
+        assert_eq!(
+            src.len(),
+            dst.len() * 2,
+            "f16 source byte length {} != 2 x destination length {}",
+            src.len(),
+            dst.len()
+        );
 
-    #[cfg(not(target_arch = "aarch64"))]
-    f16_le_to_f32_scalar(src, dst);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.f16c {
+                // SAFETY: `resolve` verified f16c and avx are present, and
+                // that answer cannot change for the life of the process;
+                // slice lengths were asserted at entry.
+                unsafe { f16_le_to_f32_f16c(src, dst) };
+            } else {
+                f16_le_to_f32_scalar(src, dst);
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: `neon` is baseline for every aarch64 target, so the
+            // feature requirement holds statically; slice lengths were
+            // asserted at entry.
+            unsafe { f16_le_to_f32_neon(src, dst) }
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        f16_le_to_f32_scalar(src, dst);
+    }
 }
 
 #[inline]
@@ -142,7 +172,7 @@ mod tests {
             let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
 
             let mut out = vec![0.0f32; len];
-            f16_le_to_f32(&bytes, &mut out);
+            F16Decoder::resolve().convert(&bytes, &mut out);
 
             for (i, (&v, &o)) in values.iter().zip(out.iter()).enumerate() {
                 assert_eq!(v.to_f32(), o, "lane {i} of {len}");
@@ -158,7 +188,7 @@ mod tests {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         let mut dispatched = vec![0.0f32; values.len()];
-        f16_le_to_f32(&bytes, &mut dispatched);
+        F16Decoder::resolve().convert(&bytes, &mut dispatched);
 
         let mut scalar = vec![0.0f32; values.len()];
         f16_le_to_f32_scalar(&bytes, &mut scalar);

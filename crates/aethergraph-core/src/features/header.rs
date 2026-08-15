@@ -33,18 +33,24 @@ impl FeatureDtype {
         }
     }
 
-    /// Decode a little-endian feature row (or any contiguous run of rows)
-    /// from `src` into `dst`.
+    /// Decode one row, resolving the dispatch inline.
     ///
-    /// F32 payloads are a straight byte copy into the `f32` destination
-    /// (no source-alignment requirement); F16 payloads upcast through the
-    /// SIMD-dispatched converter. `src.len()` must equal
-    /// `dst.len() * self.element_size()` — both branches panic otherwise.
+    /// For loops over many rows, hoist [`FeatureDtype::row_decoder`] out of
+    /// the loop instead.
     #[inline]
     pub(crate) fn decode_row(self, src: &[u8], dst: &mut [f32]) {
+        self.row_decoder().decode_row(src, dst)
+    }
+
+    /// Resolve the row decoder once, for loops that decode many rows.
+    ///
+    /// The F16 branch carries a runtime CPU dispatch; hoisting it to the
+    /// top of a batch keeps it off the per-row path.
+    #[inline]
+    pub(crate) fn row_decoder(self) -> RowDecoder {
         match self {
-            Self::F32 => bytemuck::cast_slice_mut::<f32, u8>(dst).copy_from_slice(src),
-            Self::F16 => crate::internal::simd::f16_le_to_f32(src, dst),
+            Self::F32 => RowDecoder::F32,
+            Self::F16 => RowDecoder::F16(crate::internal::simd::F16Decoder::resolve()),
         }
     }
 
@@ -53,6 +59,33 @@ impl FeatureDtype {
             0 => Ok(Self::F32),
             1 => Ok(Self::F16),
             other => anyhow::bail!("unknown feature dtype tag: {}", other),
+        }
+    }
+}
+
+/// A [`FeatureDtype`] with its SIMD dispatch already resolved.
+///
+/// Resolve one per batch via [`FeatureDtype::row_decoder`] and call
+/// [`RowDecoder::decode_row`] per row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RowDecoder {
+    F32,
+    F16(crate::internal::simd::F16Decoder),
+}
+
+impl RowDecoder {
+    /// Decode a little-endian feature row (or any contiguous run of rows)
+    /// from `src` into `dst`.
+    ///
+    /// F32 payloads are a straight byte copy into the `f32` destination (no
+    /// source-alignment requirement); F16 payloads upcast through the
+    /// resolved converter. `src.len()` must equal `dst.len()` times the
+    /// element size — both branches panic otherwise.
+    #[inline(always)]
+    pub(crate) fn decode_row(self, src: &[u8], dst: &mut [f32]) {
+        match self {
+            Self::F32 => bytemuck::cast_slice_mut::<f32, u8>(dst).copy_from_slice(src),
+            Self::F16(conv) => conv.convert(src, dst),
         }
     }
 }
