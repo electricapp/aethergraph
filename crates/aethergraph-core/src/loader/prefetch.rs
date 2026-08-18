@@ -47,7 +47,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
@@ -169,17 +169,18 @@ impl std::error::Error for PrefetchError {
 
 /// Runs a worker body, recording a panic payload or error into `fault` so the
 /// consumer can report why the result channel disconnected.
-fn run_worker(fault: &Mutex<Option<String>>, body: impl FnOnce() -> anyhow::Result<()>) {
+fn run_worker(fault: &OnceLock<String>, body: impl FnOnce() -> anyhow::Result<()>) {
     let message = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(Ok(())) => return,
         Ok(Err(e)) => format!("{e:#}"),
         Err(payload) => panic_message(payload.as_ref()),
     };
     warn!("prefetch worker fault: {}", message);
-    fault
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert(message);
+    // First fault wins. `set` returning Err means another worker already
+    // recorded one, which is the same outcome the old `get_or_insert` had —
+    // and unlike a mutex there is no poisoning to unwrap past, since a
+    // panic here cannot leave the slot half-written.
+    let _ = fault.set(message);
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -709,7 +710,7 @@ pub struct NeighborLoader {
     /// Feature dimension (if features are being loaded)
     feature_dim: Option<usize>,
     /// Why a worker exited on its own (captured panic or error), if it did
-    worker_fault: Arc<Mutex<Option<String>>>,
+    worker_fault: Arc<OnceLock<String>>,
 }
 
 impl NeighborLoader {
@@ -759,7 +760,7 @@ impl NeighborLoader {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
-        let worker_fault = Arc::new(Mutex::new(None));
+        let worker_fault = Arc::new(OnceLock::new());
 
         let mut handles = Vec::with_capacity(sampler_threads);
         for t in 0..sampler_threads {
@@ -843,7 +844,7 @@ impl NeighborLoader {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
-        let worker_fault = Arc::new(Mutex::new(None));
+        let worker_fault = Arc::new(OnceLock::new());
 
         let mut handles = Vec::with_capacity(sampler_threads + 1);
         for t in 0..sampler_threads {
@@ -1011,7 +1012,7 @@ impl NeighborLoader {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
-        let worker_fault = Arc::new(Mutex::new(None));
+        let worker_fault = Arc::new(OnceLock::new());
 
         let feature_dim = feature_store.as_ref().map(|s| s.feature_dim());
         let path = graph_path.to_path_buf();
@@ -1130,11 +1131,7 @@ impl NeighborLoader {
             Ok(None)
         } else {
             Err(PrefetchError::WorkerExited {
-                message: self
-                    .worker_fault
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
+                message: self.worker_fault.get().cloned(),
             })
         }
     }
@@ -1550,7 +1547,7 @@ pub struct HeteroNeighborLoader {
     /// Prefetch depth
     prefetch_depth: usize,
     /// Why a worker exited on its own (captured panic or error), if it did
-    worker_fault: Arc<Mutex<Option<String>>>,
+    worker_fault: Arc<OnceLock<String>>,
 }
 
 impl HeteroNeighborLoader {
@@ -1614,7 +1611,7 @@ impl HeteroNeighborLoader {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PrefetchStats::default());
-        let worker_fault = Arc::new(Mutex::new(None));
+        let worker_fault = Arc::new(OnceLock::new());
 
         let mut handles = Vec::with_capacity(sampler_threads);
         for t in 0..sampler_threads {
@@ -1732,11 +1729,7 @@ impl HeteroNeighborLoader {
             Ok(None)
         } else {
             Err(PrefetchError::WorkerExited {
-                message: self
-                    .worker_fault
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
+                message: self.worker_fault.get().cloned(),
             })
         }
     }
@@ -2260,7 +2253,7 @@ mod tests {
         // so the consumer sees the panic message.
         let (work_tx, _work_rx) = bounded::<PrefetchWork>(1);
         let (result_tx, result_rx) = bounded::<PrefetchResult>(1);
-        let worker_fault = Arc::new(Mutex::new(None));
+        let worker_fault = Arc::new(OnceLock::new());
         let handle = {
             let fault = worker_fault.clone();
             thread::Builder::new()

@@ -27,8 +27,6 @@ use std::sync::Arc;
 use tracing::{debug, trace};
 
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
 use tracing::warn;
 
 #[cfg(target_os = "linux")]
@@ -85,10 +83,7 @@ pub struct AsyncCsrGraph {
 
     /// Pool of io_uring handles for concurrent batch reads (Linux only)
     #[cfg(target_os = "linux")]
-    uring_pool: Option<Vec<Arc<parking_lot::Mutex<crate::internal::uring::UringHandle>>>>,
-    /// Round-robin selector for `uring_pool`
-    #[cfg(target_os = "linux")]
-    uring_next: AtomicUsize,
+    uring_pool: Option<Arc<crate::internal::uring::RingPool<crate::internal::uring::UringHandle>>>,
 }
 
 impl AsyncCsrGraph {
@@ -243,8 +238,6 @@ impl AsyncCsrGraph {
             offsets,
             #[cfg(target_os = "linux")]
             uring_pool,
-            #[cfg(target_os = "linux")]
-            uring_next: AtomicUsize::new(0),
         })
     }
 
@@ -253,52 +246,49 @@ impl AsyncCsrGraph {
     /// Note: We use SQPOLL only (no IOPOLL) since we're not using O_DIRECT.
     /// Variable-sized adjacency reads make buffer alignment complex, so we
     /// use buffered I/O with SQPOLL for reduced syscalls.
+    /// Each ring is built on the thread that will own it, so it can take
+    /// the single-issuer setup — see
+    /// [`RingPool`](crate::internal::uring::RingPool).
     #[cfg(target_os = "linux")]
     fn setup_uring(
         file: &Arc<File>,
-    ) -> Result<Option<Vec<Arc<parking_lot::Mutex<crate::internal::uring::UringHandle>>>>> {
-        use crate::internal::uring::UringHandle;
+    ) -> Result<Option<Arc<crate::internal::uring::RingPool<crate::internal::uring::UringHandle>>>>
+    {
+        use crate::internal::uring::{DEFAULT_RING_ENTRIES, RingPool, UringHandle};
 
         let pool_size = std::thread::available_parallelism()
             .map(|n| n.get().clamp(1, 4))
             .unwrap_or(1);
-        let mut handles = Vec::with_capacity(pool_size);
-
-        for idx in 0..pool_size {
-            let mut handle = match UringHandle::new_sqpoll_only(
-                crate::internal::uring::DEFAULT_RING_ENTRIES,
-                1000,
-            ) {
+        let file = Arc::clone(file);
+        let pool = RingPool::new(pool_size, "aethergraph-adj-ring", move |idx| {
+            let mut handle = match UringHandle::new_thread_owned(DEFAULT_RING_ENTRIES) {
                 Ok(h) => h,
+                // Adjacency reads are buffered (variable-sized rows make
+                // O_DIRECT alignment impractical), so SQPOLL without IOPOLL
+                // is the fallback shape.
                 Err(e) => {
-                    if idx == 0 {
-                        warn!("Failed to create io_uring: {}", e);
-                        return Ok(None);
+                    debug!("thread-owned io_uring unavailable ({e}); trying SQPOLL");
+                    match UringHandle::new_sqpoll_only(DEFAULT_RING_ENTRIES, 1000) {
+                        Ok(h) => h,
+                        Err(e2) => {
+                            warn!("Failed to create io_uring handle {}: {}", idx, e2);
+                            return None;
+                        }
                     }
-                    warn!("Failed to create extra io_uring handle {}: {}", idx, e);
-                    break;
                 }
             };
-
-            if idx == 0 {
-                if handle.is_sqpoll() {
-                    debug!("io_uring: SQPOLL enabled (reduced syscalls)");
-                } else {
-                    debug!("io_uring: standard mode (batched I/O)");
-                }
-            }
-
-            if let Err(e) = handle.register_fd(file) {
+            if let Err(e) = handle.register_fd(&file) {
                 warn!("Failed to register FD on handle {}: {}", idx, e);
             }
-            handles.push(Arc::new(parking_lot::Mutex::new(handle)));
-        }
+            Some(handle)
+        });
 
-        if handles.is_empty() {
+        let Some(pool) = pool else {
+            warn!("Failed to create any io_uring lane");
             return Ok(None);
-        }
-        debug!("Initialized io_uring pool with {} handle(s)", handles.len());
-        Ok(Some(handles))
+        };
+        debug!("Initialized io_uring pool with {} handle(s)", pool.lanes());
+        Ok(Some(Arc::new(pool)))
     }
 
     /// Get number of nodes
@@ -318,7 +308,7 @@ impl AsyncCsrGraph {
     pub fn io_uring_active(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            self.uring_pool.as_ref().is_some_and(|p| !p.is_empty())
+            self.uring_pool.is_some()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -404,80 +394,74 @@ impl AsyncCsrGraph {
     #[cfg(target_os = "linux")]
     async fn batch_neighbors_io_uring(&self, nodes: &[NodeId]) -> Result<Vec<Vec<NodeId>>> {
         // If io_uring isn't available, fall back to tokio
-        let uring = match &self.uring_pool {
-            Some(pool) if !pool.is_empty() => {
-                let idx = self.uring_next.fetch_add(1, Ordering::Relaxed) % pool.len();
-                Arc::clone(&pool[idx])
-            }
-            None => return self.batch_neighbors_tokio(nodes).await,
-            _ => return self.batch_neighbors_tokio(nodes).await,
+        let Some(pool) = &self.uring_pool else {
+            return self.batch_neighbors_tokio(nodes).await;
         };
 
-        // Clone what we need for the blocking task
+        // Clone what the lane thread needs to own.
         let file = Arc::clone(&self.file);
         let nodes = nodes.to_vec();
         let offsets = self.offsets.clone();
         let edges_start = self.edges_start;
         let num_nodes = self.num_nodes;
 
-        // Run io_uring operations in spawn_blocking to not block tokio runtime
-        let results = tokio::task::spawn_blocking(move || {
-            let fd = file.as_raw_fd();
+        // Runs on the thread that owns the ring, so no tokio blocking-pool
+        // slot is held and the ring keeps its single submitter.
+        let results = pool
+            .submit(move |handle| {
+                let fd = file.as_raw_fd();
 
-            // io_uring DMAs straight into each result Vec's typed backing —
-            // no byte-buffer temporaries and, on little-endian targets, no
-            // decode pass or second copy per node. The heap allocations
-            // behind the inner Vecs are address-stable even as the outer
-            // Vec grows, so the read pointers stay valid.
-            let mut results: Vec<Vec<NodeId>> = Vec::with_capacity(nodes.len());
-            let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
+                // io_uring DMAs straight into each result Vec's typed backing —
+                // no byte-buffer temporaries and, on little-endian targets, no
+                // decode pass or second copy per node. The heap allocations
+                // behind the inner Vecs are address-stable even as the outer
+                // Vec grows, so the read pointers stay valid.
+                let mut results: Vec<Vec<NodeId>> = Vec::with_capacity(nodes.len());
+                let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
 
-            for &node in nodes.iter() {
-                let idx = node as usize;
-                if idx >= num_nodes {
-                    results.push(Vec::new());
-                    continue;
+                for &node in nodes.iter() {
+                    let idx = node as usize;
+                    if idx >= num_nodes {
+                        results.push(Vec::new());
+                        continue;
+                    }
+
+                    let start_edge = offsets[idx] as usize;
+                    let end_edge = offsets[idx + 1] as usize;
+                    let num_neighbors = end_edge.saturating_sub(start_edge);
+
+                    if num_neighbors == 0 {
+                        results.push(Vec::new());
+                        continue;
+                    }
+
+                    let byte_offset =
+                        edges_start + (start_edge * std::mem::size_of::<NodeId>()) as u64;
+                    let byte_size = num_neighbors * std::mem::size_of::<NodeId>();
+
+                    results.push(vec![0 as NodeId; num_neighbors]);
+                    let slot = results
+                        .last_mut()
+                        .expect("results is non-empty after the push above");
+                    let bytes: &mut [u8] = bytemuck::cast_slice_mut(slot.as_mut_slice());
+                    reads.push((byte_offset, bytes.as_mut_ptr(), byte_size));
                 }
 
-                let start_edge = offsets[idx] as usize;
-                let end_edge = offsets[idx + 1] as usize;
-                let num_neighbors = end_edge.saturating_sub(start_edge);
-
-                if num_neighbors == 0 {
-                    results.push(Vec::new());
-                    continue;
+                if reads.is_empty() {
+                    return Ok(results);
                 }
 
-                let byte_offset = edges_start + (start_edge * std::mem::size_of::<NodeId>()) as u64;
-                let byte_size = num_neighbors * std::mem::size_of::<NodeId>();
-
-                results.push(vec![0 as NodeId; num_neighbors]);
-                let slot = results
-                    .last_mut()
-                    .expect("results is non-empty after the push above");
-                let bytes: &mut [u8] = bytemuck::cast_slice_mut(slot.as_mut_slice());
-                reads.push((byte_offset, bytes.as_mut_ptr(), byte_size));
-            }
-
-            if reads.is_empty() {
-                return Ok(results);
-            }
-
-            // Hold the ring lock only for SQ/CQ interaction.
-            {
-                let mut handle = uring.lock();
-                // SAFETY: each ptr in `reads` points into a result Vec's
-                // heap allocation, which lives until this closure returns;
-                // batch_read reaps every submitted completion before
-                // returning — on success AND on error.
-                crate::internal::uring::batch_read(&mut handle, fd, &reads)?;
+                // SAFETY: each ptr in `reads` points into a result Vec's heap
+                // allocation, which lives until this closure returns;
+                // batch_read reaps every submitted completion before returning
+                // — on success AND on error.
+                crate::internal::uring::batch_read(handle, fd, &reads)?;
                 trace!("Completed {} reads via io_uring", reads.len());
-            }
 
-            Ok::<_, anyhow::Error>(results)
-        })
-        .await
-        .context("spawn_blocking failed")??;
+                Ok::<_, anyhow::Error>(results)
+            })
+            .await
+            .context("io_uring lane thread stopped before answering")??;
 
         Ok(results)
     }

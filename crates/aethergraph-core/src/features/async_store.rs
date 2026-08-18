@@ -36,8 +36,6 @@ use std::time::Instant;
 use tracing::{debug, trace};
 
 #[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicUsize;
-#[cfg(target_os = "linux")]
 use tracing::warn;
 
 #[cfg(target_os = "linux")]
@@ -77,10 +75,7 @@ pub struct AsyncFeatureStore {
     /// Pool of io_uring lanes (ring + reusable landing buffers) for
     /// concurrent batch reads (Linux only)
     #[cfg(target_os = "linux")]
-    uring_pool: Option<Vec<Arc<parking_lot::Mutex<crate::internal::uring::UringLane>>>>,
-    /// Round-robin selector for `uring_pool`
-    #[cfg(target_os = "linux")]
-    uring_next: AtomicUsize,
+    uring_pool: Option<Arc<crate::internal::uring::RingPool<crate::internal::uring::UringLane>>>,
 
     /// Whether O_DIRECT is enabled (required for IOPOLL)
     #[cfg(target_os = "linux")]
@@ -184,8 +179,6 @@ impl AsyncFeatureStore {
             #[cfg(target_os = "linux")]
             uring_pool,
             #[cfg(target_os = "linux")]
-            uring_next: AtomicUsize::new(0),
-            #[cfg(target_os = "linux")]
             direct_io,
             telemetry: None,
         })
@@ -195,34 +188,31 @@ impl AsyncFeatureStore {
     /// `get_batch` calls can interleave across lanes; each ring is
     /// pre-registered with `file` so the hot path only uses the fixed-fd
     /// form, and each lane carries its own reusable landing buffers.
+    ///
+    /// Each lane's ring is created on the thread that will own it — see
+    /// [`RingPool`] — which is what lets it ask for `SINGLE_ISSUER` and
+    /// `DEFER_TASKRUN`, and what removes the blocking-pool hop the shared
+    /// version needed.
     #[cfg(target_os = "linux")]
     fn setup_uring(
         file: &Arc<File>,
         direct_io: bool,
-    ) -> Option<Vec<Arc<parking_lot::Mutex<crate::internal::uring::UringLane>>>> {
+    ) -> Option<Arc<crate::internal::uring::RingPool<crate::internal::uring::UringLane>>> {
+        use crate::internal::uring::{RingPool, UringLane, create_owned_feature_uring};
+
         let pool_size = std::thread::available_parallelism()
             .map(|n| n.get().clamp(1, 4))
             .unwrap_or(1);
-        let mut lanes = Vec::with_capacity(pool_size);
-        for idx in 0..pool_size {
-            let Some(mut handle) = crate::internal::uring::create_feature_uring(direct_io) else {
-                if idx == 0 {
-                    return None;
-                }
-                break;
-            };
-            if let Err(e) = handle.register_fd(file) {
+        let file = Arc::clone(file);
+        let pool = RingPool::new(pool_size, "aethergraph-feat-ring", move |idx| {
+            let mut handle = create_owned_feature_uring(direct_io)?;
+            if let Err(e) = handle.register_fd(&file) {
                 warn!("Failed to register FD on handle {}: {}", idx, e);
             }
-            lanes.push(Arc::new(parking_lot::Mutex::new(
-                crate::internal::uring::UringLane::new(handle),
-            )));
-        }
-        if lanes.is_empty() {
-            return None;
-        }
-        debug!("Initialized io_uring pool with {} lane(s)", lanes.len());
-        Some(lanes)
+            Some(UringLane::new(handle))
+        })?;
+        debug!("Initialized io_uring pool with {} lane(s)", pool.lanes());
+        Some(Arc::new(pool))
     }
 
     /// Enable telemetry tracking
@@ -326,18 +316,12 @@ impl AsyncFeatureStore {
 
         #[cfg(target_os = "linux")]
         {
+            // The pool round-robins across its own lanes, so there is no
+            // index to carry here.
             if let Some(ref uring_pool) = self.uring_pool {
-                if !uring_pool.is_empty() {
-                    let idx = self.uring_next.fetch_add(1, Ordering::Relaxed) % uring_pool.len();
-                    let uring_arc = Arc::clone(&uring_pool[idx]);
-                    // Use io_uring with spawn_blocking (io_uring ops are blocking)
-                    all_features = self
-                        .batch_read_uring_blocking(nodes, feature_size, &uring_arc)
-                        .await?;
-                } else {
-                    self.prefetch_batch_range(nodes, feature_size);
-                    all_features = self.batch_read_tokio(nodes, feature_size).await?;
-                }
+                all_features = self
+                    .batch_read_uring_blocking(nodes, feature_size, uring_pool)
+                    .await?;
             } else {
                 self.prefetch_batch_range(nodes, feature_size);
                 all_features = self.batch_read_tokio(nodes, feature_size).await?;
@@ -413,7 +397,7 @@ impl AsyncFeatureStore {
         &self,
         nodes: &[NodeId],
         feature_size: usize,
-        uring_arc: &Arc<parking_lot::Mutex<crate::internal::uring::UringLane>>,
+        pool: &Arc<crate::internal::uring::RingPool<crate::internal::uring::UringLane>>,
     ) -> Result<Vec<f32>> {
         if nodes.is_empty() {
             return Ok(Vec::new());
@@ -430,8 +414,7 @@ impl AsyncFeatureStore {
             );
         }
 
-        // Clone what we need for the blocking task
-        let uring_arc = Arc::clone(uring_arc);
+        // Clone what the lane thread needs to own.
         let file = Arc::clone(&self.file);
         let nodes = nodes.to_vec();
         let features_start_offset = self.features_start_offset;
@@ -439,22 +422,23 @@ impl AsyncFeatureStore {
         let dtype = self.dtype;
         let feature_dim = self.feature_dim;
 
-        // Run io_uring operations in spawn_blocking to not block tokio runtime
-        let features = tokio::task::spawn_blocking(move || {
-            let mut lane = uring_arc.lock();
-            super::gather::uring_gather_rows(
-                &mut lane,
-                file.as_raw_fd(),
-                &nodes,
-                features_start_offset,
-                feature_size,
-                direct_io,
-                dtype,
-                feature_dim,
-            )
-        })
-        .await
-        .context("spawn_blocking failed")??;
+        // Runs on the thread that owns the ring, so nothing here occupies a
+        // tokio blocking-pool slot and the ring keeps its single submitter.
+        let features = pool
+            .submit(move |lane| {
+                super::gather::uring_gather_rows(
+                    lane,
+                    file.as_raw_fd(),
+                    &nodes,
+                    features_start_offset,
+                    feature_size,
+                    direct_io,
+                    dtype,
+                    feature_dim,
+                )
+            })
+            .await
+            .context("io_uring lane thread stopped before answering")??;
 
         Ok(features)
     }

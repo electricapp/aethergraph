@@ -247,8 +247,8 @@ fn sqpoll_cpu() -> Option<u32> {
 /// Build a ring with no kernel poller, taking the modern setup flags the
 /// running kernel supports.
 ///
-/// Two flags apply to a batch submitter like [`batch_read`] and neither
-/// constrains which thread submits:
+/// Two of them apply to a batch submitter like [`batch_read`] whatever the
+/// threading, and neither constrains which thread submits:
 ///
 /// - `COOP_TASKRUN` (5.19) lets the kernel run completion task-work when
 ///   the submitting task next enters the kernel, instead of driving it with
@@ -259,22 +259,49 @@ fn sqpoll_cpu() -> Option<u32> {
 ///   records the first error and drains everything it submitted, so
 ///   partial-submit is the behaviour it wants.
 ///
-/// Deliberately absent: `SINGLE_ISSUER`/`DEFER_TASKRUN`, the bigger win of
-/// the two. Both require every submission to come from the task that
-/// created the ring, and the feature-store lanes are built once and then
-/// shared as `Arc<Mutex<UringLane>>` across worker threads — whichever
-/// worker takes the lock submits. Enabling them would fail submission with
-/// `EEXIST` off the creating thread. Making lanes thread-owned is the
-/// prerequisite, and that is a restructuring rather than a flag.
+/// `DEFER_TASKRUN` (6.1) is the bigger win and the reason [`RingPool`]
+/// exists. It stops the kernel running completion work at arbitrary points
+/// and defers it to the next `io_uring_enter` with `GETEVENTS` — exactly
+/// the submit-then-wait shape of a batch gather. It requires
+/// `SINGLE_ISSUER`, and both demand that every submission come from the
+/// task that *created* the ring. That holds only because a [`RingPool`]
+/// lane builds its ring on its own thread and never lets it leave; a ring
+/// shared through a mutex and driven from a blocking pool would fail
+/// submission with `EEXIST`. Pass `single_issuer = false` for any ring not
+/// owned by exactly one thread for its whole life.
 ///
 /// Each flag is dropped individually if the kernel rejects it, so an older
 /// kernel loses only the flags it lacks.
-fn build_plain_ring(entries: u32) -> Result<io_uring::IoUring> {
-    let attempts: [&[&str]; 3] = [&["coop_taskrun", "submit_all"], &["submit_all"], &[]];
+fn build_plain_ring(
+    entries: u32,
+    single_issuer: bool,
+) -> Result<(io_uring::IoUring, &'static str)> {
+    // Most capable first; each attempt drops what the previous could not
+    // get. The returned label names the rung actually reached, so a silent
+    // fall to a lesser setup is observable rather than something that has
+    // to be inferred from a benchmark that failed to improve.
+    let attempts: &[&[&str]] = if single_issuer {
+        &[
+            &["single_issuer", "defer_taskrun", "submit_all"],
+            &["single_issuer", "coop_taskrun", "submit_all"],
+            &["coop_taskrun", "submit_all"],
+            &["submit_all"],
+            &[],
+        ]
+    } else {
+        &[&["coop_taskrun", "submit_all"], &["submit_all"], &[]]
+    };
     let mut last_err = None;
     for flags in attempts {
         let mut builder = io_uring::IoUring::builder();
-        if flags.contains(&"coop_taskrun") {
+        if flags.contains(&"single_issuer") {
+            builder.setup_single_issuer();
+        }
+        // DEFER_TASKRUN subsumes the cooperative behaviour; they are not
+        // combined.
+        if flags.contains(&"defer_taskrun") {
+            builder.setup_defer_taskrun();
+        } else if flags.contains(&"coop_taskrun") {
             builder.setup_coop_taskrun();
         }
         if flags.contains(&"submit_all") {
@@ -282,8 +309,9 @@ fn build_plain_ring(entries: u32) -> Result<io_uring::IoUring> {
         }
         match builder.build(entries) {
             Ok(ring) => {
-                debug!(?flags, "io_uring initialized without a kernel poller");
-                return Ok(ring);
+                let tier = ring_tier(flags);
+                debug!(tier, ?flags, "io_uring initialized without a kernel poller");
+                return Ok((ring, tier));
             }
             Err(e) => last_err = Some(e),
         }
@@ -292,6 +320,157 @@ fn build_plain_ring(entries: u32) -> Result<io_uring::IoUring> {
         std::io::Error::other("io_uring setup failed")
     })))
     .context("failed to create io_uring")
+}
+
+/// Name the rung a flag set corresponds to, for logging and assertions.
+fn ring_tier(flags: &[&str]) -> &'static str {
+    if flags.contains(&"defer_taskrun") {
+        "deferred"
+    } else if flags.contains(&"single_issuer") {
+        "single-issuer"
+    } else if flags.contains(&"coop_taskrun") {
+        "cooperative"
+    } else if flags.contains(&"submit_all") {
+        "submit-all"
+    } else {
+        "plain"
+    }
+}
+
+/// A job handed to a ring-owning thread.
+type RingJob<T> = Box<dyn FnOnce(&mut T) + Send + 'static>;
+
+/// A pool of rings, each owned outright by one thread.
+///
+/// Each lane is created *on* its own thread and never leaves it. Callers
+/// send a closure and await its result, so single ownership is a property
+/// of the structure rather than something re-established per call.
+///
+/// That property is what the ring setup depends on. `SINGLE_ISSUER`, and
+/// `DEFER_TASKRUN` which requires it, both demand that every submission
+/// come from the task that created the ring — see [`build_plain_ring`].
+/// Sharing a ring behind a lock cannot promise that when the caller runs
+/// on a pool thread chosen per task, as `spawn_blocking` does.
+///
+/// Owning the ring on a known thread also keeps the async caller off the
+/// tokio blocking pool: awaiting a lane's reply occupies no blocking slot
+/// for the length of a gather.
+pub struct RingPool<T: Send + 'static> {
+    /// One queue per lane thread. Dropping these ends the threads.
+    txs: Vec<crossbeam_channel::Sender<RingJob<T>>>,
+    /// Round-robin cursor over `txs`.
+    next: std::sync::atomic::AtomicUsize,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl<T: Send + 'static> RingPool<T> {
+    /// Spawn `lanes` threads, each building its own `T` with `make`.
+    ///
+    /// `make` runs on the lane thread, which is the whole point: a ring
+    /// built here is submitted to only by this thread for its lifetime.
+    /// Lanes whose `make` returns `None` are dropped from the pool;
+    /// `None` overall means not one came up.
+    pub fn new<F>(lanes: usize, name: &str, make: F) -> Option<Self>
+    where
+        F: Fn(usize) -> Option<T> + Send + Clone + 'static,
+    {
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(lanes.max(1));
+        let mut txs = Vec::with_capacity(lanes);
+        let mut workers = Vec::with_capacity(lanes);
+
+        for idx in 0..lanes {
+            let (tx, rx) = crossbeam_channel::unbounded::<RingJob<T>>();
+            let make = make.clone();
+            let ready_tx = ready_tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("{name}-{idx}"))
+                .spawn(move || {
+                    let Some(mut resource) = make(idx) else {
+                        let _ = ready_tx.send(false);
+                        return;
+                    };
+                    let _ = ready_tx.send(true);
+                    drop(ready_tx);
+                    // Ends when every sender is dropped, i.e. on pool drop.
+                    while let Ok(job) = rx.recv() {
+                        job(&mut resource);
+                    }
+                });
+            match spawned {
+                Ok(handle) => {
+                    txs.push(tx);
+                    workers.push(handle);
+                }
+                Err(e) => warn!("failed to spawn ring lane {idx}: {e}"),
+            }
+        }
+        drop(ready_tx);
+
+        // Wait for each lane to report, so a pool that returns Some really
+        // has rings behind it rather than threads that failed to build one.
+        let mut live = Vec::with_capacity(txs.len());
+        for (idx, tx) in txs.into_iter().enumerate() {
+            match ready_rx.recv() {
+                Ok(true) => live.push(tx),
+                // The thread exited; its queue would never be serviced.
+                Ok(false) | Err(_) => {
+                    trace!("ring lane {idx} did not initialize");
+                }
+            }
+        }
+        if live.is_empty() {
+            return None;
+        }
+        debug!("{name}: {} ring lane(s) initialized", live.len());
+        Some(Self {
+            txs: live,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            workers,
+        })
+    }
+
+    /// Number of live lanes.
+    pub fn lanes(&self) -> usize {
+        self.txs.len()
+    }
+
+    /// Run `job` on the next lane and hand back its result.
+    ///
+    /// The returned receiver resolves when the lane finishes. An `Err`
+    /// means the lane thread died (it panicked mid-job), which the caller
+    /// should treat the same as an I/O failure.
+    pub fn submit<R, F>(&self, job: F) -> tokio::sync::oneshot::Receiver<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut T) -> R + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.txs.len();
+        let boxed: RingJob<T> = Box::new(move |resource| {
+            // A dropped receiver (caller cancelled) is not an error; the
+            // work still ran to completion on the lane, which is what keeps
+            // the ring's own invariants intact.
+            let _ = reply_tx.send(job(resource));
+        });
+        if self.txs[idx].send(boxed).is_err() {
+            // Sender alive but receiver gone means the lane thread exited;
+            // dropping reply_tx surfaces that as a receive error.
+            trace!("ring lane {idx} is gone; job dropped");
+        }
+        reply_rx
+    }
+}
+
+impl<T: Send + 'static> Drop for RingPool<T> {
+    fn drop(&mut self) {
+        // Close the queues first so each loop sees a disconnect and ends,
+        // then wait: the lane owns its ring, and joining before the thread
+        // returns is what guarantees no submission outlives the pool.
+        self.txs.clear();
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// SQPOLL-aware io_uring wrapper.
@@ -312,6 +491,10 @@ pub struct UringHandle {
     registered_fd: Option<u32>,
     /// Registered fixed-buffer region as (base address, length), if any.
     registered_buf: Option<(usize, usize)>,
+    /// Which rung of the setup ladder this ring reached — see
+    /// [`build_plain_ring`]. `"sqpoll"` for the kernel-poller rings, which
+    /// do not use that ladder.
+    tier: &'static str,
 }
 
 impl UringHandle {
@@ -340,6 +523,7 @@ impl UringHandle {
                     iopoll_enabled: true,
                     registered_fd: None,
                     registered_buf: None,
+                    tier: "sqpoll",
                 })
             }
             Err(e) => {
@@ -375,13 +559,16 @@ impl UringHandle {
                     iopoll_enabled: false,
                     registered_fd: None,
                     registered_buf: None,
+                    tier: "sqpoll",
                 })
             }
             Err(e) => {
                 warn!("SQPOLL failed ({}), trying standard io_uring", e);
                 // Fallback to standard io_uring, with the cheap modern
-                // setup flags where the kernel has them.
-                let ring = build_plain_ring(entries)?;
+                // setup flags where the kernel has them. Not single-issuer:
+                // this constructor makes no promise about which thread
+                // submits afterwards.
+                let (ring, tier) = build_plain_ring(entries, false)?;
                 Ok(Self {
                     ring,
                     entries,
@@ -389,14 +576,50 @@ impl UringHandle {
                     iopoll_enabled: false,
                     registered_fd: None,
                     registered_buf: None,
+                    tier,
                 })
             }
         }
     }
 
+    /// A ring for a caller that owns it on one thread for its whole life —
+    /// a [`RingPool`] lane.
+    ///
+    /// That ownership is what lets the ring ask for `SINGLE_ISSUER` and
+    /// `DEFER_TASKRUN`; see [`build_plain_ring`]. Calling this and then
+    /// submitting from a second thread fails at submission with `EEXIST`,
+    /// so it is deliberately separate from [`Self::new`] rather than a
+    /// flag on it.
+    ///
+    /// No SQPOLL: the point of deferred task-work is to avoid a kernel
+    /// poller burning a core, and the two are mutually exclusive anyway.
+    pub fn new_thread_owned(entries: u32) -> Result<Self> {
+        let (ring, tier) = build_plain_ring(entries, true)?;
+        Ok(Self {
+            ring,
+            entries,
+            sqpoll_enabled: false,
+            iopoll_enabled: false,
+            registered_fd: None,
+            registered_buf: None,
+            tier,
+        })
+    }
+
     /// SQ/CQ depth this ring was built with.
     pub fn entries(&self) -> u32 {
         self.entries
+    }
+
+    /// Which setup this ring actually got: `"deferred"`, `"single-issuer"`,
+    /// `"cooperative"`, `"submit-all"`, `"plain"`, or `"sqpoll"`.
+    ///
+    /// A ladder that quietly lands a rung lower still works, which is the
+    /// point — and also the risk, since the only other symptom is a
+    /// benchmark that failed to improve. Reporting the rung makes the
+    /// difference checkable.
+    pub fn tier(&self) -> &'static str {
+        self.tier
     }
 
     /// Register a file descriptor for fast access.
@@ -602,6 +825,33 @@ pub fn create_feature_uring(direct_io: bool) -> Option<UringHandle> {
         debug!("io_uring: standard (batched I/O)");
     }
     Some(handle)
+}
+
+/// A feature ring for a [`RingPool`] lane, which owns it on one thread.
+///
+/// Prefers the thread-owned setup (`SINGLE_ISSUER` + `DEFER_TASKRUN`) and
+/// falls back to the shared-safe constructors, so a kernel too old for
+/// those still gets a working lane rather than none.
+///
+/// `direct_io` still buys IOPOLL only in the SQPOLL path, which deferred
+/// task-work excludes; on a kernel that supports both, the deferred ring is
+/// the better trade for a batch gather — no core spent polling, and
+/// completion work batched into the `io_uring_enter` the gather already
+/// makes.
+pub fn create_owned_feature_uring(direct_io: bool) -> Option<UringHandle> {
+    match UringHandle::new_thread_owned(DEFAULT_RING_ENTRIES) {
+        Ok(handle) => {
+            // Name the rung reached, not the one asked for: the ladder
+            // degrades silently and this is the only place that difference
+            // is visible without a benchmark.
+            debug!(tier = handle.tier(), "io_uring: thread-owned lane");
+            Some(handle)
+        }
+        Err(e) => {
+            debug!("thread-owned io_uring unavailable ({e}); using the shared setup");
+            create_feature_uring(direct_io)
+        }
+    }
 }
 
 /// Perform a batch of reads using io_uring with proper SQPOLL handling.
@@ -900,6 +1150,96 @@ mod tests {
         assert_eq!(lane.scratch_f32(3), &written);
     }
 
+    /// A fallback ladder is only worth having if it climbs as high as the
+    /// kernel allows. Landing a rung low still produces a working ring, so
+    /// the sole other symptom is an optimization that quietly does nothing
+    /// — exactly the failure this asserts against, without hardcoding a
+    /// kernel version: if the top rung builds when asked for directly, the
+    /// ladder must have chosen it.
+    #[test]
+    fn the_ladder_takes_the_best_setup_the_kernel_offers() {
+        let Ok((_ring, tier)) = build_plain_ring(8, true) else {
+            println!("io_uring unavailable here; skipping");
+            return;
+        };
+
+        let top_rung: std::io::Result<io_uring::IoUring> = io_uring::IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .setup_submit_all()
+            .build(8);
+        let top_rung_builds = top_rung.is_ok();
+        if top_rung_builds {
+            assert_eq!(
+                tier, "deferred",
+                "kernel accepts DEFER_TASKRUN but the ladder settled for {tier}"
+            );
+        }
+
+        let coop: std::io::Result<io_uring::IoUring> = io_uring::IoUring::builder()
+            .setup_coop_taskrun()
+            .setup_submit_all()
+            .build(8);
+        let coop_builds = coop.is_ok();
+        if coop_builds {
+            assert_ne!(
+                tier, "plain",
+                "kernel accepts COOP_TASKRUN but the ladder fell all the way to plain"
+            );
+        }
+
+        println!("io_uring setup tier reached: {tier}");
+    }
+
+    /// The pool's whole reason for existing is that a lane's resource is
+    /// touched by exactly one thread. If that ever stopped holding, a ring
+    /// built with `SINGLE_ISSUER` would start failing submission with
+    /// `EEXIST` — a runtime error far from its cause — so it is asserted
+    /// here directly.
+    #[test]
+    fn every_job_on_a_lane_runs_on_that_lane_thread() {
+        // Each lane's resource records the thread that built it.
+        let pool = RingPool::new(3, "test-lane", |_idx| Some(std::thread::current().id()))
+            .expect("thread-id lanes always construct");
+
+        // Enough jobs that every lane is used several times over.
+        let checks: Vec<_> = (0..30)
+            .map(|_| {
+                pool.submit(|owner: &mut std::thread::ThreadId| {
+                    (*owner, std::thread::current().id())
+                })
+            })
+            .collect();
+
+        for rx in checks {
+            let (owner, ran_on) = rx.blocking_recv().expect("lane answered");
+            assert_eq!(owner, ran_on, "a job ran off its lane's own thread");
+        }
+    }
+
+    /// Dropping the pool must join its threads, not merely signal them: a
+    /// lane owns its ring, and a submission outliving the pool would touch
+    /// a ring whose owner is gone.
+    #[test]
+    fn dropping_the_pool_joins_every_lane() {
+        use std::sync::Arc;
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pool = {
+            let running = Arc::clone(&running);
+            RingPool::new(2, "test-drop", move |_idx| {
+                running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(())
+            })
+            .expect("unit lanes always construct")
+        };
+        assert_eq!(running.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // A job in flight at drop time still completes before drop returns.
+        let rx = pool.submit(|()| 7u32);
+        drop(pool);
+        assert_eq!(rx.blocking_recv().ok(), Some(7));
+    }
+
     /// A layout that clears 512 but not 4096 is the case the static
     /// assumption got wrong: it would be accepted on a 4Kn device and then
     /// fail every read with EINVAL. The decision must follow the alignment
@@ -944,7 +1284,7 @@ mod tests {
     /// complete an operation is worse than one without.
     #[test]
     fn plain_ring_builds_and_completes_regardless_of_flag_support() {
-        let mut ring = match build_plain_ring(8) {
+        let (mut ring, _tier) = match build_plain_ring(8, true) {
             Ok(r) => r,
             // A sandbox with io_uring disabled entirely is not this test's
             // subject.
