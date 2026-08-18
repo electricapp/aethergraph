@@ -62,7 +62,7 @@
 //!   in-process with the `Writer` guard.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub(crate) const MAGIC: [u8; 8] = *b"AGWAL\0\0\0";
@@ -150,10 +150,38 @@ pub struct EdgeRecord {
 /// `Send + Sync` from multiple writers concurrently.
 #[derive(Debug)]
 pub struct WalWriter {
-    inner: BufWriter<File>,
+    file: File,
+    /// Records staged in userspace, flushed to the file at `BUF_CAPACITY`
+    /// or by `sync`. Owned outright rather than held in a `BufWriter` so
+    /// the committed prefix can be dropped in place: the ring path writes
+    /// straight out of this buffer, and `BufWriter` exposes no way to
+    /// discard bytes it has already handed to the kernel.
+    buf: Vec<u8>,
     /// Bytes appended since the last `sync()`. Used by the
     /// [`DynamicGraph`] integration to skip no-op fsyncs.
     pending: u64,
+    /// Lazily-built ring for the linked write→fdatasync group commit.
+    /// `None` before first use or after ring setup failed (the portable
+    /// two-syscall path serves those cases).
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    ring: Option<UringCommit>,
+    /// Set once ring construction has been attempted, so a kernel
+    /// without io_uring is probed exactly once.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    ring_probed: bool,
+}
+
+/// Wrapper existing solely because `io_uring::IoUring` has no `Debug`.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+struct UringCommit {
+    ring: io_uring::IoUring,
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl std::fmt::Debug for UringCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UringCommit { .. }")
+    }
 }
 
 impl WalWriter {
@@ -229,13 +257,18 @@ impl WalWriter {
         // Seek to end for append-only writes.
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
-            inner: BufWriter::with_capacity(BUF_CAPACITY, file),
+            file,
+            buf: Vec::with_capacity(BUF_CAPACITY),
             pending: 0,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            ring: None,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            ring_probed: false,
         })
     }
 
-    /// Append one edge record. The bytes land in the BufWriter; a later
-    /// [`sync`](Self::sync) flushes and fsyncs.
+    /// Append one edge record. The bytes stage in the in-process buffer; a
+    /// later [`sync`](Self::sync) writes and fsyncs them.
     pub fn append_edge(&mut self, rec: EdgeRecord) -> Result<(), WalError> {
         let mut buf = [0u8; RECORD_LEN];
         buf[0..4].copy_from_slice(&rec.src.to_le_bytes());
@@ -243,22 +276,170 @@ impl WalWriter {
         let crc = crc32fast::hash(&buf[..8]);
         buf[8..12].copy_from_slice(&crc.to_le_bytes());
 
-        self.inner.write_all(&buf)?;
+        if self.buf.len() + RECORD_LEN > BUF_CAPACITY {
+            self.flush_buf()?;
+        }
+        self.buf.extend_from_slice(&buf);
         self.pending += RECORD_LEN as u64;
         Ok(())
     }
 
-    /// Flush the BufWriter to the file and fsync — every record durably
-    /// written before this call survives a crash. No-op if nothing has
-    /// been appended since the last sync.
+    /// Hand the staged bytes to the kernel and empty the buffer, without a
+    /// durability barrier. `pending` is deliberately left alone: it tracks
+    /// what is unsynced, and these bytes are in the page cache, not on the
+    /// medium.
+    fn flush_buf(&mut self) -> Result<(), WalError> {
+        if !self.buf.is_empty() {
+            self.file.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    /// Write the staged bytes and fsync — every record durably written
+    /// before this call survives a crash. No-op if nothing has been
+    /// appended since the last sync.
+    ///
+    /// With the `io-uring` feature on Linux, the staged bytes and the
+    /// fdatasync go to the kernel as one linked SQE chain — a single
+    /// `io_uring_enter` replaces the write + fdatasync syscall pair, and
+    /// the link makes the kernel enforce write-before-sync ordering.
     pub fn sync(&mut self) -> Result<(), WalError> {
         if self.pending == 0 {
             return Ok(());
         }
-        self.inner.flush()?;
-        self.inner.get_ref().sync_data()?;
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        if self.sync_uring()? {
+            return Ok(());
+        }
+        self.flush_buf()?;
+        self.file.sync_data()?;
         self.pending = 0;
         Ok(())
+    }
+
+    /// Group commit over io_uring. Returns `Ok(true)` when the commit
+    /// completed here, `Ok(false)` to route to the portable path (ring
+    /// unavailable), `Err` on a real I/O failure.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn sync_uring(&mut self) -> Result<bool, WalError> {
+        use io_uring::{IoUring, opcode, types};
+        use std::os::unix::io::AsRawFd;
+
+        if !self.ring_probed {
+            self.ring_probed = true;
+            match IoUring::new(4) {
+                // The write SQE below submits offset -1, which only means
+                // "use and advance the file cursor" when the kernel reports
+                // IORING_FEAT_RW_CUR_POS. Without it that offset is taken
+                // literally and the record lands at 2^64-1, so the absence
+                // of the feature has to disable the ring, not just the
+                // absence of io_uring.
+                Ok(ring) if ring.params().is_feature_rw_cur_pos() => {
+                    self.ring = Some(UringCommit { ring })
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        "io_uring lacks IORING_FEAT_RW_CUR_POS; WAL uses write+fdatasync"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "io_uring unavailable; WAL uses write+fdatasync");
+                }
+            }
+        }
+        if self.ring.is_none() {
+            return Ok(false);
+        }
+
+        let len = self.buf.len();
+        if len == 0 {
+            // Capacity flushes already handed every record to the kernel;
+            // only the durability barrier is outstanding, and a bare
+            // fdatasync beats a two-SQE chain carrying a zero-length write.
+            self.file.sync_data()?;
+            self.pending = 0;
+            return Ok(true);
+        }
+        // Raw pointer rather than a slice borrow: the SQE build below needs
+        // `self.ring` mutably while the kernel reads these bytes.
+        let buf_ptr = self.buf.as_ptr();
+        let fd = types::Fd(self.file.as_raw_fd());
+        let commit = self
+            .ring
+            .as_mut()
+            .expect("ring presence checked immediately above");
+
+        // Offset -1: append at the file's own cursor and advance it,
+        // exactly like the write(2) the portable path would issue.
+        let write_sqe = opcode::Write::new(fd, buf_ptr, len as u32)
+            .offset(u64::MAX)
+            .build()
+            .flags(io_uring::squeue::Flags::IO_LINK)
+            .user_data(1);
+        let fsync_sqe = opcode::Fsync::new(fd)
+            .flags(types::FsyncFlags::DATASYNC)
+            .build()
+            .user_data(2);
+
+        {
+            let mut sq = commit.ring.submission();
+            // SAFETY: `buf_ptr` addresses `self.buf`, which nothing touches
+            // until both CQEs are reaped below, and `submit_and_wait` does
+            // not return until the kernel is done reading it.
+            let pushed = unsafe { sq.push(&write_sqe) };
+            pushed.expect("empty 4-entry ring accepts the write SQE");
+            // SAFETY: the fsync SQE references only the fd, which stays
+            // open for the life of `self.file`.
+            let pushed = unsafe { sq.push(&fsync_sqe) };
+            pushed.expect("4-entry ring accepts the linked fsync SQE");
+        }
+        if let Err(e) = commit.ring.submit_and_wait(2) {
+            // Both SQEs may already be in flight, and their CQEs carry the
+            // same user_data every commit does, so a later sync reaping
+            // this ring could read this commit's results as its own.
+            // Retire the ring; subsequent syncs take the portable path.
+            self.ring = None;
+            return Err(WalError::Io(e));
+        }
+
+        let mut written: Option<i32> = None;
+        let mut synced: Option<i32> = None;
+        for cqe in commit.ring.completion() {
+            match cqe.user_data() {
+                1 => written = Some(cqe.result()),
+                2 => synced = Some(cqe.result()),
+                _ => {}
+            }
+        }
+        let (written, synced) = (
+            written.expect("write CQE present after submit_and_wait(2)"),
+            synced.expect("fsync CQE present after submit_and_wait(2)"),
+        );
+
+        if written < 0 {
+            return Err(WalError::Io(io::Error::from_raw_os_error(-written)));
+        }
+        let written = written as usize;
+        if written < len {
+            // Rare (disk full mid-write): the linked fsync covered only
+            // the short prefix. Finish the tail through the portable
+            // path so its own fdatasync provides the guarantee.
+            self.buf.drain(..written);
+            self.flush_buf()?;
+            self.file.sync_data()?;
+            self.pending = 0;
+            return Ok(true);
+        }
+        // A canceled link (-ECANCELED) cannot happen here: the write
+        // completed fully, so the chain proceeded to the fsync.
+        if synced < 0 {
+            return Err(WalError::Io(io::Error::from_raw_os_error(-synced)));
+        }
+
+        self.buf.clear();
+        self.pending = 0;
+        Ok(true)
     }
 
     /// Discard every buffered record that has not yet been flushed to the
@@ -267,15 +448,9 @@ impl WalWriter {
     /// by a later flush. Bytes already flushed to the file are untouched
     /// — the discard reaches only the in-process buffer.
     pub fn discard_pending(&mut self) -> Result<(), WalError> {
-        // A dup of the handle shares the file description (offset, lock),
-        // so the rebuilt BufWriter appends exactly where the old one
-        // last flushed.
-        let file = self.inner.get_ref().try_clone()?;
-        let fresh = BufWriter::with_capacity(self.inner.capacity(), file);
-        // `into_parts` hands back the file and the buffered bytes without
-        // flushing; dropping them discards the records. (A plain drop of
-        // the BufWriter would flush them instead.)
-        let _ = std::mem::replace(&mut self.inner, fresh).into_parts();
+        // The staging buffer holds exactly the records the kernel has not
+        // seen; anything a capacity flush already wrote stays in the file.
+        self.buf.clear();
         self.pending = 0;
         Ok(())
     }
@@ -661,5 +836,78 @@ mod tests {
         assert_eq!(w.pending_bytes(), 0);
         w.sync().unwrap();
         assert_eq!(w.pending_bytes(), 0);
+    }
+
+    /// Appending past `BUF_CAPACITY` spills to the file mid-guard. Every
+    /// record must still replay exactly once and in order: the spill and
+    /// the closing sync each write a disjoint slice of the buffer, so an
+    /// off-by-one in either would duplicate or drop records at the seam.
+    #[test]
+    fn records_spanning_a_capacity_flush_replay_exactly_once() {
+        let tmp = tmp_wal();
+        let count = (BUF_CAPACITY / RECORD_LEN) as u32 + 1000;
+        {
+            let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
+            for i in 0..count {
+                w.append_edge(EdgeRecord { src: i, dst: i + 1 }).unwrap();
+            }
+            // The spill is not a durability point: everything appended is
+            // still counted as unsynced until sync() lands the barrier.
+            assert_eq!(w.pending_bytes(), count as u64 * RECORD_LEN as u64);
+            w.sync().unwrap();
+            assert_eq!(w.pending_bytes(), 0);
+        }
+
+        let mut got = Vec::new();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
+        assert!(out.truncate_to.is_none(), "no torn tail expected");
+        assert_eq!(out.applied, count as u64);
+        assert_eq!(got.len(), count as usize);
+        for (i, rec) in got.iter().enumerate() {
+            let i = i as u32;
+            assert_eq!(*rec, EdgeRecord { src: i, dst: i + 1 }, "record {i}");
+        }
+    }
+
+    /// A discard after the buffer has already spilled keeps the spilled
+    /// prefix — it is in the file and out of reach — and drops only what
+    /// is still staged. The durability contract documents this as a
+    /// best-effort discard, so the replayed log must be a clean prefix.
+    #[test]
+    fn discard_after_a_capacity_flush_keeps_the_spilled_prefix() {
+        let tmp = tmp_wal();
+        let count = (BUF_CAPACITY / RECORD_LEN) as u32 + 1000;
+        {
+            let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
+            for i in 0..count {
+                w.append_edge(EdgeRecord { src: i, dst: i + 1 }).unwrap();
+            }
+            w.discard_pending().unwrap();
+            assert_eq!(w.pending_bytes(), 0);
+        }
+
+        let mut got = Vec::new();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            out.truncate_to.is_none(),
+            "a spilled prefix is record-aligned, not torn"
+        );
+        assert!(
+            !got.is_empty() && got.len() < count as usize,
+            "expected a strict prefix, got {} of {count}",
+            got.len()
+        );
+        for (i, rec) in got.iter().enumerate() {
+            let i = i as u32;
+            assert_eq!(*rec, EdgeRecord { src: i, dst: i + 1 }, "record {i}");
+        }
     }
 }

@@ -24,6 +24,9 @@ crc32fast = { workspace = true, optional = true }
 # Reserved virtual mappings for the embedding row store.
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+
 [dev-dependencies]
 criterion = "0.8"
 rand = "0.10"
@@ -42,6 +45,11 @@ loom = []
 # Enables the append-only write-ahead log + replay-based recovery. Off by
 # default: callers who want crash durability opt in explicitly.
 wal = ["dep:crc32fast"]
+# Linux-only group-commit fast path: `WalWriter::sync` submits its write
+# and fdatasync as one linked io_uring chain — one syscall instead of two,
+# with ordering enforced in-kernel. Falls back to the portable path when
+# ring setup fails at runtime.
+io-uring = ["dep:io-uring"]
 
 [[bench]]
 name = "ctree_bench"
