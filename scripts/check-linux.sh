@@ -54,6 +54,19 @@ done
 # Keep in step with the feature table in README.md.
 CORE_FEATURES="io-uring nvme-passthru uffd shm perf numa zstd-tier"
 
+# CI builds these one at a time, and a helper used only under some other
+# feature is dead code in that build — which `-D warnings` rejects. Checking
+# only the union would miss it, so check each on its own first.
+for f in $CORE_FEATURES; do
+  echo "==> $CMD aethergraph-core [$f]"
+  cargo "$CMD" -p aethergraph-core --target "$TARGET" \
+    --features "$f" ${TARGETS[@]+"${TARGETS[@]}"} ${TRAILING[@]+"${TRAILING[@]}"}
+done
+
+echo "==> $CMD aethergraph-core [no features]"
+cargo "$CMD" -p aethergraph-core --target "$TARGET" \
+  ${TARGETS[@]+"${TARGETS[@]}"} ${TRAILING[@]+"${TRAILING[@]}"}
+
 echo "==> $CMD aethergraph-core [$CORE_FEATURES]"
 cargo "$CMD" -p aethergraph-core --target "$TARGET" \
   --features "$CORE_FEATURES" ${TARGETS[@]+"${TARGETS[@]}"} ${TRAILING[@]+"${TRAILING[@]}"}
