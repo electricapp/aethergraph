@@ -245,8 +245,8 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
         crate::internal::hint::prefetch_mmap_range(offsets_bytes.as_ptr(), offsets_bytes.len());
         crate::internal::hint::advise_mmap_random(edges_bytes.as_ptr(), edges_bytes.len());
     }
-    crate::internal::hint::advise_mmap_hugepage(offsets_bytes.as_ptr(), offsets_bytes.len());
-    crate::internal::hint::advise_mmap_hugepage(edges_bytes.as_ptr(), edges_bytes.len());
+    crate::internal::hint::advise_hugepage(offsets_bytes.as_ptr(), offsets_bytes.len());
+    crate::internal::hint::advise_hugepage(edges_bytes.as_ptr(), edges_bytes.len());
 
     validate_checksum_if_present(&mmap, &layout, validation)?;
 

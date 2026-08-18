@@ -472,7 +472,7 @@ impl FeatureStore {
         // Both hints are best-effort.
         let payload = &mmap[data_offset..data_offset + expected_data_size];
         crate::internal::hint::advise_mmap_random(payload.as_ptr(), payload.len());
-        crate::internal::hint::advise_mmap_hugepage(payload.as_ptr(), payload.len());
+        crate::internal::hint::advise_hugepage(payload.as_ptr(), payload.len());
 
         Ok(Self {
             mmap,

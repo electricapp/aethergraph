@@ -86,6 +86,44 @@ pub enum GraphValidationMode {
     Full,
 }
 
+/// Smallest array worth a huge-page hint: one 2 MiB page. Below this there is
+/// nothing for the kernel to coalesce and the `madvise` is pure syscall.
+const HUGEPAGE_HINT_MIN_BYTES: usize = 2 << 20;
+
+/// Build owned CSR storage, asking the kernel to back the large arrays with
+/// huge pages.
+///
+/// Sampling reads `offsets` at an unpredictable index once per frontier node,
+/// then a short run of `edges`. At graph scale both arrays are far larger than
+/// dTLB reach, so the cost of that pattern is dominated by page-table walks
+/// rather than by cache misses, and a 2 MiB backing cuts the entries needed by
+/// 512x. The mmap loader already advises exactly these two arrays; an
+/// in-memory graph holds the same arrays and is walked the same way, so it is
+/// the same decision.
+///
+/// Every `GraphStorage::Owned` is built here, so the hint cannot be missed by
+/// a construction path that forgets it.
+fn owned_storage(
+    offsets: Arc<[EdgeOffset]>,
+    edges: Arc<[NodeId]>,
+    weights: Option<Arc<[f32]>>,
+) -> GraphStorage {
+    hint_hugepage(&offsets);
+    hint_hugepage(&edges);
+    GraphStorage::Owned {
+        offsets,
+        edges,
+        weights,
+    }
+}
+
+fn hint_hugepage<T>(slice: &[T]) {
+    let bytes = std::mem::size_of_val(slice);
+    if bytes >= HUGEPAGE_HINT_MIN_BYTES {
+        crate::internal::hint::advise_hugepage(slice.as_ptr() as *const u8, bytes);
+    }
+}
+
 /// The canonical guarded neighbor-range lookup over hoisted CSR arrays.
 ///
 /// Every neighbor accessor — [`Graph::neighbors`] and the sampler hop loops
@@ -171,11 +209,11 @@ impl Graph {
         Self {
             num_nodes: 0,
             num_edges: 0,
-            storage: GraphStorage::Owned {
-                offsets: Arc::from(vec![0u64].into_boxed_slice()),
-                edges: Arc::from(Vec::<NodeId>::new().into_boxed_slice()),
-                weights: None,
-            },
+            storage: owned_storage(
+                Arc::from(vec![0u64].into_boxed_slice()),
+                Arc::from(Vec::<NodeId>::new().into_boxed_slice()),
+                None,
+            ),
             timestamps: None,
         }
     }
@@ -231,11 +269,11 @@ impl Graph {
         Self {
             num_nodes,
             num_edges,
-            storage: GraphStorage::Owned {
-                offsets: Arc::from(offsets.into_boxed_slice()),
-                edges: Arc::from(edges.into_boxed_slice()),
-                weights: weights.map(|w| Arc::from(w.into_boxed_slice())),
-            },
+            storage: owned_storage(
+                Arc::from(offsets.into_boxed_slice()),
+                Arc::from(edges.into_boxed_slice()),
+                weights.map(|w| Arc::from(w.into_boxed_slice())),
+            ),
             timestamps: None,
         }
     }
@@ -255,11 +293,7 @@ impl Graph {
         Self {
             num_nodes,
             num_edges,
-            storage: GraphStorage::Owned {
-                offsets,
-                edges,
-                weights,
-            },
+            storage: owned_storage(offsets, edges, weights),
             timestamps: None,
         }
     }
@@ -448,11 +482,11 @@ impl Graph {
         Ok(Self {
             num_nodes,
             num_edges,
-            storage: GraphStorage::Owned {
-                offsets: Arc::from(offsets.into_boxed_slice()),
-                edges: Arc::from(csr_edges.into_boxed_slice()),
-                weights: csr_weights.map(|w| Arc::from(w.into_boxed_slice())),
-            },
+            storage: owned_storage(
+                Arc::from(offsets.into_boxed_slice()),
+                Arc::from(csr_edges.into_boxed_slice()),
+                csr_weights.map(|w| Arc::from(w.into_boxed_slice())),
+            ),
             timestamps: None,
         })
     }
