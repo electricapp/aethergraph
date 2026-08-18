@@ -53,13 +53,13 @@ ahash = "0.8"       # Alternative fast hasher
 crc32fast = "1.5"   # SIMD CRC32 with runtime dispatch (integrity checksums)
 
 # SIMD
-wide = "1.5"
+wide = "1.6"
 
 # Lock-free channels for prefetching
 crossbeam-channel = "0.5"
 
 # Async I/O (for Phase 2)
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 futures = "0.3"
 
 # Numerical computing
@@ -75,6 +75,14 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# Same codegen as `release`, but keeping the symbol table and line tables so a
+# sampling profiler can attribute benchmark time to source lines. Debug info
+# does not reach the optimizer, so timings match `release` exactly.
+[profile.bench]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

@@ -10,7 +10,6 @@
 
 use crate::graph::csr::{EdgeOffset, Graph, NodeId};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -315,16 +314,7 @@ impl Graph {
             }
         }
 
-        // Map roots to dense partition IDs.
-        let mut root_to_id: FxHashMap<u32, u32> = FxHashMap::default();
-        let mut partitions = Vec::with_capacity(n);
-        for i in 0..n as u32 {
-            let root = uf.find(i);
-            let next_id = root_to_id.len() as u32;
-            let id = *root_to_id.entry(root).or_insert(next_id);
-            partitions.push(id);
-        }
-        partitions
+        dense_partition_ids(&mut uf, n)
     }
 
     /// Compute Rabbit Order permutation AND partition assignments in one pass.
@@ -368,14 +358,7 @@ impl Graph {
         }
 
         // Partition assignments from the same union-find.
-        let mut root_to_id: FxHashMap<u32, u32> = FxHashMap::default();
-        let mut partitions = Vec::with_capacity(n);
-        for i in 0..n as u32 {
-            let root = seq_uf.find(i);
-            let next_id = root_to_id.len() as u32;
-            let id = *root_to_id.entry(root).or_insert(next_id);
-            partitions.push(id);
-        }
+        let partitions = dense_partition_ids(&mut seq_uf, n);
 
         let mut perm = Vec::with_capacity(n);
         let mut stack = Vec::with_capacity(64);
@@ -539,6 +522,28 @@ impl Graph {
 }
 
 /// Simple sequential union-find for dendrogram replay.
+/// Assign dense partition ids over `0..n` by community root.
+///
+/// Every root is itself a node id in `0..n`, so the root-to-id table is
+/// direct-indexed rather than hashed: one array probe per node instead of a
+/// hash and bucket walk, and a flat `4n` bytes instead of a map that grows an
+/// entry per community.
+fn dense_partition_ids(uf: &mut SequentialUnionFind, n: usize) -> Vec<u32> {
+    const UNASSIGNED: u32 = u32::MAX;
+    let mut root_to_id = vec![UNASSIGNED; n];
+    let mut partitions = Vec::with_capacity(n);
+    let mut next_id = 0u32;
+    for i in 0..n as u32 {
+        let root = uf.find(i) as usize;
+        if root_to_id[root] == UNASSIGNED {
+            root_to_id[root] = next_id;
+            next_id += 1;
+        }
+        partitions.push(root_to_id[root]);
+    }
+    partitions
+}
+
 struct SequentialUnionFind {
     parent: Vec<u32>,
     rank: Vec<u8>,

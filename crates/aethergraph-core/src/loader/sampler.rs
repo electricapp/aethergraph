@@ -9,6 +9,7 @@
 use crate::graph::{Graph, NodeId};
 use crate::internal::genstamp::{FRONTIER_PREFETCH_DIST, FloydStamps, GenDedup, GenSlots, WyRand};
 use crate::internal::telemetry::{SamplingTelemetry, SamplingTimer};
+use crate::loader::planned_capacity;
 
 /// Temporal sampling strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +237,17 @@ pub struct NeighborSampler<'a> {
     cumsum_buf: Vec<f64>,
 }
 
+/// Floor capacities for the output buffers swapped in after a sampling call
+/// hands its filled ones to the caller. Above these floors the replacement is
+/// sized from the count the call just produced.
+const MIN_NODE_CAPACITY: usize = 512;
+const MIN_EDGE_CAPACITY: usize = 2048;
+
+/// Largest graph that gets the dense per-node dedup table, at one `u64` slot
+/// per node — a 64 MiB allocation at this bound. Past it the sampler switches
+/// to a hash map, whose footprint follows the sample rather than the graph.
+const DENSE_DEDUP_MAX_NODES: usize = 8 << 20;
+
 impl<'a> NeighborSampler<'a> {
     /// Creates a new neighbor sampler.
     pub fn new(graph: &'a Graph, config: SamplingConfig) -> Self {
@@ -248,20 +260,23 @@ impl<'a> NeighborSampler<'a> {
         // Pre-allocate with typical sizes
         let max_fanout = config.fanout.iter().max().copied().unwrap_or(25);
 
-        // Use direct array when the expected sample is a large fraction of the graph.
-        // Direct array: O(1) lookup, but 8 bytes/node upfront → cache pressure for small samples.
-        // HashMap: O(1) amortized, grows with sample size → better when sample << graph.
+        // Dense dedup probes one u64 slot with a single load and resets with a
+        // generation bump; the map pays a hash and a control-byte scan per
+        // probe. The dense table wins at every sample density measured,
+        // including a 16-seed one-hop batch on a 4M-node graph — the case a
+        // density rule would hand to the map, where dense tracks a few hundred
+        // nodes inside a 32 MB allocation and is still faster. The table is
+        // allocated zero-filled, so slots the sample never touches are never
+        // faulted in: what an oversized table costs is address space, not
+        // resident memory.
         //
-        // Heuristic: estimate max sample size from fanout and a typical batch.
-        // If sample/graph > 1%, direct array wins (sequential gen-tag check).
-        // Otherwise HashMap avoids polluting caches with 8MB of mostly-untouched arrays.
+        // The bound is therefore a memory decision rather than a speed one.
+        // Scattered probes into a large table fault a full page per distinct
+        // node touched, so worst-case residency is the whole table, and a
+        // sampler is constructed per rayon chunk — the table is multiplied by
+        // the thread count.
         let num_nodes = graph.num_nodes();
-        let estimated_sample: usize = config
-            .fanout
-            .iter()
-            .fold(128usize, |acc, &f| acc.saturating_mul(f).min(num_nodes));
-        let use_direct =
-            num_nodes <= 100_000 || (estimated_sample as f64 / num_nodes as f64) > 0.01;
+        let use_direct = num_nodes <= DENSE_DEDUP_MAX_NODES;
         Self {
             graph,
             config,
@@ -594,25 +609,41 @@ impl<'a> NeighborSampler<'a> {
         // endpoint indices) are therefore freshly allocated on every call;
         // only the internal scratch (frontiers, dedup arrays, sample buffers)
         // is reset and reused.
-        let mut node_vec = Vec::with_capacity(512);
+        //
+        // Each replacement is sized from what this call just produced — the
+        // buffer's own length, read before it is swapped away. A sampler is
+        // reused across batches of near-identical shape, so that count
+        // predicts the next call far better than a fixed constant does: a
+        // three-hop batch emits hundreds of thousands of edges, and starting
+        // each of the five parallel edge arrays at a small constant climbs a
+        // realloc-and-copy ladder on every call.
+        let node_capacity = planned_capacity(self.node_vec.len(), MIN_NODE_CAPACITY);
+        let edge_capacity = planned_capacity(self.edge_src_buf.len(), MIN_EDGE_CAPACITY);
+
+        let mut node_vec = Vec::with_capacity(node_capacity);
         std::mem::swap(&mut self.node_vec, &mut node_vec);
 
-        let mut edge_src = Vec::with_capacity(2048);
+        let mut edge_src = Vec::with_capacity(edge_capacity);
         std::mem::swap(&mut self.edge_src_buf, &mut edge_src);
 
-        let mut edge_dst = Vec::with_capacity(2048);
+        let mut edge_dst = Vec::with_capacity(edge_capacity);
         std::mem::swap(&mut self.edge_dst_buf, &mut edge_dst);
 
-        let mut edge_ids = Vec::with_capacity(if self.config.track_edge_ids { 2048 } else { 0 });
+        let mut edge_ids = Vec::with_capacity(if self.config.track_edge_ids {
+            edge_capacity
+        } else {
+            0
+        });
         std::mem::swap(&mut self.edge_ids_buf, &mut edge_ids);
 
-        let mut src_local = Vec::with_capacity(2048);
+        let mut src_local = Vec::with_capacity(edge_capacity);
         std::mem::swap(&mut self.src_local_buf, &mut src_local);
 
-        let mut dst_local = Vec::with_capacity(2048);
+        let mut dst_local = Vec::with_capacity(edge_capacity);
         std::mem::swap(&mut self.dst_local_buf, &mut dst_local);
 
-        let mut seed_locals = Vec::with_capacity(512);
+        // Exactly one local index per seed, so this size is known, not predicted.
+        let mut seed_locals = Vec::with_capacity(seeds.len());
         std::mem::swap(&mut self.seed_locals_buf, &mut seed_locals);
 
         // Apply subgraph_type post-processing. Local endpoint indices were
@@ -620,36 +651,16 @@ impl<'a> NeighborSampler<'a> {
         // path; the Induced filter builds a transient membership map for
         // itself alone and drops it once the edges are filtered.
         let (edge_src, edge_dst, edge_ids, src_local, dst_local) = match self.config.subgraph_type {
-            SubgraphType::Directional => (edge_src, edge_dst, edge_ids, src_local, dst_local),
-            SubgraphType::Induced => {
-                // Filter to only edges where both endpoints are in the
-                // node set. `member` serves as the node set — O(1)
-                // lookup. The local arrays are filtered in lockstep.
-                let member: FxHashSet<NodeId> = node_vec.iter().copied().collect();
-
-                let mut new_src = Vec::with_capacity(edge_src.len());
-                let mut new_dst = Vec::with_capacity(edge_dst.len());
-                let mut new_ids = if self.config.track_edge_ids {
-                    Vec::with_capacity(edge_ids.len())
-                } else {
-                    Vec::new()
-                };
-                let mut new_src_local = Vec::with_capacity(src_local.len());
-                let mut new_dst_local = Vec::with_capacity(dst_local.len());
-
-                for i in 0..edge_src.len() {
-                    if member.contains(&edge_src[i]) && member.contains(&edge_dst[i]) {
-                        new_src.push(edge_src[i]);
-                        new_dst.push(edge_dst[i]);
-                        if self.config.track_edge_ids {
-                            new_ids.push(edge_ids[i]);
-                        }
-                        new_src_local.push(src_local[i]);
-                        new_dst_local.push(dst_local[i]);
-                    }
-                }
-
-                (new_src, new_dst, new_ids, new_src_local, new_dst_local)
+            // Induced keeps edges whose endpoints are both in the sampled
+            // node set, which every emitted edge already satisfies: a source
+            // is a frontier node, and a destination is registered by
+            // `insert_node_frontier` in the same step that pushes the edge.
+            // The set membership test is therefore decided at emit time, and
+            // re-deciding it here would cost a node-set build plus two hash
+            // probes per edge to retain every edge. `induced_keeps_every_edge`
+            // pins the invariant.
+            SubgraphType::Directional | SubgraphType::Induced => {
+                (edge_src, edge_dst, edge_ids, src_local, dst_local)
             }
             SubgraphType::Bidirectional => {
                 // Add reverse edges
@@ -995,8 +1006,12 @@ impl<'a> NeighborSampler<'a> {
             self.cumsum_buf.push(total);
         }
 
+        // One reciprocal for the whole node instead of a divide per draw:
+        // `total / u64::MAX` is loop-invariant, and a divide costs several
+        // times a multiply on every target here.
+        let scale = total / (u64::MAX as f64);
         for _ in 0..k {
-            let u = (self.rng.next_u64() as f64) / (u64::MAX as f64) * total;
+            let u = (self.rng.next_u64() as f64) * scale;
             let idx = self.cumsum_buf.partition_point(|&c| c <= u).min(n - 1);
             self.sample_buf.push((neighbors[idx], idx));
         }
@@ -1444,6 +1459,60 @@ mod tests {
 
         assert!(subgraph.num_edges() > 0);
         assert!(subgraph.edge_ids.is_empty());
+    }
+
+    /// Every emitted endpoint is registered in the node set as the edge is
+    /// pushed, so the Induced membership filter can never drop an edge.
+    /// `sample_neighbors_inner` relies on this to skip the filter entirely;
+    /// if an emit path ever pushes an edge without registering both
+    /// endpoints, this fails instead of silently returning stale edges.
+    #[test]
+    fn induced_keeps_every_edge() {
+        let mut edges = Vec::new();
+        for src in 0..200u32 {
+            for step in 1..=7u32 {
+                edges.push((src, (src * 7 + step * 13) % 200));
+            }
+        }
+        let graph = Graph::from_edges(200, &edges, None).unwrap();
+
+        let base = SamplingConfig {
+            fanout: vec![4, 3, 2],
+            replace: false,
+            seed: Some(7),
+            max_degree: None,
+            cumulative: false,
+            weighted: false,
+            subgraph_type: SubgraphType::Induced,
+            track_edge_ids: true,
+            temporal_strategy: None,
+            disjoint: false,
+            deterministic: false,
+            telemetry: None,
+        };
+        let seeds: Vec<NodeId> = (0..16).collect();
+
+        let mut induced = NeighborSampler::new(&graph, base.clone());
+        let induced = induced.sample_neighbors(&seeds);
+
+        let member: FxHashSet<NodeId> = induced.nodes.iter().copied().collect();
+        assert!(!induced.edge_src.is_empty());
+        for (&src, &dst) in induced.edge_src.iter().zip(induced.edge_dst.iter()) {
+            assert!(member.contains(&src), "source {src} missing from node set");
+            assert!(member.contains(&dst), "dest {dst} missing from node set");
+        }
+
+        // Same seed, same RNG stream: the two modes must agree edge for edge.
+        let directional_cfg = SamplingConfig {
+            subgraph_type: SubgraphType::Directional,
+            ..base
+        };
+        let mut directional = NeighborSampler::new(&graph, directional_cfg);
+        let directional = directional.sample_neighbors(&seeds);
+
+        assert_eq!(induced.edge_src, directional.edge_src);
+        assert_eq!(induced.edge_dst, directional.edge_dst);
+        assert_eq!(induced.edge_ids, directional.edge_ids);
     }
 
     #[test]

@@ -44,7 +44,6 @@ use crate::graph::{Graph, NodeId};
 use crate::internal::genstamp::WyRand;
 use crate::internal::hint;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
-use half::f16;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -432,32 +431,28 @@ impl SyncFeatureStore {
     }
 
     /// Sync batch read fallback.
+    ///
+    /// Bounds are checked up front, the landing buffer and the dtype
+    /// dispatch are hoisted out of the row loop, and each row decodes as a
+    /// block rather than element by element.
     fn batch_read_sync(&self, nodes: &[NodeId], feature_size: usize) -> anyhow::Result<Vec<f32>> {
-        let mut all_features = Vec::with_capacity(nodes.len() * self.feature_dim);
-
         for &node in nodes {
             if node as usize >= self.num_nodes {
                 anyhow::bail!("node {} out of bounds", node);
             }
+        }
 
+        let decoder = self.dtype.row_decoder();
+        let mut all_features = vec![0f32; nodes.len() * self.feature_dim];
+        let mut buffer = vec![0u8; feature_size];
+
+        for (i, &node) in nodes.iter().enumerate() {
             let offset = self.features_start_offset + (node as u64 * feature_size as u64);
-            let mut buffer = vec![0u8; feature_size];
-
             self.file.read_exact_at(&mut buffer, offset)?;
-
-            match self.dtype {
-                FeatureDtype::F32 => {
-                    for chunk in buffer.chunks_exact(4) {
-                        all_features
-                            .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                    }
-                }
-                FeatureDtype::F16 => {
-                    for chunk in buffer.chunks_exact(2) {
-                        all_features.push(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
-                    }
-                }
-            }
+            decoder.decode_row(
+                &buffer,
+                &mut all_features[i * self.feature_dim..(i + 1) * self.feature_dim],
+            );
         }
 
         Ok(all_features)

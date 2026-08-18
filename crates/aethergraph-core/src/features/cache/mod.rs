@@ -6,25 +6,27 @@
 //! - Warm tier: CPU RAM (larger, medium latency)
 //! - Cold tier: NVMe SSD (unlimited, high latency)
 //!
-//! Uses frequency-weighted eviction to keep hot nodes in faster tiers.
-//! When warmup frequencies are provided, the hottest nodes are pinned in GPU.
+//! The in-memory tiers evict by SIEVE, which keeps hot nodes resident
+//! without maintaining any ordering on the hit path. When warmup
+//! frequencies are provided, the hottest nodes are pinned in GPU.
 //!
-//! Tier internals live in submodules: [`slab`] (row storage), [`freq`]
-//! (frequency-weighted eviction for the in-memory tiers), and [`nvme`]
-//! (single-file spill store).
+//! Tier internals live in submodules: [`slab`] (row storage), [`sieve`]
+//! (eviction for the in-memory tiers), and [`nvme`] (single-file spill
+//! store).
 
-mod freq;
 mod nvme;
+mod sieve;
 mod slab;
 
 use crate::graph::{Graph, NodeId};
 use crate::loader::{NeighborSampler, SamplingConfig};
 use ahash::AHashMap;
 use anyhow::{Context, Result};
-use freq::{FreqCache, InsertOutcome};
+
 use nvme::NvmeTier;
 use parking_lot::RwLock;
 use rustc_hash::FxHashSet;
+use sieve::{InsertOutcome, SieveCache};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,8 +54,8 @@ pub struct FeatureCacheConfig {
     pub nvme_path: Option<PathBuf>,
 
     /// Pre-computed node access frequencies from warmup pass.
-    /// If provided, the cache uses frequency-weighted eviction and pins
-    /// the hottest nodes in GPU tier.
+    /// If provided, the hottest nodes are pinned in the GPU tier and the
+    /// rest enter eviction with a sweep of grace.
     pub warmup_frequencies: Option<Arc<AHashMap<NodeId, u32>>>,
 
     /// Fraction of GPU capacity to pin for hot nodes (default 0.8).
@@ -82,10 +84,10 @@ pub struct FeatureCache {
     nvme: Arc<NvmeTier>,
 
     /// GPU tier (hot)
-    gpu_cache: Arc<RwLock<FreqCache>>,
+    gpu_cache: Arc<RwLock<SieveCache>>,
 
     /// CPU tier (warm)
-    cpu_cache: Arc<RwLock<FreqCache>>,
+    cpu_cache: Arc<RwLock<SieveCache>>,
 
     /// Stats (atomic counters — the hot path must not take a lock to
     /// bump a hit counter)
@@ -155,8 +157,8 @@ impl FeatureCache {
             .as_ref()
             .map_or_else(AHashMap::new, |m| (**m).clone());
 
-        let mut gpu = FreqCache::new(config.gpu_capacity, dim, warmup.clone());
-        let cpu = FreqCache::new(config.cpu_capacity, dim, warmup);
+        let mut gpu = SieveCache::new(config.gpu_capacity, dim, warmup.clone());
+        let cpu = SieveCache::new(config.cpu_capacity, dim, warmup);
 
         // Pin hottest nodes in GPU tier when warmup frequencies are provided.
         // At least one slot stays unpinned: a fully-pinned tier has nothing
@@ -205,8 +207,9 @@ impl FeatureCache {
     pub async fn get_into(&self, node: NodeId, out: &mut [f32]) -> Result<()> {
         debug_assert_eq!(out.len(), self.config.feature_dim);
         // Try GPU cache first (hot tier). Hits take only the READ lock —
-        // the frequency bump is an atomic inside the entry — so concurrent
-        // loaders hitting the hot tier don't serialize on one writer lock.
+        // marking the entry visited is an atomic store inside it — so
+        // concurrent loaders hitting the hot tier don't serialize on one
+        // writer lock.
         {
             let gpu = self.gpu_cache.read();
             if let Some(row) = gpu.get(node) {
@@ -377,16 +380,32 @@ impl FeatureCache {
             }
         }
 
-        // Assemble in input order (duplicates resolved from the map).
-        Ok(nodes
-            .iter()
-            .map(|node| {
-                resolved
-                    .get(node)
-                    .cloned()
-                    .expect("every requested node was resolved or errored")
-            })
-            .collect())
+        // Assemble in input order. `resolved` holds one entry per distinct
+        // node and is dropped on return, so when the batch has no repeats
+        // every row can be moved out instead of copied — `resolved.len()`
+        // equalling `nodes.len()` is exactly that condition, since the map
+        // is keyed by node. A batch that does repeat a node still needs a
+        // copy for all but the final occurrence, so it keeps cloning.
+        let mut out = Vec::with_capacity(nodes.len());
+        if resolved.len() == nodes.len() {
+            for node in nodes {
+                out.push(
+                    resolved
+                        .remove(node)
+                        .expect("every requested node was resolved or errored"),
+                );
+            }
+        } else {
+            for node in nodes {
+                out.push(
+                    resolved
+                        .get(node)
+                        .cloned()
+                        .expect("every requested node was resolved or errored"),
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Insert features for a node into the cache

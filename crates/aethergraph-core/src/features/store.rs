@@ -285,8 +285,50 @@ pub struct FeatureStore {
     features_start_offset: usize,
     feature_data_len_bytes: usize,
     dtype: FeatureDtype,
+    /// Row size and prefetch distance, resolved once from the header.
+    gather: GatherPlan,
     /// Optional telemetry collector
     telemetry: Option<Arc<TelemetryCells>>,
+}
+
+/// How far ahead a batch gather prefetches, resolved once per store.
+///
+/// Every line of a prefetched row is touched: rows land at random offsets,
+/// so the hardware streamer never locks onto them and each line is a
+/// separate demand miss. What must scale with row size is the *distance*.
+/// The quantity that has to stay bounded is the prefetch window in bytes,
+/// not in rows: a fixed row distance spans `rows_ahead * row_bytes`, which
+/// grows without bound as feature dimension rises, and once the window
+/// outruns the cache the prefetched lines are evicted before the copy
+/// reaches them — turning each one into a wasted fetch plus the demand
+/// miss it was meant to hide.
+///
+/// `benches/feature_gather.rs` sweeps distance against feature dimension.
+/// A window near [`GatherPlan::WINDOW_BYTES`] sits at or within noise of
+/// the per-dimension optimum from 32 to 1024 dims, while a window 8x wider
+/// costs 5-6x at the large end.
+#[derive(Clone, Copy, Debug)]
+struct GatherPlan {
+    /// Bytes per feature row in the on-disk dtype.
+    row_bytes: usize,
+    /// Rows ahead of the copy cursor to prefetch.
+    rows_ahead: usize,
+}
+
+impl GatherPlan {
+    /// Target span of the prefetch window.
+    const WINDOW_BYTES: usize = 8 << 10;
+    /// Cap for narrow rows, where the quotient below would otherwise run
+    /// the prefetch cursor far past anything the copy will reach soon.
+    const MAX_ROWS_AHEAD: usize = 16;
+    const LINE: usize = 64;
+
+    fn new(row_bytes: usize) -> Self {
+        Self {
+            row_bytes,
+            rows_ahead: (Self::WINDOW_BYTES / row_bytes.max(1)).clamp(1, Self::MAX_ROWS_AHEAD),
+        }
+    }
 }
 
 // No hand-written `unsafe impl Send/Sync`: every field (`Arc<Mmap>`,
@@ -430,7 +472,7 @@ impl FeatureStore {
         // Both hints are best-effort.
         let payload = &mmap[data_offset..data_offset + expected_data_size];
         crate::internal::hint::advise_mmap_random(payload.as_ptr(), payload.len());
-        crate::internal::hint::advise_mmap_hugepage(payload.as_ptr(), payload.len());
+        crate::internal::hint::advise_hugepage(payload.as_ptr(), payload.len());
 
         Ok(Self {
             mmap,
@@ -439,18 +481,18 @@ impl FeatureStore {
             features_start_offset: data_offset,
             feature_data_len_bytes: expected_data_size,
             dtype,
+            gather: GatherPlan::new(feature_dim * dtype.element_size()),
             telemetry: None,
         })
     }
 
-    /// How many rows ahead the batch gathers prefetch. Random rows on a
-    /// large store miss LLC (and often dTLB); a handful of rows in flight
-    /// overlaps those misses with the copy of the current row.
-    const GATHER_PREFETCH_ROWS: usize = 4;
-
-    /// Prefetch every cache line of one feature row.
+    /// Prefetch every cache line of the row starting at `byte_start`.
+    ///
+    /// `byte_start` is a validated row offset, so the touched span stays
+    /// inside the payload.
     #[inline(always)]
-    fn prefetch_row(row: &[u8]) {
+    fn prefetch_row(raw: &[u8], byte_start: usize, row_bytes: usize) {
+        let row = &raw[byte_start..byte_start + row_bytes];
         let mut p = row.as_ptr();
         // SAFETY: `end` is one-past-the-slice; `p` only advances in 64-byte
         // steps while strictly below it, and prefetch tolerates any address.
@@ -458,7 +500,7 @@ impl FeatureStore {
         while p < end {
             crate::internal::prefetch::prefetch_read(p);
             // SAFETY: advancing past `end` terminates the loop before use.
-            p = unsafe { p.add(64) };
+            p = unsafe { p.add(GatherPlan::LINE) };
         }
     }
 
@@ -636,7 +678,10 @@ impl FeatureStore {
         // the copy, overlapping the random-access miss latency instead of
         // serializing one miss per row.
         let raw = self.feature_data_raw();
-        let row_bytes = self.feature_dim * self.dtype.element_size();
+        let GatherPlan {
+            row_bytes,
+            rows_ahead,
+        } = self.gather;
         let mut row_starts: Vec<usize> = Vec::with_capacity(nodes.len());
         for &node in nodes {
             let node_id: NodeId = node
@@ -653,8 +698,8 @@ impl FeatureStore {
         match self.dtype {
             FeatureDtype::F32 => {
                 for (i, &byte_start) in row_starts.iter().enumerate() {
-                    if let Some(&ahead) = row_starts.get(i + Self::GATHER_PREFETCH_ROWS) {
-                        Self::prefetch_row(&raw[ahead..ahead + row_bytes]);
+                    if let Some(&ahead) = row_starts.get(i + rows_ahead) {
+                        Self::prefetch_row(raw, ahead, row_bytes);
                     }
                     let row = &raw[byte_start..byte_start + row_bytes];
                     result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(row));
@@ -662,13 +707,14 @@ impl FeatureStore {
             }
             FeatureDtype::F16 => {
                 result.resize(nodes.len() * self.feature_dim, 0.0);
+                let decoder = self.dtype.row_decoder();
                 for (i, &byte_start) in row_starts.iter().enumerate() {
-                    if let Some(&ahead) = row_starts.get(i + Self::GATHER_PREFETCH_ROWS) {
-                        Self::prefetch_row(&raw[ahead..ahead + row_bytes]);
+                    if let Some(&ahead) = row_starts.get(i + rows_ahead) {
+                        Self::prefetch_row(raw, ahead, row_bytes);
                     }
                     let row = &raw[byte_start..byte_start + row_bytes];
                     let out = &mut result[i * self.feature_dim..(i + 1) * self.feature_dim];
-                    crate::internal::simd::f16_le_to_f32(row, out);
+                    decoder.decode_row(row, out);
                 }
             }
         }
@@ -718,7 +764,10 @@ impl FeatureStore {
         // buffer. Bounds are validated up front so the copy loop stays
         // branch-light.
         let raw = self.feature_data_raw();
-        let row_bytes = self.feature_dim * self.dtype.element_size();
+        let GatherPlan {
+            row_bytes,
+            rows_ahead,
+        } = self.gather;
         for &node in nodes {
             anyhow::ensure!(
                 (node as usize) < self.num_nodes,
@@ -727,15 +776,15 @@ impl FeatureStore {
                 self.num_nodes
             );
         }
+        let decoder = self.dtype.row_decoder();
         for (i, &node) in nodes.iter().enumerate() {
-            if let Some(&ahead) = nodes.get(i + Self::GATHER_PREFETCH_ROWS) {
-                let ahead_start = ahead as usize * row_bytes;
-                Self::prefetch_row(&raw[ahead_start..ahead_start + row_bytes]);
+            if let Some(&ahead) = nodes.get(i + rows_ahead) {
+                Self::prefetch_row(raw, ahead as usize * row_bytes, row_bytes);
             }
             let byte_start = node as usize * row_bytes;
             let row = &raw[byte_start..byte_start + row_bytes];
             let dst = &mut out[i * self.feature_dim..(i + 1) * self.feature_dim];
-            self.dtype.decode_row(row, dst);
+            decoder.decode_row(row, dst);
         }
 
         if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {

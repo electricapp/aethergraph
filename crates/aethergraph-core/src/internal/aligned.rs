@@ -218,6 +218,17 @@ impl AlignedBufferPool {
         &self.buffer.as_slice()[offset..end]
     }
 
+    /// Slot `index` viewed as `lanes` `f32` values.
+    ///
+    /// Slots start every `slot_size` bytes from a [`DIRECT_IO_ALIGNMENT`]
+    /// -aligned base, and `slot_size` is itself rounded to that alignment,
+    /// so every slot base is far more aligned than `f32` requires and this
+    /// view carries no alignment risk.
+    pub fn slot_slice_f32(&self, index: usize, lanes: usize) -> &[f32] {
+        let bytes = self.slot_slice(index, lanes * std::mem::size_of::<f32>());
+        bytemuck::cast_slice(bytes)
+    }
+
     /// Base pointer of the contiguous region holding every slot.
     pub fn region_ptr(&mut self) -> *mut u8 {
         self.buffer.as_mut_ptr()
@@ -242,6 +253,48 @@ impl AlignedBufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gather reads F32 rows straight out of a slot as `[f32]`, which
+    /// is only infallible while every slot base stays `f32`-aligned. Slot
+    /// sizes that are not themselves multiples of 4 are the case that
+    /// would break it, so they are covered explicitly.
+    #[test]
+    fn slot_slice_f32_views_every_slot_without_realignment() {
+        for slot_size in [4usize, 12, 100, 4096, 5000] {
+            let mut pool = AlignedBufferPool::try_new(4, slot_size).unwrap();
+            let lanes = slot_size / std::mem::size_of::<f32>();
+
+            for i in 0..4 {
+                let ptr = pool.slot_ptr(i);
+                assert_eq!(
+                    ptr as usize % std::mem::align_of::<f32>(),
+                    0,
+                    "slot {i} of size {slot_size} is not f32-aligned"
+                );
+                // Panics on a misaligned cast, so reaching the length
+                // assertion is itself the alignment check.
+                assert_eq!(pool.slot_slice_f32(i, lanes).len(), lanes);
+            }
+        }
+    }
+
+    /// The lane view must map to the bytes the slot actually holds, not
+    /// merely be well-aligned — including for a slot other than the first,
+    /// which is where an offset mistake would show up.
+    #[test]
+    fn slot_slice_f32_round_trips_written_lanes() {
+        let mut pool = AlignedBufferPool::try_new(2, 16).unwrap();
+        let written: [f32; 4] = [1.5, -2.25, 0.0, 7.75];
+        let src: &[u8] = bytemuck::cast_slice(&written);
+
+        let dst = pool.slot_ptr(1);
+        // SAFETY: slot 1 exists and spans at least 16 bytes, `src` is a
+        // distinct 16-byte buffer, and the two cannot overlap.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+
+        assert_eq!(pool.slot_slice_f32(1, 4), &written);
+        assert_eq!(pool.slot_slice_f32(0, 4), &[0.0f32; 4]);
+    }
 
     #[test]
     fn test_aligned_buffer() {

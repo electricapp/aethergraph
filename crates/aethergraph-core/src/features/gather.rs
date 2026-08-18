@@ -6,7 +6,7 @@
 
 #![cfg(target_os = "linux")]
 
-use super::header::FeatureDtype;
+use super::header::{FeatureDtype, RowDecoder};
 use crate::graph::NodeId;
 use crate::internal::uring::{UringLane, batch_read};
 use anyhow::Result;
@@ -41,7 +41,19 @@ pub(crate) fn uring_gather_rows(
         return Ok(Vec::new());
     }
 
-    let mut features = vec![0f32; nodes.len() * feature_dim];
+    // An F32 payload is already `f32` lanes on disk, so rows are appended
+    // straight into reserved-but-unwritten capacity and the buffer is
+    // never zeroed on its way to being fully overwritten. Both landing
+    // buffers are `f32`-aligned by construction — the O_DIRECT pool to a
+    // page, the buffered scratch through its `Vec<f32>` backing — so
+    // those views are infallible rather than alignment-dependent. F16
+    // still needs somewhere to upcast into, and keeps a zeroed buffer.
+    let decoder = dtype.row_decoder();
+    let total_elems = nodes.len() * feature_dim;
+    let mut features: Vec<f32> = match decoder {
+        RowDecoder::F32 => Vec::with_capacity(total_elems),
+        RowDecoder::F16(_) => vec![0f32; total_elems],
+    };
 
     if direct_io {
         let total_slots = nodes.len();
@@ -63,8 +75,13 @@ pub(crate) fn uring_gather_rows(
 
         let pool = lane.direct_pool(total_slots, feature_size)?;
         for i in 0..total_slots {
-            let row = pool.slot_slice(i, feature_size);
-            dtype.decode_row(row, &mut features[i * feature_dim..(i + 1) * feature_dim]);
+            match decoder {
+                RowDecoder::F32 => features.extend_from_slice(pool.slot_slice_f32(i, feature_dim)),
+                RowDecoder::F16(_) => decoder.decode_row(
+                    pool.slot_slice(i, feature_size),
+                    &mut features[i * feature_dim..(i + 1) * feature_dim],
+                ),
+            }
         }
     } else {
         let total_size = nodes.len().checked_mul(feature_size).ok_or_else(|| {
@@ -92,8 +109,10 @@ pub(crate) fn uring_gather_rows(
         batch_read(&mut lane.handle, fd, &reads)?;
         trace!("Completed {} feature reads via io_uring", reads.len());
 
-        let scratch = lane.scratch(total_size);
-        dtype.decode_row(scratch, &mut features);
+        match decoder {
+            RowDecoder::F32 => features.extend_from_slice(lane.scratch_f32(total_elems)),
+            RowDecoder::F16(_) => decoder.decode_row(lane.scratch(total_size), &mut features),
+        }
     }
 
     Ok(features)
