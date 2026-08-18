@@ -13,10 +13,64 @@ use tracing::debug;
 ///
 /// All RDMA resources (QPs, MRs) are created through this context.
 /// Dropped in reverse order: CQ → PD → device context.
+/// How a port reaches its peers, from `ibv_port_attr.link_layer`.
+///
+/// This decides how an address handle is built, and the two fabrics want
+/// opposite things: InfiniBand routes on LIDs assigned by a subnet manager
+/// and adds a Global Route Header only to leave the subnet, while RoCE has
+/// no LIDs at all and requires a GRH on every packet.
+///
+/// Reading it from the port rather than inferring it matters because the
+/// obvious inference is wrong. "The peer sent a non-zero GID, so this must
+/// be RoCE" holds for RoCE and EFA, but IB ports also have GIDs — a subnet
+/// prefix plus the port GUID — so that guess forces a 40-byte GRH onto
+/// every packet of an intra-subnet IB link that should route on its LID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkLayer {
+    /// Native InfiniBand: LID-routed within a subnet, GRH across subnets.
+    InfiniBand,
+    /// RoCE (and SoftRoCE): GID-routed, GRH always, LID is meaningless.
+    Ethernet,
+}
+
+impl LinkLayer {
+    /// Parse `ibv_port_attr.link_layer`.
+    ///
+    /// `IBV_LINK_LAYER_UNSPECIFIED` is reported by some drivers (and by
+    /// EFA) that are nonetheless GID-routed, so anything that is not
+    /// explicitly InfiniBand is treated as Ethernet — the addressing that
+    /// carries a GRH, which is the safe direction to guess wrong in.
+    pub fn from_port_attr(link_layer: u8) -> Self {
+        // From <infiniband/verbs.h>: UNSPECIFIED = 0, INFINIBAND = 1,
+        // ETHERNET = 2.
+        const IBV_LINK_LAYER_INFINIBAND: u8 = 1;
+        if link_layer == IBV_LINK_LAYER_INFINIBAND {
+            Self::InfiniBand
+        } else {
+            Self::Ethernet
+        }
+    }
+
+    /// Whether an address handle on this fabric needs a Global Route
+    /// Header to reach `remote_gid` from `local_gid`.
+    ///
+    /// RoCE always needs one. InfiniBand needs one only to cross a subnet,
+    /// which the top 8 bytes of the GID — the subnet prefix — identify; a
+    /// peer on the same subnet is reached by LID alone.
+    pub fn needs_grh(self, local_gid: &[u8; 16], remote_gid: &[u8; 16]) -> bool {
+        match self {
+            Self::Ethernet => true,
+            Self::InfiniBand => local_gid[..8] != remote_gid[..8],
+        }
+    }
+}
+
 pub struct RdmaContext {
     context: *mut IbvContext,
     pub pd: *mut IbvPd,
     pub cq: *mut IbvCq,
+    /// How this port addresses peers, read from the port at open.
+    pub link_layer: LinkLayer,
     /// Local port LID (for IB fabrics; 0 for RoCE).
     pub port_lid: u16,
     /// Local port GID (for RoCE routing).
@@ -231,15 +285,23 @@ impl RdmaContext {
             )));
         }
 
+        let link_layer = LinkLayer::from_port_attr(port_attr.link_layer);
         let ctx = Self {
             context,
             pd,
             cq,
+            link_layer,
             port_lid: port_attr.lid,
             port_gid: gid,
             gid_index,
             numa_node,
         };
+        debug!(
+            ?link_layer,
+            lid = ctx.port_lid,
+            gid_index,
+            "RDMA port addressing"
+        );
 
         // Report the device's fast-path capabilities once, at open. Which
         // of these a fabric offers decides whether the atomic, ODP, and
