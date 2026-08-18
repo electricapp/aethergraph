@@ -36,10 +36,12 @@ bench = false
 # multi-socket box the placement calls interleave the graph body and pin the
 # sampler pool; on a Linux wheel the store probes /dev/ng* at open and
 # silently falls back to the O_DIRECT io_uring gather when passthrough is
-# unavailable.
+# unavailable. `zstd-tier` is portable, so the compressed backing tier ships
+# on every wheel; it stays inert unless a `cold_store_path` is configured.
 aethergraph-core = { path = "../aethergraph-core", version = "0.1", features = [
     "numa",
     "nvme-passthru",
+    "zstd-tier",
 ] }
 # `wal` is always on so the Python `DynamicGraph.open_with_wal` constructor is
 # present on every wheel build — durability is a runtime opt-in (pass a path or

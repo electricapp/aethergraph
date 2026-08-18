@@ -86,6 +86,32 @@ class TestGraphPersistence:
         assert owned_graph.num_nodes == small_graph.num_nodes
         assert owned_graph.num_edges == small_graph.num_edges
 
+    def test_compressed_round_trip(self, small_graph: Graph, temp_dir: Path) -> None:
+        """A compressed save reloads to an identical graph, smaller on disk."""
+        flat = temp_dir / "flat.bin"
+        packed = temp_dir / "packed.bin"
+        small_graph.save(flat)
+        small_graph.save(packed, compressed=True)
+
+        loaded = Graph.load(packed)
+        assert loaded.num_nodes == small_graph.num_nodes
+        assert loaded.num_edges == small_graph.num_edges
+        for node in range(small_graph.num_nodes):
+            np.testing.assert_array_equal(loaded.neighbors(node), small_graph.neighbors(node))
+
+        assert packed.stat().st_size < flat.stat().st_size
+
+    def test_compressed_rejects_mmap_storage(self, small_graph: Graph, temp_dir: Path) -> None:
+        """Compressed files decode into owned arrays, so mmap storage is refused."""
+        path = temp_dir / "packed_mmap.bin"
+        small_graph.save(path, compressed=True)
+
+        with pytest.raises(Exception, match="compressed"):
+            Graph.load(path, storage="mmap")
+
+        owned = Graph.load(path, storage="owned")
+        assert owned.num_edges == small_graph.num_edges
+
     def test_invalid_validation_mode(self, small_graph: Graph, temp_dir: Path) -> None:
         """Invalid validation mode should raise ValueError."""
         path = temp_dir / "test_graph_invalid_validation.bin"

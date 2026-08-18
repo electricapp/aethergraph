@@ -136,6 +136,15 @@ jobs:
             --features nvme-passthru -- -D warnings
           cargo test -p aethergraph-core --features nvme-passthru internal::nvme
 
+      - name: compressed graph format + cold-tier tests
+        run: |
+          cargo clippy --workspace --all-targets --no-deps \
+            --features aethergraph-core/zstd-tier -- -D warnings
+          cargo test -p aethergraph-core succinct
+          cargo test -p aethergraph-core compressed_graph
+          cargo test -p aethergraph-core --features zstd-tier features::cold_tier
+          cargo test -p aethergraph-core --features zstd-tier features::cache
+
       - name: mlx5dv compile check
         if: matrix.run_rdma
         run: cargo check -p aether-stream --tests --features mlx5dv

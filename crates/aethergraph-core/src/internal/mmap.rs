@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, trace};
 
 /// Magic number to identify AetherGraph files: "AETH" in ASCII
-const MAGIC: u32 = 0x4145_5448;
+pub(crate) const MAGIC: u32 = 0x4145_5448;
 
 /// Current file format version. The integrity checksum is CRC32 (IEEE) —
 /// SIMD-accelerated with runtime dispatch, ~10-30 GB/s over the body.
@@ -22,6 +22,10 @@ const VERSION: u32 = 1;
 
 /// Use full validation below this threshold; offsets-only above it.
 const FULL_VALIDATION_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Structural upper bounds shared by both file format versions.
+const MAX_NODES: u64 = 10_000_000_000;
+const MAX_EDGES: u64 = 100_000_000_000;
 
 /// File header for graph storage.
 ///
@@ -34,7 +38,7 @@ const FULL_VALIDATION_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 /// - integrity_checksum32: 4 (0 => absent; checksums are optional by design)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct Header {
+pub(crate) struct Header {
     magic: u32,
     version: u32,
     num_nodes: u64,
@@ -73,7 +77,58 @@ impl Header {
         Ok(())
     }
 
-    fn checksum32(&self) -> Option<u32> {
+    /// Header for a version-2 compressed file; the checksum covers the
+    /// compressed payload rather than flat arrays.
+    pub(crate) fn for_compressed(
+        num_nodes: usize,
+        num_edges: usize,
+        has_weights: bool,
+        payload_checksum32: u32,
+    ) -> Self {
+        Self {
+            magic: MAGIC,
+            version: super::compressed_graph::COMPRESSED_VERSION,
+            num_nodes: num_nodes as u64,
+            num_edges: num_edges as u64,
+            has_weights: if has_weights { 1 } else { 0 },
+            integrity_checksum32: payload_checksum32,
+        }
+    }
+
+    /// Validate magic/version/bounds for the compressed format.
+    pub(crate) fn validate_compressed(&self) -> Result<()> {
+        anyhow::ensure!(self.magic == MAGIC, "invalid magic number");
+        anyhow::ensure!(
+            self.version == super::compressed_graph::COMPRESSED_VERSION,
+            "not a compressed graph file: version {}",
+            self.version
+        );
+        anyhow::ensure!(
+            self.num_nodes <= MAX_NODES && self.num_edges <= MAX_EDGES,
+            "graph dimensions out of bounds: {} nodes, {} edges",
+            self.num_nodes,
+            self.num_edges
+        );
+        Ok(())
+    }
+
+    pub(crate) fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub(crate) fn num_nodes(&self) -> u64 {
+        self.num_nodes
+    }
+
+    pub(crate) fn num_edges(&self) -> u64 {
+        self.num_edges
+    }
+
+    pub(crate) fn has_weights(&self) -> bool {
+        self.has_weights != 0
+    }
+
+    pub(crate) fn checksum32(&self) -> Option<u32> {
         if self.integrity_checksum32 == 0 {
             None
         } else {
@@ -82,7 +137,7 @@ impl Header {
     }
 
     #[inline(always)]
-    fn to_bytes(self) -> [u8; Self::SIZE] {
+    pub(crate) fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0u8; Self::SIZE];
         bytes[0..4].copy_from_slice(&self.magic.to_le_bytes());
         bytes[4..8].copy_from_slice(&self.version.to_le_bytes());
@@ -94,7 +149,7 @@ impl Header {
     }
 
     #[inline(always)]
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         anyhow::ensure!(
             bytes.len() >= Self::SIZE,
             "insufficient bytes for header: got {}, need {}",
@@ -192,7 +247,20 @@ pub fn save_graph(graph: &Graph, path: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+/// Reads just the header to learn which format version a file carries.
+fn sniff_version(path: &Path) -> Result<u32> {
+    use std::io::Read;
+    let mut file = File::open(path).context("failed to open graph file")?;
+    let mut head = [0u8; Header::SIZE];
+    file.read_exact(&mut head)
+        .context("failed to read graph header")?;
+    Ok(Header::from_bytes(&head)?.version())
+}
+
 /// Loads a graph from file using automatic validation mode selection.
+///
+/// Dispatches on the header's version field: flat version-1 files load
+/// mmap-backed, compressed version-2 files decode into owned storage.
 #[inline]
 #[tracing::instrument(skip(path), fields(path = %path.as_ref().display()))]
 pub fn load_graph(path: impl AsRef<Path>) -> Result<Graph> {
@@ -201,13 +269,26 @@ pub fn load_graph(path: impl AsRef<Path>) -> Result<Graph> {
         .context("failed to stat graph file")?
         .len();
     let validation = default_validation_mode(file_size);
+    if sniff_version(path)? == super::compressed_graph::COMPRESSED_VERSION {
+        return super::compressed_graph::load_graph_compressed(path, validation);
+    }
     load_graph_mmap(path, validation)
 }
 
 /// Loads a graph from file as mmap-backed storage with explicit validation.
+///
+/// Refuses compressed (version-2) files: they decode into owned arrays,
+/// which is not the page-cache-backed storage this entry point promises.
 #[inline]
 pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) -> Result<Graph> {
     let path = path.as_ref();
+    if sniff_version(path)? == super::compressed_graph::COMPRESSED_VERSION {
+        anyhow::bail!(
+            "{} is a compressed graph file, which always decodes into owned \
+             storage; load it with the auto or owned storage mode instead of mmap",
+            path.display()
+        );
+    }
     debug!(
         "Loading mmap graph from {} with {:?} validation",
         path.display(),
@@ -285,6 +366,9 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
 #[inline]
 pub fn load_graph_owned(path: impl AsRef<Path>, validation: GraphValidationMode) -> Result<Graph> {
     let path = path.as_ref();
+    if sniff_version(path)? == super::compressed_graph::COMPRESSED_VERSION {
+        return super::compressed_graph::load_graph_compressed(path, validation);
+    }
     let file = File::open(path).context("failed to open graph file")?;
     // SAFETY: file outlives the temporary mmap used for parsing; mapping is read-only
     // and the data is consumed (copied) by load_graph_from_mmap_with_validation.
@@ -354,8 +438,6 @@ fn parse_layout(bytes: &[u8]) -> Result<GraphFileLayout> {
     let header = Header::from_bytes(bytes)?;
     header.validate()?;
 
-    const MAX_NODES: u64 = 10_000_000_000;
-    const MAX_EDGES: u64 = 100_000_000_000;
     anyhow::ensure!(
         header.num_nodes <= MAX_NODES,
         "num_nodes {} exceeds maximum {}",
@@ -497,7 +579,7 @@ fn default_validation_mode(file_size: u64) -> GraphValidationMode {
 /// SIMD carryless-multiply path at runtime, so this runs at memory speed
 /// rather than the cycles-per-byte a serial byte hash costs over multi-GB
 /// bodies.
-fn crc32_parts(parts: &[&[u8]]) -> u32 {
+pub(crate) fn crc32_parts(parts: &[&[u8]]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     for part in parts {
         hasher.update(part);

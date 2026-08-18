@@ -10,6 +10,12 @@
 //! without maintaining any ordering on the hit path. When warmup
 //! frequencies are provided, the hottest nodes are pinned in GPU.
 //!
+//! With the `zstd-tier` feature and a `cold_store_path`, a fourth layer
+//! sits under the NVMe spill: the whole feature matrix, block-compressed
+//! in RAM against a trained zstd dictionary. A node found in no cache
+//! tier then decompresses out of its block instead of erroring, so the
+//! cache is a complete feature source rather than a best-effort one.
+//!
 //! Tier internals live in submodules: [`slab`] (row storage), [`sieve`]
 //! (eviction for the in-memory tiers), and [`nvme`] (single-file spill
 //! store).
@@ -61,6 +67,15 @@ pub struct FeatureCacheConfig {
     /// Fraction of GPU capacity to pin for hot nodes (default 0.8).
     /// Only used when warmup_frequencies is provided.
     pub pin_ratio: f64,
+
+    /// Optional feature-store file to compress into a resident backing
+    /// tier at construction. Requires the `zstd-tier` cargo feature;
+    /// configuring it without that feature fails construction.
+    pub cold_store_path: Option<PathBuf>,
+
+    /// zstd compression level for the backing tier (1-22; default 12 —
+    /// compressed once at construction, decompressed per block on reads).
+    pub cold_level: i32,
 }
 
 impl Default for FeatureCacheConfig {
@@ -72,6 +87,8 @@ impl Default for FeatureCacheConfig {
             nvme_path: None,
             warmup_frequencies: None,
             pin_ratio: 0.8,
+            cold_store_path: None,
+            cold_level: 12,
         }
     }
 }
@@ -82,6 +99,10 @@ pub struct FeatureCache {
 
     /// Cold tier: single-file NVMe slot store.
     nvme: Arc<NvmeTier>,
+
+    /// Compressed resident backing tier below the NVMe spill.
+    #[cfg(feature = "zstd-tier")]
+    cold: Option<Arc<super::ColdStore>>,
 
     /// GPU tier (hot)
     gpu_cache: Arc<RwLock<SieveCache>>,
@@ -100,6 +121,8 @@ pub struct CacheStats {
     pub gpu_hits: u64,
     pub cpu_hits: u64,
     pub nvme_hits: u64,
+    /// Hits served out of the compressed backing tier.
+    pub cold_hits: u64,
     pub misses: u64,
     pub evictions: u64,
     /// Hits on pinned nodes (measures pin effectiveness)
@@ -112,6 +135,7 @@ struct CacheStatCells {
     gpu_hits: AtomicU64,
     cpu_hits: AtomicU64,
     nvme_hits: AtomicU64,
+    cold_hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
     pinned_hits: AtomicU64,
@@ -123,6 +147,7 @@ impl CacheStatCells {
             gpu_hits: self.gpu_hits.load(Ordering::Relaxed),
             cpu_hits: self.cpu_hits.load(Ordering::Relaxed),
             nvme_hits: self.nvme_hits.load(Ordering::Relaxed),
+            cold_hits: self.cold_hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             pinned_hits: self.pinned_hits.load(Ordering::Relaxed),
@@ -145,6 +170,36 @@ impl FeatureCache {
                 .await
                 .context("task panicked")??
         };
+
+        #[cfg(feature = "zstd-tier")]
+        let cold = match &config.cold_store_path {
+            Some(path) => {
+                let path = path.clone();
+                let level = config.cold_level;
+                let store = tokio::task::spawn_blocking(move || {
+                    super::ColdStore::build_from_store(&path, level)
+                })
+                .await
+                .context("task panicked")??;
+                anyhow::ensure!(
+                    store.feature_dim() == dim,
+                    "cold store feature_dim {} does not match cache feature_dim {dim}",
+                    store.feature_dim()
+                );
+                debug!(
+                    "  Cold backing store: {} rows at {:.2}x compression",
+                    store.num_rows(),
+                    store.ratio()
+                );
+                Some(Arc::new(store))
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "zstd-tier"))]
+        anyhow::ensure!(
+            config.cold_store_path.is_none(),
+            "cold_store_path requires aethergraph-core built with the zstd-tier feature"
+        );
 
         debug!("Initialized feature cache:");
         debug!("  GPU capacity: {} features", config.gpu_capacity);
@@ -190,6 +245,8 @@ impl FeatureCache {
             cpu_cache: Arc::new(RwLock::new(cpu)),
             config,
             nvme: Arc::new(nvme),
+            #[cfg(feature = "zstd-tier")]
+            cold,
             stats: Arc::new(CacheStatCells::default()),
         })
     }
@@ -262,6 +319,19 @@ impl FeatureCache {
                 Ok(())
             }
             None => {
+                #[cfg(feature = "zstd-tier")]
+                if let Some(cold) = &self.cold
+                    && (node as usize) < cold.num_rows()
+                {
+                    let cold = Arc::clone(cold);
+                    let features = tokio::task::spawn_blocking(move || cold.gather(&[node]))
+                        .await
+                        .context("task panicked")??;
+                    out.copy_from_slice(&features);
+                    self.stats.cold_hits.fetch_add(1, Ordering::Relaxed);
+                    self.promote_to_cpu(node, &features).await;
+                    return Ok(());
+                }
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
                 Err(anyhow::anyhow!(
                     "features for node {node} are in no cache tier"
@@ -341,6 +411,8 @@ impl FeatureCache {
         // blocking-pool dispatch issuing sequential positional reads, and
         // the spawn/JoinHandle overhead stays constant instead of scaling
         // with the miss count.
+        #[cfg(feature = "zstd-tier")]
+        let mut cold_missing: Vec<NodeId> = Vec::new();
         if !missing.is_empty() {
             const NVME_FANOUT: usize = 64;
             let n_tasks = missing.len().min(NVME_FANOUT);
@@ -370,6 +442,11 @@ impl FeatureCache {
                             resolved.insert(node, features);
                         }
                         None => {
+                            #[cfg(feature = "zstd-tier")]
+                            if self.cold.is_some() {
+                                cold_missing.push(node);
+                                continue;
+                            }
                             self.stats.misses.fetch_add(1, Ordering::Relaxed);
                             return Err(anyhow::anyhow!(
                                 "features for node {node} are in no cache tier"
@@ -377,6 +454,39 @@ impl FeatureCache {
                         }
                     }
                 }
+            }
+        }
+
+        // The compressed backing tier serves whatever NVMe never spilled,
+        // as ONE gather so each touched block decompresses once for the
+        // whole batch.
+        #[cfg(feature = "zstd-tier")]
+        if !cold_missing.is_empty() {
+            let cold = Arc::clone(
+                self.cold
+                    .as_ref()
+                    .expect("cold_missing only fills when the tier exists"),
+            );
+            for &node in &cold_missing {
+                if node as usize >= cold.num_rows() {
+                    self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                    return Err(anyhow::anyhow!(
+                        "features for node {node} are in no cache tier"
+                    ));
+                }
+            }
+            let dim = self.config.feature_dim;
+            let gather_nodes = cold_missing.clone();
+            let gathered = tokio::task::spawn_blocking(move || cold.gather(&gather_nodes))
+                .await
+                .context("task panicked")??;
+            self.stats
+                .cold_hits
+                .fetch_add(cold_missing.len() as u64, Ordering::Relaxed);
+            for (i, &node) in cold_missing.iter().enumerate() {
+                let features = gathered[i * dim..(i + 1) * dim].to_vec();
+                self.promote_to_cpu(node, &features).await;
+                resolved.insert(node, features);
             }
         }
 
@@ -489,7 +599,8 @@ impl FeatureCache {
     /// Print cache statistics
     pub fn print_stats(&self) {
         let stats = self.stats();
-        let total_requests = stats.gpu_hits + stats.cpu_hits + stats.nvme_hits + stats.misses;
+        let total_requests =
+            stats.gpu_hits + stats.cpu_hits + stats.nvme_hits + stats.cold_hits + stats.misses;
 
         if total_requests == 0 {
             debug!("No cache requests yet");
@@ -499,12 +610,14 @@ impl FeatureCache {
         let gpu_hit_rate = (stats.gpu_hits as f64 / total_requests as f64) * 100.0;
         let cpu_hit_rate = (stats.cpu_hits as f64 / total_requests as f64) * 100.0;
         let nvme_hit_rate = (stats.nvme_hits as f64 / total_requests as f64) * 100.0;
+        let cold_hit_rate = (stats.cold_hits as f64 / total_requests as f64) * 100.0;
 
         debug!("Feature Cache Statistics:");
         debug!("  Total requests: {}", total_requests);
         debug!("  GPU hits:  {} ({:.2}%)", stats.gpu_hits, gpu_hit_rate);
         debug!("  CPU hits:  {} ({:.2}%)", stats.cpu_hits, cpu_hit_rate);
         debug!("  NVMe hits: {} ({:.2}%)", stats.nvme_hits, nvme_hit_rate);
+        debug!("  Cold hits: {} ({:.2}%)", stats.cold_hits, cold_hit_rate);
         debug!(
             "  Misses:    {} ({:.2}%)",
             stats.misses,
@@ -642,6 +755,7 @@ mod tests {
             nvme_path: Some(dir.path().to_path_buf()),
             warmup_frequencies: Some(Arc::new(warmup)),
             pin_ratio: 0.5, // pin 1 of 2 GPU slots
+            ..Default::default()
         };
 
         let cache = FeatureCache::new(config).await.unwrap();
@@ -682,6 +796,7 @@ mod tests {
             nvme_path: Some(dir.path().to_path_buf()),
             warmup_frequencies: Some(Arc::new(warmup)),
             pin_ratio: 1.0,
+            ..Default::default()
         };
 
         let cache = FeatureCache::new(config).await.unwrap();
@@ -801,6 +916,7 @@ mod tests {
             nvme_path: Some(dir.path().to_path_buf()),
             warmup_frequencies: Some(Arc::new(warmup)),
             pin_ratio: 1.0,
+            ..Default::default()
         };
 
         let cache = FeatureCache::new(config).await.unwrap();
@@ -812,5 +928,79 @@ mod tests {
 
         let stats = cache.stats();
         assert_eq!(stats.pinned_hits, 2);
+    }
+
+    /// The compressed backing tier makes the cache a complete feature
+    /// source: nodes that were never inserted (so live in no memory tier
+    /// and were never spilled to NVMe) still resolve.
+    #[cfg(feature = "zstd-tier")]
+    #[tokio::test]
+    async fn cold_store_serves_nodes_no_other_tier_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("features.bin");
+        let (num_nodes, dim) = (1000usize, 8usize);
+        let features: Vec<f32> = (0..num_nodes * dim).map(|i| i as f32 * 0.5).collect();
+        crate::features::save_features(&store_path, features.clone(), num_nodes, dim).unwrap();
+
+        let config = FeatureCacheConfig {
+            gpu_capacity: 4,
+            cpu_capacity: 8,
+            feature_dim: dim,
+            nvme_path: Some(dir.path().join("spill")),
+            cold_store_path: Some(store_path),
+            ..Default::default()
+        };
+        let cache = FeatureCache::new(config).await.unwrap();
+
+        // Nothing was ever inserted: without the backing tier these error.
+        let node = 900u32;
+        let got = cache.get(node).await.unwrap();
+        assert_eq!(
+            got,
+            &features[node as usize * dim..(node as usize + 1) * dim]
+        );
+        assert_eq!(cache.stats().cold_hits, 1);
+
+        // It promoted, so the re-read is a memory-tier hit, not another
+        // decompression.
+        let again = cache.get(node).await.unwrap();
+        assert_eq!(again, got);
+        assert_eq!(cache.stats().cold_hits, 1);
+
+        // A batch spanning distinct blocks resolves in one gather.
+        let nodes: Vec<u32> = vec![1, 300, 700, 999, 300];
+        let batch = cache.get_batch(&nodes).await.unwrap();
+        for (i, &n) in nodes.iter().enumerate() {
+            assert_eq!(
+                batch[i],
+                &features[n as usize * dim..(n as usize + 1) * dim],
+                "node {n} at position {i}"
+            );
+        }
+
+        // Out of range stays an error rather than a silent zero row.
+        assert!(cache.get(num_nodes as u32).await.is_err());
+    }
+
+    /// Configuring a cold store whose dimension disagrees with the cache
+    /// is caught at construction, not at first read.
+    #[cfg(feature = "zstd-tier")]
+    #[tokio::test]
+    async fn cold_store_dim_mismatch_fails_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("features.bin");
+        crate::features::save_features(&store_path, vec![0.0; 100 * 8], 100, 8).unwrap();
+
+        let config = FeatureCacheConfig {
+            feature_dim: 16,
+            nvme_path: Some(dir.path().join("spill")),
+            cold_store_path: Some(store_path),
+            ..Default::default()
+        };
+        let err = match FeatureCache::new(config).await {
+            Ok(_) => panic!("a dimension mismatch must fail construction"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("feature_dim"), "unexpected error: {err}");
     }
 }
