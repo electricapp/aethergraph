@@ -46,7 +46,8 @@ pub use features::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_
 #[cfg(all(target_os = "linux", feature = "shm"))]
 pub use features::{ShareHandle, SharedFeatureStore};
 pub use features::{
-    create_features, save_feature_data, save_features, save_features_f16, save_features_ndarray,
+    create_features, save_feature_data, save_features, save_features_bf16, save_features_f16,
+    save_features_ndarray,
 };
 
 // Graph (de)serialization entry points — public API surface; the `internal`
@@ -62,6 +63,10 @@ pub use internal::parquet_import::{from_parquet, from_parquet_files};
 pub use internal::perf::{Counter, CounterReadings, CounterSet};
 #[cfg(all(target_os = "linux", feature = "shm"))]
 pub use internal::shm::{SharedRegion, recv_fd, send_fd, socket_pair};
+// Vectorized bf16 → f32 conversion with runtime SIMD dispatch (AVX2, scalar
+// fallback). The f16 path is reached through `FeatureDtype::row_decoder`,
+// which resolves its dispatch once per batch rather than per call.
+pub use internal::simd::bf16_le_to_f32;
 pub use internal::succinct::{EliasFano, StreamVByte};
 pub use internal::telemetry::{SamplingTelemetry, TelemetrySummary};
 #[cfg(all(target_os = "linux", feature = "uffd"))]

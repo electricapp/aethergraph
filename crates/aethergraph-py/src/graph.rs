@@ -232,6 +232,30 @@ impl PyCsrGraph {
         PyArray1::from_vec(py, degrees)
     }
 
+    /// Returns the degree of each node in `nodes`, in input order.
+    ///
+    /// Unlike `degrees()`, this touches only the requested nodes — the
+    /// right shape for a sampled batch, where materializing all
+    /// `num_nodes` degrees would dominate the work. Out-of-range nodes
+    /// report 0.
+    ///
+    /// Args:
+    ///     nodes: Node IDs (uint32)
+    ///
+    /// Returns:
+    ///     numpy.ndarray: Degrees (dtype=uint32), same length as `nodes`
+    fn degrees_of<'py>(
+        &self,
+        py: Python<'py>,
+        nodes: PyReadonlyArray1<'py, u32>,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let nodes = nodes.as_slice()?;
+        // Scattered offsets lookups over a possibly-mmap'd array; release
+        // the GIL so other Python threads run through the cache misses.
+        let degrees = py.detach(|| self.inner.degrees_of(nodes));
+        Ok(PyArray1::from_vec(py, degrees))
+    }
+
     /// Returns the neighbor IDs for a given node as a numpy array.
     ///
     /// Args:

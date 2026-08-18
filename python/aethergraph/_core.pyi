@@ -11,7 +11,7 @@ Path-accepting APIs declare `str | os.PathLike[str]` since PyO3's
 import os
 from collections.abc import Sequence
 from types import TracebackType
-from typing import Any, Self, TypeAlias
+from typing import Any, Literal, Self, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
@@ -109,6 +109,9 @@ class CsrGraph:
     # Methods (take an argument).
     def degree(self, node: int) -> int: ...
     def degrees(self) -> npt.NDArray[np.uint32]: ...
+    def degrees_of(self, nodes: npt.NDArray[np.uint32]) -> npt.NDArray[np.uint32]:
+        """Degrees of just these nodes, in input order (out-of-range → 0).
+        Touches only the requested nodes, unlike `degrees()`."""
     def neighbors(self, node: int) -> npt.NDArray[np.uint32]: ...
     def batch_neighbors(self, nodes: list[int]) -> list[npt.NDArray[np.uint32]]: ...
     def neighbor_weights(self, node: int) -> npt.NDArray[np.float32] | None: ...
@@ -121,8 +124,19 @@ class CsrGraph:
 
 # -- Free functions ----------------------------------------------------------
 
-def save_features(path: PathLike, features: npt.NDArray[np.float32]) -> None:
-    """Save node features in AETHFEAT format."""
+def save_features(
+    path: PathLike,
+    features: npt.NDArray[np.float32],
+    dtype: Literal["f32", "f16", "bf16"] = "f32",
+) -> None:
+    """Save node features in AETHFEAT format.
+
+    `dtype` sets the on-disk element type. ``"f16"`` and ``"bf16"`` both
+    halve the file; bf16 keeps f32's exponent range (so small magnitudes
+    don't flush to zero and large ones don't saturate) at the cost of
+    mantissa bits, which is the usual trade for trained embeddings.
+    Readers pick the decoder up from the header — nothing at the call site
+    changes."""
 
 # -- Sampling ----------------------------------------------------------------
 

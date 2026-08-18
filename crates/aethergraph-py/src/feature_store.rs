@@ -3,7 +3,8 @@
 use aethergraph_core::{
     FeatureData as CoreFeatureData, FeatureStore as CoreFeatureStore, NodeId,
     create_features as core_create_features, save_feature_data as core_save_feature_data,
-    save_features as core_save_features,
+    save_features as core_save_features, save_features_bf16 as core_save_features_bf16,
+    save_features_f16 as core_save_features_f16,
 };
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
@@ -315,9 +316,21 @@ impl PyFeatureStore {
 /// features = np.random.randn(100000, 768).astype(np.float32)
 /// save_features("features.bin", features)
 /// ```
+///
+/// `dtype` selects the on-disk element type:
+/// - `"f32"` (default): full precision, 4 bytes/element
+/// - `"f16"`: half the bytes; range is ~6e-5 to 65504, so small
+///   magnitudes flush to zero and large ones saturate
+/// - `"bf16"`: half the bytes with f32's exponent range, ~3 decimal
+///   digits of precision — the right choice for embeddings trained in
+///   bf16
 #[pyfunction]
-#[pyo3(signature = (path, features))]
-fn save_features(path: std::path::PathBuf, features: numpy::PyReadonlyArray2<f32>) -> PyResult<()> {
+#[pyo3(signature = (path, features, dtype="f32"))]
+fn save_features(
+    path: std::path::PathBuf,
+    features: numpy::PyReadonlyArray2<f32>,
+    dtype: &str,
+) -> PyResult<()> {
     let features_array = features.as_array();
     let shape = features_array.shape();
     let num_nodes = shape[0];
@@ -332,7 +345,17 @@ fn save_features(path: std::path::PathBuf, features: numpy::PyReadonlyArray2<f32
         None => features_array.iter().copied().collect(),
     };
 
-    core_save_features(&path, features_vec, num_nodes, feature_dim).map_err(|e| {
+    let result = match dtype {
+        "f32" => core_save_features(&path, features_vec, num_nodes, feature_dim),
+        "f16" => core_save_features_f16(&path, &features_vec, num_nodes, feature_dim),
+        "bf16" => core_save_features_bf16(&path, &features_vec, num_nodes, feature_dim),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown dtype {other:?}: expected \"f32\", \"f16\", or \"bf16\""
+            )));
+        }
+    };
+    result.map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("Failed to save features: {}", e))
     })?;
 

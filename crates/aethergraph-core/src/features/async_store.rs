@@ -26,7 +26,6 @@ use super::header::{FeatureDtype, parse_feature_header};
 use super::store::{FeatureLoadTelemetry, TelemetryCells};
 use crate::graph::NodeId;
 use anyhow::{Context, Result};
-use half::f16;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -297,14 +296,13 @@ impl AsyncFeatureStore {
                         .context("sync read failed")?;
                     features
                 }
-                FeatureDtype::F16 => {
+                half => {
                     let mut buffer = vec![0u8; feature_size];
                     file.read_exact_at(&mut buffer, offset)
                         .context("sync read failed")?;
-                    buffer
-                        .chunks_exact(2)
-                        .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                        .collect()
+                    let mut features = vec![0f32; feature_dim];
+                    half.decode_row(&buffer, &mut features);
+                    features
                 }
             };
             Ok::<_, anyhow::Error>(features)
@@ -547,15 +545,15 @@ impl AsyncFeatureStore {
                                 features.extend_from_slice(&row);
                             }
                         }
-                        FeatureDtype::F16 => {
+                        half => {
                             let mut buffer = vec![0u8; feature_size];
+                            let mut row = vec![0f32; feature_dim];
                             for &node in &chunk {
                                 let byte_offset = offset + (node as u64 * feature_size as u64);
                                 file.read_exact_at(&mut buffer, byte_offset)
                                     .context("failed to read features")?;
-                                features.extend(buffer.chunks_exact(2).map(|chunk| {
-                                    f16::from_le_bytes([chunk[0], chunk[1]]).to_f32()
-                                }));
+                                half.decode_row(&buffer, &mut row);
+                                features.extend_from_slice(&row);
                             }
                         }
                     }
@@ -587,29 +585,18 @@ impl AsyncFeatureStore {
             );
         }
 
-        let mut all_features = Vec::with_capacity(nodes.len() * self.feature_dim);
+        let mut all_features = vec![0f32; nodes.len() * self.feature_dim];
+        let mut buffer = vec![0u8; feature_size];
 
-        for &node in nodes {
+        for (i, &node) in nodes.iter().enumerate() {
             let offset = self.features_start_offset + (node as u64 * feature_size as u64);
-            let mut buffer = vec![0u8; feature_size];
-
             self.file
                 .read_exact_at(&mut buffer, offset)
                 .context("sync read failed")?;
-
-            match self.dtype {
-                FeatureDtype::F32 => {
-                    for chunk in buffer.chunks_exact(4) {
-                        all_features
-                            .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                    }
-                }
-                FeatureDtype::F16 => {
-                    for chunk in buffer.chunks_exact(2) {
-                        all_features.push(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
-                    }
-                }
-            }
+            self.dtype.decode_row(
+                &buffer,
+                &mut all_features[i * self.feature_dim..(i + 1) * self.feature_dim],
+            );
         }
 
         Ok(all_features)

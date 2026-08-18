@@ -13,7 +13,7 @@ dependencies = [
  "aether-epoch",
  "crc32fast",
  "criterion",
- "io-uring 0.7.13",
+ "io-uring 0.7.14",
  "libc",
  "loom",
  "proptest",

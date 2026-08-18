@@ -30,7 +30,7 @@ pub use shared_store::{ShareHandle, SharedFeatureStore};
 pub(crate) use store::PaddedAtomicU64;
 pub use store::{
     FeatureData, FeatureLoadTelemetry, FeatureStore, create_features, save_feature_data,
-    save_features, save_features_f16, save_features_ndarray,
+    save_features, save_features_bf16, save_features_f16, save_features_ndarray,
 };
 
 /// Trait for reading node features from any backing store.

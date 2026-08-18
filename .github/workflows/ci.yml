@@ -153,6 +153,25 @@ jobs:
           cargo test -p aethergraph-core --features shm internal::shm
           cargo test -p aethergraph-core --features shm features::shared_store
 
+      - name: simd conversion + gather kernels
+        run: |
+          cargo test -p aethergraph-core internal::simd
+          cargo test -p aethergraph-core features::store
+      - name: Record which SIMD paths this runner exercised
+        if: always()
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            isa=$(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' \
+                    | grep -E '^(avx2|avx512f|f16c)$' | sort | tr '\n' ' ')
+          else
+            isa="neon (aarch64 baseline)"
+          fi
+          {
+            echo "## simd — ${{ matrix.label }}"
+            echo ""
+            echo "Dispatch-vs-scalar equivalence tests ran against: ${isa:-scalar only}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: mlx5dv compile check
         if: matrix.run_rdma
         run: cargo check -p aether-stream --tests --features mlx5dv
