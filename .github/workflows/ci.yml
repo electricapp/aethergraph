@@ -512,6 +512,56 @@ jobs:
           name: aethergraph-wheel-${{ matrix.level }}
           path: python/${{ matrix.out_dir }}/*.whl
 
+  python-wheel-freethreaded:
+    name: wheel free-threaded (cp314t)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Provision free-threaded 3.14t venv
+        run: |
+          uv venv --python 3.14t "$RUNNER_TEMP/ft-venv"
+          echo "$RUNNER_TEMP/ft-venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/ft-venv" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: wheel-freethreaded
+      - name: Confirm free-threaded interpreter
+        run: python -c "import sys; assert not sys._is_gil_enabled(), 'GIL still on'; print(sys.version)"
+      - name: Build free-threaded wheel
+        working-directory: python
+        # No abi3: the free-threaded ABI is version-specific, so this is a
+        # cp314t wheel built directly against the no-GIL interpreter.
+        # 3.14 is the floor pyo3 0.29 supports for free-threaded builds.
+        run: |
+          uv pip install maturin
+          maturin build --release --out dist-ft \
+            --interpreter "$(command -v python)" \
+            --no-default-features --features extension-module
+      - name: Install + parallel smoke test
+        working-directory: python
+        # The smoke test imports aethergraph._core directly, so numpy is the
+        # only runtime dependency it needs; --no-deps keeps the CLI's rich and
+        # typer out of a leg that exists to test the extension module.
+        run: |
+          uv pip install numpy
+          uv pip install --no-index --find-links dist-ft --no-deps aethergraph
+          python tests/free_threaded_smoke.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aethergraph-wheel-cp314t
+          path: python/dist-ft/*.whl
+
   python-wheel-pgo:
     name: wheel x86-64 pgo
     runs-on: ubuntu-latest
@@ -609,7 +659,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, numa, supply-chain, unused-deps, python, python-wheel, python-wheel-pgo]
+    needs: [markdown-format, gpudirect-check, rust, miri, loom, wal, numa, supply-chain, unused-deps, python, python-wheel, python-wheel-pgo, python-wheel-freethreaded]
     if: always()
     steps:
       - name: Render summary
@@ -633,6 +683,7 @@ jobs:
             echo "| wheel x86-64 | Linux x86_64 | portable baseline | ${{ needs.python-wheel.result }} |"
             echo "| wheel x86-64-v3 | Linux x86_64 | target-cpu=x86-64-v3 | ${{ needs.python-wheel.result }} |"
             echo "| wheel x86-64 pgo | Linux x86_64 | PGO + BOLT | ${{ needs.python-wheel-pgo.result }} |"
+            echo "| wheel cp314t | Linux x86_64 | free-threaded, no abi3 | ${{ needs.python-wheel-freethreaded.result }} |"
             echo ""
             echo "Hardware-gated tests (SoftRoCE micro-bench, SRD loopback,"
             echo "billion-node scale) run only on the self-hosted \`rdma-hardware\`"
