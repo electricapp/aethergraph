@@ -110,21 +110,34 @@ loader = NeighborLoader(graph, num_neighbors=[15, 10], batch_size=128)
 
 ### I/O Pipeline
 
-| Optimization            | Description                          |
-| ----------------------- | ------------------------------------ |
-| **Memory-Mapped Graph** | Zero-copy graph loading              |
-| **io_uring (Linux)**    | Async feature loading with SQPOLL    |
-| **Prefetch Thread**     | Overlaps sampling with training      |
-| **Bounded Queue**       | Backpressure prevents memory blow-up |
+| Optimization            | Description                                          |
+| ----------------------- | ---------------------------------------------------- |
+| **Memory-Mapped Graph** | Zero-copy graph loading                              |
+| **Compressed graphs**   | Elias-Fano offsets + StreamVByte edges, 2-4x smaller |
+| **io_uring (Linux)**    | Async feature loading, thread-owned rings, SQPOLL    |
+| **NVMe passthrough**    | Block-layer bypass over `/dev/ng*` (Linux)           |
+| **Half-precision**      | f16/bf16 payloads, SIMD upcast on read               |
+| **Shared features**     | One mapped copy of the matrix per host (Linux)       |
+| **Prefetch Thread**     | Overlaps sampling with training                      |
+| **Bounded Queue**       | Backpressure prevents memory blow-up                 |
 
-### Zero-Copy Data Path
+### Data path
 
 ```
-Rust Vec<u32> → numpy int64 → torch.from_numpy() → PyG Data
-     │              │                │
-     └──────────────┴────────────────┘
-              No copies (shared memory)
+mmap'd CSR ─► Rust sampler ─► Vec<u32> ─► numpy int64 ─► torch.from_numpy() ─► PyG Data
+     │                                        │                  │
+  no copy                                 widened            wraps in place
 ```
+
+The graph itself is never copied — sampling reads it through the mapping. The
+returned index arrays are Python-owned and widened to `int64`, because that is
+PyTorch's index dtype; that widening is the one copy on the path, and it
+vectorizes. Because the arrays never alias Rust memory, `torch.from_numpy` wraps
+them without a defensive copy.
+
+Accessors cache, so the same array object may come back on every access. Treat a
+returned array as immutable — a mutation would be visible through every later
+access and through `to_dict()`. Copy first if you need to write.
 
 ## CLI Usage
 

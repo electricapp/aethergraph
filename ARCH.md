@@ -26,9 +26,15 @@ instant startup.
 
 **Sampling design:**
 
-- Generation-tagged direct array (< 1M nodes) or FxHashMap (> 1M nodes) for node
-  dedup — O(1) lookup
-- Pre-allocated buffers reused across calls via `clear()` — zero hot-path
+- Generation-tagged direct array for node dedup, chosen by memory budget: one
+  `u64` slot per node up to 8M nodes (a 64 MiB table), FxHashMap above that. The
+  table is `alloc_zeroed`, so slots a batch never touches are never faulted in.
+- Per-call output buffers sized from the previous call plus an eighth of
+  headroom, so a steady-state batch reallocates nothing. An exact fit would
+  leave roughly half of all calls one element short, and falling short costs a
+  full-array copy. Asserted at zero reallocations by
+  `tests/sampler_allocations.rs`.
+- Pre-allocated scratch reused across calls via `clear()` — zero hot-path
   allocations
 - Local indices assigned during sampling — no post-sort, no binary search for
   edge remapping
@@ -59,6 +65,38 @@ instant startup.
   the batch.
 - Measured in `benches/graph_benchmarks.rs::reorder_sampling_speedup` — sampling
   throughput delta on the same seeds before vs. after permutation.
+
+## Feature I/O paths
+
+Four ways a feature row reaches a tensor, chosen at open time and each falling
+back to the one below it.
+
+**NVMe passthrough** (`nvme-passthru`). `IORING_OP_URING_CMD` against `/dev/ng*`
+with rows resolved to LBAs through FIEMAP, so a read skips the block layer
+entirely. Probed at store-open; a row that is not stably mapped drops the whole
+batch to the io_uring gather.
+
+**io_uring gather** (`io-uring`). O_DIRECT plus IOPOLL where the layout allows
+it, falling back to SQPOLL-only on an unaligned payload. Each ring is owned by
+one thread — work arrives as a closure over that thread's lane — so the ring
+keeps a single submitter and can run `DEFER_TASKRUN` with `SINGLE_ISSUER`. Files
+and landing buffers are registered, so reads land via `ReadFixed` and the kernel
+skips the per-op page pin. The real O_DIRECT alignment comes from
+`statx(STATX_DIOALIGN)` rather than a hardcoded 512, because a 4Kn device
+rejects a merely 512-aligned layout with `EINVAL`.
+
+**mmap** (portable). `MADV_RANDOM` so readahead does not fault 128 KiB per
+useful row, plus `MADV_HUGEPAGE` on the payload, since TB-scale random gathers
+are dTLB-bound at 4 KiB pages.
+
+**userfaultfd pager** (`uffd`). Registers an anonymous region and services
+faults from the file under a fixed residency budget, so the process holds a
+bounded number of pages rather than whatever the kernel chose to keep. Eviction
+is degree-weighted: pass node degrees and a hub's pages outlive a leaf's.
+
+Above all four, `SharedFeatureStore` (`shm`) holds one copy of the matrix in a
+sealed memfd and passes the descriptor over `SCM_RIGHTS`, so N worker processes
+map the same physical pages read-only instead of each paying for their own.
 
 ## aether-graph — Dynamic Graph Engine
 
@@ -254,6 +292,21 @@ HeteroNeighborSampler:
 | macOS    | mmap         | C-tree        | mmap + madvise    | N/A           |
 | Windows  | mmap         | C-tree        | mmap              | N/A           |
 
+Linux-only subsystems, each behind a cargo feature and each runtime-probed so a
+build carrying it still runs where the kernel or hardware does not:
+
+| Subsystem          | Feature         | Falls back to                  |
+| ------------------ | --------------- | ------------------------------ |
+| NVMe passthrough   | `nvme-passthru` | O_DIRECT io_uring gather       |
+| userfaultfd pager  | `uffd`          | `FeatureStore::load` (mmap)    |
+| memfd shared store | `shm`           | per-process mmap               |
+| `perf_event_open`  | `perf`          | a counter set with none active |
+| NUMA placement     | `numa`          | default kernel placement       |
+| GPUDirect Storage  | `gds`           | io_uring gather                |
+
+Because these compile nowhere else, `scripts/check-linux.sh` cross-compiles them
+with zig from a non-Linux machine. `cargo check` on macOS builds none of them.
+
 ## Binary Formats
 
 Every on-disk format starts with a 32-bit magic plus a 32-bit `version` integer.
@@ -264,9 +317,16 @@ test (see `crates/aethergraph-core/tests/golden/`).
 
 ### Graph (static CSR, `.bin`)
 
-| Version | Magic                   | Status  | Notes                       |
-| ------- | ----------------------- | ------- | --------------------------- |
-| **v1**  | `0x41455448` (`"AETH"`) | current | only version emitted today. |
+| Version | Magic                   | Status  | Notes                                                 |
+| ------- | ----------------------- | ------- | ----------------------------------------------------- |
+| **v1**  | `0x41455448` (`"AETH"`) | current | Flat arrays, mmap-able in place.                      |
+| **v2**  | `0x41455448` (`"AETH"`) | current | Succinct-coded. Same header, decodes to owned arrays. |
+
+Both are emitted today and `load` dispatches on `header.version`. v2 replaces
+the flat arrays with Elias-Fano offsets and StreamVByte-coded edge deltas,
+typically 2-4x smaller at rest. It cannot be mapped in place — a v2 file always
+decodes into owned arrays, so `storage="mmap"` raises on one. Written with
+`graph.save(path, compressed=True)`.
 
 Layout (v1):
 
@@ -310,20 +370,31 @@ checked arithmetic — corrupt or truncated files fail at load, not at access.
 
 ### Features (`.bin`)
 
-| Version | Magic        | Status  | Notes          |
-| ------- | ------------ | ------- | -------------- |
-| **v1**  | `"AETHFEAT"` | current | f32 row-major. |
+| Version | Magic        | Status  | Notes                        |
+| ------- | ------------ | ------- | ---------------------------- |
+| **v1**  | `"AETHFEAT"` | current | Row-major, f32 / f16 / bf16. |
 
 Layout (v1):
 
 ```
-[Header]
+[Header: 32 bytes]
   magic        char[8] = "AETHFEAT"
   num_nodes    u64
   feature_dim  u64
   data_offset  u64
-[Data: num_nodes × feature_dim × 4 bytes, f32 LE row-major]
+[dtype tag: 1 byte at offset 32 — 0 = f32, 1 = f16, 2 = bf16]
+[Data: num_nodes × feature_dim × element_size bytes, LE row-major]
 ```
+
+`element_size` is 4 for f32 and 2 for the half-width types, so an f16 or bf16
+file is half the size. bf16 keeps f32's exponent range and loses mantissa bits;
+f16 does the reverse. Readers resolve the decoder from the tag, so nothing at
+the call site changes.
+
+Decoding dispatches on CPU features once per batch rather than per row: AVX-512
+or F16C on x86-64 and NEON on aarch64 for f16, AVX2 for bf16, with a scalar
+fallback. `FeatureDtype::row_decoder()` resolves that choice at the batch
+boundary and the per-row path is a register-held branch.
 
 ### Golden-file regression tests
 

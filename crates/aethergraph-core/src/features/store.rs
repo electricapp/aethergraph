@@ -793,27 +793,24 @@ impl FeatureStore {
         }
 
         let mut result = Vec::with_capacity(nodes.len() * self.feature_dim);
-        match self.dtype {
-            FeatureDtype::F32 => {
-                for (i, &byte_start) in row_starts.iter().enumerate() {
-                    if let Some(&ahead) = row_starts.get(i + rows_ahead) {
-                        Self::prefetch_row(raw, ahead, row_bytes);
-                    }
-                    let row = &raw[byte_start..byte_start + row_bytes];
-                    result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(row));
+        let decoder = self.dtype.row_decoder();
+        if decoder.is_f32_passthrough() {
+            for (i, &byte_start) in row_starts.iter().enumerate() {
+                if let Some(&ahead) = row_starts.get(i + rows_ahead) {
+                    Self::prefetch_row(raw, ahead, row_bytes);
                 }
+                let row = &raw[byte_start..byte_start + row_bytes];
+                result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(row));
             }
-            _ => {
-                result.resize(nodes.len() * self.feature_dim, 0.0);
-                let decoder = self.dtype.row_decoder();
-                for (i, &byte_start) in row_starts.iter().enumerate() {
-                    if let Some(&ahead) = row_starts.get(i + rows_ahead) {
-                        Self::prefetch_row(raw, ahead, row_bytes);
-                    }
-                    let row = &raw[byte_start..byte_start + row_bytes];
-                    let out = &mut result[i * self.feature_dim..(i + 1) * self.feature_dim];
-                    decoder.decode_row(row, out);
+        } else {
+            result.resize(nodes.len() * self.feature_dim, 0.0);
+            for (i, &byte_start) in row_starts.iter().enumerate() {
+                if let Some(&ahead) = row_starts.get(i + rows_ahead) {
+                    Self::prefetch_row(raw, ahead, row_bytes);
                 }
+                let row = &raw[byte_start..byte_start + row_bytes];
+                let out = &mut result[i * self.feature_dim..(i + 1) * self.feature_dim];
+                decoder.decode_row(row, out);
             }
         }
 

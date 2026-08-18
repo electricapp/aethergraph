@@ -93,7 +93,21 @@ commodity hardware.
 - **Rabbit Order reordering**: Hierarchical community-detection vertex
   permutation (Arai et al., IPDPS 2016) for cache-friendly sampling on power-law
   graphs
-- **io_uring (Linux)**: Batched async NVMe reads, ~10us per random access
+- **io_uring (Linux)**: Batched async NVMe reads, ~10us per random access. Each
+  ring is owned by one thread and set up with `DEFER_TASKRUN`, registered files
+  and registered buffers, so a read is submitted and reaped without a syscall
+- **NVMe passthrough**: `IORING_OP_URING_CMD` against `/dev/ng*` maps feature
+  rows to LBAs and skips the block layer, falling back to the O_DIRECT gather
+  when a row is not stably mapped
+- **Compressed at rest**: Elias-Fano offsets plus StreamVByte edges typically
+  cut a graph file 2-4x, and it loads through the same `Graph.load`
+- **Half-precision features**: f16 and bf16 payloads halve the feature file and
+  upcast on the way out through AVX-512 / F16C / NEON / AVX2 kernels
+- **Out-of-core and shared features**: a userfaultfd pager bounds resident pages
+  under a degree-weighted budget; a sealed memfd lets N worker processes map one
+  copy of the feature matrix
+- **NUMA placement**: graph body interleaved across nodes with the sampler pool
+  pinned to them
 - **AF_XDP + RDMA**: Kernel-bypass ingestion and GPUDirect feature serving
 - **Rust core**: Zero-copy data pipeline from disk to PyTorch tensors
 
@@ -107,6 +121,7 @@ commodity hardware.
 | `aether-graph`     | Dynamic graph with C-tree neighbor lists, lock-free reader path        |
 | `aether-mem`       | Lock-free slab allocator with HugePages and pluggable memory hooks     |
 | `aether-stream`    | Kernel-bypass streaming: AF_XDP ingestion, seqlock feature table, RDMA |
+| `aether-epoch`     | Monotonic version clock for consistent reads across subsystems         |
 
 ## Three Graph Modes
 
@@ -223,6 +238,55 @@ locality.
 See `crates/aethergraph-core/benches/graph_benchmarks.rs` (`rabbit_reorder`,
 `reorder_sampling_speedup`) for the measurement methodology.
 
+## Storage and Memory
+
+Four independent levers for fitting a graph and its features on the hardware you
+have. They compose: a compressed graph with bf16 features served out of a shared
+region is the usual multi-worker setup.
+
+**Compressed graph files.** Elias-Fano offsets and StreamVByte edges, typically
+2-4x smaller at rest. `load` detects the format, so nothing at the call site
+changes.
+
+```python
+graph.save("graph.bin", compressed=True)
+graph = Graph.load("graph.bin")          # same call either way
+```
+
+**Half-precision features.** bf16 keeps f32's exponent range and loses mantissa
+bits, which is the usual trade for trained embeddings; f16 does the reverse.
+Both halve the file. Readers pick the decoder up from the header.
+
+```python
+from aethergraph import save_features
+save_features("features.bin", x, dtype="bf16")   # "f32" | "f16" | "bf16"
+```
+
+**Out-of-core paging.** Bounds resident pages instead of letting the kernel
+decide, and evicts by degree so hub nodes outlive leaves.
+
+```python
+store = FeatureStore.load_paged("features.bin", budget_pages=1 << 20,
+                                degrees=graph.degrees())
+faults, evictions = store.pager_stats()
+```
+
+**Shared feature memory.** One copy of the matrix for N workers: the owner seals
+it into a memfd and serves the descriptor over a Unix socket, each worker maps
+the same physical pages read-only.
+
+```python
+owner = SharedFeatureStore.publish("features.bin")   # in the parent
+owner.serve("/tmp/ag.sock")
+
+store = SharedFeatureStore.attach("/tmp/ag.sock")    # in each worker
+```
+
+The tiered `FeatureCache` (GPU / CPU / NVMe) can also take a `cold_store_path`,
+which compresses the whole matrix into a resident zstd-backed tier underneath
+the NVMe spill. That makes the cache a complete feature source: a node in no
+other tier decompresses out of its block instead of raising.
+
 ## Installation
 
 ```bash
@@ -233,6 +297,41 @@ For PyTorch Geometric integration:
 
 ```bash
 pip install aethergraph[pytorch-geometric]
+```
+
+Wheels target the stable ABI (CPython 3.10+), with a separate free-threaded
+`cp314t` wheel built without abi3 — the free-threaded ABI is not part of abi3.
+The extension declares `gil_used = false`, so importing it into a no-GIL build
+does not re-enable the GIL: every class is `Send` and guards its own state with
+Rust locks rather than relying on the GIL.
+
+### Build features
+
+Platform-specific paths are cargo features. All of them degrade at runtime
+rather than failing the build, so a wheel carrying them still runs where the
+kernel or hardware does not.
+
+| Feature         | Crate            | Effect                                          |
+| --------------- | ---------------- | ----------------------------------------------- |
+| `io-uring`      | aethergraph-core | Async NVMe reads (Linux)                        |
+| `nvme-passthru` | aethergraph-core | Block-layer-bypassing gather over `/dev/ng*`    |
+| `zstd-tier`     | aethergraph-core | Compressed resident cold feature tier           |
+| `uffd`          | aethergraph-core | userfaultfd out-of-core pager                   |
+| `shm`           | aethergraph-core | memfd cross-process shared feature store        |
+| `perf`          | aethergraph-core | `perf_event_open` self-profiling counters       |
+| `numa`          | aethergraph-core | Graph interleaving and sampler-pool pinning     |
+| `gds`           | aethergraph-core | GPUDirect Storage (cuFile) feature reads        |
+| `parquet`       | aethergraph-core | Parquet edge/feature import                     |
+| `rdma`          | aether-stream    | RDMA feature transport (InfiniBand or RoCE)     |
+| `gpudirect`     | aether-stream    | NIC-to-VRAM delivery, DLPack handoff to PyTorch |
+| `xdp_bpf`       | aether-stream    | AF_XDP kernel-bypass ingestion                  |
+
+Python builds enable `uffd`, `shm` and `perf` by default; `gpudirect` is opt-in.
+Check what a wheel actually carries at runtime:
+
+```python
+from aethergraph import _core
+_core.HAS_GPUDIRECT, _core.HAS_NUMA, _core.HAS_SHARED_STORE, _core.HAS_PERF_COUNTERS
 ```
 
 ## Ray Data (Distributed Training)
@@ -267,10 +366,12 @@ from aethergraph import Graph
 
 graph = Graph.load("graph.bin")            # mmap, instant startup
 graph = Graph.from_edges(num_nodes, src, dst)
-graph.save("graph.bin")
+graph.save("graph.bin")                    # add compressed=True for the succinct format
 graph.load_features("features.bin")
 graph.num_nodes  # int
 graph.num_edges  # int
+graph.degrees()                            # every node's degree
+graph.degrees_of(nodes)                    # just these, in input order
 
 # Cache-locality reordering (Rabbit Order)
 perm = graph.reorder_rabbit()                       # permutation: new_id → old_id
@@ -335,6 +436,40 @@ for batch in loader:  # yields PyG HeteroData
     batch["user", "votes", "post"].edge_index
 ```
 
+### Features
+
+```python
+from aethergraph import FeatureStore, SharedFeatureStore, save_features
+
+save_features("features.bin", x, dtype="bf16")   # "f32" | "f16" | "bf16"
+
+store = FeatureStore.load("features.bin")        # mmap
+store = FeatureStore.load_paged("features.bin", budget_pages, degrees)
+store.get(node)                                  # one row
+store.get_batch(nodes)                           # [len(nodes), feature_dim]
+store.pager_stats()                              # (faults, evictions) when paged
+
+owner = SharedFeatureStore.publish("features.bin")
+owner.serve("/tmp/ag.sock")                      # until stop_serving() or drop
+worker = SharedFeatureStore.attach("/tmp/ag.sock")
+worker.shared_bytes                              # region size, mapped once per host
+```
+
+### PerfCounters
+
+Hardware counters around a block of work. Thread-scoped, user space only. A host
+that withholds PMU access grants fewer counters; those come back `None` rather
+than raising, and `active` reports what was granted.
+
+```python
+from aethergraph import PerfCounters
+
+with PerfCounters(["cycles", "LLC-misses", "dTLB-misses"]) as pc:
+    for batch in loader:
+        train_step(batch)
+print(pc.readings())
+```
+
 ### Differences from PyTorch Geometric
 
 AetherGraph is a **high-performance replacement** for PyG's data loading
@@ -358,8 +493,13 @@ pipeline.
   readers)
 - `feature_source="rdma://..."` for GPUDirect RDMA live features
 - mmap'd CSR for instant startup on billion-node graphs
-- io_uring feature loading at NVMe line rate
+- io_uring feature loading at NVMe line rate, with NVMe passthrough where the
+  namespace allows it
 - Rabbit Order vertex reordering with partition-aligned batching
+- Compressed graph files and f16/bf16 feature payloads
+- Out-of-core feature paging under an explicit residency budget
+- One shared copy of the feature matrix across worker processes
+- Free-threaded (no-GIL) CPython support
 - 1.2-1.5x faster sampling than PyG's pyg-lib C++ kernel
 
 ## CLI

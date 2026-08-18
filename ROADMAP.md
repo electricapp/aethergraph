@@ -4,15 +4,18 @@ Outstanding work only. Delete rows from these tables as they land.
 
 ## Status
 
-| ID  | What                          | Code written? | Blocker to run                        |
-| --- | ----------------------------- | ------------- | ------------------------------------- |
-| R6  | T4.3 Ray Data multi-GPU       | Yes           | ≥2 GPUs (Modal `gpu="T4:2"` suffices) |
-| H1  | GPU orchestration paths       | Yes           | Any CUDA GPU                          |
-| H2  | NVMe passthrough gather       | Yes           | A drive exposing `/dev/ng*`           |
-| H3  | NUMA placement chooses a node | Yes           | A 2-socket host                       |
-| H4  | USDT probe arguments          | Yes           | Linux + `bpftrace`                    |
-| H5  | io_uring setup wins           | Bench only    | NVMe host under load                  |
-| H6  | Native InfiniBand addressing  | Yes           | IB fabric + subnet manager            |
+| ID  | What                                  | Code written? | Blocker to run                            |
+| --- | ------------------------------------- | ------------- | ----------------------------------------- |
+| R6  | T4.3 Ray Data multi-GPU               | Yes           | ≥2 GPUs (Modal `gpu="T4:2"` suffices)     |
+| H1  | GPU orchestration paths               | Yes           | Any CUDA GPU                              |
+| H2  | NVMe passthrough gather               | Yes           | A drive exposing `/dev/ng*`               |
+| H3  | NUMA placement chooses a node         | Yes           | A 2-socket host                           |
+| H4  | USDT probe arguments                  | Yes           | Linux + `bpftrace`                        |
+| H5  | io_uring setup wins                   | Bench only    | NVMe host under load                      |
+| H6  | Native InfiniBand addressing          | Yes           | IB fabric + subnet manager                |
+| H7  | AVX-512 / F16C f16 upcast             | Yes           | An x86-64 host with AVX-512               |
+| H8  | Huge-page backing for in-memory CSR   | Yes           | Linux with `transparent_hugepage=madvise` |
+| P1  | Whether node ordering speeds sampling | Bench only    | A quiet host with headroom to spare       |
 
 All test code is written and gated. What's left is _running_ it on the right
 hardware.
@@ -27,14 +30,17 @@ because every one of these is a path where the code can look finished and do
 nothing: a fallback that silently degrades, a placement call that is inert on
 one socket, a probe that fires without its arguments.
 
-| ID  | Never executed                                                                                           | Why CI cannot cover it                                                                                           | Rig                        |
-| --- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| H1  | `gpu/gdrcopy.rs` BAR1 stores, `gpu/kernel.rs` seqlock validation, the CUDA half of `gpu/uvm.rs` prefetch | `gpudirect-check` runs `cargo check` in a CUDA container with no device — type-checked, never run                | Any CUDA GPU               |
-| H2  | `NvmeReader::read_batch` submission and completion; MDTS rejection of an oversized command               | Runners have no NVMe character device, so `NvmeReader::open_for` returns `None` and the gather takes the fs path | Drive with `/dev/ng*`      |
-| H3  | `interleave_region` spreading pages, `pin_current_thread` binding a worker to one socket's cores         | Runners are single-node: `nodes_online().len() < 2`, so both calls short-circuit before the syscall              | 2-socket host              |
-| H4  | A tracer reading `arg1`…`arg4` off a probe                                                               | CI asserts the ELF note carries descriptors; nothing attaches to confirm a consumer resolves them                | Linux + `bpftrace`         |
-| H5  | Whether `DEFER_TASKRUN` and the coalesced UVM prefetch are actually faster, not merely selected          | The tier assertion proves the setup was chosen; it says nothing about throughput                                 | NVMe host, GPU host        |
-| H6  | A QP reaching a peer over LID routing, and `LinkLayer::InfiniBand` being taken at all                    | Every fabric available is Ethernet-link-layer — SoftRoCE, ConnectX-6 RoCE, EFA — so the IB branch never runs     | IB fabric + subnet manager |
+| ID  | Never executed                                                                                           | Why CI cannot cover it                                                                                           | Rig                         |
+| --- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| H1  | `gpu/gdrcopy.rs` BAR1 stores, `gpu/kernel.rs` seqlock validation, the CUDA half of `gpu/uvm.rs` prefetch | `gpudirect-check` runs `cargo check` in a CUDA container with no device — type-checked, never run                | Any CUDA GPU                |
+| H2  | `NvmeReader::read_batch` submission and completion; MDTS rejection of an oversized command               | Runners have no NVMe character device, so `NvmeReader::open_for` returns `None` and the gather takes the fs path | Drive with `/dev/ng*`       |
+| H3  | `interleave_region` spreading pages, `pin_current_thread` binding a worker to one socket's cores         | Runners are single-node: `nodes_online().len() < 2`, so both calls short-circuit before the syscall              | 2-socket host               |
+| H4  | A tracer reading `arg1`…`arg4` off a probe                                                               | CI asserts the ELF note carries descriptors; nothing attaches to confirm a consumer resolves them                | Linux + `bpftrace`          |
+| H5  | Whether `DEFER_TASKRUN` and the coalesced UVM prefetch are actually faster, not merely selected          | The tier assertion proves the setup was chosen; it says nothing about throughput                                 | NVMe host, GPU host         |
+| H6  | A QP reaching a peer over LID routing, and `LinkLayer::InfiniBand` being taken at all                    | Every fabric available is Ethernet-link-layer — SoftRoCE, ConnectX-6 RoCE, EFA — so the IB branch never runs     | IB fabric + subnet manager  |
+| H7  | `f16_le_to_f32_avx512` and `f16_le_to_f32_f16c`; the AVX2 bf16 kernel                                    | Development is on aarch64, where those blocks are `cfg`'d out entirely and NEON is the only path compiled        | x86-64 host with AVX-512    |
+| H8  | Whether `MADV_HUGEPAGE` on the in-memory CSR arrays changes anything                                     | `advise_hugepage` compiles to a no-op off Linux, and is redundant under `transparent_hugepage=always`            | Linux, THP set to `madvise` |
+| P1  | Whether Rabbit ordering makes sampling faster at all                                                     | Not a hardware gap — a noise-floor one; see below                                                                | Quiet host, ≥32 GB          |
 
 **H3 is not covered by the Lambda A10** — that instance is single-socket, so it
 exercises H1 and H2 but leaves NUMA placement inert exactly as CI does. A
@@ -54,38 +60,24 @@ the ring forced down each rung (`UringHandle::tier()` reports which one took
 effect) and with prefetch coalescing disabled, so the claim is a measured delta
 rather than a plausible mechanism.
 
----
+P1 is a measurement gap, not a hardware one, and it is open in both directions —
+no result yet shows reordering helping _or_ not helping.
+`benches/sampling_locality.rs` is the instrument: two isomorphic R-MAT graphs,
+one randomly permuted and one Rabbit-reordered, asserted to emit the same edge
+count and visit the same node count before it reports, so a timing gap can only
+be layout. Its one-hop arm reproduces to ~1%; its multi-hop arm does not, and
+has returned differences of both signs across runs of the same binary. That arm
+holds hundreds of thousands of output elements and dedup slots, which makes it
+sensitive to memory pressure and to competing load. Read it only where repeated
+runs agree on the sign and their intervals stay apart.
 
-## Merge sequence
-
-Fifteen branches are green against `main` individually, which says nothing about
-landing them together — GitHub's mergeable flag compares each to `main`, not to
-its predecessors. This order was validated by replaying the cascade in a scratch
-worktree.
-
-**Zero-conflict prefix**, in order: **#110, #111, #102, #106, #97, #98.** These
-touch disjoint files or append to different regions, and merge clean one after
-another with no intervention.
-
-**Then the rest**, each conflicting only in append-only files: **#99, #100,
-#101, #104, #105, #103, #107, #108, #109.**
-
-**#109 must follow #108** — it is branched off it, and `DEFER_TASKRUN` is only
-sound once the rings are thread-owned. In that order the pair merges clean; out
-of order it does not.
-
-Every conflict in this sequence lands in one of three files, and all are "both
-sides appended":
-
-| File                                          | Resolution                                                                                          |
-| --------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `.github/workflows/ci.yml`                    | Keep both job/step blocks; add both rows to the summary table                                       |
-| `crates/aethergraph-py/Cargo.toml`            | Union the `features` array of the `aethergraph-core` dependency, and keep both explanatory comments |
-| `crates/aethergraph-core/src/internal/mod.rs` | Keep both `pub mod` lines                                                                           |
-
-No conflict falls in code logic. The one that looks like it might —
-`features/async_store.rs` between #108 and #109 — is an artifact of merging them
-out of order; in sequence it does not arise.
+Two things to hold separate when it is run. The benchmark draws seeds uniformly,
+which is the ordering-unfriendly case — at the first hop, consecutive frontier
+entries are unrelated whatever the numbering, so only later hops have locality
+to win back. And `partition_aligned_batches` would show a larger number, but it
+samples a denser subgraph: part of that gain is doing less work, not touching
+less memory, and it changes batch gradient statistics. Those are two claims, not
+one.
 
 ---
 

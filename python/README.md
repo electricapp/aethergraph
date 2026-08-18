@@ -6,9 +6,14 @@ documentation.
 ## Features
 
 - **Zero-copy I/O**: Memory-mapped graphs, Arrow integration
-- **io_uring async I/O**: Parallel NVMe reads (Linux)
+- **io_uring async I/O**: Parallel NVMe reads, with NVMe passthrough where the
+  namespace allows it (Linux)
 - **PyTorch Geometric compatible**: Drop-in NeighborLoader replacement
 - **Ray Data integration**: Distributed sampling with Replicated Topology
+- **Compact at rest**: Compressed graph files, f16/bf16 feature payloads
+- **Feature memory**: One shared copy across worker processes, or demand paging
+  under a fixed residency budget (Linux)
+- **Free-threaded CPython**: A `cp314t` wheel that does not re-enable the GIL
 
 ## Installation
 
@@ -180,6 +185,33 @@ graph.save("graph.bin")
 
 # Load existing graph
 graph = Graph.load("graph.bin")
+
+# Compressed at rest — load() detects the format
+graph.save("graph.compressed.bin", compressed=True)
+```
+
+```python
+from aethergraph import FeatureStore, SharedFeatureStore, save_features
+
+# Half the file, decoded on the way out
+save_features("features.bin", x, dtype="bf16")  # "f32" | "f16" | "bf16"
+
+store = FeatureStore.load("features.bin")
+store.get_batch(nodes)  # [len(nodes), feature_dim]
+
+# One copy of the matrix for many workers (Linux)
+owner = SharedFeatureStore.publish("features.bin")
+owner.serve("/tmp/ag.sock")
+worker = SharedFeatureStore.attach("/tmp/ag.sock")
+```
+
+Platform-gated classes are absent rather than broken where they do not apply.
+Check before use:
+
+```python
+from aethergraph import _core
+
+_core.HAS_GPUDIRECT, _core.HAS_NUMA, _core.HAS_SHARED_STORE, _core.HAS_PERF_COUNTERS
 ```
 
 ## License

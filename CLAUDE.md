@@ -77,6 +77,6 @@ scripts/check-linux.sh --clippy --tests   # what CI runs, cross-compiled
 ```
 
 It uses zig as the cross toolchain (`brew install zig`, plus
-`rustup target add x86_64-unknown-linux-gnu`) — no container, no emulation.
-Run it after touching anything Linux-gated. It is not a pre-commit or pre-push
-hook, because a full cross-check costs more than a commit should.
+`rustup target add x86_64-unknown-linux-gnu`) — no container, no emulation. Run
+it after touching anything Linux-gated. It is not a pre-commit or pre-push hook,
+because a full cross-check costs more than a commit should.
