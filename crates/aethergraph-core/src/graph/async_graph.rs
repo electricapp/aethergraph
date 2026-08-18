@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -57,8 +57,6 @@ pub struct AsyncCsrGraph {
     file: Arc<File>,
 
     /// Path to graph file (used for logging and debugging)
-    #[allow(dead_code)]
-    path: PathBuf,
 
     /// Number of nodes
     num_nodes: usize,
@@ -230,7 +228,6 @@ impl AsyncCsrGraph {
 
         Ok(Self {
             file: file_arc,
-            path: path.to_path_buf(),
             num_nodes,
             num_edges,
             _offsets_start: offsets_start,

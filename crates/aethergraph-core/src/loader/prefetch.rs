@@ -45,7 +45,7 @@ use crate::internal::genstamp::WyRand;
 use crate::internal::hint;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -203,8 +203,6 @@ pub struct SyncFeatureStore {
     /// File handle (may be O_DIRECT on Linux)
     file: Arc<File>,
     /// Path to feature file
-    #[allow(dead_code)]
-    path: PathBuf,
     /// Number of nodes
     num_nodes: usize,
     /// Feature dimension per node
@@ -308,7 +306,6 @@ impl SyncFeatureStore {
 
         Ok(Self {
             file: Arc::new(file),
-            path: path.to_path_buf(),
             num_nodes: header.num_nodes,
             feature_dim: header.feature_dim,
             features_start_offset: header.features_start_offset,

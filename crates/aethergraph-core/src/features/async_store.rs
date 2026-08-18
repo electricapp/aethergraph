@@ -28,7 +28,7 @@ use crate::graph::NodeId;
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -56,8 +56,6 @@ pub struct AsyncFeatureStore {
     file: Arc<File>,
 
     /// Path to feature file
-    #[allow(dead_code)]
-    path: PathBuf,
 
     /// Number of nodes
     num_nodes: usize,
@@ -197,7 +195,6 @@ impl AsyncFeatureStore {
 
         Ok(Self {
             file: file_arc,
-            path: path.to_path_buf(),
             num_nodes: header.num_nodes,
             feature_dim: header.feature_dim,
             features_start_offset: header.features_start_offset,
@@ -567,36 +564,6 @@ impl AsyncFeatureStore {
         for task in tasks {
             let features = task.await.context("blocking task failed")??;
             all_features.extend(features);
-        }
-
-        Ok(all_features)
-    }
-
-    /// Batch sync reads (sequential) - used internally for synchronous contexts
-    #[allow(dead_code)]
-    fn batch_read_sync(&self, nodes: &[NodeId], feature_size: usize) -> Result<Vec<f32>> {
-        // Validate all nodes upfront - O(n) to find max, O(1) to check
-        if let Some(&max_node) = nodes.iter().max() {
-            anyhow::ensure!(
-                (max_node as usize) < self.num_nodes,
-                "node {} out of bounds (num_nodes={})",
-                max_node,
-                self.num_nodes
-            );
-        }
-
-        let mut all_features = vec![0f32; nodes.len() * self.feature_dim];
-        let mut buffer = vec![0u8; feature_size];
-
-        for (i, &node) in nodes.iter().enumerate() {
-            let offset = self.features_start_offset + (node as u64 * feature_size as u64);
-            self.file
-                .read_exact_at(&mut buffer, offset)
-                .context("sync read failed")?;
-            self.dtype.decode_row(
-                &buffer,
-                &mut all_features[i * self.feature_dim..(i + 1) * self.feature_dim],
-            );
         }
 
         Ok(all_features)

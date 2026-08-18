@@ -59,21 +59,6 @@ impl AlignedBuffer {
         })
     }
 
-    /// Allocate a new aligned buffer.
-    ///
-    /// # Arguments
-    /// * `len` - Desired buffer size (will be rounded up to alignment)
-    /// * `alignment` - Required alignment (default: 4096)
-    ///
-    /// # Panics
-    /// Panics if allocation fails (out of memory).
-    #[cfg(test)]
-    #[allow(dead_code)]
-    #[inline]
-    pub fn new(len: usize, alignment: usize) -> Self {
-        Self::try_new(len, alignment).expect("AlignedBuffer allocation failed")
-    }
-
     /// Try to allocate with default 4KB alignment.
     pub fn try_new_default(len: usize) -> Result<Self> {
         Self::try_new(len, DIRECT_IO_ALIGNMENT)
@@ -111,13 +96,6 @@ impl AlignedBuffer {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    /// Check if buffer is empty.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 }
 

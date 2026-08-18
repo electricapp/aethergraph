@@ -15,7 +15,7 @@
 #![cfg(all(target_os = "linux", feature = "shm"))]
 
 use anyhow::{Result, bail};
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// A shared memory region backed by a sealed `memfd`.
 ///
@@ -359,10 +359,6 @@ pub fn socket_pair() -> Result<(OwnedFd, OwnedFd)> {
     let b = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     Ok((a, b))
 }
-
-// Re-exported so callers can hand a token's fd off after receiving it.
-#[allow(unused_imports)]
-use std::os::unix::io::AsRawFd;
 
 #[cfg(test)]
 mod tests {

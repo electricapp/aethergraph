@@ -147,7 +147,7 @@ impl ExtentMap {
     /// Number of extents (1 for a freshly fallocated store; more if the
     /// filesystem fragmented it). A store mapped to many extents is a
     /// fragmentation signal worth logging.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn extent_count(&self) -> usize {
         self.extents.len()
     }

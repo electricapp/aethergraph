@@ -2,10 +2,6 @@
 //!
 //! These functions tell the kernel to prefetch data into the page cache
 //! *before* we actually read it, reducing page fault latency.
-//!
-//! Note: Some functions are kept for future optimization opportunities.
-
-#![allow(dead_code)]
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -96,40 +92,6 @@ pub fn prefetch_mmap_range(addr: *const u8, len: usize) {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn prefetch_mmap_range(_addr: *const u8, _len: usize) {}
-
-/// Hint: sequential access pattern (increases readahead).
-#[cfg(target_os = "linux")]
-pub fn hint_sequential<F: AsRawFd>(file: &F, offset: u64, len: usize) {
-    // SAFETY: posix_fadvise is a kernel hint; only requires a valid fd from `file`.
-    unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            offset as libc::off_t,
-            len as libc::off_t,
-            libc::POSIX_FADV_SEQUENTIAL,
-        );
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn hint_sequential<F>(_file: &F, _offset: u64, _len: usize) {}
-
-/// Hint: random access pattern (disables readahead).
-#[cfg(target_os = "linux")]
-pub fn hint_random<F: AsRawFd>(file: &F, offset: u64, len: usize) {
-    // SAFETY: posix_fadvise is a kernel hint; only requires a valid fd from `file`.
-    unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            offset as libc::off_t,
-            len as libc::off_t,
-            libc::POSIX_FADV_RANDOM,
-        );
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn hint_random<F>(_file: &F, _offset: u64, _len: usize) {}
 
 /// Hint: this mmap'd region is accessed randomly — disable readahead.
 ///
@@ -255,23 +217,6 @@ pub fn populate_read(addr: *const u8, len: usize) -> bool {
 pub fn populate_read(_addr: *const u8, _len: usize) -> bool {
     false
 }
-
-/// Hint: done with this region, can be evicted.
-#[cfg(target_os = "linux")]
-pub fn hint_dontneed<F: AsRawFd>(file: &F, offset: u64, len: usize) {
-    // SAFETY: posix_fadvise is a kernel hint; only requires a valid fd from `file`.
-    unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            offset as libc::off_t,
-            len as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        );
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn hint_dontneed<F>(_file: &F, _offset: u64, _len: usize) {}
 
 #[cfg(test)]
 mod tests {

@@ -102,8 +102,8 @@ pub struct GpuGatherBuffer {
     /// MR registered against the NIC; declared first so it drops BEFORE
     /// `_allocation` — `ibv_dereg_mr` must run while the VRAM is still valid.
     mr: RegisteredMr,
-    #[allow(dead_code)]
-    ctx: Arc<CudaContext>,
+    /// Held so the context outlives `device_ptr`, never read.
+    _ctx: Arc<CudaContext>,
     /// Raw CUDA device pointer (for RDMA WR local_addr).
     device_ptr: u64,
     /// Full slot size matching server layout (head + features + padding + tail).
@@ -170,7 +170,7 @@ impl GpuGatherBuffer {
         let mr = unsafe { reg_mr_cuda(rdma_ctx, device_ptr, total_bytes, access)? };
 
         Ok(Self {
-            ctx: cuda_ctx.clone(),
+            _ctx: cuda_ctx.clone(),
             device_ptr,
             mr,
             slot_size,

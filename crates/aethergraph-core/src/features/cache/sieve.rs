@@ -264,7 +264,7 @@ impl SieveCache {
     /// Pinned entries keep their place in the queue rather than being
     /// dropped from it, so unpinning needs no requeue — the hand will
     /// reach the entry on its next pass.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn unpin(&mut self, node: NodeId) {
         self.pinned.remove(&node);
     }

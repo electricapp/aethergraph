@@ -8,7 +8,7 @@
 //!   [16..24)   feature_dim: u64 le
 //!   [24..32)   features_start_offset: u64 le, > 32 (writers pick an
 //!              O_DIRECT-aligned offset, currently 512)
-//!   [32]       dtype tag (0 = F32, 1 = F16)
+//!   [32]       dtype tag (0 = F32, 1 = F16, 2 = BF16)
 //!   [offset..) feature payload: num_nodes × feature_dim × elements (little-endian)
 //! ```
 
@@ -131,9 +131,8 @@ pub struct FeatureHeader {
     /// `feature_dim * dtype.element_size()` -- bytes per node's feature row.
     /// Only used by Linux-gated O_DIRECT alignment checks today, but validated
     /// for overflow on every load.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub feature_size: usize,
-    /// Element data type (F32 or F16).
+    /// Element data type (F32, F16 or BF16).
     pub dtype: FeatureDtype,
 }
 
