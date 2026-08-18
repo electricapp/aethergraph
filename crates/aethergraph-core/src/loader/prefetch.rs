@@ -385,8 +385,20 @@ impl SyncFeatureStore {
                     self.dtype,
                     self.feature_dim,
                 );
-                self.uring = Some(lane);
-                return result;
+                match result {
+                    // The ring was accepted at setup, but this filesystem
+                    // cannot serve the reads it was built for. Drop the lane
+                    // — leaving `self.uring` empty — and let this call and
+                    // every later one take the portable path below.
+                    Err(ref e) if crate::internal::uring::is_ring_unsupported(e) => {
+                        debug!("io_uring gather unsupported for this file ({e}); using pread");
+                        drop(lane);
+                    }
+                    _ => {
+                        self.uring = Some(lane);
+                        return result;
+                    }
+                }
             }
         }
 

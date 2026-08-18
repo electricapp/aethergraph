@@ -854,6 +854,19 @@ pub fn create_owned_feature_uring(direct_io: bool) -> Option<UringHandle> {
     }
 }
 
+/// Whether a [`batch_read`] error means the ring cannot serve this file at
+/// all, rather than that one read failed.
+///
+/// A ring built with IOPOLL is accepted by a kernel that has the feature,
+/// even when the filesystem underneath cannot do polled I/O — that only
+/// surfaces as `EOPNOTSUPP` on the first real read. The setup ladder cannot
+/// see it, so the caller degrades to its portable path instead.
+pub fn is_ring_unsupported(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.raw_os_error() == Some(libc::EOPNOTSUPP))
+}
+
 /// Perform a batch of reads using io_uring with proper SQPOLL handling.
 ///
 /// Caller-supplied buffers: each tuple is `(file_offset, dest_buffer_ptr, length)`.
@@ -957,11 +970,13 @@ pub fn batch_read(
         };
         if result < 0 {
             if first_err.is_none() {
-                *first_err = Some(anyhow::anyhow!(
-                    "io_uring read at offset {} failed with error {}",
-                    offset,
-                    -result
-                ));
+                // Keep the errno typed rather than formatting it away:
+                // callers branch on it to tell "this ring cannot serve this
+                // file" from "this read failed".
+                *first_err = Some(
+                    anyhow::Error::new(std::io::Error::from_raw_os_error(-result))
+                        .context(format!("io_uring read at offset {offset}")),
+                );
             }
             return;
         }
