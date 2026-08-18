@@ -15,9 +15,14 @@ workspace = true
 # which turns this on via `[tool.maturin].features` in python/pyproject.toml.
 # Plain `cargo test` omits it so unit tests can link against libpython
 # normally and run as a standalone test binary.
-default = []
+#
+# `uffd` is on by default: its code is additionally Linux-gated, so mac
+# builds are unaffected, and on Linux `FeatureStore.load_paged` raises when
+# the kernel withholds userfaultfd rather than failing the build.
+default = ["uffd"]
 extension-module = ["pyo3/extension-module"]
 gpudirect = ["aether-stream/gpudirect"]
+uffd = ["aethergraph-core/uffd"]
 
 [lib]
 name = "_core"

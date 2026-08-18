@@ -26,6 +26,10 @@ numa = ["dep:aether-mem"]
 # zstd-compressed, dictionary-trained cold feature tier: rarely touched
 # rows compressed in fixed-size blocks, decompressed per-block on gather.
 zstd-tier = ["dep:zstd"]
+# Userspace demand paging: register an anonymous region with userfaultfd
+# and page it in from a backing store under a degree-weighted residency
+# budget. Linux-only; needs vm.unprivileged_userfaultfd=1 or CAP_SYS_PTRACE.
+uffd = []
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 # Enables loom-backed model checking of the lock-free union-find. Run with:
 #   cargo test -p aethergraph-core --features loom --test loom_union_find

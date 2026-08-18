@@ -22,7 +22,7 @@ pub use cache::{CacheStats, FeatureCache, FeatureCacheConfig, count_node_frequen
 pub use cold_tier::{ColdStore, ColdTier, ROWS_PER_BLOCK};
 #[cfg(feature = "gds")]
 pub use gds::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
-pub use header::FeatureDtype;
+pub use header::{FeatureDtype, FeatureHeader, parse_feature_header};
 pub(crate) use store::PaddedAtomicU64;
 pub use store::{
     FeatureData, FeatureLoadTelemetry, FeatureStore, create_features, save_feature_data,

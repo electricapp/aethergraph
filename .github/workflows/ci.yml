@@ -289,6 +289,40 @@ jobs:
             printf 'nodes online: %s\n' "$(cat /sys/devices/system/node/online 2>/dev/null || echo unknown)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  uffd:
+    name: userfaultfd pager
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: uffd
+      - name: Enable unprivileged userfaultfd
+        run: sudo sysctl -w vm.unprivileged_userfaultfd=1
+      - run: |
+          cargo clippy -p aethergraph-core -p aethergraph-py --all-targets \
+            --features uffd -- -D warnings
+          cargo test -p aethergraph-core --features uffd internal::uffd
+          cargo test -p aethergraph-core --features uffd features::store
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## userfaultfd pager"
+            echo ""
+            echo "Demand-paging round-trip from a backing file,"
+            echo "degree-weighted retention under a residency budget, and"
+            echo "a paged FeatureStore gathering identically to a mapped one."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   loom:
     name: loom model checker
     runs-on: ubuntu-latest

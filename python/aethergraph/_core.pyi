@@ -393,6 +393,22 @@ class FeatureStore:
 
     @staticmethod
     def load(path: PathLike, telemetry: bool = False) -> FeatureStore: ...
+    @staticmethod
+    def load_paged(
+        path: PathLike,
+        budget_pages: int,
+        degrees: npt.NDArray[np.uint32] | None = None,
+        telemetry: bool = False,
+    ) -> FeatureStore:
+        """Demand-page the store from disk with at most `budget_pages`
+        pages resident, instead of mapping it and letting the kernel choose.
+        `degrees` (one per node) makes eviction degree-weighted so hub nodes
+        outlive leaves.
+
+        Linux only, and needs ``vm.unprivileged_userfaultfd=1`` or
+        CAP_SYS_PTRACE; raises OSError otherwise, where `load` is the
+        fallback."""
+
     @property
     def num_nodes(self) -> int: ...
     @property
@@ -401,6 +417,9 @@ class FeatureStore:
     def get_batch(self, nodes: npt.NDArray[np.int64]) -> npt.NDArray[np.float32]: ...
     def features(self) -> npt.NDArray[np.float32]: ...
     def telemetry(self) -> FeatureLoadTelemetry | None: ...
+    def pager_stats(self) -> tuple[int, int] | None:
+        """`(faults, evictions)` for a store opened with `load_paged`, or
+        None for a mapped store. Linux only."""
 
 class FeatureData:
     """Mutable feature builder."""
