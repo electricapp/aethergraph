@@ -14,6 +14,10 @@ bench = false
 [features]
 default = []
 io-uring = []
+# NVMe passthrough gather: FIEMAP-mapped, block-layer-bypassing reads over
+# IORING_OP_URING_CMD against /dev/ng*. Linux-only; the live path is
+# runtime-probed and falls back to the O_DIRECT/IOPOLL gather.
+nvme-passthru = []
 gds = []
 # Places the graph body across NUMA nodes and pins the sampler pool to
 # them. Off by default: on a single-socket machine it is inert, and the

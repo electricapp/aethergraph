@@ -31,11 +31,16 @@ doctest = false
 bench = false
 
 [dependencies]
-# `numa` is always requested: the placement calls are Linux-gated and
-# inert on a single-node machine, so mac and one-socket Linux wheels are
-# unaffected, while a wheel running on a multi-socket box interleaves the
-# graph body and pins its sampler pool.
-aethergraph-core = { path = "../aethergraph-core", version = "0.1", features = ["numa"] }
+# `numa` and `nvme-passthru` are always requested: both are additionally
+# gated on Linux, so mac and one-socket Linux wheels are unaffected. On a
+# multi-socket box the placement calls interleave the graph body and pin the
+# sampler pool; on a Linux wheel the store probes /dev/ng* at open and
+# silently falls back to the O_DIRECT io_uring gather when passthrough is
+# unavailable.
+aethergraph-core = { path = "../aethergraph-core", version = "0.1", features = [
+    "numa",
+    "nvme-passthru",
+] }
 # `wal` is always on so the Python `DynamicGraph.open_with_wal` constructor is
 # present on every wheel build — durability is a runtime opt-in (pass a path or
 # don't), not a compile-time one. `io-uring` rides along: its dependency is

@@ -129,6 +129,13 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p aether-stream --tests --features xdp_bpf
 
+      - name: nvme-passthru build + unit tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo clippy -p aethergraph-core --all-targets \
+            --features nvme-passthru -- -D warnings
+          cargo test -p aethergraph-core --features nvme-passthru internal::nvme
+
       - name: mlx5dv compile check
         if: matrix.run_rdma
         run: cargo check -p aether-stream --tests --features mlx5dv

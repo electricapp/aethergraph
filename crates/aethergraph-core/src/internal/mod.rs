@@ -9,6 +9,8 @@ pub mod hint;
 pub mod mmap;
 pub mod mmap_hetero;
 pub mod numa;
+#[cfg(all(target_os = "linux", feature = "nvme-passthru"))]
+pub mod nvme;
 #[cfg(feature = "parquet")]
 pub mod parquet_import;
 pub mod prefetch;
