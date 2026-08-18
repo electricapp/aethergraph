@@ -31,19 +31,65 @@ pub const DEFAULT_RING_ENTRIES: u32 = 4096;
 /// File offsets must be aligned to this value for O_DIRECT reads to succeed.
 pub const DIRECT_IO_OFFSET_ALIGNMENT: usize = 512;
 
+/// The file's real O_DIRECT offset alignment, from `statx(STATX_DIOALIGN)`.
+///
+/// [`DIRECT_IO_OFFSET_ALIGNMENT`] is the historical 512-byte assumption. It
+/// is not universal: a 4Kn drive, or a filesystem layered over one, requires
+/// 4096, and a layout that satisfies 512 but not 4096 passes the static
+/// check and then fails every read with `EINVAL`. `STATX_DIOALIGN` (Linux
+/// 6.1) reports what the backing device actually needs, so the compatibility
+/// decision can be made against the truth rather than a guess.
+///
+/// Returns `None` when the kernel or filesystem does not report it — the
+/// caller then keeps the conservative default.
+pub fn direct_io_offset_alignment(file: &File) -> Option<usize> {
+    // STATX_DIOALIGN, from <linux/stat.h>.
+    const STATX_DIOALIGN: libc::c_uint = 0x0000_2000;
+    // SAFETY: an all-zero statx is a valid out-parameter the kernel fills.
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` provides a live fd; with AT_EMPTY_PATH and an empty
+    // path the fd itself is the target, and `st` is a valid out-pointer.
+    let rc = unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            STATX_DIOALIGN,
+            &mut st,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // The mask reports what the kernel actually filled in; a kernel that
+    // does not know the flag succeeds and simply leaves it clear.
+    if st.stx_mask & STATX_DIOALIGN == 0 {
+        return None;
+    }
+    let align = st.stx_dio_offset_align as usize;
+    // Zero means the file does not support O_DIRECT at all.
+    (align > 0).then_some(align)
+}
+
 /// Check if a feature file layout is compatible with O_DIRECT.
 ///
-/// O_DIRECT requires both buffer and file offset alignment. For feature files,
-/// this means:
-/// - `features_start_offset` must be aligned to 512 bytes
-/// - `feature_size` (feature_dim * 4) must be aligned to 512 bytes
+/// O_DIRECT requires both buffer and file offset alignment. For feature
+/// files this means `features_start_offset` and `feature_size` must both be
+/// multiples of the device's offset alignment; if either is not, reads fail
+/// with `EINVAL`.
 ///
-/// If either is not aligned, O_DIRECT reads will fail with EINVAL.
-pub fn is_layout_direct_io_compatible(features_start_offset: u64, feature_size: usize) -> bool {
-    let offset_aligned =
-        (features_start_offset as usize).is_multiple_of(DIRECT_IO_OFFSET_ALIGNMENT);
-    let size_aligned = feature_size.is_multiple_of(DIRECT_IO_OFFSET_ALIGNMENT);
-    offset_aligned && size_aligned
+/// `alignment` comes from [`direct_io_offset_alignment`] where the kernel
+/// reports it, and [`DIRECT_IO_OFFSET_ALIGNMENT`] otherwise.
+pub fn is_layout_direct_io_compatible_with(
+    features_start_offset: u64,
+    feature_size: usize,
+    alignment: usize,
+) -> bool {
+    if alignment == 0 {
+        return false;
+    }
+    (features_start_offset as usize).is_multiple_of(alignment)
+        && feature_size.is_multiple_of(alignment)
 }
 
 /// Open a file with O_DIRECT for use with io_uring IOPOLL.
@@ -198,6 +244,56 @@ fn sqpoll_cpu() -> Option<u32> {
     })
 }
 
+/// Build a ring with no kernel poller, taking the modern setup flags the
+/// running kernel supports.
+///
+/// Two flags apply to a batch submitter like [`batch_read`] and neither
+/// constrains which thread submits:
+///
+/// - `COOP_TASKRUN` (5.19) lets the kernel run completion task-work when
+///   the submitting task next enters the kernel, instead of driving it with
+///   an IPI. A batch that submits and then waits is already about to enter,
+///   so the interrupt buys nothing and costs both cores a round trip.
+/// - `SUBMIT_ALL` (5.18) keeps submitting the rest of a batch after one SQE
+///   is rejected, rather than stopping at the first. `batch_read` already
+///   records the first error and drains everything it submitted, so
+///   partial-submit is the behaviour it wants.
+///
+/// Deliberately absent: `SINGLE_ISSUER`/`DEFER_TASKRUN`, the bigger win of
+/// the two. Both require every submission to come from the task that
+/// created the ring, and the feature-store lanes are built once and then
+/// shared as `Arc<Mutex<UringLane>>` across worker threads — whichever
+/// worker takes the lock submits. Enabling them would fail submission with
+/// `EEXIST` off the creating thread. Making lanes thread-owned is the
+/// prerequisite, and that is a restructuring rather than a flag.
+///
+/// Each flag is dropped individually if the kernel rejects it, so an older
+/// kernel loses only the flags it lacks.
+fn build_plain_ring(entries: u32) -> Result<io_uring::IoUring> {
+    let attempts: [&[&str]; 3] = [&["coop_taskrun", "submit_all"], &["submit_all"], &[]];
+    let mut last_err = None;
+    for flags in attempts {
+        let mut builder = io_uring::IoUring::builder();
+        if flags.contains(&"coop_taskrun") {
+            builder.setup_coop_taskrun();
+        }
+        if flags.contains(&"submit_all") {
+            builder.setup_submit_all();
+        }
+        match builder.build(entries) {
+            Ok(ring) => {
+                debug!(?flags, "io_uring initialized without a kernel poller");
+                return Ok(ring);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(anyhow::Error::from(last_err.unwrap_or_else(|| {
+        std::io::Error::other("io_uring setup failed")
+    })))
+    .context("failed to create io_uring")
+}
+
 /// SQPOLL-aware io_uring wrapper.
 ///
 /// Handles the complexity of SQPOLL mode correctly:
@@ -283,8 +379,9 @@ impl UringHandle {
             }
             Err(e) => {
                 warn!("SQPOLL failed ({}), trying standard io_uring", e);
-                // Fallback to standard io_uring
-                let ring = io_uring::IoUring::new(entries).context("failed to create io_uring")?;
+                // Fallback to standard io_uring, with the cheap modern
+                // setup flags where the kernel has them.
+                let ring = build_plain_ring(entries)?;
                 Ok(Self {
                     ring,
                     entries,
@@ -801,6 +898,75 @@ mod tests {
         lane.scratch(12)
             .copy_from_slice(bytemuck::cast_slice(&written));
         assert_eq!(lane.scratch_f32(3), &written);
+    }
+
+    /// A layout that clears 512 but not 4096 is the case the static
+    /// assumption got wrong: it would be accepted on a 4Kn device and then
+    /// fail every read with EINVAL. The decision must follow the alignment
+    /// it is given.
+    #[test]
+    fn layout_compatibility_follows_the_reported_alignment() {
+        // 512-aligned but not 4096-aligned.
+        let offset = 512u64;
+        let size = 1536usize;
+        assert!(is_layout_direct_io_compatible_with(offset, size, 512));
+        assert!(
+            !is_layout_direct_io_compatible_with(offset, size, 4096),
+            "a 4Kn device must reject a merely 512-aligned layout"
+        );
+
+        // Aligned for both.
+        assert!(is_layout_direct_io_compatible_with(8192, 4096, 512));
+        assert!(is_layout_direct_io_compatible_with(8192, 4096, 4096));
+
+        // A zero alignment means the file cannot do O_DIRECT at all, and
+        // must never divide.
+        assert!(!is_layout_direct_io_compatible_with(0, 0, 0));
+    }
+
+    /// The query either reports a real power-of-two alignment or declines.
+    /// A bogus value would silently disable O_DIRECT or, worse, wave
+    /// through a layout the device rejects.
+    #[test]
+    fn reported_alignment_is_sane_or_absent() {
+        let temp = NamedTempFile::new().unwrap();
+        let file = File::open(temp.path()).unwrap();
+        if let Some(align) = direct_io_offset_alignment(&file) {
+            assert!(align.is_power_of_two(), "alignment {align} is not 2^n");
+            assert!(align >= 512, "alignment {align} is below a sector");
+        }
+    }
+
+    /// The setup flags degrade one at a time, so a kernel missing any of
+    /// them still yields a usable ring rather than failing construction.
+    /// Whatever it settles on must be able to submit and reap — the flags
+    /// are an optimization, and a ring that carries them but cannot
+    /// complete an operation is worse than one without.
+    #[test]
+    fn plain_ring_builds_and_completes_regardless_of_flag_support() {
+        let mut ring = match build_plain_ring(8) {
+            Ok(r) => r,
+            // A sandbox with io_uring disabled entirely is not this test's
+            // subject.
+            Err(e) => {
+                println!("io_uring unavailable here ({e}); skipping");
+                return;
+            }
+        };
+
+        // A no-op SQE is enough to prove submission and completion work
+        // under whichever flag combination survived.
+        let entry = io_uring::opcode::Nop::new().build().user_data(42);
+        {
+            let mut sq = ring.submission();
+            // SAFETY: Nop references no buffers, so there is nothing that
+            // has to outlive the call.
+            unsafe { sq.push(&entry) }.expect("8-entry ring accepts one SQE");
+        }
+        ring.submit_and_wait(1).expect("submit_and_wait");
+        let cqe = ring.completion().next().expect("one completion");
+        assert_eq!(cqe.user_data(), 42);
+        assert!(cqe.result() >= 0, "nop failed: {}", cqe.result());
     }
 
     #[test]

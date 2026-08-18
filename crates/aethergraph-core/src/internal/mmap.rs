@@ -252,7 +252,16 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
     if validation == GraphValidationMode::Full {
         crate::internal::hint::prefetch_mmap_range(body.as_ptr(), body.len());
     } else {
-        crate::internal::hint::prefetch_mmap_range(offsets_bytes.as_ptr(), offsets_bytes.len());
+        // The offsets array is read on the critical path of every batch —
+        // one random lookup per frontier node — so it is worth having
+        // resident before the first batch rather than queued for
+        // readahead. Populate it synchronously; WILLNEED remains the
+        // fallback on kernels without MADV_POPULATE_READ, since it returns
+        // before the pages arrive and a first-touch fault would otherwise
+        // stall the whole frontier.
+        if !crate::internal::hint::populate_read(offsets_bytes.as_ptr(), offsets_bytes.len()) {
+            crate::internal::hint::prefetch_mmap_range(offsets_bytes.as_ptr(), offsets_bytes.len());
+        }
         crate::internal::hint::advise_mmap_random(edges_bytes.as_ptr(), edges_bytes.len());
     }
     crate::internal::hint::advise_hugepage(offsets_bytes.as_ptr(), offsets_bytes.len());
