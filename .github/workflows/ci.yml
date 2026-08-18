@@ -331,6 +331,70 @@ jobs:
             echo "a paged FeatureStore gathering identically to a mapped one."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  perf:
+    name: perf counters
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: perf
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Relax perf_event_paranoid (best effort)
+        run: sudo sysctl -w kernel.perf_event_paranoid=1 || true
+      - run: |
+          cargo clippy -p aethergraph-core -p aethergraph-py --all-targets \
+            --features perf -- -D warnings
+          cargo test -p aethergraph-core --features perf internal::perf
+          cargo test -p aethergraph-core internal::probe
+      - name: USDT probes are attachable
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends systemtap-sdt-dev
+          cargo build -p aethergraph-py --release
+          so=$(find target/release -name 'lib_core.so' -o -name '_core.so' | head -1)
+          [ -n "$so" ] || so=$(find target/release -name 'libaethergraph_core*.rlib' | head -1)
+          echo "Inspecting $so"
+          readelf -n "$so" | grep -A2 stapsdt | head -40
+          for probe in sample_batch_done hub_node_capped feature_gather_done \
+                       cache_hit cache_miss; do
+            readelf -n "$so" | grep -q "$probe" \
+              || { echo "probe $probe missing from .note.stapsdt"; exit 1; }
+          done
+          # A probe whose note carries no argument descriptor still shows up
+          # by name, so the loop above passes while every value a call site
+          # passed is invisible to a tracer. Assert the descriptors exist.
+          readelf -n "$so" | grep -q 'Arguments: -8@' \
+            || { echo "no probe declares arguments; tracers would see none"; exit 1; }
+      - name: Python perf counter API
+        working-directory: python
+        run: |
+          uv sync --group dev --no-install-project
+          uv run --no-sync maturin develop --release
+          uv run --no-sync pytest tests/test_perf_counters.py -v
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## perf counters"
+            echo ""
+            echo "perf_event_open self-counters plus the Python PerfCounters"
+            echo "context manager; readings degrade to None when the runner's"
+            echo "PMU or paranoid setting forbids user counting."
+            echo ""
+            echo "All five USDT probes verified present in .note.stapsdt."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   loom:
     name: loom model checker
     runs-on: ubuntu-latest

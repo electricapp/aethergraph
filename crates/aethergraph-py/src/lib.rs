@@ -24,6 +24,8 @@ mod feature_telemetry;
 mod graph;
 mod hetero;
 mod metrics;
+#[cfg(all(target_os = "linux", feature = "perf"))]
+mod perf;
 mod prefetch;
 mod sampler;
 #[cfg(all(target_os = "linux", feature = "shm"))]
@@ -128,6 +130,14 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     #[cfg(all(target_os = "linux", feature = "shm"))]
     m.add_class::<shared_store::PySharedFeatureStore>()?;
+
+    m.add(
+        "HAS_PERF_COUNTERS",
+        cfg!(all(target_os = "linux", feature = "perf")),
+    )?;
+
+    #[cfg(all(target_os = "linux", feature = "perf"))]
+    m.add_class::<perf::PyPerfCounters>()?;
 
     #[cfg(feature = "gpudirect")]
     m.add_function(wrap_pyfunction!(

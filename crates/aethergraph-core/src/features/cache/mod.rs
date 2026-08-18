@@ -278,6 +278,9 @@ impl FeatureCache {
                     self.stats.pinned_hits.fetch_add(1, Ordering::Relaxed);
                 }
                 trace!("GPU cache hit for node {}", node);
+                // Tier 0 = the hot tier; the probe carries the tier so one
+                // attachment can histogram where reads are actually served.
+                crate::probe!(cache_hit, node as usize, 0);
                 return Ok(());
             }
         }
@@ -299,6 +302,7 @@ impl FeatureCache {
         if cpu_hit {
             self.stats.cpu_hits.fetch_add(1, Ordering::Relaxed);
             trace!("CPU cache hit for node {}", node);
+            crate::probe!(cache_hit, node as usize, 1);
             self.promote_to_gpu(node, out).await;
             return Ok(());
         }
@@ -315,6 +319,7 @@ impl FeatureCache {
             Some(features) => {
                 out.copy_from_slice(&features);
                 self.stats.nvme_hits.fetch_add(1, Ordering::Relaxed);
+                crate::probe!(cache_hit, node as usize, 2);
                 self.promote_to_cpu(node, &features).await;
                 Ok(())
             }
@@ -333,6 +338,7 @@ impl FeatureCache {
                     return Ok(());
                 }
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                crate::probe!(cache_miss, node as usize);
                 Err(anyhow::anyhow!(
                     "features for node {node} are in no cache tier"
                 ))
