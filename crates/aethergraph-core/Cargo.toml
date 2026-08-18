@@ -84,3 +84,7 @@ harness = false
 [[bench]]
 name = "sampling_scale"
 harness = false
+
+[[bench]]
+name = "sampling_locality"
+harness = false
