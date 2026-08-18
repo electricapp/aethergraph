@@ -674,7 +674,11 @@ class NeighborLoader(IterableDataset[Data]):
                 if result is None:
                     return None
                 subgraph, dlpack_capsule = result
-                return self._to_pyg_data_gpu(subgraph, torch.from_dlpack(dlpack_capsule))
+                # torch re-exports from_dlpack without an explicit re-export.
+                return self._to_pyg_data_gpu(
+                    subgraph,
+                    torch.from_dlpack(dlpack_capsule),  # type: ignore[attr-defined]
+                )
 
             yield from self._drive_epoch(
                 sampler, num_batches, get_batch, next_gpu_data, "epoch_rdma"

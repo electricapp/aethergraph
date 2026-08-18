@@ -546,6 +546,17 @@ jobs:
       - name: Build extension
         working-directory: python
         run: uv run --no-sync maturin develop --release
+      - name: ruff
+        working-directory: python
+        run: |
+          uv run --no-sync ruff format --check .
+          uv run --no-sync ruff check .
+      - name: mypy
+        # Runs after the extension is built: the stubs are checked against a
+        # real `_core`, so a `.pyi` that has drifted from the PyO3 surface
+        # fails here rather than at a user's import.
+        working-directory: python
+        run: uv run --no-sync mypy aethergraph
       - name: Run pytest
         working-directory: python
         timeout-minutes: 10

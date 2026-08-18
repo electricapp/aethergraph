@@ -169,6 +169,9 @@ def create_sampling_dataset(
         features_path=str(features_path) if features_path else None,
     )
 
-    num_blocks = parallelism or int(ray.available_resources().get("CPU", 1))
+    # ray leaves available_resources unannotated.
+    num_blocks = parallelism or int(
+        ray.available_resources().get("CPU", 1)  # type: ignore[no-untyped-call]
+    )
     result: ray.data.Dataset = ray.data.read_datasource(datasource, override_num_blocks=num_blocks)
     return result

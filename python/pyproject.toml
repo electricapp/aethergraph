@@ -92,10 +92,17 @@ extend-immutable-calls = ["typer.Option", "typer.Argument"]
 # 3.12 floor: numpy 2.x stubs use PEP 695 `type` statements, which mypy
 # rejects when analyzing for older versions.
 python_version = "3.12"
-warn_return_any = true
+# Strict lives in the config, not in the command line, so `mypy aethergraph`
+# and `mypy aethergraph --strict` cannot disagree about what passing means.
+strict = true
 warn_unused_configs = true
-disallow_untyped_defs = true
 namespace_packages = true
+
+# Gaps in torch's and ray's own stubs are waived at the call site with a
+# narrow `type: ignore[code]`, never by excluding a module here: an exclusion
+# would also wave through the next untyped call anywhere in that tree.
+# `strict` implies `warn_unused_ignores`, so each waiver fails the run once
+# upstream annotates it and can be deleted.
 
 # Third-party libraries that don't ship `py.typed` markers / stubs. We treat
 # their public surface as `Any` rather than fail the strict run.

@@ -61,7 +61,18 @@ boundary is drawn too far in.
 - Python: always `uv run` (`uv run pytest`, `uv run ruff check`,
   `uv run mypy aethergraph`); rebuild the extension with
   `uv run maturin develop --release` from `python/`.
-- `mypy --strict` and ruff must pass; `_core.pyi` stubs are hand-authored.
+- mypy and ruff must pass; both are CI gates on the python job, and
+  `ruff format`/`ruff check` also run in the pre-commit hook. `strict = true`
+  lives in `pyproject.toml`, so `mypy aethergraph` and
+  `mypy aethergraph --strict` cannot disagree about what passing means.
+- A gap in a third-party stub is waived at the call site with a narrow
+  `# type: ignore[code]`, never by excluding a module in config — an exclusion
+  would also wave through the next untyped call in that tree. `strict` implies
+  `warn_unused_ignores`, so a waiver fails the run once upstream annotates it.
+- `_core.pyi` stubs are hand-authored, and nothing generates them:
+  `tests/test_stub_coverage.py` fails if a runtime export has no declaration.
+  The stub may declare names absent at runtime — platform-gated classes are
+  guarded by the `HAS_*` flags rather than by attribute probing.
 - Rust: `cargo fmt --all` before committing (pre-commit enforces it); clippy
   clean across the workspace.
 

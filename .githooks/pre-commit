@@ -20,9 +20,15 @@ if command -v cargo >/dev/null 2>&1; then
 fi
 
 # Python: uv-managed; --no-sync keeps the hook fast. Skipped if uv is absent.
+# Lint rides along because ruff check costs milliseconds; mypy does not, and
+# stays in CI where it can run against a freshly built extension.
 if command -v uv >/dev/null 2>&1; then
     if ! (cd python && uv run --no-sync ruff format --check .); then
         echo "pre-commit: Python is not formatted — run 'cd python && uv run ruff format .' and re-stage." >&2
+        status=1
+    fi
+    if ! (cd python && uv run --no-sync ruff check .); then
+        echo "pre-commit: Python lint failed — run 'cd python && uv run ruff check --fix .' and re-stage." >&2
         status=1
     fi
 fi

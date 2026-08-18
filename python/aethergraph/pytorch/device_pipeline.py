@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 try:
     import torch
@@ -27,7 +27,10 @@ except ImportError as e:  # pragma: no cover - torch is a hard dep of this modul
 if TYPE_CHECKING:
     from torch_geometric.data import Data, HeteroData
 
-    Batch = Data | HeteroData
+    # Annotated as a TypeAlias, not a bare assignment: under
+    # `from __future__ import annotations` a plain `Batch = Data | HeteroData`
+    # reads as a variable, and every annotation naming it is rejected.
+    Batch: TypeAlias = Data | HeteroData
 
 
 def move_data_to_device(
@@ -97,7 +100,8 @@ class DeviceTransferPipeline:
         yield from self._run_cuda()
 
     def _run_cuda(self) -> Iterator[Data]:
-        copy_stream = torch.cuda.Stream(device=self._device)
+        # torch ships py.typed but leaves Stream.__init__ unannotated.
+        copy_stream = torch.cuda.Stream(device=self._device)  # type: ignore[no-untyped-call]
         # Each in-flight entry is (data_on_device, copy_done_event).
         inflight: deque[tuple[Data, torch.cuda.Event]] = deque()
         source = iter(self._source)
@@ -110,7 +114,8 @@ class DeviceTransferPipeline:
                 return False
             with torch.cuda.stream(copy_stream):
                 data = move_data_to_device(data, self._device, non_blocking=True)
-                done = torch.cuda.Event()
+                # As above: Event.__init__ is unannotated upstream.
+                done = torch.cuda.Event()  # type: ignore[no-untyped-call]
                 done.record(copy_stream)
             inflight.append((data, done))
             return True
