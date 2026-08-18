@@ -262,16 +262,22 @@ mod tests {
     #[test]
     fn slot_slice_f32_round_trips_written_lanes() {
         let mut pool = AlignedBufferPool::try_new(2, 16).unwrap();
+        let sentinel: [f32; 4] = [-1.0, -1.0, -1.0, -1.0];
         let written: [f32; 4] = [1.5, -2.25, 0.0, 7.75];
-        let src: &[u8] = bytemuck::cast_slice(&written);
 
-        let dst = pool.slot_ptr(1);
-        // SAFETY: slot 1 exists and spans at least 16 bytes, `src` is a
-        // distinct 16-byte buffer, and the two cannot overlap.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        // The pool allocates without zeroing, so slot 0 has to be given a
+        // known value before it can witness anything: "slot 1 did not bleed
+        // into slot 0" says nothing about bytes that were never defined.
+        for (slot, values) in [(0usize, &sentinel), (1usize, &written)] {
+            let src: &[u8] = bytemuck::cast_slice(values);
+            let dst = pool.slot_ptr(slot);
+            // SAFETY: both slots exist and span at least 16 bytes; `src` is
+            // a distinct buffer that cannot overlap the pool.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        }
 
         assert_eq!(pool.slot_slice_f32(1, 4), &written);
-        assert_eq!(pool.slot_slice_f32(0, 4), &[0.0f32; 4]);
+        assert_eq!(pool.slot_slice_f32(0, 4), &sentinel);
     }
 
     #[test]

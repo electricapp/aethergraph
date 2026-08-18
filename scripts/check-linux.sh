@@ -10,6 +10,10 @@
 # Run it yourself before pushing; it is deliberately not a pre-commit or
 # pre-push hook.
 #
+# It compiles; it does not execute. The binaries it builds are x86-64 Linux and
+# will not run here, so a Linux-only test that compiles but fails still reaches
+# CI. This closes the "does it build" gap, not the "does it work" one.
+#
 # Usage:
 #   scripts/check-linux.sh            # type-check the Linux surface
 #   scripts/check-linux.sh --clippy   # the same, as clippy with -D warnings
