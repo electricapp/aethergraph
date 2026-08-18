@@ -86,23 +86,16 @@ pub enum GraphValidationMode {
     Full,
 }
 
-/// Smallest array worth a huge-page hint: one 2 MiB page. Below this there is
-/// nothing for the kernel to coalesce and the `madvise` is pure syscall.
+/// Smallest array worth a huge-page hint: one 2 MiB page.
 const HUGEPAGE_HINT_MIN_BYTES: usize = 2 << 20;
 
 /// Build owned CSR storage, asking the kernel to back the large arrays with
 /// huge pages.
 ///
-/// Sampling reads `offsets` at an unpredictable index once per frontier node,
-/// then a short run of `edges`. At graph scale both arrays are far larger than
-/// dTLB reach, so the cost of that pattern is dominated by page-table walks
-/// rather than by cache misses, and a 2 MiB backing cuts the entries needed by
-/// 512x. The mmap loader already advises exactly these two arrays; an
-/// in-memory graph holds the same arrays and is walked the same way, so it is
-/// the same decision.
-///
-/// Every `GraphStorage::Owned` is built here, so the hint cannot be missed by
-/// a construction path that forgets it.
+/// Sampling probes `offsets` at an unpredictable index per frontier node, so at
+/// graph scale the cost is page-table walks rather than cache misses. The mmap
+/// loader advises the same two arrays; every `GraphStorage::Owned` is built
+/// here so no construction path can miss the hint.
 fn owned_storage(
     offsets: Arc<[EdgeOffset]>,
     edges: Arc<[NodeId]>,

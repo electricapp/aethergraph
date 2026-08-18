@@ -1,6 +1,23 @@
 # scripts/
 
-Operational scripts for spinning up a fresh AWS instance.
+Local development gates and operational scripts for spinning up a fresh AWS
+instance.
+
+## `check-linux.sh`
+
+Compiles the `cfg(target_os = "linux")` surface — io_uring gather, NVMe
+passthrough, userfaultfd pager, memfd shared store, perf counters, NUMA — from
+a non-Linux machine, using zig as the cross toolchain. `cargo check` on macOS
+compiles none of it, so this is what catches a Linux-only break before CI does.
+
+```bash
+scripts/check-linux.sh                    # type-check
+scripts/check-linux.sh --clippy --tests   # what CI runs
+```
+
+Needs `brew install zig` and `rustup target add x86_64-unknown-linux-gnu`. Run
+it yourself before pushing; it is not a pre-commit or pre-push hook.
+`zigcc` is the compiler shim it drives.
 
 ## `bootstrap_node.sh`
 

@@ -64,3 +64,19 @@ boundary is drawn too far in.
 - `mypy --strict` and ruff must pass; `_core.pyi` stubs are hand-authored.
 - Rust: `cargo fmt --all` before committing (pre-commit enforces it); clippy
   clean across the workspace.
+
+## Check the Linux surface before pushing
+
+Much of the workspace is `cfg(target_os = "linux")` — the io_uring gather, NVMe
+passthrough, the userfaultfd pager, the memfd shared store, perf counters, NUMA
+placement. On macOS none of it compiles, so a change that breaks those paths
+passes every local check and fails in CI.
+
+```bash
+scripts/check-linux.sh --clippy --tests   # what CI runs, cross-compiled
+```
+
+It uses zig as the cross toolchain (`brew install zig`, plus
+`rustup target add x86_64-unknown-linux-gnu`) — no container, no emulation.
+Run it after touching anything Linux-gated. It is not a pre-commit or pre-push
+hook, because a full cross-check costs more than a commit should.

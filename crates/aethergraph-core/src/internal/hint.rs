@@ -160,14 +160,13 @@ pub fn advise_mmap_random(_addr: *const u8, _len: usize) {}
 /// Hint: back this region with huge pages where the kernel can.
 ///
 /// Random gathers over multi-GB arrays are dTLB-bound with 4 KiB pages; a
-/// 2 MiB backing cuts the TLB entry count 512x. Applies to both file-backed
-/// mappings and the large anonymous mappings the allocator hands out for
+/// 2 MiB backing cuts the TLB entry count 512x. Applies to file-backed
+/// mappings and to the large anonymous mappings the allocator returns for
 /// multi-megabyte arrays.
 ///
-/// Best-effort in three ways: file-backed THP requires kernel support, the
-/// hint does nothing at all when `transparent_hugepage/enabled` is `never`
-/// and is redundant when it is `always` (it earns its keep under the
-/// `madvise` setting), and the errno on refusal is ignored.
+/// Best-effort: it earns its keep under `transparent_hugepage=madvise`, does
+/// nothing under `never`, is redundant under `always`, and the errno on
+/// refusal is ignored.
 #[cfg(target_os = "linux")]
 pub fn advise_hugepage(addr: *const u8, len: usize) {
     let (start, span) = page_span(addr, len);

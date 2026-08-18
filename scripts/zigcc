@@ -1,0 +1,17 @@
+#!/bin/sh
+# zig as the C compiler and linker for x86_64 Linux, used by
+# scripts/check-linux.sh to build the Linux-only surface off-Linux.
+#
+# cc-rs passes the Rust triple through as `-target`, which zig does not parse.
+# Strip any caller-supplied target so the one below is the only one.
+args=""
+skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -target) skip=1; continue ;;
+    --target=*) continue ;;
+  esac
+  args="$args $a"
+done
+exec zig cc -target x86_64-linux-gnu $args

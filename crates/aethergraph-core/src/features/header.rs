@@ -85,13 +85,19 @@ impl FeatureDtype {
 pub(crate) enum RowDecoder {
     F32,
     F16(crate::internal::simd::F16Decoder),
-    /// bf16 carries no resolved state: its upcast is a shift-and-widen whose
-    /// only dispatch is a single cached AVX2 query, so there is nothing to
-    /// hoist the way the f16 path hoists `vcvtph2ps` availability.
+    /// Carries no resolved state: the bf16 upcast is a shift-and-widen with
+    /// a single cached AVX2 query, so there is nothing to hoist.
     BF16,
 }
 
 impl RowDecoder {
+    /// Whether the payload is already `f32` lanes on disk, so rows can be
+    /// appended into reserved capacity instead of upcast into a zeroed buffer.
+    #[inline]
+    pub(crate) fn is_f32_passthrough(self) -> bool {
+        matches!(self, Self::F32)
+    }
+
     /// Decode a little-endian feature row (or any contiguous run of rows)
     /// from `src` into `dst`.
     ///

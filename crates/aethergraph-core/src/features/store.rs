@@ -569,6 +569,7 @@ impl FeatureStore {
             features_start_offset: start,
             feature_data_len_bytes: payload_bytes,
             dtype: header.dtype,
+            gather: GatherPlan::new(header.feature_dim * header.dtype.element_size()),
             telemetry: None,
         })
     }
