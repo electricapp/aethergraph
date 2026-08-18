@@ -760,6 +760,7 @@ impl NeighborLoader {
                 thread::Builder::new()
                     .name(format!("aethergraph-prefetch-{t}"))
                     .spawn(move || {
+                        crate::internal::numa::pin_worker(t);
                         run_worker(&fault, move || {
                             Self::worker_loop_inmemory(
                                 graph, config, work_rx, result_tx, shutdown, None,
@@ -844,6 +845,7 @@ impl NeighborLoader {
                 thread::Builder::new()
                     .name(format!("aethergraph-sampler-{t}"))
                     .spawn(move || {
+                        crate::internal::numa::pin_worker(t);
                         run_worker(&fault, move || {
                             worker_loop_sampler(graph, config, work_rx, sample_tx, shutdown, stats);
                             Ok(())
@@ -1614,6 +1616,7 @@ impl HeteroNeighborLoader {
                 thread::Builder::new()
                     .name(format!("aethergraph-hetero-sampler-{t}"))
                     .spawn(move || {
+                        crate::internal::numa::pin_worker(t);
                         run_worker(&fault, move || {
                             worker_loop_hetero(
                                 graph, config, seed_type, work_rx, result_tx, shutdown, stats,

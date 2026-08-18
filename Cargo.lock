@@ -68,6 +68,7 @@ name = "aethergraph-core"
 version = "0.1.0"
 dependencies = [
  "aether-epoch",
+ "aether-mem",
  "ahash",
  "anyhow",
  "arrow-array",
