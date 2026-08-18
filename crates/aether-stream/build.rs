@@ -10,7 +10,16 @@ fn main() {
     let rdma = std::env::var("CARGO_FEATURE_RDMA").is_ok();
     let efa = std::env::var("CARGO_FEATURE_EFA").is_ok();
     let mlx5dv = std::env::var("CARGO_FEATURE_MLX5DV").is_ok();
+    let gdrcopy = std::env::var("CARGO_FEATURE_GDRCOPY").is_ok();
     let xdp_bpf = std::env::var("CARGO_FEATURE_XDP_BPF").is_ok();
+
+    // GDRCopy binds NVIDIA's userspace libgdrapi. The link is only needed
+    // when the feature is on; `cargo check` records it without linking, so
+    // the compile-gate CI job type-checks the FFI without the library
+    // present.
+    if target_os == "linux" && gdrcopy {
+        println!("cargo:rustc-link-lib=gdrapi");
+    }
 
     if target_os == "linux" && rdma {
         let mut build = cc::Build::new();

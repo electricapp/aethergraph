@@ -496,8 +496,15 @@ impl PyNeighborLoader {
     ///     gid_index: Local GID-table index for RoCEv2 (default: 1, the
     ///         typical IPv4-mapped GID on Linux; verify with `show_gids`)
     ///     sampler_threads: Sampler threads feeding the pipeline (default: 1)
+    ///     pooled: Serve gathers from one reusable VRAM pool instead of
+    ///         allocating per batch, taking the CUDA allocator off the
+    ///         per-batch critical path. Requires the DLPack consumer to
+    ///         finish with a batch before requesting the next.
+    ///     staging_rows: With `pooled`, attach a managed-memory staging
+    ///         tier of this many rows for `prefetch_upcoming()` to migrate
+    ///         into ahead of the batch. 0 disables staging.
     #[staticmethod]
-    #[pyo3(signature = (graph, config, server_addr, gpu_id=0, max_batch_nodes=65536, prefetch_depth=2, gid_index=1, sampler_threads=1))]
+    #[pyo3(signature = (graph, config, server_addr, gpu_id=0, max_batch_nodes=65536, prefetch_depth=2, gid_index=1, sampler_threads=1, pooled=false, staging_rows=0))]
     #[cfg(all(target_os = "linux", feature = "gpudirect"))]
     #[allow(clippy::too_many_arguments)]
     fn with_rdma_features(
@@ -509,6 +516,8 @@ impl PyNeighborLoader {
         prefetch_depth: usize,
         gid_index: u8,
         sampler_threads: usize,
+        pooled: bool,
+        staging_rows: usize,
     ) -> PyResult<Self> {
         let graph_arc = graph.inner_arc();
 
@@ -524,7 +533,7 @@ impl PyNeighborLoader {
             ))
         })?;
 
-        let rdma = aether_stream::rdma::gather::RdmaFeatureGather::connect(
+        let mut rdma = aether_stream::rdma::gather::RdmaFeatureGather::connect(
             server_addr,
             gpu_id,
             max_batch_nodes,
@@ -535,6 +544,15 @@ impl PyNeighborLoader {
                 "Failed to connect RDMA feature gather: {e}"
             ))
         })?;
+
+        if pooled {
+            rdma.enable_pool(max_batch_nodes, staging_rows)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to set up the VRAM feature pool: {e}"
+                    ))
+                })?;
+        }
 
         let feature_dim = Some(rdma.feature_dim());
 
@@ -562,6 +580,43 @@ impl PyNeighborLoader {
     ///         may be retried.
     ///     RuntimeError: The prefetch worker exited unexpectedly, or the RDMA
     ///         gather failed.
+    /// Migrate the rows an upcoming batch will read onto the GPU.
+    ///
+    /// Call after sampling batch N+1 and before training on batch N: the
+    /// UVM migration then overlaps compute rather than faulting inside it.
+    /// Returns False when the loader has no pool or no staging tier, so it
+    /// can be called unconditionally.
+    ///
+    /// Args:
+    ///     nodes: Node IDs the upcoming batch will read (uint32)
+    #[cfg(all(target_os = "linux", feature = "gpudirect"))]
+    fn prefetch_upcoming(&self, nodes: numpy::PyReadonlyArray1<'_, u32>) -> PyResult<bool> {
+        let Some(rdma) = self.rdma_gather.as_ref() else {
+            return Ok(false);
+        };
+        rdma.prefetch_next(nodes.as_slice()?).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("UVM prefetch failed: {e}"))
+        })
+    }
+
+    /// Export the VRAM pool as `(fd, bytes)` for a peer process to map.
+    ///
+    /// Send the descriptor over a Unix socket with SCM_RIGHTS; the byte
+    /// count must travel with it, since the importer cannot infer it. The
+    /// peer then maps the same physical VRAM — one copy of the cached
+    /// block per GPU rather than per worker process.
+    ///
+    /// Raises RuntimeError when the loader was not built with `pooled=True`.
+    #[cfg(all(target_os = "linux", feature = "gpudirect"))]
+    fn export_pool_fd(&self) -> PyResult<(i32, usize)> {
+        let rdma = self.rdma_gather.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("loader has no RDMA feature gather")
+        })?;
+        rdma.export_pool_fd().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to export pool fd: {e}"))
+        })
+    }
+
     #[cfg(all(target_os = "linux", feature = "gpudirect"))]
     fn next_with_gpu_features(
         &mut self,

@@ -56,6 +56,9 @@ jobs:
         with:
           key: gpudirect-check
       - run: cargo check -p aether-stream --tests --features "rdma gpudirect"
+      # GDRCopy binds libgpudirect at link time only; `cargo check` type-
+      # checks the FFI + orchestration modules without the library present.
+      - run: cargo check -p aether-stream --features "rdma gpudirect gdrcopy"
       - run: cargo check -p aethergraph-py --features gpudirect
 
   rust:

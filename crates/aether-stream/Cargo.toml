@@ -18,6 +18,9 @@ rdma = ["aether-mem/rdma"]
 mlx5dv = ["rdma"]
 cuda = ["aether-mem/cuda"]
 gpudirect = ["rdma", "cuda", "dep:cudarc"]
+# GDRCopy BAR1 small-write path. Links NVIDIA's libgdrapi (needs the
+# gdrdrv kernel module at runtime); build with `gpudirect gdrcopy`.
+gdrcopy = ["gpudirect"]
 # EFA SRD path — skeleton only; see crates/aether-stream/src/rdma/srd.rs for
 # the work needed before this is functional. Building with this feature today
 # only exposes the type stubs; no link to libefa yet.

@@ -10,6 +10,7 @@
 
 pub mod feature_table;
 pub mod ingest;
+pub mod span;
 pub mod umem;
 pub mod xdp;
 
