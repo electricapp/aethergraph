@@ -4,12 +4,88 @@ Outstanding work only. Delete rows from these tables as they land.
 
 ## Status
 
-| ID  | What                    | Code written? | Blocker to run                        |
-| --- | ----------------------- | ------------- | ------------------------------------- |
-| R6  | T4.3 Ray Data multi-GPU | Yes           | ≥2 GPUs (Modal `gpu="T4:2"` suffices) |
+| ID  | What                          | Code written? | Blocker to run                        |
+| --- | ----------------------------- | ------------- | ------------------------------------- |
+| R6  | T4.3 Ray Data multi-GPU       | Yes           | ≥2 GPUs (Modal `gpu="T4:2"` suffices) |
+| H1  | GPU orchestration paths       | Yes           | Any CUDA GPU                          |
+| H2  | NVMe passthrough gather       | Yes           | A drive exposing `/dev/ng*`           |
+| H3  | NUMA placement chooses a node | Yes           | A 2-socket host                       |
+| H4  | USDT probe arguments          | Yes           | Linux + `bpftrace`                    |
+| H5  | io_uring setup wins           | Bench only    | NVMe host under load                  |
+| H6  | Native InfiniBand addressing  | Yes           | IB fabric + subnet manager            |
 
 All test code is written and gated. What's left is _running_ it on the right
 hardware.
+
+---
+
+## Hardware verification debt
+
+Each row below is compiled, linted, and (where the logic is portable) unit
+tested — but the behaviour that motivates it has never executed. Kept explicit
+because every one of these is a path where the code can look finished and do
+nothing: a fallback that silently degrades, a placement call that is inert on
+one socket, a probe that fires without its arguments.
+
+| ID  | Never executed                                                                                           | Why CI cannot cover it                                                                                           | Rig                        |
+| --- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| H1  | `gpu/gdrcopy.rs` BAR1 stores, `gpu/kernel.rs` seqlock validation, the CUDA half of `gpu/uvm.rs` prefetch | `gpudirect-check` runs `cargo check` in a CUDA container with no device — type-checked, never run                | Any CUDA GPU               |
+| H2  | `NvmeReader::read_batch` submission and completion; MDTS rejection of an oversized command               | Runners have no NVMe character device, so `NvmeReader::open_for` returns `None` and the gather takes the fs path | Drive with `/dev/ng*`      |
+| H3  | `interleave_region` spreading pages, `pin_current_thread` binding a worker to one socket's cores         | Runners are single-node: `nodes_online().len() < 2`, so both calls short-circuit before the syscall              | 2-socket host              |
+| H4  | A tracer reading `arg1`…`arg4` off a probe                                                               | CI asserts the ELF note carries descriptors; nothing attaches to confirm a consumer resolves them                | Linux + `bpftrace`         |
+| H5  | Whether `DEFER_TASKRUN` and the coalesced UVM prefetch are actually faster, not merely selected          | The tier assertion proves the setup was chosen; it says nothing about throughput                                 | NVMe host, GPU host        |
+| H6  | A QP reaching a peer over LID routing, and `LinkLayer::InfiniBand` being taken at all                    | Every fabric available is Ethernet-link-layer — SoftRoCE, ConnectX-6 RoCE, EFA — so the IB branch never runs     | IB fabric + subnet manager |
+
+**H3 is not covered by the Lambda A10** — that instance is single-socket, so it
+exercises H1 and H2 but leaves NUMA placement inert exactly as CI does. A
+separate 2-socket box is the only thing that shows `interleave_region` choosing
+between nodes.
+
+H6 is worth stating precisely, because "uses libibverbs" reads as "supports
+InfiniBand" and does not mean it. The verbs API is common to IB, RoCE, iWARP,
+and EFA, and `/sys/class/infiniband/` is Linux's name for every RDMA device
+including pure Ethernet ones. What runs here is RoCE and EFA/SRD. The IB
+addressing path is written and its decision logic is unit tested — same subnet
+routes on the LID, crossing subnets adds a GRH — but no IB fabric has executed
+it.
+
+For H5, the numbers worth capturing are per-tier: run the feature gather with
+the ring forced down each rung (`UringHandle::tier()` reports which one took
+effect) and with prefetch coalescing disabled, so the claim is a measured delta
+rather than a plausible mechanism.
+
+---
+
+## Merge sequence
+
+Fifteen branches are green against `main` individually, which says nothing about
+landing them together — GitHub's mergeable flag compares each to `main`, not to
+its predecessors. This order was validated by replaying the cascade in a scratch
+worktree.
+
+**Zero-conflict prefix**, in order: **#110, #111, #102, #106, #97, #98.** These
+touch disjoint files or append to different regions, and merge clean one after
+another with no intervention.
+
+**Then the rest**, each conflicting only in append-only files: **#99, #100,
+#101, #104, #105, #103, #107, #108, #109.**
+
+**#109 must follow #108** — it is branched off it, and `DEFER_TASKRUN` is only
+sound once the rings are thread-owned. In that order the pair merges clean; out
+of order it does not.
+
+Every conflict in this sequence lands in one of three files, and all are "both
+sides appended":
+
+| File                                          | Resolution                                                                                          |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `.github/workflows/ci.yml`                    | Keep both job/step blocks; add both rows to the summary table                                       |
+| `crates/aethergraph-py/Cargo.toml`            | Union the `features` array of the `aethergraph-core` dependency, and keep both explanatory comments |
+| `crates/aethergraph-core/src/internal/mod.rs` | Keep both `pub mod` lines                                                                           |
+
+No conflict falls in code logic. The one that looks like it might —
+`features/async_store.rs` between #108 and #109 — is an artifact of merging them
+out of order; in sequence it does not arise.
 
 ---
 
@@ -42,6 +118,19 @@ Remaining larger redesigns; land each with its own tests.
 | `markdown-format`        | `bunx prettier --check '**/*.md'`                                                                                              |
 | `gpudirect-check`        | Compile-only `cargo check` of the rdma + gpudirect path on an `nvidia/cuda:12.5.0-devel-ubuntu22.04` container — no GPU needed |
 | `rust` matrix (existing) | macOS + Ubuntu defaults; Ubuntu + `rdma` feature                                                                               |
+| `numa placement`         | Exercises the mbind/affinity syscalls against node 0; the choice _between_ nodes stays untested (H3)                           |
+| `perf counters`          | Reads `.note.stapsdt` back out of the build and requires at least one probe to declare arguments                               |
+
+Two surrogates guard against a silent downgrade rather than a failure, which is
+the failure mode these paths actually have:
+
+- `UringHandle::tier()` names the setup rung the ring reached, and a test
+  asserts the ladder climbs as high as the running kernel allows — so landing on
+  a lesser rung is a test failure, not a benchmark that quietly fails to
+  improve.
+- The USDT check requires an argument descriptor, not just a probe name. A probe
+  carrying no arguments still appears by name, which is how an empty descriptor
+  survived being "checked".
 
 ---
 
