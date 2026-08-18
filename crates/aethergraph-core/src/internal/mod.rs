@@ -15,6 +15,8 @@ pub mod nvme;
 #[cfg(feature = "parquet")]
 pub mod parquet_import;
 pub mod prefetch;
+#[cfg(all(target_os = "linux", feature = "shm"))]
+pub mod shm;
 pub mod simd;
 pub mod succinct;
 pub mod telemetry;

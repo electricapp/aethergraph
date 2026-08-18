@@ -16,13 +16,16 @@ workspace = true
 # Plain `cargo test` omits it so unit tests can link against libpython
 # normally and run as a standalone test binary.
 #
-# `uffd` is on by default: its code is additionally Linux-gated, so mac
-# builds are unaffected, and on Linux `FeatureStore.load_paged` raises when
-# the kernel withholds userfaultfd rather than failing the build.
-default = ["uffd"]
+# `uffd` and `shm` are on by default: both are additionally Linux-gated, so
+# mac builds are unaffected. On Linux `FeatureStore.load_paged` raises when
+# the kernel withholds userfaultfd rather than failing the build, and
+# `SharedFeatureStore` is simply absent off Linux (check the module's
+# HAS_SHARED_STORE flag).
+default = ["uffd", "shm"]
 extension-module = ["pyo3/extension-module"]
 gpudirect = ["aether-stream/gpudirect"]
 uffd = ["aethergraph-core/uffd"]
+shm = ["aethergraph-core/shm"]
 
 [lib]
 name = "_core"

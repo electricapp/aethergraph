@@ -43,6 +43,8 @@ pub use features::{
 pub use features::{FeatureHeader, parse_feature_header};
 #[cfg(feature = "gds")]
 pub use features::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
+#[cfg(all(target_os = "linux", feature = "shm"))]
+pub use features::{ShareHandle, SharedFeatureStore};
 pub use features::{
     create_features, save_feature_data, save_features, save_features_f16, save_features_ndarray,
 };
@@ -56,6 +58,8 @@ pub use internal::mmap::{
 pub use internal::mmap_hetero::{load_hetero_graph, save_hetero_graph};
 #[cfg(feature = "parquet")]
 pub use internal::parquet_import::{from_parquet, from_parquet_files};
+#[cfg(all(target_os = "linux", feature = "shm"))]
+pub use internal::shm::{SharedRegion, recv_fd, send_fd, socket_pair};
 pub use internal::succinct::{EliasFano, StreamVByte};
 pub use internal::telemetry::{SamplingTelemetry, TelemetrySummary};
 #[cfg(all(target_os = "linux", feature = "uffd"))]

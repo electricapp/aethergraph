@@ -31,6 +31,10 @@ HAS_GPUDIRECT: bool
 # took effect: placement is inert on a single-node machine.
 HAS_NUMA: bool
 
+# True on Linux builds carrying the memfd-backed cross-process store.
+# `SharedFeatureStore` is absent entirely when this is False.
+HAS_SHARED_STORE: bool
+
 # Test-only helper, only present in `gpudirect` builds. Wraps a raw CUDA
 # device pointer in a DLPack capsule so `torch.from_dlpack` can ingest it.
 def _dlpack_capsule_from_cuda_ptr(
@@ -420,6 +424,39 @@ class FeatureStore:
     def pager_stats(self) -> tuple[int, int] | None:
         """`(faults, evictions)` for a store opened with `load_paged`, or
         None for a mapped store. Linux only."""
+
+class SharedFeatureStore:
+    """A feature store held once in shared memory and mapped by many
+    processes.
+
+    The owner publishes a feature file into a sealed memfd and serves the
+    descriptor on a Unix socket; each worker attaches and maps the same
+    physical pages read-only, so N workers cost one copy of the matrix and
+    attaching is a mmap rather than a read.
+
+    Linux only — present only when `HAS_SHARED_STORE` is True."""
+
+    @staticmethod
+    def publish(path: PathLike) -> SharedFeatureStore:
+        """Copy a feature file's payload into a fresh sealed shared region."""
+
+    @staticmethod
+    def attach(socket_path: PathLike) -> SharedFeatureStore:
+        """Map a store being served at `socket_path` read-only."""
+
+    def serve(self, socket_path: PathLike) -> None:
+        """Serve this store to workers until `stop_serving()` or drop."""
+
+    def stop_serving(self) -> None: ...
+    @property
+    def is_serving(self) -> bool: ...
+    @property
+    def num_nodes(self) -> int: ...
+    @property
+    def feature_dim(self) -> int: ...
+    @property
+    def shared_bytes(self) -> int: ...
+    def get_batch(self, nodes: npt.NDArray[np.int64]) -> npt.NDArray[np.float32]: ...
 
 class FeatureData:
     """Mutable feature builder."""

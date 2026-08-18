@@ -145,6 +145,14 @@ jobs:
           cargo test -p aethergraph-core --features zstd-tier features::cold_tier
           cargo test -p aethergraph-core --features zstd-tier features::cache
 
+      - name: shm shared-cache tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo clippy -p aethergraph-core -p aethergraph-py --all-targets \
+            --features shm -- -D warnings
+          cargo test -p aethergraph-core --features shm internal::shm
+          cargo test -p aethergraph-core --features shm features::shared_store
+
       - name: mlx5dv compile check
         if: matrix.run_rdma
         run: cargo check -p aether-stream --tests --features mlx5dv
