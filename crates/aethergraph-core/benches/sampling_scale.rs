@@ -72,7 +72,7 @@ fn bench_cold_probe(c: &mut Criterion, graph: &Graph) {
                 acc += csr.neighbor_range(black_box(n)).len();
             }
             acc
-        })
+        });
     });
     group.finish();
 }
@@ -91,7 +91,7 @@ fn bench_scale_sampling(c: &mut Criterion, graph: &Graph) {
     for fanout in [vec![25], vec![15, 10], vec![10, 10, 5]] {
         let label = fanout
             .iter()
-            .map(|f| f.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join("x");
         let config = SamplingConfig {

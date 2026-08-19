@@ -93,19 +93,22 @@ fn billion_node_async_throughput() {
     let total = t_total.elapsed();
 
     per_batch.sort();
-    let mean_ns: u128 =
-        per_batch.iter().map(|d| d.as_nanos()).sum::<u128>() / per_batch.len() as u128;
+    let mean_ns: u128 = per_batch
+        .iter()
+        .map(std::time::Duration::as_nanos)
+        .sum::<u128>()
+        / per_batch.len() as u128;
     let batches_per_sec = num_batches as f64 / total.as_secs_f64();
     let seeds_per_sec = batches_per_sec * batch_size as f64;
 
     eprintln!();
     eprintln!("Throughput:");
-    eprintln!("  batch_size      = {}", batch_size);
-    eprintln!("  warmup batches  = {}", warmup);
-    eprintln!("  measure batches = {}", num_batches);
+    eprintln!("  batch_size      = {batch_size}");
+    eprintln!("  warmup batches  = {warmup}");
+    eprintln!("  measure batches = {num_batches}");
     eprintln!("  total           = {:.3}s", total.as_secs_f64());
-    eprintln!("  batches/sec     = {:.1}", batches_per_sec);
-    eprintln!("  seeds/sec       = {:.0}", seeds_per_sec);
+    eprintln!("  batches/sec     = {batches_per_sec:.1}");
+    eprintln!("  seeds/sec       = {seeds_per_sec:.0}");
     eprintln!();
     eprintln!("Per-batch latency:");
     eprintln!("  mean = {:>8.1} µs", mean_ns as f64 / 1_000.0);

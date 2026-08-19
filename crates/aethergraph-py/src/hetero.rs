@@ -119,7 +119,7 @@ impl PyHeteroCsrGraph {
         self.inner
             .node_type_names()
             .into_iter()
-            .map(|s| s.to_owned())
+            .map(std::borrow::ToOwned::to_owned)
             .collect()
     }
 
@@ -212,7 +212,7 @@ impl PyHeteroSamplingConfig {
                 "num_neighbors must not be empty",
             ));
         }
-        let mut hop_counts = num_neighbors.values().map(|v| v.len());
+        let mut hop_counts = num_neighbors.values().map(std::vec::Vec::len);
         let first_hops = hop_counts.next().unwrap_or(0);
         if hop_counts.any(|h| h != first_hops) {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -267,7 +267,7 @@ impl PyHeteroSamplingConfig {
         self.num_neighbors
             .values()
             .next()
-            .map(|v| v.len())
+            .map(std::vec::Vec::len)
             .unwrap_or(0)
     }
 
@@ -345,7 +345,7 @@ impl PyHeteroSampledSubgraph {
             pyo3::exceptions::PyKeyError::new_err(format!("unknown node type '{node_type}'"))
         })?;
         let nodes = &self.inner.nodes[nt_id as usize];
-        let arr: Vec<i64> = nodes.iter().map(|&n| n as i64).collect();
+        let arr: Vec<i64> = nodes.iter().map(|&n| i64::from(n)).collect();
         Ok(PyArray1::from_vec(py, arr))
     }
 
@@ -384,8 +384,8 @@ impl PyHeteroSampledSubgraph {
 
         let num_edges = src_local.len();
         let mut data: Vec<i64> = Vec::with_capacity(num_edges * 2);
-        data.extend(src_local.iter().map(|&x| x as i64));
-        data.extend(dst_local.iter().map(|&x| x as i64));
+        data.extend(src_local.iter().map(|&x| i64::from(x)));
+        data.extend(dst_local.iter().map(|&x| i64::from(x)));
 
         let flat = PyArray1::from_vec(py, data);
         flat.reshape([2, num_edges])
@@ -401,7 +401,7 @@ impl PyHeteroSampledSubgraph {
     /// Seed node IDs as a numpy `int64` array (PyTorch index dtype).
     #[getter]
     fn seeds<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
-        let arr: Vec<i64> = self.inner.seeds.iter().map(|&s| s as i64).collect();
+        let arr: Vec<i64> = self.inner.seeds.iter().map(|&s| i64::from(s)).collect();
         PyArray1::from_vec(py, arr)
     }
 

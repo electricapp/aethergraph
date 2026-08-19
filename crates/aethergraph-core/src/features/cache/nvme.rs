@@ -55,7 +55,7 @@ impl NvmeTier {
             return Ok(None);
         }
         let mut features = vec![0f32; self.dim];
-        let offset = node as u64 * self.record_bytes;
+        let offset = u64::from(node) * self.record_bytes;
         self.file
             .read_exact_at(bytemuck::cast_slice_mut(&mut features), offset)
             .with_context(|| format!("failed to read NVMe slot for node {node}"))?;
@@ -67,7 +67,7 @@ impl NvmeTier {
     /// path on device flushes — a crash at worst loses cache entries.
     pub(super) fn save_blocking(&self, node: NodeId, features: &[f32]) -> Result<()> {
         debug_assert_eq!(features.len(), self.dim);
-        let offset = node as u64 * self.record_bytes;
+        let offset = u64::from(node) * self.record_bytes;
         self.file
             .write_all_at(bytemuck::cast_slice(features), offset)
             .with_context(|| format!("failed to write NVMe slot for node {node}"))?;

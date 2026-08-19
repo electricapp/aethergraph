@@ -196,8 +196,7 @@ impl PyNeighborLoader {
         )
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to create NeighborLoader: {}",
-                e
+                "Failed to create NeighborLoader: {e}"
             ))
         })?;
 
@@ -243,7 +242,7 @@ impl PyNeighborLoader {
             prefetch_depth,
             sampler_threads,
         )
-        .map_err(|e| sampling_error(format!("Failed to create prefetcher with features: {}", e)))?;
+        .map_err(|e| sampling_error(format!("Failed to create prefetcher with features: {e}")))?;
 
         let feature_dim = inner.feature_dim();
 
@@ -353,7 +352,7 @@ impl PyNeighborLoader {
         // the GIL so the consumer thread can drain. No Python object is
         // touched inside.
         py.detach(|| inner.submit(batch_idx, seeds_vec))
-            .map_err(|e| sampling_error(format!("Submit failed: {}", e)))
+            .map_err(|e| sampling_error(format!("Submit failed: {e}")))
     }
 
     /// Submit all batches for an epoch.
@@ -465,7 +464,7 @@ impl PyNeighborLoader {
                         // Reshape flat features to (num_nodes, feature_dim)
                         let arr = PyArray1::from_vec(py, features);
                         Some(arr.reshape([num_nodes, dim]).map_err(|e| {
-                            sampling_error(format!("Failed to reshape features: {}", e))
+                            sampling_error(format!("Failed to reshape features: {e}"))
                         })?)
                     } else {
                         None

@@ -105,7 +105,7 @@ impl Chunk {
         let mut found = false;
         for i in 0..CHUNK_CAP {
             let in_range = i < n;
-            pos += (in_range & (self.data[i] < val)) as usize;
+            pos += usize::from(in_range & (self.data[i] < val));
             found |= in_range & (self.data[i] == val);
         }
         if found { Ok(pos) } else { Err(pos) }
@@ -120,7 +120,7 @@ impl Chunk {
     /// Insert `val` into a new chunk (sorted). Returns None if already present.
     /// Panics if chunk is full — caller must split first.
     #[inline]
-    pub fn insert(&self, val: u32) -> Option<Chunk> {
+    pub fn insert(&self, val: u32) -> Option<Self> {
         match self.search(val) {
             Ok(_) => None, // duplicate
             Err(pos) => {
@@ -142,11 +142,11 @@ impl Chunk {
     /// Split chunk into two halves. Returns (left, right).
     /// Left gets the first half, right gets the second half.
     #[inline]
-    pub fn split(&self) -> (Chunk, Chunk) {
+    pub fn split(&self) -> (Self, Self) {
         let n = self.count as usize;
         let mid = n / 2;
-        let left = Chunk::from_sorted_unchecked(&self.data[..mid]);
-        let right = Chunk::from_sorted_unchecked(&self.data[mid..n]);
+        let left = Self::from_sorted_unchecked(&self.data[..mid]);
+        let right = Self::from_sorted_unchecked(&self.data[mid..n]);
         (left, right)
     }
 
@@ -158,7 +158,7 @@ impl Chunk {
     /// chunk invariant. The strict `<` comparison below would silently drop
     /// the `a` copy in that case; a debug assertion checks for it explicitly.
     #[inline]
-    pub fn merge(a: &Chunk, b: &Chunk) -> Chunk {
+    pub fn merge(a: &Self, b: &Self) -> Self {
         let an = a.len();
         let bn = b.len();
         debug_assert!(an + bn <= CHUNK_CAP);
@@ -166,7 +166,7 @@ impl Chunk {
             an == 0 || bn == 0 || a.max() < b.min() || b.max() < a.min(),
             "Chunk::merge inputs must have disjoint key ranges",
         );
-        let mut c = Chunk::empty();
+        let mut c = Self::empty();
         let mut ai = 0;
         let mut bi = 0;
         let mut ci = 0;

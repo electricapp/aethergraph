@@ -23,7 +23,7 @@ pub fn prefetch_read<T>(ptr: *const T) {
             "prfm pldl1keep, [{p}]",
             p = in(reg) ptr,
             options(nostack, preserves_flags),
-        )
+        );
     };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = ptr;

@@ -51,7 +51,7 @@ impl FeatureDtype {
     /// the loop instead.
     #[inline]
     pub(crate) fn decode_row(self, src: &[u8], dst: &mut [f32]) {
-        self.row_decoder().decode_row(src, dst)
+        self.row_decoder().decode_row(src, dst);
     }
 
     /// Resolve the row decoder once, for loops that decode many rows.
@@ -72,7 +72,7 @@ impl FeatureDtype {
             0 => Ok(Self::F32),
             1 => Ok(Self::F16),
             2 => Ok(Self::BF16),
-            other => anyhow::bail!("unknown feature dtype tag: {}", other),
+            other => anyhow::bail!("unknown feature dtype tag: {other}"),
         }
     }
 }
@@ -151,24 +151,18 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
     let feature_dim_u64 = u64::from_le_bytes(header[16..24].try_into()?);
     anyhow::ensure!(
         num_nodes_u64 <= MAX_FEATURE_NODES,
-        "num_nodes {} exceeds maximum {}",
-        num_nodes_u64,
-        MAX_FEATURE_NODES
+        "num_nodes {num_nodes_u64} exceeds maximum {MAX_FEATURE_NODES}"
     );
     anyhow::ensure!(
         feature_dim_u64 <= MAX_FEATURE_DIM,
-        "feature_dim {} exceeds maximum {}",
-        feature_dim_u64,
-        MAX_FEATURE_DIM
+        "feature_dim {feature_dim_u64} exceeds maximum {MAX_FEATURE_DIM}"
     );
 
     let features_start_offset = u64::from_le_bytes(header[24..32].try_into()?);
     // The dtype tag lives at byte 32, so the payload must start past it.
     anyhow::ensure!(
         features_start_offset > HEADER_SIZE,
-        "invalid feature payload offset {} (must be > {})",
-        features_start_offset,
-        HEADER_SIZE
+        "invalid feature payload offset {features_start_offset} (must be > {HEADER_SIZE})"
     );
     // Mirror FeatureStore::load: the f32 fast path casts the payload to
     // &[f32], which requires a 4-byte-aligned start. Written files (offset
@@ -207,9 +201,7 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         .len();
     anyhow::ensure!(
         file_size >= min_file_size,
-        "feature file truncated: expected at least {} bytes, got {}",
-        min_file_size,
-        file_size
+        "feature file truncated: expected at least {min_file_size} bytes, got {file_size}"
     );
 
     let num_nodes = usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;

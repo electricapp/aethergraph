@@ -32,7 +32,7 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 fn generate_synthetic(path: &Path, num_nodes: usize, avg_degree: u32, seed: u64) {
-    let num_edges = (num_nodes as u64) * (avg_degree as u64);
+    let num_edges = (num_nodes as u64) * u64::from(avg_degree);
     eprintln!(
         "generating {num_nodes} nodes × {avg_degree} degree = {num_edges} edges → {}",
         path.display()
@@ -64,7 +64,7 @@ fn generate_synthetic(path: &Path, num_nodes: usize, avg_degree: u32, seed: u64)
     while i <= num_nodes {
         let n = (num_nodes + 1 - i).min(chunk);
         for j in 0..n {
-            let off = ((i + j) as u64) * (avg_degree as u64);
+            let off = ((i + j) as u64) * u64::from(avg_degree);
             buf[j * 8..j * 8 + 8].copy_from_slice(&off.to_le_bytes());
         }
         w.write_all(&buf[..n * 8]).unwrap();
@@ -127,10 +127,10 @@ fn billion_node_mmap_load_and_walk() {
     let t0 = Instant::now();
     let g = load_graph(&path).expect("load_graph default");
     let default_secs = t0.elapsed().as_secs_f64();
-    eprintln!("load_graph (OffsetsOnly): {:.3}s", default_secs);
+    eprintln!("load_graph (OffsetsOnly): {default_secs:.3}s");
 
     assert_eq!(g.num_nodes(), num_nodes, "num_nodes mismatch");
-    let expected_edges = (num_nodes as u64) * (avg_degree as u64);
+    let expected_edges = (num_nodes as u64) * u64::from(avg_degree);
     assert_eq!(
         g.num_edges() as u64,
         expected_edges,
@@ -143,7 +143,7 @@ fn billion_node_mmap_load_and_walk() {
     let t0 = Instant::now();
     let g = load_graph_mmap(&path, GraphValidationMode::HeaderOnly).expect("load_graph HeaderOnly");
     let header_only_secs = t0.elapsed().as_secs_f64();
-    eprintln!("load_graph (HeaderOnly):  {:.3}s", header_only_secs);
+    eprintln!("load_graph (HeaderOnly):  {header_only_secs:.3}s");
 
     // Cold walk: touch a 0.1% sample of the offsets array. First access per
     // page faults in the mmap; timing this gives the working-set warm-up cost.

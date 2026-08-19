@@ -280,7 +280,7 @@ fn bench_async_iouring(c: &mut Criterion) {
             rt.block_on(async {
                 let results = graph.batch_neighbors(black_box(&nodes)).await.unwrap();
                 black_box(results);
-            })
+            });
         });
     });
 }
@@ -341,7 +341,7 @@ fn bench_gnn_sampling_workload(c: &mut Criterion) {
                         .collect();
                     let _hop2 = graph.batch_neighbors(black_box(&hop1_flat)).await.unwrap();
                 }
-            })
+            });
         });
     });
 }

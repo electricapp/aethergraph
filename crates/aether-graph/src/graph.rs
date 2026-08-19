@@ -550,7 +550,7 @@ mod tests {
             w.insert_edge(2, 3).unwrap();
         }
         let mut dirty = g.drain_dirty();
-        dirty.sort();
+        dirty.sort_unstable();
         assert_eq!(dirty, vec![0, 1, 2, 3]);
         assert_eq!(g.dirty_count(), 0);
     }

@@ -253,7 +253,7 @@ fn convert_edge_list(
         line_count += 1;
         if line_count % 100_000 == 0 {
             if let Some(pb) = &pb {
-                pb.set_message(format!("Read {} edges", line_count));
+                pb.set_message(format!("Read {line_count} edges"));
             }
             trace!("Read {} edges", line_count);
         }
@@ -369,7 +369,7 @@ fn show_stats(path: &PathBuf) -> Result<()> {
         if node % 10000 == 0
             && let Some(pb) = &pb
         {
-            pb.set_position(node as u64);
+            pb.set_position(u64::from(node));
         }
     }
     if let Some(pb) = pb {

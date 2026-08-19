@@ -323,7 +323,7 @@ impl<'a> HeteroNeighborSampler<'a> {
     ) {
         let n = neighbors.len() as u64;
         for _ in 0..k {
-            let idx = ((self.rng.next_u32() as u64).wrapping_mul(n) >> 32) as usize;
+            let idx = (u64::from(self.rng.next_u32()).wrapping_mul(n) >> 32) as usize;
             let dst_id = neighbors[idx];
             let dst_local = self.insert_dst(dst_id, dst_type);
             self.edge_src_buf[et].push(src_local);
@@ -348,7 +348,7 @@ impl<'a> HeteroNeighborSampler<'a> {
             for i in (n - k)..n {
                 let s = (i + 1) as u64;
                 let x = self.rng.next_u32();
-                let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
+                let j = (u64::from(x).wrapping_mul(s) >> 32) as usize;
                 let pick = if self.floyd.test_and_set(j) {
                     j
                 } else {
@@ -364,7 +364,7 @@ impl<'a> HeteroNeighborSampler<'a> {
             for i in (n - k)..n {
                 let s = (i + 1) as u64;
                 let x = self.rng.next_u32();
-                let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
+                let j = (u64::from(x).wrapping_mul(s) >> 32) as usize;
                 let pick = if self.floyd_set.insert(j) {
                     j
                 } else {
@@ -872,9 +872,7 @@ mod tests {
         for &d in &sub.edge_dst_local[connects_et as usize] {
             assert!(
                 (d as usize) < num_b,
-                "dst local index out of bounds: {} >= {}",
-                d,
-                num_b
+                "dst local index out of bounds: {d} >= {num_b}"
             );
         }
 
@@ -899,8 +897,7 @@ mod tests {
             let global_id = sub2.nodes[b_type as usize][d as usize];
             assert!(
                 global_id < 100,
-                "with max_degree=100, sampled neighbor {} should be < 100",
-                global_id
+                "with max_degree=100, sampled neighbor {global_id} should be < 100"
             );
         }
     }
@@ -1009,17 +1006,13 @@ mod tests {
         for &s in &sub.edge_src_local[link_et as usize] {
             assert!(
                 (s as usize) < num_nodes,
-                "src local {} out of bounds (num_nodes={})",
-                s,
-                num_nodes
+                "src local {s} out of bounds (num_nodes={num_nodes})"
             );
         }
         for &d in &sub.edge_dst_local[link_et as usize] {
             assert!(
                 (d as usize) < num_nodes,
-                "dst local {} out of bounds (num_nodes={})",
-                d,
-                num_nodes
+                "dst local {d} out of bounds (num_nodes={num_nodes})"
             );
         }
 
@@ -1033,9 +1026,7 @@ mod tests {
             let neighbors = graph.csr(link_et).neighbors(src_global);
             assert!(
                 neighbors.contains(&dst_global),
-                "edge {}->{} not in CSR",
-                src_global,
-                dst_global
+                "edge {src_global}->{dst_global} not in CSR"
             );
         }
     }
@@ -1097,17 +1088,13 @@ mod tests {
         for &s in &sub.edge_src_local[votes_et as usize] {
             assert!(
                 (s as usize) < num_users,
-                "src local {} out of bounds (num_users={})",
-                s,
-                num_users
+                "src local {s} out of bounds (num_users={num_users})"
             );
         }
         for &d in &sub.edge_dst_local[votes_et as usize] {
             assert!(
                 (d as usize) < num_posts,
-                "dst local {} out of bounds (num_posts={})",
-                d,
-                num_posts
+                "dst local {d} out of bounds (num_posts={num_posts})"
             );
         }
     }

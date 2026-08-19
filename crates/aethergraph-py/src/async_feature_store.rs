@@ -61,10 +61,7 @@ impl PyAsyncFeatureStore {
     fn load<'py>(py: Python<'py>, path: String, telemetry: bool) -> PyResult<Bound<'py, PyAny>> {
         future_into_py(py, async move {
             let mut inner = CoreAsyncFeatureStore::load(&path).await.map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!(
-                    "Failed to load async features: {}",
-                    e
-                ))
+                pyo3::exceptions::PyIOError::new_err(format!("Failed to load async features: {e}"))
             })?;
             if telemetry {
                 inner = inner.with_telemetry();
@@ -110,7 +107,7 @@ impl PyAsyncFeatureStore {
 
         future_into_py(py, async move {
             let features = store.get(node).await.map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get features: {}", e))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get features: {e}"))
             })?;
 
             Python::attach(|py| Ok(PyArray1::from_vec(py, features).unbind().into_any()))
@@ -144,8 +141,7 @@ impl PyAsyncFeatureStore {
         future_into_py(py, async move {
             let features_flat = store.get_batch(&nodes).await.map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to get batch features: {}",
-                    e
+                    "Failed to get batch features: {e}"
                 ))
             })?;
 
@@ -154,10 +150,7 @@ impl PyAsyncFeatureStore {
                 let arr = PyArray1::from_vec(py, features_flat);
                 let shape = (nodes.len(), feature_dim);
                 let arr_2d = arr.reshape(shape).map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "Failed to reshape array: {}",
-                        e
-                    ))
+                    pyo3::exceptions::PyValueError::new_err(format!("Failed to reshape array: {e}"))
                 })?;
                 Ok(arr_2d.unbind().into_any())
             })

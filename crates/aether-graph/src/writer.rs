@@ -52,7 +52,7 @@ impl DynamicGraph {
             wal_guard: self
                 .wal
                 .as_ref()
-                .map(|m| m.lock().unwrap_or_else(|e| e.into_inner())),
+                .map(|m| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)),
             #[cfg(feature = "wal")]
             wal_failed: false,
         })
@@ -335,7 +335,11 @@ impl<'a> Writer<'a> {
             // SAFETY: the old tree is unreachable from the just-published
             // root, and none of its slots were logged before.
             unsafe {
-                crate::ctree::retire_subtree(self.arena.arena(), current_root, &mut self.retire_log)
+                crate::ctree::retire_subtree(
+                    self.arena.arena(),
+                    current_root,
+                    &mut self.retire_log,
+                );
             };
         }
         self.pending_edges += new_count;

@@ -86,15 +86,15 @@ pub enum IngestSpawnError {
 
 impl From<WriterError> for IngestSpawnError {
     fn from(e: WriterError) -> Self {
-        IngestSpawnError::Writer(e)
+        Self::Writer(e)
     }
 }
 
 impl std::fmt::Display for IngestSpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IngestSpawnError::Writer(e) => write!(f, "{e}"),
-            IngestSpawnError::Thread(e) => write!(f, "failed to spawn ingestor thread: {e}"),
+            Self::Writer(e) => write!(f, "{e}"),
+            Self::Thread(e) => write!(f, "failed to spawn ingestor thread: {e}"),
         }
     }
 }
@@ -102,8 +102,8 @@ impl std::fmt::Display for IngestSpawnError {
 impl std::error::Error for IngestSpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            IngestSpawnError::Writer(e) => Some(e),
-            IngestSpawnError::Thread(e) => Some(e),
+            Self::Writer(e) => Some(e),
+            Self::Thread(e) => Some(e),
         }
     }
 }

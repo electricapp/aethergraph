@@ -199,7 +199,10 @@ impl HeteroGraph {
 
     /// Total number of edges across all edge types.
     pub fn total_edges(&self) -> usize {
-        self.csr_graphs.iter().map(|g| g.num_edges()).sum()
+        self.csr_graphs
+            .iter()
+            .map(super::csr::Graph::num_edges)
+            .sum()
     }
 
     /// Number of node types.

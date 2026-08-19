@@ -120,12 +120,12 @@ impl Graph {
                 if neighbors.is_empty() {
                     return u32::MAX;
                 }
-                let max_deg_v = m / (degrees[u] as u64).max(1);
+                let max_deg_v = m / u64::from(degrees[u]).max(1);
                 let mut best_v = u32::MAX;
                 let mut best_deg = u32::MAX;
                 for &v in neighbors {
                     let dv = degrees[v as usize];
-                    if (dv as u64) < max_deg_v && dv < best_deg {
+                    if u64::from(dv) < max_deg_v && dv < best_deg {
                         best_deg = dv;
                         best_v = v;
                     }
@@ -156,14 +156,14 @@ impl Graph {
             .into_par_iter()
             .flat_map_iter(|u| {
                 let u = u as NodeId;
-                let deg_u = degrees_ref[u as usize] as u64;
+                let deg_u = u64::from(degrees_ref[u as usize]);
                 let max_deg_v = m / deg_u.max(1);
 
                 self.neighbors(u).iter().filter_map(move |&v| {
                     if u >= v {
                         return None;
                     }
-                    let dv = degrees_ref[v as usize] as u64;
+                    let dv = u64::from(degrees_ref[v as usize]);
                     if dv >= max_deg_v {
                         return None;
                     }
@@ -211,7 +211,7 @@ impl Graph {
         // and a forest over `n` leaves has at most `n - 1` internal nodes, so
         // the index space fits u32 whenever `n` does (up to ~2.1B leaves).
         debug_assert!(
-            (n as u64 + merge_log.merges.len() as u64) <= u32::MAX as u64,
+            (n as u64 + merge_log.merges.len() as u64) <= u64::from(u32::MAX),
             "dendrogram index space exceeds u32"
         );
         let mut community_dendro: Vec<u32> = (0..n as u32).collect();
@@ -336,7 +336,7 @@ impl Graph {
         // more O(n) arrays and a full second replay of the sequential
         // phase) produced byte-identical roots.
         debug_assert!(
-            (n as u64 + merge_log.merges.len() as u64) <= u32::MAX as u64,
+            (n as u64 + merge_log.merges.len() as u64) <= u64::from(u32::MAX),
             "dendrogram index space exceeds u32"
         );
         let mut community_dendro: Vec<u32> = (0..n as u32).collect();
@@ -403,12 +403,12 @@ impl Graph {
     }
 
     /// Apply a node permutation to produce a new reordered graph.
-    pub fn permute(&self, perm: &[NodeId]) -> anyhow::Result<Graph> {
+    pub fn permute(&self, perm: &[NodeId]) -> anyhow::Result<Self> {
         let n = self.num_nodes();
         anyhow::ensure!(perm.len() == n, "permutation length mismatch");
 
         if n == 0 {
-            return Graph::from_edges(0, &[], None);
+            return Self::from_edges(0, &[], None);
         }
 
         // The duplicate/range check folds into the inverse-permutation
@@ -417,11 +417,10 @@ impl Graph {
         // second O(n) pass.
         let mut inv_perm = vec![u32::MAX; n];
         for (new_id, &old_id) in perm.iter().enumerate() {
-            anyhow::ensure!((old_id as usize) < n, "out-of-range node {}", old_id);
+            anyhow::ensure!((old_id as usize) < n, "out-of-range node {old_id}");
             anyhow::ensure!(
                 inv_perm[old_id as usize] == u32::MAX,
-                "duplicate node {}",
-                old_id
+                "duplicate node {old_id}"
             );
             inv_perm[old_id as usize] = new_id as u32;
         }
@@ -502,7 +501,7 @@ impl Graph {
         } else {
             None
         };
-        let mut graph = Graph::from_owned_parts(
+        let mut graph = Self::from_owned_parts(
             n,
             num_edges,
             new_offsets.into(),
@@ -626,7 +625,7 @@ pub fn partition_aligned_batches(
                 partitions.len()
             );
             let p = partitions.get(s as usize).copied().unwrap_or(0);
-            ((p as u64) << 32) | i as u64
+            (u64::from(p) << 32) | i as u64
         })
         .collect();
     keyed.sort_unstable();
@@ -709,9 +708,9 @@ mod tests {
         assert_eq!(permuted.num_edges(), graph.num_edges());
         for n in 0..3u32 {
             let mut a: Vec<_> = graph.neighbors(n).to_vec();
-            a.sort();
+            a.sort_unstable();
             let mut b: Vec<_> = permuted.neighbors(n).to_vec();
-            b.sort();
+            b.sort_unstable();
             assert_eq!(a, b);
         }
     }
@@ -771,11 +770,11 @@ mod tests {
         }
 
         let mut c1: Vec<u32> = (0..4).map(|i| inv[i]).collect();
-        c1.sort();
+        c1.sort_unstable();
         assert_eq!(c1[3] - c1[0], 3, "Clique 1 should be contiguous");
 
         let mut c2: Vec<u32> = (4..8).map(|i| inv[i]).collect();
-        c2.sort();
+        c2.sort_unstable();
         assert_eq!(c2[3] - c2[0], 3, "Clique 2 should be contiguous");
     }
 
@@ -887,7 +886,7 @@ mod tests {
         let seeds: Vec<NodeId> = vec![0, 1, 2, 3, 4, 5];
         let batches = partition_aligned_batches(&partitions, &seeds, 2, false, 0);
         let mut all: Vec<NodeId> = batches.into_iter().flatten().collect();
-        all.sort();
+        all.sort_unstable();
         assert_eq!(all, seeds);
     }
 
@@ -903,7 +902,7 @@ mod tests {
                 assert!(batch.len() <= 3);
             }
         }
-        let total: usize = batches.iter().map(|b| b.len()).sum();
+        let total: usize = batches.iter().map(std::vec::Vec::len).sum();
         assert_eq!(total, 10);
     }
 
@@ -960,7 +959,7 @@ mod tests {
         // Different seed may produce different order (not guaranteed but very likely
         // with 3 partitions). Just verify all seeds present.
         let mut all: Vec<NodeId> = b3.into_iter().flatten().collect();
-        all.sort();
+        all.sort_unstable();
         assert_eq!(all, seeds);
     }
 

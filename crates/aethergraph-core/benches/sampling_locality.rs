@@ -148,7 +148,7 @@ fn fanouts() -> Vec<(String, SamplingConfig)> {
         .map(|fanout| {
             let label = fanout
                 .iter()
-                .map(|f| f.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("x");
             let config = SamplingConfig {

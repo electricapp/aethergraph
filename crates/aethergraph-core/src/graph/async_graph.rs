@@ -110,15 +110,11 @@ impl AsyncCsrGraph {
         let version = u32::from_le_bytes(header[4..8].try_into()?);
         anyhow::ensure!(
             magic == GRAPH_MAGIC,
-            "invalid graph magic: expected {:#x}, got {:#x}",
-            GRAPH_MAGIC,
-            magic
+            "invalid graph magic: expected {GRAPH_MAGIC:#x}, got {magic:#x}"
         );
         anyhow::ensure!(
             version == GRAPH_VERSION,
-            "unsupported graph version: expected {}, got {}",
-            GRAPH_VERSION,
-            version
+            "unsupported graph version: expected {GRAPH_VERSION}, got {version}"
         );
 
         let num_nodes_u64 = u64::from_le_bytes(header[8..16].try_into()?);
@@ -126,15 +122,11 @@ impl AsyncCsrGraph {
         let _has_weights = u32::from_le_bytes(header[24..28].try_into()?) != 0;
         anyhow::ensure!(
             num_nodes_u64 <= MAX_NODES,
-            "num_nodes {} exceeds maximum {}",
-            num_nodes_u64,
-            MAX_NODES
+            "num_nodes {num_nodes_u64} exceeds maximum {MAX_NODES}"
         );
         anyhow::ensure!(
             num_edges_u64 <= MAX_EDGES,
-            "num_edges {} exceeds maximum {}",
-            num_edges_u64,
-            MAX_EDGES
+            "num_edges {num_edges_u64} exceeds maximum {MAX_EDGES}"
         );
         let num_nodes =
             usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;
@@ -164,9 +156,7 @@ impl AsyncCsrGraph {
             .len();
         anyhow::ensure!(
             file_size >= min_file_size,
-            "graph file truncated: expected at least {} bytes, got {}",
-            min_file_size,
-            file_size
+            "graph file truncated: expected at least {min_file_size} bytes, got {file_size}"
         );
 
         // Read offsets array into memory. For billion-node graphs this is 8
@@ -182,7 +172,7 @@ impl AsyncCsrGraph {
             assert!(
                 cfg!(target_endian = "little"),
                 "graph file is little-endian"
-            )
+            );
         };
         let mut offsets: Vec<EdgeOffset> = vec![0; num_nodes + 1];
         {
@@ -479,7 +469,7 @@ impl AsyncCsrGraph {
         }
 
         let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(4)
             .min(nodes.len());
         let chunk_len = nodes.len().div_ceil(parallelism);

@@ -784,9 +784,9 @@ impl FeatureStore {
         for &node in nodes {
             let node_id: NodeId = node
                 .try_into()
-                .map_err(|e| anyhow::anyhow!("invalid node id: {:?}", e))?;
+                .map_err(|e| anyhow::anyhow!("invalid node id: {e:?}"))?;
             let node_idx = node_id as usize;
-            anyhow::ensure!(node_idx < self.num_nodes, "node {} out of bounds", node_id);
+            anyhow::ensure!(node_idx < self.num_nodes, "node {node_id} out of bounds");
             // Payload length is exactly num_nodes * row_bytes (validated at
             // load), so this offset cannot overflow or escape the slice.
             row_starts.push(node_idx * row_bytes);
@@ -987,8 +987,7 @@ pub fn save_features(
     let data_offset = ALIGNED_DATA_OFFSET;
     anyhow::ensure!(
         data_offset >= HEADER_SIZE as u64,
-        "invalid data_offset {}",
-        data_offset
+        "invalid data_offset {data_offset}"
     );
     file.write_all(MAGIC)?;
     file.write_all(&(num_nodes as u64).to_le_bytes())?;
@@ -1529,10 +1528,7 @@ mod tests {
             let expected = (j as f32) * 0.01;
             assert!(
                 (v - expected).abs() < 0.01,
-                "node 0 dim {}: got {}, expected {}",
-                j,
-                v,
-                expected
+                "node 0 dim {j}: got {v}, expected {expected}"
             );
         }
     }
@@ -1563,10 +1559,7 @@ mod tests {
             let got = batch[feature_dim + j];
             assert!(
                 (got - expected).abs() < 0.1,
-                "node 10 dim {}: got {}, expected {}",
-                j,
-                got,
-                expected
+                "node 10 dim {j}: got {got}, expected {expected}"
             );
         }
     }
@@ -1651,7 +1644,7 @@ mod tests {
         let features = vec![42.0f32; num_nodes * feature_dim];
 
         let temp_file = NamedTempFile::new().unwrap();
-        save_features(temp_file.path(), features.clone(), num_nodes, feature_dim).unwrap();
+        save_features(temp_file.path(), features, num_nodes, feature_dim).unwrap();
 
         let store = FeatureStore::load(temp_file.path()).unwrap();
         assert_eq!(store.dtype(), crate::FeatureDtype::F32);

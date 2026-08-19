@@ -69,17 +69,17 @@ fn bench_offset_width(c: &mut Criterion) {
                 acc += csr.offsets64[i + 1] - csr.offsets64[i];
             }
             black_box(acc)
-        })
+        });
     });
     group.bench_with_input(BenchmarkId::new("range_only", "u32"), &nodes, |b, nodes| {
         b.iter(|| {
             let mut acc = 0u64;
             for &n in nodes {
                 let i = n as usize;
-                acc += (csr.offsets32[i + 1] - csr.offsets32[i]) as u64;
+                acc += u64::from(csr.offsets32[i + 1] - csr.offsets32[i]);
             }
             black_box(acc)
-        })
+        });
     });
 
     // Lookup plus the neighbour scan it gates — the shape of real work,
@@ -91,11 +91,11 @@ fn bench_offset_width(c: &mut Criterion) {
                 let i = n as usize;
                 let (s, e) = (csr.offsets64[i] as usize, csr.offsets64[i + 1] as usize);
                 for &nb in &csr.edges[s..e] {
-                    acc += nb as u64;
+                    acc += u64::from(nb);
                 }
             }
             black_box(acc)
-        })
+        });
     });
     group.bench_with_input(BenchmarkId::new("with_scan", "u32"), &nodes, |b, nodes| {
         b.iter(|| {
@@ -104,11 +104,11 @@ fn bench_offset_width(c: &mut Criterion) {
                 let i = n as usize;
                 let (s, e) = (csr.offsets32[i] as usize, csr.offsets32[i + 1] as usize);
                 for &nb in &csr.edges[s..e] {
-                    acc += nb as u64;
+                    acc += u64::from(nb);
                 }
             }
             black_box(acc)
-        })
+        });
     });
 
     group.finish();

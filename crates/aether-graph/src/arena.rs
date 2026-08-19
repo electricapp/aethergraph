@@ -394,7 +394,7 @@ impl Arena {
     #[inline]
     unsafe fn write_link(&self, byte: usize, next: u32) {
         // SAFETY: `byte` is in bounds per the caller contract.
-        let p = unsafe { self.ptr.as_ptr().add(byte) } as *mut u32;
+        let p = unsafe { self.ptr.as_ptr().add(byte) }.cast::<u32>();
         // SAFETY: the slot is unobservable by readers per the caller
         // contract, so the write cannot race a reference.
         unsafe { std::ptr::write(p, next) };
@@ -632,7 +632,7 @@ impl ArenaWriter<'_> {
     pub fn alloc_write_chunk(&mut self, val: Chunk) -> Option<u32> {
         let idx = self.alloc_chunk()?;
         // SAFETY: `idx` is a fresh slot, so the offset is in bounds.
-        let p = unsafe { self.arena.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) } as *mut Chunk;
+        let p = unsafe { self.arena.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) }.cast::<Chunk>();
         // SAFETY: the slot is fresh (unobservable), 64-byte aligned, and
         // `Chunk` is exactly one slot (const-asserted in ctree.rs).
         unsafe { std::ptr::write(p, val) };
@@ -644,8 +644,8 @@ impl ArenaWriter<'_> {
     pub fn alloc_write_interior(&mut self, val: Interior) -> Option<u32> {
         let idx = self.alloc_interior()?;
         // SAFETY: `idx` is a fresh slot, so the offset is in bounds.
-        let p =
-            unsafe { self.arena.ptr.as_ptr().add(self.arena.interior_byte(idx)) } as *mut Interior;
+        let p = unsafe { self.arena.ptr.as_ptr().add(self.arena.interior_byte(idx)) }
+            .cast::<Interior>();
         // SAFETY: the slot is fresh (unobservable), 16-byte aligned, and
         // `Interior` is exactly one slot (const-asserted in ctree.rs).
         unsafe { std::ptr::write(p, val) };
@@ -736,7 +736,7 @@ impl RegionWriter<'_> {
         let idx = self.next_chunk;
         self.next_chunk += 1;
         // SAFETY: `idx` is inside this writer's reservation, in bounds.
-        let p = unsafe { self.arena.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) } as *mut Chunk;
+        let p = unsafe { self.arena.ptr.as_ptr().add(idx as usize * CHUNK_SLOT) }.cast::<Chunk>();
         // SAFETY: the reservation is exclusive to this writer, so the
         // write cannot race another thread.
         unsafe { std::ptr::write(p, val) };
@@ -753,8 +753,8 @@ impl RegionWriter<'_> {
         let idx = self.next_interior;
         self.next_interior += 1;
         // SAFETY: `idx` is inside this writer's reservation, in bounds.
-        let p =
-            unsafe { self.arena.ptr.as_ptr().add(self.arena.interior_byte(idx)) } as *mut Interior;
+        let p = unsafe { self.arena.ptr.as_ptr().add(self.arena.interior_byte(idx)) }
+            .cast::<Interior>();
         // SAFETY: the reservation is exclusive to this writer, so the
         // write cannot race another thread.
         unsafe { std::ptr::write(p, val) };

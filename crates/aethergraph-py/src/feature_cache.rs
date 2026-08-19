@@ -154,9 +154,9 @@ impl PyFeatureCache {
         future_into_py(py, async move {
             let cache = FeatureCache::new(config.inner)
                 .await
-                .map_err(|e| cache_error(format!("Failed to create feature cache: {}", e)))?;
+                .map_err(|e| cache_error(format!("Failed to create feature cache: {e}")))?;
 
-            Ok(PyFeatureCache {
+            Ok(Self {
                 inner: Arc::new(cache),
             })
         })
@@ -177,9 +177,10 @@ impl PyFeatureCache {
         let cache = Arc::clone(&self.inner);
 
         future_into_py(py, async move {
-            let features = cache.get(node).await.map_err(|e| {
-                cache_error(format!("Failed to get features for node {}: {}", node, e))
-            })?;
+            let features = cache
+                .get(node)
+                .await
+                .map_err(|e| cache_error(format!("Failed to get features for node {node}: {e}")))?;
 
             Ok(Python::attach(|py| {
                 PyArray1::from_vec(py, features).unbind().into_any()
@@ -212,7 +213,7 @@ impl PyFeatureCache {
             let features_vec = cache
                 .get_batch(&nodes)
                 .await
-                .map_err(|e| cache_error(format!("Failed to get batch features: {}", e)))?;
+                .map_err(|e| cache_error(format!("Failed to get batch features: {e}")))?;
 
             Python::attach(|py| {
                 let num_nodes = features_vec.len();
@@ -239,7 +240,7 @@ impl PyFeatureCache {
                 let array = PyArray1::from_vec(py, flat);
                 let array_2d = array
                     .reshape([num_nodes, feature_dim])
-                    .map_err(|e| cache_error(format!("Failed to reshape array: {}", e)))?;
+                    .map_err(|e| cache_error(format!("Failed to reshape array: {e}")))?;
 
                 Ok(array_2d.unbind().into_any())
             })
@@ -263,7 +264,7 @@ impl PyFeatureCache {
             cache
                 .insert(node, features)
                 .await
-                .map_err(|e| cache_error(format!("Failed to insert features: {}", e)))?;
+                .map_err(|e| cache_error(format!("Failed to insert features: {e}")))?;
 
             Ok(())
         })

@@ -56,7 +56,7 @@ impl PyMetricsSnapshot {
         Self {
             inner: MetricsSnapshot {
                 sampling: sampling.map(|s| s.inner.summary()),
-                feature_load: feature_load.map(|f| f.inner.clone()),
+                feature_load: feature_load.map(|f| f.inner),
                 prefetch: prefetch_summary,
             },
         }

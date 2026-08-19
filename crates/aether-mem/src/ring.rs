@@ -1261,7 +1261,7 @@ mod tests {
                     // SAFETY: idx < SLOTS and this thread holds the lease.
                     unsafe {
                         ring.slot_ptr_for_ffi(idx)
-                            .write_volatile((t * 31 + i) as u8)
+                            .write_volatile((t * 31 + i) as u8);
                     };
                     occupied[idx].store(false, Ordering::Release);
                     ring.release_index(idx);

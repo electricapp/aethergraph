@@ -139,7 +139,7 @@ impl PyCsrGraph {
         // materialized. Release the GIL across the build.
         let graph = py
             .detach(|| Graph::from_src_dst(num_nodes, src_slice, dst_slice, w))
-            .map_err(|e| graph_load_error(format!("Failed to create graph: {}", e)))?;
+            .map_err(|e| graph_load_error(format!("Failed to create graph: {e}")))?;
         Ok(Self {
             inner: Arc::new(graph),
         })
@@ -168,7 +168,7 @@ impl PyCsrGraph {
         // release the GIL across it.
         let new_graph = py
             .detach(|| self.inner.permute(perm_slice))
-            .map_err(|e| graph_load_error(format!("Permutation failed: {}", e)))?;
+            .map_err(|e| graph_load_error(format!("Permutation failed: {e}")))?;
         Ok(Self {
             inner: Arc::new(new_graph),
         })
@@ -193,7 +193,7 @@ impl PyCsrGraph {
                 save_graph(self.inner.as_ref(), &path)
             }
         })
-        .map_err(|e| graph_load_error(format!("Failed to save graph: {}", e)))
+        .map_err(|e| graph_load_error(format!("Failed to save graph: {e}")))
     }
 
     /// Number of nodes in the graph.
@@ -401,8 +401,7 @@ fn parse_validation_mode(value: &str) -> PyResult<GraphValidationMode> {
 fn auto_validation_mode(path: &Path) -> PyResult<GraphValidationMode> {
     let metadata = std::fs::metadata(path).map_err(|e| {
         graph_load_error(format!(
-            "Failed to stat graph file for auto validation mode selection: {}",
-            e
+            "Failed to stat graph file for auto validation mode selection: {e}"
         ))
     })?;
 

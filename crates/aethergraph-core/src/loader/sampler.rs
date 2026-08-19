@@ -782,7 +782,7 @@ impl<'a> NeighborSampler<'a> {
                     for i in (valid - sample_size)..valid {
                         let s = (i + 1) as u64;
                         let x = self.rng.next_u32();
-                        let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
+                        let j = (u64::from(x).wrapping_mul(s) >> 32) as usize;
                         if self.seen_set.insert(j) {
                             let (csr_idx, _) = self.temporal_filtered[j];
                             self.sample_buf.push((neighbors[csr_idx], csr_idx));
@@ -933,7 +933,7 @@ impl<'a> NeighborSampler<'a> {
         let track = self.config.track_edge_ids;
         for _ in 0..k {
             let x = self.rng.next_u32();
-            let idx = ((x as u64).wrapping_mul(n) >> 32) as usize;
+            let idx = (u64::from(x).wrapping_mul(n) >> 32) as usize;
             self.emit_edge(src, src_local, neighbors[idx], edge_offset, idx, track);
         }
     }
@@ -972,7 +972,7 @@ impl<'a> NeighborSampler<'a> {
             for i in (n - k)..n {
                 let s = (i + 1) as u64;
                 let x = self.rng.next_u32();
-                let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
+                let j = (u64::from(x).wrapping_mul(s) >> 32) as usize;
                 let pick = if self.floyd.test_and_set(j) {
                     j
                 } else {
@@ -986,7 +986,7 @@ impl<'a> NeighborSampler<'a> {
             for i in (n - k)..n {
                 let s = (i + 1) as u64;
                 let x = self.rng.next_u32();
-                let j = ((x as u64).wrapping_mul(s) >> 32) as usize;
+                let j = (u64::from(x).wrapping_mul(s) >> 32) as usize;
                 let pick = if self.seen_set.insert(j) {
                     j
                 } else {
@@ -1012,7 +1012,7 @@ impl<'a> NeighborSampler<'a> {
         self.cumsum_buf.clear();
         let mut total = 0.0f64;
         for &w in weights {
-            total += w as f64;
+            total += f64::from(w);
             self.cumsum_buf.push(total);
         }
 
@@ -1063,7 +1063,7 @@ impl<'a> NeighborSampler<'a> {
         // poisons the sort. Require strictly finite, strictly positive weight.
         for (i, &weight) in weights[..n].iter().enumerate() {
             let u_bits = self.rng.next_u64();
-            let w = weight as f64;
+            let w = f64::from(weight);
             let key = if w.is_finite() && w > 0.0 {
                 fast_neg_ln_u64(u_bits) / w
             } else {
@@ -1236,7 +1236,7 @@ impl SampledSubgraph {
                 for src in &self.edge_src {
                     match local_index.get(src) {
                         Some(&idx) => src_local.push(idx),
-                        None => return Err(format!("edge src {} not in subgraph nodes", src)),
+                        None => return Err(format!("edge src {src} not in subgraph nodes")),
                     }
                 }
 
@@ -1244,7 +1244,7 @@ impl SampledSubgraph {
                 for dst in &self.edge_dst {
                     match local_index.get(dst) {
                         Some(&idx) => dst_local.push(idx),
-                        None => return Err(format!("edge dst {} not in subgraph nodes", dst)),
+                        None => return Err(format!("edge dst {dst} not in subgraph nodes")),
                     }
                 }
 
@@ -1275,7 +1275,7 @@ impl SampledSubgraph {
                         local_index
                             .get(id)
                             .copied()
-                            .ok_or_else(|| format!("seed {} not in subgraph nodes", id))
+                            .ok_or_else(|| format!("seed {id} not in subgraph nodes"))
                     })
                     .collect()
             }
@@ -1966,9 +1966,7 @@ mod tests {
         // Being conservative: just check > 50% to avoid flaky tests.
         assert!(
             count_heavy > 500,
-            "Heavy-weight edge (w=100) should be sampled >50% of the time, got {}/{}",
-            count_heavy,
-            trials
+            "Heavy-weight edge (w=100) should be sampled >50% of the time, got {count_heavy}/{trials}"
         );
     }
 
@@ -2334,20 +2332,10 @@ mod tests {
         // All local indices should be valid (< total nodes in combined subgraph)
         let num_nodes = subgraph.nodes.len() as u32;
         for &s in src_local.iter() {
-            assert!(
-                s < num_nodes,
-                "local src index {} should be < {}",
-                s,
-                num_nodes
-            );
+            assert!(s < num_nodes, "local src index {s} should be < {num_nodes}");
         }
         for &d in dst_local.iter() {
-            assert!(
-                d < num_nodes,
-                "local dst index {} should be < {}",
-                d,
-                num_nodes
-            );
+            assert!(d < num_nodes, "local dst index {d} should be < {num_nodes}");
         }
 
         // Verify that local indices correctly map back to global IDs
@@ -2463,7 +2451,7 @@ mod tests {
             ..Default::default()
         };
         let batches: Vec<Vec<NodeId>> = vec![vec![0, 1], vec![2, 3], vec![4]];
-        let s = ParallelBatchSampler::new(&graph, config.clone());
+        let s = ParallelBatchSampler::new(&graph, config);
 
         let run1 = s.sample_batches(&batches);
         let run2 = s.sample_batches(&batches);

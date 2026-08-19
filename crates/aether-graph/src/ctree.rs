@@ -53,9 +53,9 @@ fn prefetch_read<T>(ptr: *const T) {
     unsafe {
         core::arch::asm!(
             "prfm pldl1keep, [{p}]",
-            p = in(reg) ptr as *const u8,
+            p = in(reg) ptr.cast::<u8>(),
             options(nostack, preserves_flags),
-        )
+        );
     };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = ptr;
@@ -228,12 +228,12 @@ impl CTree {
     /// Used by bulk inserts and graph compaction to rebuild adjacency
     /// lists with zero garbage. Returns `None` if the arena runs out of
     /// space.
-    pub(crate) fn from_sorted(aw: &mut ArenaWriter<'_>, vals: &[u32]) -> Option<CTree> {
+    pub(crate) fn from_sorted(aw: &mut ArenaWriter<'_>, vals: &[u32]) -> Option<Self> {
         if vals.is_empty() {
-            return Some(CTree::empty());
+            return Some(Self::empty());
         }
         let root = build_balanced(aw, vals)?;
-        Some(CTree { root })
+        Some(Self { root })
     }
 
     /// Insert `val` into the tree. Returns a new root (path-copied).
@@ -273,7 +273,7 @@ impl CTree {
         if self.root == NULL {
             let chunk = Chunk::from_sorted(&[val]);
             return match aw.alloc_write_chunk(chunk) {
-                Some(off) => InsertResult::Inserted(CTree { root: off }),
+                Some(off) => InsertResult::Inserted(Self { root: off }),
                 None => InsertResult::ArenaFull,
             };
         }
@@ -417,15 +417,15 @@ impl CTree {
                 unsafe { &*(&went_left[..depth] as *const [MaybeUninit<bool>] as *const [bool]) };
             match rebalance(aw, new_root, new_path_init, went_left_init, scratch, retire) {
                 Some(balanced_root) => {
-                    return InsertResult::Inserted(CTree {
+                    return InsertResult::Inserted(Self {
                         root: balanced_root,
                     });
                 }
-                None => return InsertResult::Inserted(CTree { root: new_root }),
+                None => return InsertResult::Inserted(Self { root: new_root }),
             }
         }
 
-        InsertResult::Inserted(CTree { root: new_root })
+        InsertResult::Inserted(Self { root: new_root })
     }
 }
 
@@ -822,7 +822,7 @@ mod tests {
         let mut buf = Vec::new();
         tree.collect_into(&arena, &mut buf);
         let mut expected = vals.to_vec();
-        expected.sort();
+        expected.sort_unstable();
         assert_eq!(buf, expected);
     }
 
@@ -899,7 +899,7 @@ mod tests {
         assert_eq!(tree.count(&arena), CHUNK_CAP + 1);
 
         for i in 0..=CHUNK_CAP as u32 {
-            assert!(tree.contains(&arena, i), "missing {}", i);
+            assert!(tree.contains(&arena, i), "missing {i}");
         }
 
         let mut buf = Vec::new();

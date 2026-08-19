@@ -63,7 +63,7 @@ impl PyFeatureStore {
     #[pyo3(signature = (path, telemetry=false))]
     fn load(path: std::path::PathBuf, telemetry: bool) -> PyResult<Self> {
         let mut inner = CoreFeatureStore::load(&path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("Failed to load features: {}", e))
+            pyo3::exceptions::PyIOError::new_err(format!("Failed to load features: {e}"))
         })?;
 
         if telemetry {
@@ -178,7 +178,7 @@ impl PyFeatureStore {
             let features = store
                 .inner
                 .get(node)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?;
             (features.as_ptr(), features.len())
         };
 
@@ -236,7 +236,7 @@ impl PyFeatureStore {
         let store = &self.inner;
         let features = py
             .detach(|| store.get_batch(nodes_slice))
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?;
 
         let num_nodes = nodes_slice.len();
         let feature_dim = self.inner.feature_dim();
@@ -356,7 +356,7 @@ fn save_features(
         }
     };
     result.map_err(|e| {
-        pyo3::exceptions::PyIOError::new_err(format!("Failed to save features: {}", e))
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to save features: {e}"))
     })?;
 
     Ok(())
@@ -414,7 +414,7 @@ impl PyFeatureData {
     /// Get features for a node.
     fn get(&self, py: Python, node: NodeId) -> PyResult<Py<PyAny>> {
         let features = self.inner.get(node).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!("node {} out of bounds", node))
+            pyo3::exceptions::PyValueError::new_err(format!("node {node} out of bounds"))
         })?;
 
         Ok(PyArray1::from_slice(py, features).unbind().into_any())
@@ -437,7 +437,7 @@ impl PyFeatureData {
         }
 
         let slot = self.inner.get_mut(node).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!("node {} out of bounds", node))
+            pyo3::exceptions::PyValueError::new_err(format!("node {node} out of bounds"))
         })?;
 
         slot.copy_from_slice(features_array.as_slice().ok_or_else(|| {
@@ -449,7 +449,7 @@ impl PyFeatureData {
     /// Save to file.
     fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
         core_save_feature_data(&path, &self.inner).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("Failed to save features: {}", e))
+            pyo3::exceptions::PyIOError::new_err(format!("Failed to save features: {e}"))
         })?;
         Ok(())
     }

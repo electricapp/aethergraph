@@ -272,12 +272,11 @@ impl AsyncFeatureStore {
 
         anyhow::ensure!(
             (node as usize) < self.num_nodes,
-            "node {} out of bounds",
-            node
+            "node {node} out of bounds"
         );
 
         let feature_size = self.feature_dim * self.dtype.element_size();
-        let offset = self.features_start_offset + (node as u64 * feature_size as u64);
+        let offset = self.features_start_offset + (u64::from(node) * feature_size as u64);
         let file = Arc::clone(&self.file);
         let dtype = self.dtype;
 
@@ -394,7 +393,7 @@ impl AsyncFeatureStore {
             if min_node <= max_node
                 && let (Some(min_offset), Some(range_len), Some(batch_bytes)) = (
                     self.features_start_offset
-                        .checked_add((min_node as u64).saturating_mul(feature_size as u64)),
+                        .checked_add(u64::from(min_node).saturating_mul(feature_size as u64)),
                     (max_node as usize)
                         .checked_sub(min_node as usize)
                         .and_then(|d| d.checked_add(1))
@@ -516,7 +515,7 @@ impl AsyncFeatureStore {
         let dtype = self.dtype;
         let feature_dim = self.feature_dim;
         let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(4)
             .min(nodes.len());
         let chunk_len = nodes.len().div_ceil(parallelism);
@@ -536,7 +535,7 @@ impl AsyncFeatureStore {
                             // (bulk copy on little-endian) and append it.
                             let mut row = vec![0f32; feature_dim];
                             for &node in &chunk {
-                                let byte_offset = offset + (node as u64 * feature_size as u64);
+                                let byte_offset = offset + (u64::from(node) * feature_size as u64);
                                 file.read_exact_at(bytemuck::cast_slice_mut(&mut row), byte_offset)
                                     .context("failed to read features")?;
                                 features.extend_from_slice(&row);
@@ -546,7 +545,7 @@ impl AsyncFeatureStore {
                             let mut buffer = vec![0u8; feature_size];
                             let mut row = vec![0f32; feature_dim];
                             for &node in &chunk {
-                                let byte_offset = offset + (node as u64 * feature_size as u64);
+                                let byte_offset = offset + (u64::from(node) * feature_size as u64);
                                 file.read_exact_at(&mut buffer, byte_offset)
                                     .context("failed to read features")?;
                                 half.decode_row(&buffer, &mut row);

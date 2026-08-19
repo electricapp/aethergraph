@@ -89,7 +89,7 @@ impl DirtyBitmap {
             let base = (i as u64) * 64;
             let mut remaining = bits;
             while remaining != 0 {
-                let bit = remaining.trailing_zeros() as u64;
+                let bit = u64::from(remaining.trailing_zeros());
                 let id = base + bit;
                 // Mask off bits past num_vertices (last word can over-allocate).
                 if (id as usize) < self.num_vertices {

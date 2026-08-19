@@ -36,7 +36,7 @@ fn ctree_insert(tree: CTree, aw: &mut ArenaWriter<'_>, val: u32) -> (CTree, Inse
 fn sorted_dedup_vec(max_len: usize) -> impl Strategy<Value = Vec<u32>> {
     prop::collection::hash_set(0..100_000u32, 0..=max_len).prop_map(|s| {
         let mut v: Vec<u32> = s.into_iter().collect();
-        v.sort();
+        v.sort_unstable();
         v
     })
 }
@@ -442,8 +442,7 @@ fn stress_10k_inserts() {
         );
         assert!(
             is_sorted_strict(&buf),
-            "neighbors of vertex {} not sorted",
-            src
+            "neighbors of vertex {src} not sorted"
         );
     }
 
@@ -451,8 +450,7 @@ fn stress_10k_inserts() {
         assert_eq!(
             g.degree(*src),
             dsts.len(),
-            "degree mismatch for vertex {}",
-            src
+            "degree mismatch for vertex {src}"
         );
     }
 
@@ -460,9 +458,7 @@ fn stress_10k_inserts() {
         for dst in dsts {
             assert!(
                 g.has_edge(*src, *dst),
-                "has_edge({}, {}) returned false",
-                src,
-                dst
+                "has_edge({src}, {dst}) returned false"
             );
         }
     }

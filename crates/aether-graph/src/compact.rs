@@ -54,7 +54,7 @@ impl DynamicGraph {
         // partition. Ranges split on edge count so one hub-heavy stretch
         // doesn't serialize the rebuild.
         let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(1)
             .clamp(1, 16);
         let threads = if edges.len() < (1 << 20) { 1 } else { threads };

@@ -853,7 +853,7 @@ mod tests {
             }
             // The spill is not a durability point: everything appended is
             // still counted as unsynced until sync() lands the barrier.
-            assert_eq!(w.pending_bytes(), count as u64 * RECORD_LEN as u64);
+            assert_eq!(w.pending_bytes(), u64::from(count) * RECORD_LEN as u64);
             w.sync().unwrap();
             assert_eq!(w.pending_bytes(), 0);
         }
@@ -865,7 +865,7 @@ mod tests {
         })
         .unwrap();
         assert!(out.truncate_to.is_none(), "no torn tail expected");
-        assert_eq!(out.applied, count as u64);
+        assert_eq!(out.applied, u64::from(count));
         assert_eq!(got.len(), count as usize);
         for (i, rec) in got.iter().enumerate() {
             let i = i as u32;

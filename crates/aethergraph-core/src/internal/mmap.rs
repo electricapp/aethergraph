@@ -160,20 +160,20 @@ impl Header {
         fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
             let slice = bytes
                 .get(offset..offset + 4)
-                .ok_or_else(|| anyhow::anyhow!("header read out of bounds at offset {}", offset))?;
+                .ok_or_else(|| anyhow::anyhow!("header read out of bounds at offset {offset}"))?;
             let arr: [u8; 4] = slice
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("failed to read u32 at offset {}", offset))?;
+                .map_err(|_| anyhow::anyhow!("failed to read u32 at offset {offset}"))?;
             Ok(u32::from_le_bytes(arr))
         }
 
         fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
             let slice = bytes
                 .get(offset..offset + 8)
-                .ok_or_else(|| anyhow::anyhow!("header read out of bounds at offset {}", offset))?;
+                .ok_or_else(|| anyhow::anyhow!("header read out of bounds at offset {offset}"))?;
             let arr: [u8; 8] = slice
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("failed to read u64 at offset {}", offset))?;
+                .map_err(|_| anyhow::anyhow!("failed to read u64 at offset {offset}"))?;
             Ok(u64::from_le_bytes(arr))
         }
 
@@ -356,7 +356,7 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
         Arc::clone(&mmap),
         layout.offsets_range.clone(),
         layout.edges_range.clone(),
-        layout.weights_range.clone(),
+        layout.weights_range,
     );
     graph.validate_with_mode(validation)?;
     Ok(graph)
@@ -560,9 +560,7 @@ fn validate_checksum_if_present(
 
     anyhow::ensure!(
         actual == expected,
-        "graph integrity checksum mismatch: expected {:#x}, got {:#x}",
-        expected,
-        actual
+        "graph integrity checksum mismatch: expected {expected:#x}, got {actual:#x}"
     );
     Ok(())
 }

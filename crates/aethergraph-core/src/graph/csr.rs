@@ -113,7 +113,7 @@ fn owned_storage(
 fn hint_hugepage<T>(slice: &[T]) {
     let bytes = std::mem::size_of_val(slice);
     if bytes >= HUGEPAGE_HINT_MIN_BYTES {
-        crate::internal::hint::advise_hugepage(slice.as_ptr() as *const u8, bytes);
+        crate::internal::hint::advise_hugepage(slice.as_ptr().cast::<u8>(), bytes);
     }
 }
 
@@ -440,7 +440,7 @@ impl Graph {
         for &deg in &degree {
             let last = *offsets.last().unwrap();
             let next = last.checked_add(deg).ok_or_else(|| {
-                anyhow::anyhow!("CSR offset overflow: {} + {} exceeds u64::MAX", last, deg)
+                anyhow::anyhow!("CSR offset overflow: {last} + {deg} exceeds u64::MAX")
             })?;
             offsets.push(next);
         }
@@ -457,9 +457,7 @@ impl Graph {
             let dst = dst_at(edge_idx);
             anyhow::ensure!(
                 (dst as usize) < num_nodes,
-                "destination node {} exceeds num_nodes {}",
-                dst,
-                num_nodes
+                "destination node {dst} exceeds num_nodes {num_nodes}"
             );
 
             let pos = cursors[src as usize] as usize;
@@ -902,7 +900,7 @@ unsafe fn typed_slice<T: bytemuck::Pod>(bytes: &[u8]) -> &[T] {
     // the caller's contract, stated above.
     unsafe {
         std::slice::from_raw_parts(
-            bytes.as_ptr() as *const T,
+            bytes.as_ptr().cast::<T>(),
             bytes.len() / std::mem::size_of::<T>(),
         )
     }

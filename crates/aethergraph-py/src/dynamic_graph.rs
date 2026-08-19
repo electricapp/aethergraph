@@ -244,7 +244,7 @@ impl PyDynamicGraph {
         let mut packed: Vec<u64> = src_slice
             .iter()
             .zip(dst_slice)
-            .map(|(&s, &d)| ((s as u64) << 32) | d as u64)
+            .map(|(&s, &d)| (u64::from(s) << 32) | u64::from(d))
             .collect();
         let inner = Arc::clone(&self.inner);
 
@@ -291,7 +291,7 @@ impl PyDynamicGraph {
         self.check_vertex(vertex)?;
         let mut buf = self.buf.lock();
         self.inner.neighbors_into(vertex, &mut buf);
-        let i64_vec: Vec<i64> = buf.iter().map(|&v| v as i64).collect();
+        let i64_vec: Vec<i64> = buf.iter().map(|&v| i64::from(v)).collect();
         Ok(PyArray1::from_vec(py, i64_vec))
     }
 

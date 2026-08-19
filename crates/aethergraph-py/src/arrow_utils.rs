@@ -90,7 +90,7 @@ pub fn subgraph_into_record_batches(
 /// to the project's [`crate::error::ArrowConversionError`] Python exception.
 pub fn subgraph_into_arrow(subgraph: SampledSubgraph) -> PyResult<SubgraphRecordBatches> {
     subgraph_into_record_batches(subgraph)
-        .map_err(|e| arrow_conversion_error(format!("Arrow conversion failed: {}", e)))
+        .map_err(|e| arrow_conversion_error(format!("Arrow conversion failed: {e}")))
 }
 
 #[cfg(test)]
@@ -148,7 +148,7 @@ mod tests {
             vec![0],
             vec![1],
             // edge_id beyond u32::MAX
-            vec![(u32::MAX as u64) + 1],
+            vec![u64::from(u32::MAX) + 1],
             vec![0],
             vec![2],
             vec![1],

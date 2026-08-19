@@ -69,8 +69,8 @@ fn bench_gather(c: &mut Criterion) {
                 b.iter(|| {
                     store
                         .get_batch_into(black_box(&nodes), black_box(&mut out))
-                        .unwrap()
-                })
+                        .unwrap();
+                });
             },
         );
     }

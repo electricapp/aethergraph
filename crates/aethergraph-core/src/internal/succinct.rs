@@ -229,7 +229,7 @@ impl EliasFano {
     fn select(&self, rank: usize) -> usize {
         let mut remaining = rank as i64;
         for (word_idx, &word) in self.high.iter().enumerate() {
-            let ones = word.count_ones() as i64;
+            let ones = i64::from(word.count_ones());
             if remaining < ones {
                 // The target bit is in this word: skip `remaining` set bits.
                 let mut w = word;

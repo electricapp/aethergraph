@@ -76,7 +76,7 @@ impl RowStore {
             "EmbeddingCache: failed to reserve {bytes} bytes of virtual space"
         );
         Self {
-            base: std::ptr::NonNull::new(raw as *mut f32).expect("mmap returned null"),
+            base: std::ptr::NonNull::new(raw.cast::<f32>()).expect("mmap returned null"),
             bytes,
             stride,
         }
@@ -161,7 +161,7 @@ impl Drop for RowStore {
     fn drop(&mut self) {
         // SAFETY: base/bytes came from the successful mmap in `new`.
         unsafe {
-            libc::munmap(self.base.as_ptr() as *mut libc::c_void, self.bytes);
+            libc::munmap(self.base.as_ptr().cast::<libc::c_void>(), self.bytes);
         }
     }
 }
@@ -375,7 +375,7 @@ mod tests {
         let candidates: Vec<u32> = vec![0, 1, 2];
         let dirty = vec![2];
         let mut stale = cache.stale_nodes(&candidates, &dirty);
-        stale.sort();
+        stale.sort_unstable();
         assert_eq!(stale, vec![0, 1, 2]);
     }
 
@@ -392,7 +392,7 @@ mod tests {
         let candidates = vec![0, 2, 3, 4];
         let dirty = vec![0];
         let mut stale = cache.stale_nodes(&candidates, &dirty);
-        stale.sort();
+        stale.sort_unstable();
         assert_eq!(stale, vec![0, 2, 3, 4]);
     }
 

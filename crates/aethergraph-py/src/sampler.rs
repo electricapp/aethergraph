@@ -129,8 +129,7 @@ impl PySamplingConfig {
             "bidirectional" => SubgraphType::Bidirectional,
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid subgraph_type '{}'. Must be 'directional', 'induced', or 'bidirectional'",
-                    subgraph_type
+                    "Invalid subgraph_type '{subgraph_type}'. Must be 'directional', 'induced', or 'bidirectional'"
                 )));
             }
         };
@@ -141,8 +140,7 @@ impl PySamplingConfig {
             Some("last") => Some(TemporalStrategy::Last),
             Some(other) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid temporal_strategy '{}'. Must be 'uniform' or 'last'",
-                    other
+                    "Invalid temporal_strategy '{other}'. Must be 'uniform' or 'last'"
                 )));
             }
         };
@@ -160,7 +158,7 @@ impl PySamplingConfig {
                 temporal_strategy: temporal,
                 disjoint,
                 deterministic,
-                telemetry: telemetry.map(|t| t.inner.clone()),
+                telemetry: telemetry.map(|t| t.inner),
             },
         })
     }
@@ -326,15 +324,15 @@ impl PySampledSubgraph {
         let mut edge_data_local: Vec<i64> = Vec::with_capacity(num_edges * 2);
         {
             let (src_local, dst_local) = subgraph.edge_index_local().map_err(|e| {
-                sampling_error(format!("Failed to compute local edge indices: {}", e))
+                sampling_error(format!("Failed to compute local edge indices: {e}"))
             })?;
-            edge_data_local.extend(src_local.iter().map(|&e| e as i64));
-            edge_data_local.extend(dst_local.iter().map(|&e| e as i64));
+            edge_data_local.extend(src_local.iter().map(|&e| i64::from(e)));
+            edge_data_local.extend(dst_local.iter().map(|&e| i64::from(e)));
         }
 
         let seed_indices_local = subgraph
             .seed_indices_local()
-            .map_err(|e| sampling_error(format!("Failed to compute seed indices: {}", e)))?;
+            .map_err(|e| sampling_error(format!("Failed to compute seed indices: {e}")))?;
 
         // u32 → i64 widening, one pass per buffer — the only per-buffer copy
         // on this path; the source Vecs move into `original_*` below so
@@ -342,9 +340,9 @@ impl PySampledSubgraph {
         // an i64→u32 narrowing pass. The cast is monotonic and free of
         // branches, so it vectorizes: on aarch64 the release build emits
         // ushll.2d/ushll2.2d, widening eight lanes per unrolled iteration.
-        let nodes_i64: Vec<i64> = subgraph.nodes.iter().map(|&n| n as i64).collect();
-        let seeds_i64: Vec<i64> = subgraph.seeds.iter().map(|&s| s as i64).collect();
-        let seed_indices_i64: Vec<i64> = seed_indices_local.into_iter().map(|i| i as i64).collect();
+        let nodes_i64: Vec<i64> = subgraph.nodes.iter().map(|&n| i64::from(n)).collect();
+        let seeds_i64: Vec<i64> = subgraph.seeds.iter().map(|&s| i64::from(s)).collect();
+        let seed_indices_i64: Vec<i64> = seed_indices_local.into_iter().map(i64::from).collect();
         let edge_ids_i64: Vec<i64> = subgraph.edge_ids.iter().map(|&e| e as i64).collect();
 
         let nodes = PyArray1::from_vec(py, nodes_i64).unbind();
@@ -356,11 +354,11 @@ impl PySampledSubgraph {
         let edge_array_local = PyArray1::from_vec(py, edge_data_local);
         let edge_index_local = edge_array_local
             .reshape([2, num_edges])
-            .map_err(|e| sampling_error(format!("Failed to reshape local edge index: {}", e)))?
+            .map_err(|e| sampling_error(format!("Failed to reshape local edge index: {e}")))?
             .unbind();
 
         let batch_vec = subgraph.batch.map(|b| {
-            let batch_i64: Vec<i64> = b.into_iter().map(|x| x as i64).collect();
+            let batch_i64: Vec<i64> = b.into_iter().map(i64::from).collect();
             PyArray1::from_vec(py, batch_i64).unbind()
         });
 
@@ -434,11 +432,11 @@ impl PySampledSubgraph {
             return Ok(cached.clone_ref(py).into_any());
         }
         let mut edge_data: Vec<i64> = Vec::with_capacity(self.num_edges * 2);
-        edge_data.extend(self.original_edge_src.iter().map(|&e| e as i64));
-        edge_data.extend(self.original_edge_dst.iter().map(|&e| e as i64));
+        edge_data.extend(self.original_edge_src.iter().map(|&e| i64::from(e)));
+        edge_data.extend(self.original_edge_dst.iter().map(|&e| i64::from(e)));
         let arr = PyArray1::from_vec(py, edge_data)
             .reshape([2, self.num_edges])
-            .map_err(|e| sampling_error(format!("Failed to reshape edge index: {}", e)))?
+            .map_err(|e| sampling_error(format!("Failed to reshape edge index: {e}")))?
             .unbind();
         let _ = self.edge_index.set(arr);
         Ok(self
@@ -512,11 +510,11 @@ impl PySampledSubgraph {
     /// lengths.
     fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let temp_subgraph = SampledSubgraph::from_parts(
-            self.original_nodes.to_vec(),
-            self.original_edge_src.to_vec(),
-            self.original_edge_dst.to_vec(),
-            self.original_edge_ids.to_vec(),
-            self.original_seeds.to_vec(),
+            self.original_nodes.clone(),
+            self.original_edge_src.clone(),
+            self.original_edge_dst.clone(),
+            self.original_edge_ids.clone(),
+            self.original_seeds.clone(),
             self.num_sampled_nodes.clone(),
             self.num_sampled_edges.clone(),
         );
@@ -728,7 +726,7 @@ impl PyNeighborSampler {
         let seeds_vec: Vec<u32> = crate::error::extract_seeds(seeds)?;
         let times_vec: Option<Vec<f64>> = input_times
             .as_ref()
-            .map(|t| t.as_slice().map(|s| s.to_vec()))
+            .map(|t| t.as_slice().map(<[f64]>::to_vec))
             .transpose()?;
         let disjoint = self.config.inner.disjoint;
         let temporal = self.config.inner.temporal_strategy.is_some();

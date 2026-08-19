@@ -140,18 +140,18 @@ pub enum PrefetchError {
 impl std::fmt::Display for PrefetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PrefetchError::Timeout { waited } => {
+            Self::Timeout { waited } => {
                 write!(f, "prefetch timed out after {waited:?}")
             }
-            PrefetchError::WorkerExited {
+            Self::WorkerExited {
                 message: Some(message),
             } => {
                 write!(f, "prefetch worker exited: {message}")
             }
-            PrefetchError::WorkerExited { message: None } => {
+            Self::WorkerExited { message: None } => {
                 write!(f, "prefetch worker exited unexpectedly")
             }
-            PrefetchError::FeatureLoad { batch_idx, source } => {
+            Self::FeatureLoad { batch_idx, source } => {
                 write!(f, "feature load failed for batch {batch_idx}: {source}")
             }
         }
@@ -161,7 +161,7 @@ impl std::fmt::Display for PrefetchError {
 impl std::error::Error for PrefetchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            PrefetchError::FeatureLoad { source, .. } => Some(source.as_ref()),
+            Self::FeatureLoad { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -354,8 +354,8 @@ impl SyncFeatureStore {
     pub fn prefetch_nodes(&self, nodes: &[NodeId]) {
         let feature_size = self.feature_dim * self.dtype.element_size();
         if let (Some(&min), Some(&max)) = (nodes.iter().min(), nodes.iter().max()) {
-            let offset = self.features_start_offset + (min as u64 * feature_size as u64);
-            let span_rows = (max as u64 - min as u64) + 1;
+            let offset = self.features_start_offset + (u64::from(min) * feature_size as u64);
+            let span_rows = (u64::from(max) - u64::from(min)) + 1;
             let len = span_rows
                 .saturating_mul(feature_size as u64)
                 .min(PREFETCH_SPAN_CAP_BYTES);
@@ -405,8 +405,9 @@ impl SyncFeatureStore {
         // Sync fallback: issue single prefetch hint for the range, computed in
         // u64 and clamped so a low+high node pair can't hint the whole file.
         if let (Some(&min_node), Some(&max_node)) = (nodes.iter().min(), nodes.iter().max()) {
-            let min_offset = self.features_start_offset + (min_node as u64 * feature_size as u64);
-            let span_rows = (max_node as u64 - min_node as u64) + 1;
+            let min_offset =
+                self.features_start_offset + (u64::from(min_node) * feature_size as u64);
+            let span_rows = (u64::from(max_node) - u64::from(min_node)) + 1;
             let range_len = span_rows
                 .saturating_mul(feature_size as u64)
                 .min(PREFETCH_SPAN_CAP_BYTES);
@@ -461,7 +462,7 @@ impl SyncFeatureStore {
     fn batch_read_sync(&self, nodes: &[NodeId], feature_size: usize) -> anyhow::Result<Vec<f32>> {
         for &node in nodes {
             if node as usize >= self.num_nodes {
-                anyhow::bail!("node {} out of bounds", node);
+                anyhow::bail!("node {node} out of bounds");
             }
         }
 
@@ -470,7 +471,7 @@ impl SyncFeatureStore {
         let mut buffer = vec![0u8; feature_size];
 
         for (i, &node) in nodes.iter().enumerate() {
-            let offset = self.features_start_offset + (node as u64 * feature_size as u64);
+            let offset = self.features_start_offset + (u64::from(node) * feature_size as u64);
             self.file.read_exact_at(&mut buffer, offset)?;
             decoder.decode_row(
                 &buffer,
@@ -874,7 +875,7 @@ impl NeighborLoader {
                             Ok(())
                         });
                     })
-                    .map_err(|e| anyhow::anyhow!("failed to spawn sampler thread: {}", e))?,
+                    .map_err(|e| anyhow::anyhow!("failed to spawn sampler thread: {e}"))?,
             );
         }
         // The workers own the only senders after this point, so the loader's
@@ -899,7 +900,7 @@ impl NeighborLoader {
                         Ok(())
                     });
                 })
-                .map_err(|e| anyhow::anyhow!("failed to spawn feature loader thread: {}", e))?
+                .map_err(|e| anyhow::anyhow!("failed to spawn feature loader thread: {e}"))?
         };
         handles.push(loader_handle);
 
@@ -2025,8 +2026,8 @@ pub enum SubmitError {
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SubmitError::Shutdown => write!(f, "prefetcher shut down"),
-            SubmitError::ChannelClosed => write!(f, "channel closed"),
+            Self::Shutdown => write!(f, "prefetcher shut down"),
+            Self::ChannelClosed => write!(f, "channel closed"),
         }
     }
 }
@@ -2185,11 +2186,7 @@ mod tests {
         println!("Hit rate: {:.1}%", hit_rate * 100.0);
         // With prefetch_depth=3 and 10 batches, we expect some hits
         // The exact rate depends on timing, so just verify we got some hits
-        assert!(
-            hit_rate >= 0.3,
-            "Expected hit_rate >= 0.3, got {}",
-            hit_rate
-        );
+        assert!(hit_rate >= 0.3, "Expected hit_rate >= 0.3, got {hit_rate}");
     }
 
     #[test]

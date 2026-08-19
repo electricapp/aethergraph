@@ -16,12 +16,12 @@ impl std::error::Error for AetherGraphError {}
 
 impl From<anyhow::Error> for AetherGraphError {
     fn from(err: anyhow::Error) -> Self {
-        AetherGraphError(err)
+        Self(err)
     }
 }
 
 impl From<AetherGraphError> for PyErr {
-    fn from(err: AetherGraphError) -> PyErr {
+    fn from(err: AetherGraphError) -> Self {
         PyException::new_err(format!("{}", err.0))
     }
 }

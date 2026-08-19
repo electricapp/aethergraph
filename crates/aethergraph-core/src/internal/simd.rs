@@ -178,7 +178,7 @@ unsafe fn f16_le_to_f32_neon(src: &[u8], dst: &mut [f32]) {
     while i + 8 <= n {
         // SAFETY: `i + 8 <= n` and `src.len() == 2 * n` keep byte offset
         // `2 * i` plus 16 bytes in range.
-        let src_p = unsafe { src.as_ptr().add(i * 2) } as *const uint16x8_t;
+        let src_p = unsafe { src.as_ptr().add(i * 2) }.cast::<uint16x8_t>();
         // SAFETY: `src_p` points at 16 in-range bytes; `read_unaligned`
         // tolerates any alignment.
         let raw = unsafe { src_p.read_unaligned() };
@@ -188,7 +188,7 @@ unsafe fn f16_le_to_f32_neon(src: &[u8], dst: &mut [f32]) {
         let lo = vcvt_f32_f16(vget_low_f16(h));
         let hi = vcvt_high_f32_f16(h);
         // SAFETY: `i + 8 <= n` keeps offset `i` plus 8 floats in range.
-        let dst_p = unsafe { dst.as_mut_ptr().add(i) } as *mut float32x4_t;
+        let dst_p = unsafe { dst.as_mut_ptr().add(i) }.cast::<float32x4_t>();
         // SAFETY: `dst_p` points at the first 4 of 8 in-range floats;
         // `write_unaligned` tolerates any alignment.
         unsafe { dst_p.write_unaligned(lo) };
@@ -233,7 +233,7 @@ pub fn bf16_le_to_f32(src: &[u8], dst: &mut [f32]) {
 fn bf16_le_to_f32_scalar(src: &[u8], dst: &mut [f32]) {
     for (out, chunk) in dst.iter_mut().zip(src.chunks_exact(2)) {
         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-        *out = f32::from_bits((bits as u32) << 16);
+        *out = f32::from_bits(u32::from(bits) << 16);
     }
 }
 
