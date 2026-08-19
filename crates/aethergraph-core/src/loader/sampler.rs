@@ -663,36 +663,27 @@ impl<'a> NeighborSampler<'a> {
                 (edge_src, edge_dst, edge_ids, src_local, dst_local)
             }
             SubgraphType::Bidirectional => {
-                // Add reverse edges
-                let mut new_src = Vec::with_capacity(edge_src.len() * 2);
-                let mut new_dst = Vec::with_capacity(edge_dst.len() * 2);
-                let mut new_ids = if self.config.track_edge_ids {
-                    Vec::with_capacity(edge_ids.len() * 2)
-                } else {
-                    Vec::new()
-                };
-                let mut new_src_local = Vec::with_capacity(src_local.len() * 2);
-                let mut new_dst_local = Vec::with_capacity(dst_local.len() * 2);
+                // Append the reverse run onto the forward one, rather than
+                // allocating five fresh vectors and copying every array
+                // twice. Each append reads the *other* array's forward
+                // prefix, which stays put: the new elements land past it, so
+                // `..n` still names the forward run on the second read.
+                let n = edge_src.len();
+                edge_src.reserve(n);
+                edge_dst.reserve(n);
+                src_local.reserve(n);
+                dst_local.reserve(n);
 
-                // Original edges
-                new_src.extend_from_slice(&edge_src);
-                new_dst.extend_from_slice(&edge_dst);
+                edge_src.extend_from_slice(&edge_dst[..n]);
+                edge_dst.extend_from_slice(&edge_src[..n]);
+                src_local.extend_from_slice(&dst_local[..n]);
+                dst_local.extend_from_slice(&src_local[..n]);
                 if self.config.track_edge_ids {
-                    new_ids.extend_from_slice(&edge_ids);
+                    // A reverse edge carries its forward edge's id.
+                    edge_ids.extend_from_within(..n);
                 }
-                new_src_local.extend_from_slice(&src_local);
-                new_dst_local.extend_from_slice(&dst_local);
 
-                // Reverse edges (edge_id for reverse is same as forward)
-                new_src.extend_from_slice(&edge_dst);
-                new_dst.extend_from_slice(&edge_src);
-                if self.config.track_edge_ids {
-                    new_ids.extend_from_slice(&edge_ids);
-                }
-                new_src_local.extend_from_slice(&dst_local);
-                new_dst_local.extend_from_slice(&src_local);
-
-                (new_src, new_dst, new_ids, new_src_local, new_dst_local)
+                (edge_src, edge_dst, edge_ids, src_local, dst_local)
             }
         };
 
@@ -1523,6 +1514,76 @@ mod tests {
         assert_eq!(induced.edge_src, directional.edge_src);
         assert_eq!(induced.edge_dst, directional.edge_dst);
         assert_eq!(induced.edge_ids, directional.edge_ids);
+    }
+
+    /// Bidirectional had no test at all, and it is the one subgraph mode that
+    /// rewrites the emitted arrays rather than passing them through. Length
+    /// alone proves nothing here — an append that read the wrong array, or
+    /// left the locals unmirrored, still doubles every array. So this pins the
+    /// values: the forward run survives untouched, the reverse run is it with
+    /// endpoints swapped, ids are shared, and the local indices mirror so
+    /// `edge_index_local` stays consistent with `edge_src`/`edge_dst`.
+    #[test]
+    fn bidirectional_mirrors_every_forward_edge() {
+        let mut edges = Vec::new();
+        for src in 0..120u32 {
+            for step in 1..=5u32 {
+                edges.push((src, (src * 11 + step * 7) % 120));
+            }
+        }
+        let graph = Graph::from_edges(120, &edges, None).unwrap();
+
+        let base = SamplingConfig {
+            fanout: vec![4, 3],
+            replace: false,
+            seed: Some(11),
+            max_degree: None,
+            cumulative: false,
+            weighted: false,
+            subgraph_type: SubgraphType::Directional,
+            track_edge_ids: true,
+            temporal_strategy: None,
+            disjoint: false,
+            deterministic: false,
+            telemetry: None,
+        };
+        let seeds: Vec<NodeId> = (0..12).collect();
+
+        let mut forward = NeighborSampler::new(&graph, base.clone());
+        let forward = forward.sample_neighbors(&seeds);
+
+        let bidi_cfg = SamplingConfig {
+            subgraph_type: SubgraphType::Bidirectional,
+            ..base
+        };
+        let mut bidi = NeighborSampler::new(&graph, bidi_cfg);
+        let bidi = bidi.sample_neighbors(&seeds);
+
+        let n = forward.edge_src.len();
+        assert!(n > 0, "fixture produced no edges");
+        assert_eq!(bidi.edge_src.len(), n * 2);
+        assert_eq!(bidi.edge_dst.len(), n * 2);
+        assert_eq!(bidi.edge_ids.len(), n * 2);
+
+        // The forward run is untouched.
+        assert_eq!(&bidi.edge_src[..n], &forward.edge_src[..]);
+        assert_eq!(&bidi.edge_dst[..n], &forward.edge_dst[..]);
+        assert_eq!(&bidi.edge_ids[..n], &forward.edge_ids[..]);
+
+        // The reverse run is the forward run with endpoints swapped, sharing
+        // each forward edge's id.
+        assert_eq!(&bidi.edge_src[n..], &forward.edge_dst[..]);
+        assert_eq!(&bidi.edge_dst[n..], &forward.edge_src[..]);
+        assert_eq!(&bidi.edge_ids[n..], &forward.edge_ids[..]);
+
+        // Local endpoint indices mirror the same way, so edge_index_local
+        // stays consistent with edge_src/edge_dst.
+        let (fwd_src_local, fwd_dst_local) = forward.edge_index_local().unwrap();
+        let (bidi_src_local, bidi_dst_local) = bidi.edge_index_local().unwrap();
+        assert_eq!(&bidi_src_local[..n], &fwd_src_local[..]);
+        assert_eq!(&bidi_dst_local[..n], &fwd_dst_local[..]);
+        assert_eq!(&bidi_src_local[n..], &fwd_dst_local[..]);
+        assert_eq!(&bidi_dst_local[n..], &fwd_src_local[..]);
     }
 
     #[test]
