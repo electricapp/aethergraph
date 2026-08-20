@@ -96,5 +96,16 @@ cargo "$CMD" -p aether-graph --target "$TARGET" \
 echo "==> $CMD workspace [default features]"
 cargo "$CMD" --workspace --target "$TARGET" ${TARGETS[@]+"${TARGETS[@]}"} ${TRAILING[@]+"${TRAILING[@]}"}
 
+# The rustdoc gate CI runs: docs only exist for cfg'd-in code, so macOS
+# doc runs never see the Linux-gated modules. rdma needs verbs headers
+# and stays CI-only.
+export RUSTDOCFLAGS="-D warnings"
+echo "==> doc workspace [no features]"
+cargo doc --workspace --no-deps --target "$TARGET"
+echo "==> doc workspace [$CORE_FEATURES]"
+cargo doc --workspace --no-deps --target "$TARGET" --features "$CORE_FEATURES"
+echo "==> doc aether-graph [wal, io-uring]"
+cargo doc -p aether-graph --no-deps --target "$TARGET" --features "wal,io-uring"
+
 echo
 echo "Linux cross-check passed."
