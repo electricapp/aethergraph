@@ -41,7 +41,8 @@ fi
 # One-time provisioning, keyed on rustup's presence.
 if ! limactl shell "$VM" bash -c 'command -v cargo >/dev/null 2>&1 || test -x "$HOME/.cargo/bin/cargo"'; then
   echo "==> provisioning toolchain + apt deps (one-time)"
-  limactl shell "$VM" bash -c 'sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libbpf-dev libibverbs-dev libnuma-dev curl ca-certificates'
+  # Lock timeout: cloud-init's own first-boot apt may still be running.
+  limactl shell "$VM" bash -c 'sudo apt-get -o DPkg::Lock::Timeout=600 update && sudo apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends build-essential clang pkg-config libbpf-dev libibverbs-dev libnuma-dev curl ca-certificates'
   limactl shell "$VM" bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
 fi
 
