@@ -28,7 +28,7 @@ impl DynamicGraph {
 
     /// Like [`compact`](Self::compact), but the rebuilt trees go into an
     /// arena of `new_capacity` bytes. The escape hatch for recovering
-    /// from [`ArenaFull`]: compact into a larger arena and keep
+    /// from [`ArenaFull`](crate::InsertError::ArenaFull): compact into a larger arena and keep
     /// ingesting.
     ///
     /// The rebuild is parallel: a prepass computes each vertex's exact
@@ -45,6 +45,11 @@ impl DynamicGraph {
     pub fn compact_with_capacity(&mut self, new_capacity: usize) -> Result<(), CompactError> {
         if self.is_poisoned() {
             return Err(CompactError::Poisoned);
+        }
+        // The old arena's slot indices die with it; only the graph's own
+        // latest-snapshot pin may remain.
+        if self.arena.pins().pin_count() > 1 {
+            return Err(CompactError::Pinned);
         }
 
         let (offsets, edges) = self.snapshot_csr();
@@ -143,8 +148,12 @@ impl DynamicGraph {
         unsafe { new_arena.commit_regions(total_chunks, total_interiors) };
 
         // Rebuild succeeded in full — only now replace the live state.
+        // Republishing `latest` last drops the old snapshot with the old
+        // arena's registry.
         self.arena = new_arena;
         self.roots = new_roots.into_iter().map(AtomicU32::new).collect();
+        let snap = self.full_snapshot(self.current_epoch().as_u64());
+        *self.latest.lock().unwrap() = snap;
         Ok(())
     }
 }
@@ -158,6 +167,9 @@ pub enum CompactError {
     /// The rebuilt trees did not fit in the requested capacity. The
     /// graph is unchanged; retry with a larger capacity.
     ArenaFull,
+    /// Live [`Snapshot`](crate::Snapshot)s pin the current arena; drop
+    /// them and retry.
+    Pinned,
 }
 
 impl std::fmt::Display for CompactError {
@@ -165,6 +177,7 @@ impl std::fmt::Display for CompactError {
         match self {
             Self::Poisoned => f.write_str("cannot compact a poisoned graph"),
             Self::ArenaFull => f.write_str("compacted trees exceed the requested arena capacity"),
+            Self::Pinned => f.write_str("cannot compact while snapshots are held"),
         }
     }
 }

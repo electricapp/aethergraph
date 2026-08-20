@@ -198,7 +198,7 @@ impl ColdTier {
 /// rows through the store's dtype into `f32`.
 ///
 /// This is the compressed in-memory backing tier of
-/// [`FeatureCache`](super::cache — see `FeatureCacheConfig::cold_store_path`):
+/// `FeatureCache` (see `FeatureCacheConfig::cold_store_path`):
 /// the whole feature matrix held resident at a fraction of its raw size,
 /// so a node absent from every cache tier is a block decompression away
 /// instead of an error.

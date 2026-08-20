@@ -33,7 +33,7 @@ mod shared_store;
 
 use pyo3::prelude::*;
 
-use dynamic_graph::PyDynamicGraph;
+use dynamic_graph::{PyDynamicGraph, PyGraphSnapshot};
 use error::{ArrowConversionError, CacheError, GraphLoadError, SamplingError};
 use feature_cache::{PyFeatureCache, PyFeatureCacheConfig};
 use graph::PyCsrGraph;
@@ -78,6 +78,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register classes
     m.add_class::<PyCsrGraph>()?;
     m.add_class::<PyDynamicGraph>()?;
+    m.add_class::<PyGraphSnapshot>()?;
     m.add_class::<PySamplingConfig>()?;
     m.add_class::<PySampledSubgraph>()?;
     m.add_class::<PySamplingTelemetry>()?;

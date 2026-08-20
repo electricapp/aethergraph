@@ -128,11 +128,9 @@ pub(crate) enum NodeRef<'a> {
 /// Decode the node at a tagged offset.
 ///
 /// Relies on the module invariant that every tagged offset in circulation
-/// names a live node of `arena` (offsets are created only by this
-/// module's allocations and stored only in nodes and published roots),
-/// and on the caller-side reader contract of the safe read API: hold a
-/// [`ReadGuard`](crate::ReadGuard) or the write handle across the
-/// traversal.
+/// names a live node of `arena`, and on the reader contract of the safe
+/// read API: traverse while holding a [`ReadGuard`](crate::ReadGuard),
+/// the write handle, or a pin via [`Snapshot`](crate::Snapshot).
 #[inline(always)]
 pub(crate) fn node_at(arena: &Arena, tagged: u32) -> NodeRef<'_> {
     debug_assert_ne!(tagged, NULL, "node_at on NULL offset");
@@ -244,7 +242,7 @@ impl CTree {
     ///
     /// Allocates a fresh scratch buffer and a discarded retire log per
     /// call. Callers on a hot insert path should use
-    /// [`insert_with_scratch`](Self::insert_with_scratch) with reused
+    /// `insert_with_scratch` with reused
     /// buffers instead — that is also what makes superseded nodes
     /// recyclable rather than garbage.
     pub fn insert(&self, aw: &mut ArenaWriter<'_>, val: u32) -> InsertResult {

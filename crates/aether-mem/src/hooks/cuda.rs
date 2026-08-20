@@ -12,7 +12,7 @@ const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 0x02;
 
 /// Registers memory with CUDA for zero-copy DMA transfers.
 ///
-/// Uses `cuMemHostRegister_v2` with [`CU_MEMHOSTREGISTER_DEVICEMAP`]
+/// Uses `cuMemHostRegister_v2` with `CU_MEMHOSTREGISTER_DEVICEMAP`
 /// to enable direct GPU access to the ring buffer memory.
 pub struct CudaRegHook;
 

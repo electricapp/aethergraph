@@ -23,6 +23,7 @@ from aethergraph._core import (
     ArrowConversionError,
     CacheError,
     GraphLoadError,
+    GraphSnapshot,
     MetricsSnapshot,
     SamplingError,
     __version__,
@@ -45,6 +46,7 @@ __all__ = [
     "DynamicGraph",
     "Graph",
     "GraphLoadError",
+    "GraphSnapshot",
     "HeteroGraph",
     "MetricsSnapshot",
     "NeighborSampler",  # PyG-compatible alias

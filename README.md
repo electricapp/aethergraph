@@ -74,22 +74,22 @@ wall at millions-of-nodes scale. AetherGraph keeps topology on disk and streams
 neighborhoods via memory-mapping + `io_uring`, enabling 100B+ edge graphs on
 commodity hardware.
 
-|                     | PyTorch Geometric    | AetherGraph                  |
-| ------------------- | -------------------- | ---------------------------- |
-| Max graph size      | ~40M nodes (VRAM)    | 2B+ nodes (NVMe)             |
-| Graph updates       | Full rebuild         | O(1) edge insert, no rebuild |
-| Feature loading     | All in RAM           | Streamed on-demand           |
-| Feature serving     | N/A                  | GPUDirect RDMA (<5us)        |
-| Hetero graphs       | Python-level looping | Rust-native typed sampling   |
-| Startup time        | Minutes (load all)   | Instant (mmap)               |
-| Sampling (1M nodes) | 341 us/batch         | 240 us/batch (1.4x faster)   |
+|                     | PyTorch Geometric    | AetherGraph                      |
+| ------------------- | -------------------- | -------------------------------- |
+| Max graph size      | ~40M nodes (VRAM)    | 2B+ nodes (NVMe)                 |
+| Graph updates       | Full rebuild         | O(log degree) insert, no rebuild |
+| Feature loading     | All in RAM           | Streamed on-demand               |
+| Feature serving     | N/A                  | GPUDirect RDMA (<5us)            |
+| Hetero graphs       | Python-level looping | Rust-native typed sampling       |
+| Startup time        | Minutes (load all)   | Instant (mmap)                   |
+| Sampling (1M nodes) | 341 us/batch         | 240 us/batch (1.4x faster)       |
 
 **How it works:**
 
 - **Static CSR**: Graph stored as 3 arrays (offsets, destinations, weights) —
   O(1) neighbor lookup, mmap'd from NVMe
-- **Dynamic C-tree**: Balanced tree of cache-line-sized chunks — O(1) edge
-  insert, lock-free reads via functional persistence and atomic root swap
+- **Dynamic C-tree**: Balanced tree of cache-line-sized chunks — O(log degree)
+  edge insert, lock-free reads via functional persistence and atomic root swap
 - **Rabbit Order reordering**: Hierarchical community-detection vertex
   permutation (Arai et al., IPDPS 2016) for cache-friendly sampling on power-law
   graphs
@@ -386,11 +386,15 @@ perm, parts = graph.reorder_rabbit_with_partitions()  # both in one pass
 from aethergraph import DynamicGraph
 
 graph = DynamicGraph(num_vertices=2_000_000_000, arena_mb=8192)
-graph.insert_edge(src, dst)                # O(1), lock-free for readers
+graph.insert_edge(src, dst)                # O(log degree), lock-free for readers
 graph.insert_edges(src_array, dst_array)   # batch insert from numpy
 graph.neighbors(node)                      # sorted numpy array
 graph.degree(node)                         # O(1)
 graph.has_edge(src, dst)                   # O(log degree)
+
+snap = graph.acquire()                     # pin the latest committed snapshot
+snap.neighbors(node)                       # immutable while inserts continue
+snap.to_static()                           # atomic-cut CSR freeze
 ```
 
 ### NeighborLoader (Homogeneous)

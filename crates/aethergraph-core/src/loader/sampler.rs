@@ -1146,7 +1146,7 @@ impl SampledSubgraph {
     ///
     /// This is intended for external callers (e.g., PyO3 round-trip) that
     /// need to reconstruct a SampledSubgraph. The result carries no recorded
-    /// local indices ([`Locals::Lazy`]); accessors derive them per call.
+    /// local indices (`Locals::Lazy`); accessors derive them per call.
     pub fn from_parts(
         nodes: Vec<NodeId>,
         edge_src: Vec<NodeId>,

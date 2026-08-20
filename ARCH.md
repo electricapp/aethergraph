@@ -123,14 +123,23 @@ C-tree for degree 45 node:
   CSR
 - Edge insert: path-copy affected nodes, arena bump-alloc (single `fetch_add`),
   atomic root swap
-- Readers see a consistent snapshot via functional persistence — old tree valid
-  for concurrent readers
+- Readers see a consistent snapshot via functional persistence — the tree
+  reached from the root a reader loaded stays intact for the lifetime of its
+  `ReadGuard`, which is also what holds off recycling of the slots the writer
+  has retired
 - C-tree balance: scapegoat scheme (α = 2/3) — an insert that pushes its path
   past the α-height bound rebuilds the highest weight-unbalanced subtree, so
   depth stays O(log degree) even for monotonically increasing neighbor IDs
-- Arena: pre-allocated contiguous region (max 2 GiB — u32 offsets with a tag
-  bit), zero-alloc writes; superseded nodes are reclaimed in bulk by
-  `DynamicGraph::compact`, which rebuilds live trees into a fresh arena
+- Arena: pre-allocated contiguous region (max 32 GiB — u32 slot indices with a
+  tag bit), zero-alloc writes; superseded nodes are logged as they are replaced
+  and recycled once no reader or pinned snapshot can still observe them, so
+  steady-state footprint tracks live edges rather than total inserts;
+  `DynamicGraph::compact` repacks every live tree into a fresh arena and
+  reclaims any slot the recycler missed
+- Snapshots: each writer commit publishes an immutable `Snapshot` (CoW
+  root-table pages, shared with the previous commit); `acquire()` clones it,
+  pinning its epoch so reclamation holds off. Pinned reads are gate-free — zero
+  per-vertex synchronization while ingest keeps committing
 - 9M inserts/sec, 38M neighbor reads/sec (criterion benchmarks)
 
 ## aether-stream — Real-Time Feature Serving

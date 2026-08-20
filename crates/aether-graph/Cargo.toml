@@ -59,3 +59,8 @@ harness = false
 name = "loom_writer_guard"
 path = "tests/loom_writer_guard.rs"
 required-features = ["loom"]
+
+[[test]]
+name = "loom_pin_reclaim"
+path = "tests/loom_pin_reclaim.rs"
+required-features = ["loom"]

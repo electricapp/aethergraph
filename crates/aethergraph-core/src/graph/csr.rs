@@ -227,9 +227,9 @@ impl Graph {
     /// checked with `debug_assert!` (active in debug builds, compiled out in
     /// release):
     /// - offsets.len() == num_nodes + 1
-    /// - offsets[0] == 0
+    /// - `offsets[0] == 0`
     /// - offsets is monotonically increasing
-    /// - offsets[num_nodes] == edges.len()
+    /// - `offsets[num_nodes] == edges.len()`
     ///
     /// Edge-destination range (all destinations < num_nodes) is not asserted
     /// here; use [`Graph::validate`] for that.

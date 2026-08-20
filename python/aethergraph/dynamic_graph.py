@@ -17,6 +17,7 @@ from aethergraph._core import DynamicGraph as _DynamicGraph
 from aethergraph._ids import _to_uint32_ids
 
 if TYPE_CHECKING:
+    from aethergraph._core import GraphSnapshot
     from aethergraph.graph import Graph
 
 
@@ -50,10 +51,10 @@ class DynamicGraph:
 
         Args:
             num_vertices: Number of vertices (fixed at construction).
-            arena_mb: Arena capacity in megabytes (max 2048). Each insert
-                consumes ~100-250 bytes of arena (path-copying leaves the
-                superseded nodes behind), so capacity tracks total inserts,
-                not live edges.
+            arena_mb: Arena capacity in megabytes (max 32768). Superseded
+                nodes are recycled once no reader or snapshot can observe
+                them, so steady-state usage tracks live edges plus a
+                bounded recycling lag.
         """
         self._inner = _DynamicGraph(num_vertices=num_vertices, arena_mb=arena_mb)
 
@@ -246,6 +247,31 @@ class DynamicGraph:
         # `Graph` is `aethergraph._core.CsrGraph` directly; `snapshot()`
         # already returns one, so this is just a passthrough.
         return self._inner.snapshot()
+
+    def acquire(self) -> GraphSnapshot:
+        """Pin the latest committed snapshot.
+
+        The snapshot is immutable and strictly serializable: it reflects
+        every committed insert up to its epoch and never changes while
+        inserts continue concurrently. Reads on it are lock-free. Holding
+        it defers arena recycling of its state -- drop it when done.
+
+        Returns:
+            A :class:`GraphSnapshot` pinned at the current epoch.
+
+        Example:
+            >>> dg = DynamicGraph(num_vertices=100)
+            >>> dg.insert_edge(0, 1)
+            True
+            >>> snap = dg.acquire()
+            >>> dg.insert_edge(0, 2)
+            True
+            >>> snap.degree(0)
+            1
+            >>> dg.degree(0)
+            2
+        """
+        return self._inner.acquire()
 
     def __repr__(self) -> str:
         """Return detailed string representation."""

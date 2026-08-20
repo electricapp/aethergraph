@@ -342,6 +342,20 @@ impl PyDynamicGraph {
         self.inner.current_epoch().as_u64()
     }
 
+    /// Acquire a pinned snapshot of the latest committed state.
+    ///
+    /// The snapshot is immutable and strictly serializable: it reflects
+    /// every commit up to its epoch and never changes, while inserts keep
+    /// running concurrently. Reads on it are lock-free and gate-free.
+    /// Holding it defers arena recycling of its state — drop it when done.
+    fn acquire(&self) -> PyGraphSnapshot {
+        PyGraphSnapshot {
+            graph: Arc::clone(&self.inner),
+            snap: self.inner.acquire(),
+            buf: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Create a frozen CSR snapshot for use with NeighborSampler/NeighborLoader.
     ///
     /// Collects all edges from the C-tree neighbor lists into a static CSR
@@ -375,5 +389,119 @@ impl PyDynamicGraph {
 
     fn __str__(&self) -> String {
         self.__repr__()
+    }
+}
+
+/// Pinned, immutable snapshot of a DynamicGraph at one committed epoch.
+///
+/// Reads are lock-free and gate-free; concurrent inserts never move it.
+/// Holding it defers arena recycling of its state.
+#[pyclass(name = "GraphSnapshot")]
+pub struct PyGraphSnapshot {
+    graph: Arc<aether_graph::DynamicGraph>,
+    snap: aether_graph::Snapshot,
+    /// Reusable neighbor buffer (avoids per-call allocation).
+    buf: Mutex<Vec<u32>>,
+}
+
+impl PyGraphSnapshot {
+    fn check_vertex(&self, vertex: u32) -> PyResult<()> {
+        let num_vertices = self.snap.num_vertices();
+        if (vertex as usize) < num_vertices {
+            Ok(())
+        } else {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "vertex {vertex} out of range for graph with {num_vertices} vertices"
+            )))
+        }
+    }
+}
+
+#[pymethods]
+impl PyGraphSnapshot {
+    /// Epoch of the commit this snapshot reflects.
+    #[getter]
+    fn epoch(&self) -> u64 {
+        self.snap.epoch().as_u64()
+    }
+
+    #[getter]
+    fn num_vertices(&self) -> usize {
+        self.snap.num_vertices()
+    }
+
+    /// Edge count as of this snapshot's commit.
+    #[getter]
+    fn num_edges(&self) -> u64 {
+        self.snap.num_edges()
+    }
+
+    /// Degree of a vertex at this snapshot's epoch.
+    ///
+    /// Raises ValueError if the vertex is out of range.
+    fn degree(&self, vertex: u32) -> PyResult<usize> {
+        self.check_vertex(vertex)?;
+        Ok(self.snap.degree(&self.graph, vertex))
+    }
+
+    /// Check whether edge (src -> dst) existed at this snapshot's epoch.
+    ///
+    /// Raises ValueError if src or dst is out of range.
+    fn has_edge(&self, src: u32, dst: u32) -> PyResult<bool> {
+        self.check_vertex(src)?;
+        self.check_vertex(dst)?;
+        Ok(self.snap.has_edge(&self.graph, src, dst))
+    }
+
+    /// Sorted neighbor array as int64 (PyTorch compatible).
+    ///
+    /// Raises ValueError if the vertex is out of range.
+    fn neighbors<'py>(&self, py: Python<'py>, vertex: u32) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        self.check_vertex(vertex)?;
+        let mut buf = self.buf.lock();
+        self.snap.neighbors_into(&self.graph, vertex, &mut buf);
+        let i64_vec: Vec<i64> = buf.iter().map(|&v| i64::from(v)).collect();
+        Ok(PyArray1::from_vec(py, i64_vec))
+    }
+
+    /// Sorted neighbor array as uint32 (zero-copy convertible).
+    ///
+    /// Raises ValueError if the vertex is out of range.
+    fn neighbors_u32<'py>(
+        &self,
+        py: Python<'py>,
+        vertex: u32,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        self.check_vertex(vertex)?;
+        let mut buf = self.buf.lock();
+        self.snap.neighbors_into(&self.graph, vertex, &mut buf);
+        Ok(PyArray1::from_slice(py, &buf))
+    }
+
+    /// Freeze this snapshot into a static CSR graph — an atomic cut at
+    /// its commit, unlike DynamicGraph.snapshot() which reads live roots.
+    fn to_static(&self, py: Python<'_>) -> PyCsrGraph {
+        let graph = Arc::clone(&self.graph);
+        let snap = self.snap.clone();
+        let built = py.detach(move || {
+            let (offsets, edges) = snap.snapshot_csr(&graph);
+            Graph::from_csr_arrays(graph.num_vertices(), offsets, edges, None)
+        });
+        PyCsrGraph {
+            inner: Arc::new(built),
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        self.snap.num_vertices()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "GraphSnapshot(epoch={}, num_vertices={}, num_edges={})",
+            self.snap.epoch().as_u64(),
+            self.snap.num_vertices(),
+            self.snap.num_edges(),
+        )
     }
 }

@@ -42,11 +42,14 @@ impl DynamicGraph {
             // owns this handle for its lifetime; `compact*` takes
             // `&mut self` and so cannot overlap a live guard.
             arena: unsafe { self.arena.writer() },
+            commit_epoch: self.epoch.current().as_u64() + 1,
             rebalance_scratch: Vec::new(),
             merge_scratch: Vec::new(),
             new_dsts: Vec::new(),
             pending_edges: 0,
             dirty_buf: Vec::with_capacity(DIRTY_BUF_FLUSH_THRESHOLD),
+            touched_pages: Vec::new(),
+            touched_dedup_limit: TOUCHED_PAGES_DEDUP_START,
             retire_log: RetireLog::new(),
             #[cfg(feature = "wal")]
             wal_guard: self
@@ -77,6 +80,10 @@ impl DynamicGraph {
 /// by `tests/zero_alloc.rs`).
 const DIRTY_BUF_FLUSH_THRESHOLD: usize = 8192;
 
+/// First in-place sort+dedup of `touched_pages`; doubles after each pass
+/// so scattered writers pay amortized O(log) sorts, not one per push.
+const TOUCHED_PAGES_DEDUP_START: usize = 1024;
+
 /// Single-writer guard for [`DynamicGraph`].
 ///
 /// Created by [`DynamicGraph::writer`]. Releases the writer slot on drop.
@@ -88,6 +95,9 @@ pub struct Writer<'a> {
     /// [`DynamicGraph::writer`] is the one point where the single-writer
     /// invariant is proven; allocation through it is safe code.
     arena: ArenaWriter<'a>,
+    /// Epoch this guard commits (`current + 1`); stamps retire batches
+    /// and becomes the published snapshot's epoch.
+    commit_epoch: u64,
     /// Scratch buffer reused across inserts to hold a scapegoat subtree's
     /// elements during a rebalance. Owned by the guard so the write path
     /// allocates at most once per writer instead of once per rebalance.
@@ -107,11 +117,14 @@ pub struct Writer<'a> {
     /// (each a likely DRAM + TLB miss on a multi-hundred-MB bitmap), and
     /// consumers only drain dirtiness at epoch boundaries anyway.
     dirty_buf: Vec<u32>,
-    /// Slots superseded by this guard's inserts, awaiting their gate
-    /// stamp. Stamped (handed to the arena's grace ring) at the fixed
-    /// watermark and at commit — always after the root stores that made
-    /// the slots unreachable, which is what makes the stamp's grace
-    /// reasoning sound.
+    /// Root-table pages whose roots this guard stored — the pages the
+    /// commit snapshot must copy. Clustered-deduped on push (skip if same
+    /// as last), fully deduped at `touched_dedup_limit` and at commit.
+    touched_pages: Vec<u32>,
+    touched_dedup_limit: usize,
+    /// Slots superseded by this guard's inserts. Stamped and queued at
+    /// the fixed watermark and at commit — always after the root stores
+    /// that made the slots unreachable.
     retire_log: RetireLog,
     /// The WAL, locked once for the guard's lifetime — the guard already
     /// enforces single-writer, so per-edge lock traffic would be pure tax.
@@ -146,7 +159,7 @@ impl<'a> Writer<'a> {
                 // grace-cleared batch, then retry once.
                 // SAFETY: everything in the log was unpublished by a
                 // prior root store.
-                unsafe { self.arena.retire(&mut self.retire_log) };
+                unsafe { self.arena.retire(&mut self.retire_log, self.commit_epoch) };
                 self.insert_edge_inner(src, dst)
             }
             other => other,
@@ -201,6 +214,7 @@ impl<'a> Writer<'a> {
                 // guard and folded in at commit (or at the buffer's fixed
                 // watermark).
                 self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
+                self.note_root_store(src);
                 self.pending_edges += 1;
                 self.note_dirty(src);
                 self.note_dirty(dst);
@@ -220,7 +234,7 @@ impl<'a> Writer<'a> {
         if self.retire_log.wants_flush() {
             // SAFETY: called only after the root stores that unpublished
             // every logged slot.
-            unsafe { self.arena.retire(&mut self.retire_log) };
+            unsafe { self.arena.retire(&mut self.retire_log, self.commit_epoch) };
         }
     }
 
@@ -310,7 +324,7 @@ impl<'a> Writer<'a> {
             // (see `insert_edge`).
             // SAFETY: everything in the log was unpublished by a prior
             // root store.
-            unsafe { self.arena.retire(&mut self.retire_log) };
+            unsafe { self.arena.retire(&mut self.retire_log, self.commit_epoch) };
             built = CTree::from_sorted(&mut self.arena, &self.merge_scratch);
         }
         let Some(new_tree) = built else {
@@ -329,6 +343,7 @@ impl<'a> Writer<'a> {
         }
 
         self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
+        self.note_root_store(src);
         // The old tree is superseded in full now that the merged rebuild
         // is published; log every one of its nodes for recycling.
         if current_root != crate::ctree::NULL {
@@ -351,6 +366,22 @@ impl<'a> Writer<'a> {
         self.maybe_stamp_retired();
 
         Ok(new_count)
+    }
+
+    /// Record that this guard stored a root in `src`'s page.
+    #[inline]
+    fn note_root_store(&mut self, src: u32) {
+        let page = src >> crate::snapshot::PAGE_BITS;
+        if self.touched_pages.last() == Some(&page) {
+            return;
+        }
+        self.touched_pages.push(page);
+        if self.touched_pages.len() >= self.touched_dedup_limit {
+            self.touched_pages.sort_unstable();
+            self.touched_pages.dedup();
+            self.touched_dedup_limit =
+                (self.touched_pages.len() * 2).max(TOUCHED_PAGES_DEDUP_START);
+        }
     }
 
     /// Record a vertex as dirtied by this guard, flushing at the fixed
@@ -449,16 +480,23 @@ impl Drop for Writer<'_> {
             self.graph.poisoned.store(true, Ordering::Release);
         } else {
             self.flush_bookkeeping();
+            // Publish this commit's pinned snapshot before stamping, so
+            // retire batches from the next guard can never outrun it.
+            if !self.touched_pages.is_empty() {
+                self.graph
+                    .publish_snapshot(self.commit_epoch, &mut self.touched_pages);
+            }
             // Stamp this guard's remaining retirements (all root stores
             // are done) and fold in any batches whose grace has passed,
             // so a subsequent guard starts with a warm free list.
             // SAFETY: every logged slot was unpublished by its root store.
-            unsafe { self.arena.retire(&mut self.retire_log) };
+            unsafe { self.arena.retire(&mut self.retire_log, self.commit_epoch) };
             self.arena.reclaim();
             // Publish a new epoch so readers pinning the clock see this
             // writer's edits. Done before releasing the writer lock so
             // the next writer can't bump the clock first.
             let new_epoch = self.graph.epoch.advance().as_u64();
+            debug_assert_eq!(new_epoch, self.commit_epoch);
             tracing::trace!(epoch = new_epoch, "DynamicGraph writer committed");
         }
         self.graph.writer_locked.store(false, Ordering::Release);

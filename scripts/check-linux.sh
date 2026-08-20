@@ -18,13 +18,24 @@
 #   scripts/check-linux.sh            # type-check the Linux surface
 #   scripts/check-linux.sh --clippy   # the same, as clippy with -D warnings
 #   scripts/check-linux.sh --tests    # include test and bench targets
+#   scripts/check-linux.sh --arm      # aarch64-linux instead of x86_64
 #
 # Requires zig (brew install zig) and:
-#   rustup target add x86_64-unknown-linux-gnu
+#   rustup target add x86_64-unknown-linux-gnu   # (aarch64-... for --arm)
+#
+# To actually RUN the Linux tests, use scripts/linux-test.sh (lima VM).
 
 set -euo pipefail
 
 TARGET=x86_64-unknown-linux-gnu
+ZIG_TARGET=x86_64-linux-gnu
+for arg in "$@"; do
+  if [ "$arg" = --arm ]; then
+    TARGET=aarch64-unknown-linux-gnu
+    ZIG_TARGET=aarch64-linux-gnu
+  fi
+done
+export ZIG_TARGET
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -43,6 +54,8 @@ ZIGCC="$REPO_ROOT/scripts/zigcc"
 chmod +x "$ZIGCC" 2>/dev/null || true
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$ZIGCC"
 export CC_x86_64_unknown_linux_gnu="$ZIGCC"
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$ZIGCC"
+export CC_aarch64_unknown_linux_gnu="$ZIGCC"
 
 CMD=check
 TARGETS=()
@@ -51,6 +64,7 @@ for arg in "$@"; do
   case "$arg" in
     --clippy) CMD=clippy; TRAILING=(-- -D warnings) ;;
     --tests)  TARGETS=(--all-targets) ;;
+    --arm)    ;; # handled above
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done

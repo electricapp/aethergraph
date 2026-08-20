@@ -1,4 +1,4 @@
-//! Write-ahead log for [`DynamicGraph`] crash durability.
+//! Write-ahead log for [`DynamicGraph`](crate::DynamicGraph) crash durability.
 //!
 //! Append-only log of every edge insertion. On startup, [`replay`] walks the
 //! log and rebuilds the graph in memory. The log is the source of truth;
@@ -9,7 +9,7 @@
 //! - `WalWriter::append_edge` writes (buffered) but does not fsync.
 //! - `WalWriter::sync` calls `fdatasync(2)` so all preceding edges survive a
 //!   process / kernel / power crash.
-//! - [`DynamicGraph`] integration: each clean `Writer::drop` calls `sync`
+//! - [`DynamicGraph`](crate::DynamicGraph) integration: each clean `Writer::drop` calls `sync`
 //!   exactly once. Crash mid-writer-guard loses every insert in that guard;
 //!   crash after a clean drop loses zero inserts.
 //! - A panicked writer guard never commits: its drop path calls
@@ -58,7 +58,7 @@
 //! - **Concurrent writers**: a `WalWriter` holds an exclusive advisory
 //!   lock on the file for its lifetime, so a second open of the same path
 //!   fails with [`WalError::Locked`] instead of interleaving appends. The
-//!   surrounding [`DynamicGraph`] additionally enforces single-writer
+//!   surrounding [`DynamicGraph`](crate::DynamicGraph) additionally enforces single-writer
 //!   in-process with the `Writer` guard.
 
 use std::fs::{File, OpenOptions, TryLockError};
@@ -158,7 +158,7 @@ pub struct WalWriter {
     /// discard bytes it has already handed to the kernel.
     buf: Vec<u8>,
     /// Bytes appended since the last `sync()`. Used by the
-    /// [`DynamicGraph`] integration to skip no-op fsyncs.
+    /// [`DynamicGraph`](crate::DynamicGraph) integration to skip no-op fsyncs.
     pending: u64,
     /// Lazily-built ring for the linked write→fdatasync group commit.
     /// `None` before first use or after ring setup failed (the portable

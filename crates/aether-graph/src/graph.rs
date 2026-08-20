@@ -1,9 +1,10 @@
 //! Dynamic graph: vertex array + per-vertex C-tree neighbor lists.
 //!
 //! Single-writer, multi-reader via functional C-trees. Edge inserts
-//! path-copy the affected C-tree; the old version remains valid for
-//! concurrent readers. The vertex array uses atomic stores for the
-//! root pointer swap.
+//! path-copy the affected C-tree; the old version stays intact for any
+//! reader holding a [`ReadGuard`](crate::ReadGuard), which is what defers
+//! recycling of the slots the writer retired. The vertex array uses atomic
+//! stores for the root pointer swap.
 //!
 //! Read path (sampling): zero allocations, lock-free.
 //! Write path (edge insert): arena bump-alloc only, no locks.
@@ -16,11 +17,12 @@ use crate::chunk::Chunk;
 use crate::ctree::CTree;
 use crate::dirty::DirtyBitmap;
 use crate::pad::CachePadded;
+use crate::snapshot::Snapshot;
 use crate::writer::InsertError;
 #[cfg(feature = "wal")]
 use crate::writer::Writer;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use aether_epoch::{Epoch, EpochClock};
 
@@ -28,14 +30,14 @@ use aether_epoch::{Epoch, EpochClock};
 use crate::wal::{WalError, WalWriter};
 #[cfg(feature = "wal")]
 use std::path::Path;
-#[cfg(feature = "wal")]
-use std::sync::Mutex;
 
-/// Lock-free dynamic graph with O(1) edge insert and O(degree) neighbor access.
+/// Lock-free dynamic graph with O(log degree) edge insert and O(degree)
+/// neighbor access.
 ///
 /// Each vertex's neighbor list is a C-tree (balanced tree of sorted chunks)
 /// stored in a bump-allocating arena. Edge inserts create new tree nodes
-/// via path copying; old trees remain valid for concurrent readers.
+/// via path copying; the superseded tree stays intact for any reader holding
+/// a [`ReadGuard`](crate::ReadGuard), which is what defers slot recycling.
 pub struct DynamicGraph {
     /// Per-vertex C-tree root offsets. Atomic for lock-free root swaps.
     /// NULL (u32::MAX) means no neighbors.
@@ -69,6 +71,11 @@ pub struct DynamicGraph {
     /// like the feature store; today it's an opaque counter, but the same
     /// `Arc<EpochClock>` is the join point for future MVCC.
     pub(crate) epoch: Arc<EpochClock>,
+    /// Latest committed snapshot, replaced at each writer-guard commit.
+    /// Always live, so its epoch is always pinned — any snapshot
+    /// [`acquire`](Self::acquire) hands out is protected from publication
+    /// onward.
+    pub(crate) latest: Mutex<Snapshot>,
     /// Optional write-ahead log. When present, every successful
     /// `Writer::insert_edge` appends a record; `Writer::drop` fsyncs.
     /// The `Mutex` is uncontended in practice (the surrounding `Writer`
@@ -112,15 +119,22 @@ impl DynamicGraph {
         for _ in 0..num_vertices {
             roots.push(AtomicU32::new(crate::ctree::NULL));
         }
+        let arena = Arena::new(arena_bytes);
+        let latest = Mutex::new(crate::snapshot::empty_snapshot(
+            num_vertices,
+            arena.pins(),
+            epoch.current().as_u64(),
+        ));
         Self {
             roots,
-            arena: Arena::new(arena_bytes),
+            arena,
             num_vertices,
             num_edges: CachePadded(AtomicU64::new(0)),
             dirty: DirtyBitmap::new(num_vertices),
             writer_locked: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             epoch,
+            latest,
             #[cfg(feature = "wal")]
             wal: None,
         }

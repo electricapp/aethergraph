@@ -842,7 +842,7 @@ impl FeatureStore {
     /// Writes node `i`'s feature row into `out[i * feature_dim .. (i+1) * feature_dim]`,
     /// so the result is packed contiguously in `nodes` order. `out` must have
     /// length >= `nodes.len() * feature_dim`. Works for both F32 (memcpy) and
-    /// F16 (upcast). Avoids the per-call `Vec` that [`get_batch`] allocates.
+    /// F16 (upcast). Avoids the per-call `Vec` that `get_batch` allocates.
     pub fn get_batch_into(&self, nodes: &[NodeId], out: &mut [f32]) -> Result<()> {
         let total = nodes
             .len()

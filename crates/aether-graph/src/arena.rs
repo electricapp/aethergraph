@@ -8,29 +8,27 @@
 //! addresses far more than 2^31 bytes: capacity is bounded by the
 //! interior-slot index range at 32 GiB.
 //!
-//! Retired slots (superseded by path copying) are recycled: the writer
-//! stages retired indices, stamps each staged batch with a snapshot of the
-//! striped reader gate, and once every reader that might have entered
-//! before the stamp has exited, threads the slots onto intrusive free
-//! lists (the link lives in the freed slot itself — recycling costs no
-//! memory and no heap allocation). Allocation pops the free list before
-//! bumping a cursor, so steady-state ingest reuses garbage instead of
-//! growing until [`compact`](crate::DynamicGraph::compact).
+//! Retired slots are recycled: each staged batch is stamped with a reader-
+//! gate snapshot and its guard's commit epoch, and is freed once the gate
+//! drains past the stamp and no pinned [`Snapshot`](crate::Snapshot) older
+//! than it remains. Free lists are intrusive (link in the freed slot) and
+//! allocation pops them before bumping, so steady-state ingest reuses
+//! garbage instead of growing until [`compact`](crate::DynamicGraph::compact).
 //!
 //! Mutation goes through [`ArenaWriter`], obtained once from
-//! [`Arena::writer`] — the one `unsafe` point where the caller proves the
-//! single-writer invariant; every allocation after that is safe code
-//! borrowing the handle. Concurrent reads of previously-allocated nodes
-//! are safe provided readers hold a [`ReadGuard`] for the duration of the
-//! traversal — the guard is what makes slot reuse sound.
+//! [`Arena::writer`] — the one `unsafe` point proving the single-writer
+//! invariant. Concurrent reads are sound while holding a [`ReadGuard`] or
+//! reading via a pinned [`Snapshot`](crate::Snapshot).
 
 use crate::chunk::Chunk;
 use crate::ctree::Interior;
 use crate::pad::CachePadded;
 use std::alloc::Layout;
 use std::cell::{Cell, UnsafeCell};
+use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::{Arc, Mutex};
 
 /// Bytes per chunk slot (low region). Matches `Chunk`'s size/alignment.
 pub const CHUNK_SLOT: usize = 64;
@@ -44,16 +42,19 @@ const NO_SLOT: u32 = u32::MAX;
 /// from serializing on one cache line while staying cheap to snapshot.
 const GATE_STRIPES: usize = 16;
 
-/// Retire-log capacity per class before the writer should flush it to the
-/// ring. Also the pre-allocated capacity of ring batch buffers, so a flush
-/// at this watermark never grows a vector.
+/// Retire-log capacity per class before the writer should flush. Also the
+/// batch buffers' pre-allocated capacity, so a watermark flush never
+/// grows a vector.
 pub(crate) const RETIRE_LOG_CAP: usize = 4096;
 
-/// Pending (grace-awaiting) batches. With reads lasting microseconds the
-/// grace period is effectively instant, so a short ring suffices; if every
-/// slot is somehow still awaiting grace at flush time, the staged slots
-/// are dropped (left as garbage for `compact`) rather than blocking.
-const RING_SLOTS: usize = 4;
+/// Cleared batches pooled for reuse — keeps unpinned-steady-state
+/// retirement allocation-free.
+const SPARE_BATCHES: usize = 4;
+
+/// Backstop cap on batches awaiting grace/pin release; past it, staged
+/// slots are dropped (garbage until compact) — recycling never blocks
+/// the writer.
+const MAX_PENDING_BATCHES: usize = 4096;
 
 /// One stripe of the reader gate: monotonic entry/exit counters.
 struct GateStripe {
@@ -131,38 +132,148 @@ impl Drop for ReadGuard<'_> {
     }
 }
 
-/// A batch of retired slots awaiting the reader grace period.
+/// A batch of retired slots awaiting reader grace and pin release.
 struct PendingBatch {
-    occupied: bool,
+    /// Epoch the retiring guard commits. A batch is held while any pinned
+    /// snapshot's epoch is below it.
+    stamp_epoch: u64,
     snap: [u64; GATE_STRIPES],
     chunks: Vec<u32>,
     interiors: Vec<u32>,
 }
 
+impl PendingBatch {
+    fn new() -> Self {
+        Self {
+            stamp_epoch: 0,
+            snap: [0; GATE_STRIPES],
+            chunks: Vec::with_capacity(RETIRE_LOG_CAP),
+            interiors: Vec::with_capacity(RETIRE_LOG_CAP),
+        }
+    }
+}
+
+/// Epochs pinned by live [`Snapshot`](crate::Snapshot)s. Registrations
+/// only ever happen at the latest committed epoch (which is itself always
+/// pinned by the graph), so the cached minimum is monotone nondecreasing
+/// and a stale read in the reclaimer is conservative.
+pub(crate) struct PinRegistry {
+    /// (epoch, refcount), ascending. One entry per distinct pinned epoch.
+    pins: Mutex<Vec<(u64, u32)>>,
+    /// Cached minimum pinned epoch; `u64::MAX` when nothing is pinned.
+    min: AtomicU64,
+}
+
+impl PinRegistry {
+    fn new() -> Self {
+        Self {
+            pins: Mutex::new(Vec::new()),
+            min: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    fn register(&self, epoch: u64) {
+        let mut pins = self.pins.lock().unwrap();
+        match pins.binary_search_by_key(&epoch, |&(e, _)| e) {
+            Ok(i) => pins[i].1 += 1,
+            Err(i) => pins.insert(i, (epoch, 1)),
+        }
+        // Release pairs with the reclaimer's Acquire: a pin's reads
+        // happen-before any slot rewrite the new minimum permits.
+        self.min.store(
+            pins.first().map_or(u64::MAX, |&(e, _)| e),
+            Ordering::Release,
+        );
+    }
+
+    fn release(&self, epoch: u64) {
+        let mut pins = self.pins.lock().unwrap();
+        let i = pins
+            .binary_search_by_key(&epoch, |&(e, _)| e)
+            .expect("released epoch not pinned");
+        pins[i].1 -= 1;
+        if pins[i].1 == 0 {
+            pins.remove(i);
+        }
+        self.min.store(
+            pins.first().map_or(u64::MAX, |&(e, _)| e),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn min_pinned(&self) -> u64 {
+        self.min.load(Ordering::Acquire)
+    }
+
+    /// Total live pins (sum of refcounts).
+    pub(crate) fn pin_count(&self) -> u64 {
+        self.pins
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|&(_, c)| u64::from(c))
+            .sum()
+    }
+}
+
+/// RAII pin of one epoch in a [`PinRegistry`]. Clone re-registers.
+pub(crate) struct PinTicket {
+    reg: Arc<PinRegistry>,
+    epoch: u64,
+}
+
+impl PinTicket {
+    pub(crate) fn new(reg: Arc<PinRegistry>, epoch: u64) -> Self {
+        reg.register(epoch);
+        Self { reg, epoch }
+    }
+
+    pub(crate) fn registry(&self) -> &Arc<PinRegistry> {
+        &self.reg
+    }
+}
+
+impl Clone for PinTicket {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.reg), self.epoch)
+    }
+}
+
+impl Drop for PinTicket {
+    fn drop(&mut self) {
+        self.reg.release(self.epoch);
+    }
+}
+
 /// Recycling state, reached only through an [`ArenaWriter`] (whose
 /// construction contract makes access exclusive).
 struct Recycler {
-    /// Stamped batches awaiting grace.
-    ring: [PendingBatch; RING_SLOTS],
-    /// Intrusive free-list heads. The link (next free index) is stored in
-    /// the first 4 bytes of the freed slot itself.
+    /// Young batches: slots allocated and retired by the same guard, so
+    /// unreachable from every committed snapshot — gate grace suffices.
+    pending_young: VecDeque<PendingBatch>,
+    /// Old batches: reachable from pre-guard snapshots; wait for gate
+    /// grace AND all pins below the stamp. Stamps are nondecreasing, so
+    /// both queues reclaim from the front (conditions are prefix-closed).
+    pending_old: VecDeque<PendingBatch>,
+    /// Cleared batches pooled for reuse.
+    spare: Vec<PendingBatch>,
+    /// Intrusive free-list heads; the link lives in the freed slot.
     free_chunk_head: u32,
     free_interior_head: u32,
     free_chunks: usize,
     free_interiors: usize,
-    /// Slots dropped because the ring was full (garbage until compact).
+    /// Slots dropped because `pending` hit its cap (garbage until compact).
     leaked: u64,
 }
 
 impl Recycler {
     fn new() -> Self {
         Self {
-            ring: std::array::from_fn(|_| PendingBatch {
-                occupied: false,
-                snap: [0; GATE_STRIPES],
-                chunks: Vec::with_capacity(RETIRE_LOG_CAP),
-                interiors: Vec::with_capacity(RETIRE_LOG_CAP),
-            }),
+            // Sized for the unpinned steady state (a couple in flight);
+            // growth under a long pin allocates on the retire path.
+            pending_young: VecDeque::with_capacity(SPARE_BATCHES),
+            pending_old: VecDeque::with_capacity(SPARE_BATCHES),
+            spare: (0..SPARE_BATCHES).map(|_| PendingBatch::new()).collect(),
             free_chunk_head: NO_SLOT,
             free_interior_head: NO_SLOT,
             free_chunks: 0,
@@ -213,7 +324,7 @@ pub struct RecycleStats {
     pub free_interiors: usize,
     /// Retired slots staged or awaiting grace (not yet reusable).
     pub pending: usize,
-    /// Slots dropped because the pending ring was full.
+    /// Slots dropped because the pending queue hit its cap.
     pub leaked: u64,
 }
 
@@ -235,6 +346,8 @@ pub struct Arena {
     /// Reader gate for grace-period recycling. Striped; read-mostly from
     /// the writer's perspective.
     gate: ReadGate,
+    /// Epochs pinned by live snapshots; shared with their tickets.
+    pins: Arc<PinRegistry>,
     /// Bump cursors, advanced only through an [`ArenaWriter`]. `low` is
     /// the next free byte in the chunk region (grows up); `high` is one
     /// past the last free byte of the interior region (grows down).
@@ -288,9 +401,15 @@ impl Arena {
             layout,
             capacity,
             gate: ReadGate::new(),
+            pins: Arc::new(PinRegistry::new()),
             cursors: CachePadded((AtomicUsize::new(0), AtomicUsize::new(capacity))),
             recycler: UnsafeCell::new(Recycler::new()),
         }
+    }
+
+    /// The pin registry snapshots register their epochs in.
+    pub(crate) fn pins(&self) -> &Arc<PinRegistry> {
+        &self.pins
     }
 
     /// Enter the reader gate for one traversal. Every dereference of arena
@@ -310,13 +429,23 @@ impl Arena {
     ///
     /// # Safety
     /// At most one `ArenaWriter` may be live per arena at any time, and no
-    /// [`RegionWriter`] (from [`region`](Self::region)) or
+    /// `RegionWriter` (from [`region`](Self::region)) or
     /// [`commit_regions`](Self::commit_regions) call may overlap its
     /// lifetime. In `aether-graph` the proof is `DynamicGraph::writer()`'s
     /// CAS guard: one `Writer` exists at a time and owns the handle.
     #[inline]
     pub unsafe fn writer(&self) -> ArenaWriter<'_> {
-        ArenaWriter { arena: self }
+        // Bump cursors at guard start: a slot index at-or-past them was
+        // allocated by this guard ("young"), so it was never reachable
+        // from any committed snapshot. Recycled indices sit below them
+        // and conservatively classify as old.
+        let low = self.cursors.0.0.load(Ordering::Relaxed);
+        let high = self.cursors.0.1.load(Ordering::Relaxed);
+        ArenaWriter {
+            arena: self,
+            young_chunk_start: (low / CHUNK_SLOT) as u32,
+            young_interior_start: ((self.capacity - high) / INTERIOR_SLOT) as u32,
+        }
     }
 
     // -- Access -------------------------------------------------------------
@@ -400,18 +529,32 @@ impl Arena {
         unsafe { std::ptr::write(p, next) };
     }
 
-    /// Thread every grace-cleared pending batch onto the intrusive free
-    /// lists. Writing the link into a freed slot is sound precisely
-    /// because grace has passed: no reader can still hold a reference.
+    /// Free every ready pending batch: young ones on gate grace, old ones
+    /// on grace plus release of all pins below their stamp. Conditions
+    /// are prefix-closed over each stamp-ordered queue, so each drains
+    /// from the front to its first blocked batch.
     fn reclaim_ready(&self, rec: &mut Recycler) {
-        for batch in &mut rec.ring {
-            if !batch.occupied || !self.gate.grace_passed(&batch.snap) {
-                continue;
-            }
+        let min_pinned = self.pins.min_pinned();
+        loop {
+            let ready_young = rec
+                .pending_young
+                .front()
+                .is_some_and(|b| self.gate.grace_passed(&b.snap));
+            let queue = if ready_young {
+                &mut rec.pending_young
+            } else {
+                let ready_old = rec.pending_old.front().is_some_and(|b| {
+                    b.stamp_epoch <= min_pinned && self.gate.grace_passed(&b.snap)
+                });
+                if !ready_old {
+                    return;
+                }
+                &mut rec.pending_old
+            };
+            let mut batch = queue.pop_front().expect("front checked");
             for idx in batch.chunks.drain(..) {
-                // SAFETY: grace passed — the slot is unobservable; the
-                // link write targets in-bounds memory owned by the sole
-                // mutator (`rec` is reached only through `ArenaWriter`).
+                // SAFETY: the batch's conditions passed — the slot is
+                // unobservable; `rec` is exclusive via `ArenaWriter`.
                 unsafe { self.write_link(idx as usize * CHUNK_SLOT, rec.free_chunk_head) };
                 rec.free_chunk_head = idx;
                 rec.free_chunks += 1;
@@ -422,7 +565,9 @@ impl Arena {
                 rec.free_interior_head = idx;
                 rec.free_interiors += 1;
             }
-            batch.occupied = false;
+            if rec.spare.len() < SPARE_BATCHES {
+                rec.spare.push(batch);
+            }
         }
     }
 
@@ -508,6 +653,9 @@ impl Drop for Arena {
 /// API.
 pub struct ArenaWriter<'a> {
     arena: &'a Arena,
+    /// First bump slot index of each class allocated by this guard.
+    young_chunk_start: u32,
+    young_interior_start: u32,
 }
 
 impl std::ops::Deref for ArenaWriter<'_> {
@@ -652,41 +800,59 @@ impl ArenaWriter<'_> {
         Some(idx)
     }
 
-    /// Stamp the retire log with a gate snapshot and queue it for
-    /// reclamation, then fold any batches whose grace period has already
-    /// passed onto the free lists.
-    ///
-    /// The log's buffers are swapped with pre-sized ring buffers, so a
-    /// flush at the [`RetireLog::wants_flush`] watermark never allocates.
-    /// If every ring slot is still awaiting grace, the logged slots are
-    /// dropped (garbage until compact) — recycling is an optimization and
-    /// must never block the writer.
+    /// Stamp the retire log with a gate snapshot and `stamp_epoch` (the
+    /// epoch the current guard commits), partition it into young/old
+    /// batches, queue them, and fold any ready batches onto the free
+    /// lists. Buffers come from a pool, so steady-state flushes never
+    /// allocate; at the pending cap the slots are dropped instead
+    /// (recycling never blocks the writer).
     ///
     /// # Safety
-    /// Every logged slot must already be unreachable from any published
-    /// root (the root stores superseding it have happened), and no slot
-    /// may be logged twice. The snapshot's meaning is "any reader that
-    /// entered after this point cannot observe the logged slots"; stamping
-    /// a still-published slot would let a later reader walk memory that
-    /// gets rewritten under it.
-    pub(crate) unsafe fn retire(&mut self, log: &mut RetireLog) {
+    /// Every logged slot must already be unreachable from every published
+    /// root, and no slot may be logged twice.
+    pub(crate) unsafe fn retire(&mut self, log: &mut RetireLog, stamp_epoch: u64) {
         if log.chunks.is_empty() && log.interiors.is_empty() {
             return;
         }
         let rec = self.recycler();
         self.arena.reclaim_ready(rec);
-        let Some(slot) = rec.ring.iter_mut().find(|b| !b.occupied) else {
+        if rec.pending_young.len() + rec.pending_old.len() >= MAX_PENDING_BATCHES {
             rec.leaked += (log.chunks.len() + log.interiors.len()) as u64;
             log.chunks.clear();
             log.interiors.clear();
             return;
-        };
-        std::mem::swap(&mut slot.chunks, &mut log.chunks);
-        std::mem::swap(&mut slot.interiors, &mut log.interiors);
+        }
+        // Split by guard-start cursor: young slots (allocated this guard)
+        // free on gate grace alone; old ones also wait out older pins.
+        let mut young = rec.spare.pop().unwrap_or_else(PendingBatch::new);
+        let mut old = rec.spare.pop().unwrap_or_else(PendingBatch::new);
+        for &idx in &log.chunks {
+            if idx >= self.young_chunk_start {
+                young.chunks.push(idx);
+            } else {
+                old.chunks.push(idx);
+            }
+        }
+        for &idx in &log.interiors {
+            if idx >= self.young_interior_start {
+                young.interiors.push(idx);
+            } else {
+                old.interiors.push(idx);
+            }
+        }
         log.chunks.clear();
         log.interiors.clear();
-        self.arena.gate.snapshot(&mut slot.snap);
-        slot.occupied = true;
+        let mut snap = [0u64; GATE_STRIPES];
+        self.arena.gate.snapshot(&mut snap);
+        for (mut batch, queue) in [(young, &mut rec.pending_young), (old, &mut rec.pending_old)] {
+            if batch.chunks.is_empty() && batch.interiors.is_empty() {
+                rec.spare.push(batch);
+            } else {
+                batch.stamp_epoch = stamp_epoch;
+                batch.snap = snap;
+                queue.push_back(batch);
+            }
+        }
     }
 
     /// Fold grace-cleared pending batches onto the free lists without
@@ -702,9 +868,9 @@ impl ArenaWriter<'_> {
     pub(crate) fn recycle_stats(&self) -> RecycleStats {
         let rec = self.recycler();
         let pending = rec
-            .ring
+            .pending_young
             .iter()
-            .filter(|b| b.occupied)
+            .chain(rec.pending_old.iter())
             .map(|b| b.chunks.len() + b.interiors.len())
             .sum::<usize>();
         RecycleStats {
@@ -830,7 +996,7 @@ mod tests {
         log.chunks.push(b);
         // No readers in flight: grace passes at the next reclaim.
         // SAFETY: the logged slots are test-local and never published.
-        unsafe { aw.retire(&mut log) };
+        unsafe { aw.retire(&mut log, 1) };
         aw.reclaim();
         let stats = aw.recycle_stats();
         assert_eq!(stats.free_chunks, 2);
@@ -851,7 +1017,7 @@ mod tests {
         let guard = arena.read_guard();
         log.chunks.push(a);
         // SAFETY: the logged slot is test-local and never published.
-        unsafe { aw.retire(&mut log) };
+        unsafe { aw.retire(&mut log, 1) };
         aw.reclaim();
         assert_eq!(
             aw.recycle_stats().free_chunks,
@@ -873,7 +1039,7 @@ mod tests {
         let a = aw.alloc_chunk().unwrap();
         log.chunks.push(a);
         // SAFETY: the logged slot is test-local and never published.
-        unsafe { aw.retire(&mut log) };
+        unsafe { aw.retire(&mut log, 1) };
         // This reader entered after the snapshot: it can only see the
         // post-retirement roots, so it must not block reuse.
         let _guard = arena.read_guard();
@@ -892,7 +1058,7 @@ mod tests {
         let _b = aw.alloc_chunk().unwrap();
         log.chunks.push(a);
         // SAFETY: the logged slot is test-local and never published.
-        unsafe { aw.retire(&mut log) };
+        unsafe { aw.retire(&mut log, 1) };
         // The stamped batch is reclaimed by the exhausted alloc itself.
         let c = aw.alloc_chunk().unwrap();
         assert_eq!(c, a);
@@ -908,7 +1074,7 @@ mod tests {
         let i1 = aw.alloc_interior().unwrap();
         log.interiors.push(i0);
         // SAFETY: the logged slot is test-local and never published.
-        unsafe { aw.retire(&mut log) };
+        unsafe { aw.retire(&mut log, 1) };
         aw.reclaim();
         assert_eq!(aw.recycle_stats().free_interiors, 1);
         assert_eq!(aw.alloc_interior().unwrap(), i0);
@@ -930,6 +1096,81 @@ mod tests {
         let p1 = unsafe { arena.interior_ptr(1) };
         assert!(p0 > p1);
         assert_eq!(p0.addr() % INTERIOR_SLOT, 0);
+    }
+
+    #[test]
+    fn pin_blocks_old_batches_until_release() {
+        let arena = Arena::new(4096);
+        // SAFETY: dropped before the second handle exists.
+        let a = unsafe { arena.writer() }.alloc_chunk().unwrap();
+
+        // `a` predates this guard, so it partitions as old.
+        // SAFETY: the first handle is gone.
+        let mut aw = unsafe { arena.writer() };
+        let ticket = PinTicket::new(Arc::clone(arena.pins()), 5);
+        let mut log = RetireLog::new();
+        log.chunks.push(a);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log, 10) };
+        aw.reclaim();
+        assert_eq!(
+            aw.recycle_stats().free_chunks,
+            0,
+            "pin 5 must block stamp 10"
+        );
+        assert_eq!(aw.recycle_stats().pending, 1);
+        drop(ticket);
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, 1);
+    }
+
+    #[test]
+    fn pin_at_or_past_stamp_does_not_block() {
+        let arena = Arena::new(4096);
+        // SAFETY: dropped before the second handle exists.
+        let a = unsafe { arena.writer() }.alloc_chunk().unwrap();
+        // SAFETY: the first handle is gone.
+        let mut aw = unsafe { arena.writer() };
+        let _ticket = PinTicket::new(Arc::clone(arena.pins()), 10);
+        let mut log = RetireLog::new();
+        log.chunks.push(a);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log, 10) };
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, 1);
+    }
+
+    #[test]
+    fn young_slots_recycle_under_any_pin() {
+        let arena = Arena::new(4096);
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let _ticket = PinTicket::new(Arc::clone(arena.pins()), 0);
+        // Allocated by this guard: young, gate grace alone frees it.
+        let b = aw.alloc_chunk().unwrap();
+        let mut log = RetireLog::new();
+        log.chunks.push(b);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log, 10) };
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, 1);
+    }
+
+    #[test]
+    fn min_pinned_tracks_registrations() {
+        let reg = Arc::new(PinRegistry::new());
+        assert_eq!(reg.min_pinned(), u64::MAX);
+        let t5 = PinTicket::new(Arc::clone(&reg), 5);
+        let t5b = t5.clone();
+        let t7 = PinTicket::new(Arc::clone(&reg), 7);
+        assert_eq!(reg.min_pinned(), 5);
+        assert_eq!(reg.pin_count(), 3);
+        drop(t5);
+        assert_eq!(reg.min_pinned(), 5, "refcount holds the epoch");
+        drop(t5b);
+        assert_eq!(reg.min_pinned(), 7);
+        drop(t7);
+        assert_eq!(reg.min_pinned(), u64::MAX);
     }
 
     #[test]

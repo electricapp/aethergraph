@@ -65,15 +65,22 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
 filterwarnings = [
+    # Everything not explicitly waived below is an error.
+    "error",
     # Upstream issues - cannot fix from our code:
     # PyG imports deprecated torch_geometric.distributed internally
     "ignore:.*torch_geometric.distributed.*:DeprecationWarning",
+    # PyG calls deprecated torch.jit.script at import
+    "ignore:`torch.jit.script` is deprecated:DeprecationWarning",
     # Ray DataContext uses deprecated config names internally
     "ignore:.*use_push_based_shuffle.*:DeprecationWarning",
     "ignore:.*use_polars.*:DeprecationWarning",
     "ignore:.*use_arrow_tensor_v2.*:DeprecationWarning",
     # ray.shutdown() leaves worker Popen handles to be GC'd at interpreter exit
     "ignore:Exception ignored in. .function Popen.__del__:pytest.PytestUnraisableExceptionWarning",
+    # ray's process-kill path leaks its own log-file handles
+    "ignore:unclosed file:ResourceWarning:ray._private",
+    "ignore:Exception ignored in. ._io.FileIO:pytest.PytestUnraisableExceptionWarning",
 ]
 
 [tool.ruff]

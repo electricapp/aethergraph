@@ -76,3 +76,65 @@ fn concurrent_readers_never_observe_a_torn_tree() {
         );
     }
 }
+
+/// Gate-free pinned reads must return the exact frozen adjacency while the
+/// writer churns and recycles underneath — the pin, not the reader gate,
+/// is what keeps the snapshot's slots from being rewritten.
+#[test]
+fn pinned_snapshot_reads_are_stable_under_concurrent_churn() {
+    const NUM_VERTICES: u32 = 128;
+
+    let g = Arc::new(DynamicGraph::new(NUM_VERTICES as usize, 256 << 20));
+    {
+        let mut w = g.writer().unwrap();
+        for v in 0..NUM_VERTICES {
+            for k in 1..=8 {
+                w.insert_edge(v, (v + k) % NUM_VERTICES).unwrap();
+            }
+        }
+    }
+    let snap = g.acquire();
+
+    // Expected adjacency, frozen through the snapshot itself.
+    let mut expected: Vec<Vec<u32>> = Vec::with_capacity(NUM_VERTICES as usize);
+    let mut buf = Vec::new();
+    for v in 0..NUM_VERTICES {
+        snap.neighbors_into(&g, v, &mut buf);
+        expected.push(buf.clone());
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let g = Arc::clone(&g);
+            let snap = snap.clone();
+            let expected = expected.clone();
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    for v in 0..NUM_VERTICES {
+                        snap.neighbors_into(&g, v, &mut buf);
+                        assert_eq!(buf, expected[v as usize], "snapshot moved under pin");
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Writer: many small commits churning every vertex, forcing retire
+    // and recycling of everything the pin doesn't hold.
+    for round in 0..48u32 {
+        for v in 0..NUM_VERTICES {
+            let mut w = g.writer().unwrap();
+            for k in 9..=24 {
+                let _ = w.insert_edge(v, (v + k + round) % NUM_VERTICES);
+            }
+        }
+    }
+
+    done.store(true, Ordering::Release);
+    for r in readers {
+        r.join().expect("pinned reader observed churn");
+    }
+}

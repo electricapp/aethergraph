@@ -125,6 +125,17 @@ jobs:
           cargo clippy --workspace --all-targets --no-deps \
             --features "${{ matrix.features }}" -- -D warnings
 
+      - name: rustdoc (no features)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+      - name: rustdoc (with features)
+        if: matrix.features != ''
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --features "${{ matrix.features }}"
+
       - name: xdp_bpf compile check
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p aether-stream --tests --features xdp_bpf
@@ -273,6 +284,10 @@ jobs:
       - run: cargo test -p aether-graph --features wal
       - name: wal over io_uring group commit
         run: cargo test -p aether-graph --features "wal io-uring"
+      - name: rustdoc (wal)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p aether-graph --no-deps --features "wal io-uring"
       - name: Summary
         if: always()
         run: |
@@ -431,6 +446,7 @@ jobs:
         with:
           key: loom
       - run: cargo test -p aether-graph --features loom --test loom_writer_guard
+      - run: cargo test -p aether-graph --features loom --test loom_pin_reclaim
       - run: cargo test -p aethergraph-core --features loom --test loom_union_find
       - run: cargo test -p aether-mem --test loom_lockfree --release
         env:

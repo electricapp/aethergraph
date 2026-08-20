@@ -481,3 +481,78 @@ class TestWalDurability:
         wal.write_bytes(b"NOT_A_WAL_FILE\0\0\0\0\0\0\0\0\0\0\0\0")
         with pytest.raises(ValueError, match="bad magic"):
             DynamicGraph.open_with_wal(wal, num_vertices=10)
+
+
+class TestAcquireSnapshot:
+    """Pinned snapshots: immutability under concurrent inserts."""
+
+    def test_snapshot_is_frozen(self) -> None:
+        g = DynamicGraph(num_vertices=100)
+        g.insert_edge(0, 1)
+        snap = g.acquire()
+        g.insert_edge(0, 2)
+
+        assert snap.degree(0) == 1
+        assert snap.has_edge(0, 1)
+        assert not snap.has_edge(0, 2)
+        np.testing.assert_array_equal(snap.neighbors(0), [1])
+        assert g.degree(0) == 2
+
+    def test_epoch_and_counts(self) -> None:
+        g = DynamicGraph(num_vertices=10)
+        s0 = g.acquire()
+        assert s0.epoch == 0
+        assert s0.num_edges == 0
+        g.insert_edge(1, 2)
+        s1 = g.acquire()
+        assert s1.epoch == g.current_epoch
+        assert s1.num_edges == 1
+        assert s1.num_vertices == 10
+        assert len(s1) == 10
+
+    def test_to_static_is_commit_cut(self) -> None:
+        g = DynamicGraph(num_vertices=4)
+        g.insert_edge(0, 1)
+        g.insert_edge(2, 3)
+        snap = g.acquire()
+        g.insert_edge(0, 3)
+
+        frozen = snap.to_static()
+        assert frozen.num_edges == 2
+        assert frozen.degree(0) == 1
+        assert frozen.degree(2) == 1
+
+    def test_out_of_range_raises(self) -> None:
+        g = DynamicGraph(num_vertices=4)
+        snap = g.acquire()
+        with pytest.raises(ValueError, match="out of range"):
+            snap.degree(99)
+        with pytest.raises(ValueError, match="out of range"):
+            snap.neighbors(99)
+
+    def test_stable_under_concurrent_inserts(self) -> None:
+        g = DynamicGraph(num_vertices=64)
+        for v in range(64):
+            g.insert_edge(v, (v + 1) % 64)
+        snap = g.acquire()
+        expected = {v: list(snap.neighbors(v)) for v in range(64)}
+
+        stop = threading.Event()
+        failures: list[str] = []
+
+        def read() -> None:
+            while not stop.is_set():
+                for v in range(64):
+                    got = list(snap.neighbors(v))
+                    if got != expected[v]:
+                        failures.append(f"vertex {v}: {got} != {expected[v]}")
+                        return
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        for round_ in range(50):
+            for v in range(64):
+                g.insert_edge(v, (v + 2 + round_) % 64)
+        stop.set()
+        reader.join()
+        assert not failures

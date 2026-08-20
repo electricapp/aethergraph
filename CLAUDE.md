@@ -85,9 +85,14 @@ passes every local check and fails in CI.
 
 ```bash
 scripts/check-linux.sh --clippy --tests   # what CI runs, cross-compiled
+scripts/check-linux.sh --arm              # same, aarch64-linux
+scripts/linux-test.sh -p aether-graph --features "wal io-uring"  # RUN tests
 ```
 
-It uses zig as the cross toolchain (`brew install zig`, plus
-`rustup target add x86_64-unknown-linux-gnu`) — no container, no emulation. Run
-it after touching anything Linux-gated. It is not a pre-commit or pre-push hook,
-because a full cross-check costs more than a commit should.
+`check-linux.sh` uses zig as the cross toolchain (`brew install zig`, plus
+`rustup target add x86_64-unknown-linux-gnu` / `aarch64-...` for `--arm`) — no
+container, no emulation; it proves the build, not the behavior. `linux-test.sh`
+executes tests in a lima VM (`brew install lima`, arm64 Linux, real kernel —
+io_uring/uffd/memfd actually run; RDMA/XDP self-skip). Run one of them after
+touching anything Linux-gated. Neither is a pre-commit or pre-push hook, because
+a full cross-check costs more than a commit should.
