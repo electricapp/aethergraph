@@ -161,7 +161,7 @@ pub fn serve_control_plane(
 /// The accept loop is single-threaded: each handshake is processed to
 /// completion before the next connection is accepted, so a client that stalls
 /// mid-handshake blocks all other clients until the TCP timeout fires (see
-/// [`TCP_TIMEOUT`]). Each server QP must outlive the RDMA connection it backs,
+/// `TCP_TIMEOUT`). Each server QP must outlive the RDMA connection it backs,
 /// so QPs are retained in `active_qps` for the server's entire lifetime; the
 /// table grows monotonically with the number of clients ever served and is
 /// freed only when this function returns (server shutdown).
