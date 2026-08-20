@@ -240,7 +240,7 @@ impl FeatureTable {
     /// # Panic safety
     /// If the user-supplied `features` slice access — or any code path inside
     /// this function — panics between steps 1 and 4, an internal
-    /// [`SeqlockWriteGuard`] still runs and forces head to an even value
+    /// `SeqlockWriteGuard` still runs and forces head to an even value
     /// (`prev + 2`, abandoning the in-progress generation). Without this,
     /// any reader that observed the odd head would spin forever waiting for
     /// the write to complete.

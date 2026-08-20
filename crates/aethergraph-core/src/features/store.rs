@@ -517,7 +517,7 @@ impl FeatureStore {
     /// the gather code indexes exactly like a mapping, but residency is
     /// bounded by the caller instead of by kernel policy, and eviction
     /// follows `weights` — pass node degrees (see
-    /// [`PageWeights::from_node_degrees`]) so a hot hub node's pages
+    /// [`PageWeights::from_node_degrees`](crate::PageWeights::from_node_degrees)) so a hot hub node's pages
     /// outlive a cold leaf's.
     ///
     /// Requires `vm.unprivileged_userfaultfd=1` or `CAP_SYS_PTRACE`;

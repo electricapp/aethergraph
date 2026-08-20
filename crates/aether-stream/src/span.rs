@@ -5,7 +5,7 @@
 //! a DMA descriptor list — pays per range, not per byte, so the number of
 //! ranges is the cost that matters.
 //!
-//! Lives outside the GPU module although [`gpu::uvm`](crate::gpu::uvm) is
+//! Lives outside the GPU module although `gpu::uvm` is
 //! its caller: the arithmetic needs no CUDA, and behind the `gpudirect`
 //! feature its tests would only ever be type-checked, never run.
 
