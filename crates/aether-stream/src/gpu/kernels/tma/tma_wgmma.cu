@@ -4,7 +4,6 @@
 //   - B staged into shared memory once per CTA (reused across rows)
 //   - A consumed with ld.global.cs.v4.f32 (streaming, once-touched)
 //   - multiple independent FMA accumulators for ILP
-//   - SM80+: cp.async pipeline into smem tiles of A when cols are large
 //
 // Hopper TMA + WGMMA / Blackwell tcgen05 need host-side tensor-map
 // descriptors (cuTensorMapEncodeTiled) which NVRTC string kernels cannot

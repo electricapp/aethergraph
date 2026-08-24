@@ -109,6 +109,13 @@ static long aether_p2pdma_ioctl(struct file *file, unsigned int cmd,
 		msg.resp.status = AETHER_P2PDMA_UNSUPPORTED;
 	} else if (msg.req.require_iommu && !iommu_present(&pci_bus_type)) {
 		msg.resp.status = AETHER_P2PDMA_NO_IOMMU;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0)
+	} else if (pci_acs_enabled(producer, PCI_ACS_RR) ||
+		   pci_acs_enabled(consumer, PCI_ACS_RR)) {
+		/* Request Redirection forces peer DMA via the root complex. */
+		msg.resp.status = AETHER_P2PDMA_ACS_REDIRECTED;
+		msg.resp.distance = (u32)distance;
+#endif
 	} else if ((u32)distance > msg.req.maximum_distance) {
 		msg.resp.status = AETHER_P2PDMA_TOO_FAR;
 		msg.resp.distance = (u32)distance;

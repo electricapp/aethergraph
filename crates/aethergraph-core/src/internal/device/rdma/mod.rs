@@ -13,5 +13,5 @@ pub use devx::{
 pub use dpa::DpaParsePipeline;
 pub use flexio::{DpaStagingRegion, FlexIoHost};
 pub use gpu_eth::{FlowSteeringRule, GpuRingPlacement};
-pub use ibgda::{IbgdaQueue, Mlx5DoorbellRecord};
+pub use ibgda::{IbgdaError, IbgdaQueue, MLX5_WQE_BB, Mlx5DoorbellRecord};
 pub use mlx5_wqe::Mlx5RdmaReadWqe;

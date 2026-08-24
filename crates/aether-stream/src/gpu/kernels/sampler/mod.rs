@@ -2,8 +2,11 @@
 //!
 //! One warp owns one seed. Algorithm R (`fanout <= 32`) streams neighbors
 //! through a shared 32-wide `ld.global.cs` window; reservoir state stays in
-//! registers with `__ballot_sync` replacement. Larger fanouts use
-//! with-replacement Philox draws. Bit-parity vs [`aethergraph_core::reservoir_sample`].
+//! registers with `__ballot_sync` replacement. Bit-parity vs
+//! [`aethergraph_core::reservoir_sample`] holds for that path.
+//!
+//! Larger fanouts use with-replacement Philox draws (not Algorithm R) — do
+//! not diff those outputs against `reservoir_sample`.
 //!
 //! TODO(HARDWARE): C-tree arena walker + NeighborSampler parity on-box.
 

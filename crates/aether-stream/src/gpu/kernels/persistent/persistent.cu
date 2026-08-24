@@ -47,8 +47,8 @@ extern "C" __global__ void persistent_work_drain(
 
     while (true) {
         const int stopping = *(volatile int*)stop;
-        const unsigned int h = *head;
-        const unsigned int t = *tail;
+        const unsigned int h = *(volatile unsigned int*)head;
+        const unsigned int t = *(volatile unsigned int*)tail;
         const unsigned int fqh = fq_head;
         const unsigned int fqt = fq_tail;
         const unsigned int cqh = cq_head;
@@ -63,7 +63,7 @@ extern "C" __global__ void persistent_work_drain(
         if (warp == 0 && lane == 0) {
             if (!global_empty && (fqt - fqh) < (unsigned int)LOCAL_CAP) {
                 const PersistentWork work = ring[h & gmask];
-                *head = h + 1;
+                *(volatile unsigned int*)head = h + 1;
                 fetch_q[fqt & lmask] = work;
                 __threadfence_block();
                 fq_tail = fqt + 1;

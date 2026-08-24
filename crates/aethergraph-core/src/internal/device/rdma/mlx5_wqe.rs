@@ -8,6 +8,8 @@
 
 /// mlx5 transport opcode for RDMA READ.
 pub const MLX5_OPCODE_RDMA_READ: u8 = 0x10;
+/// `fm_ce_se` bit: generate a CQ entry on success.
+pub const MLX5_WQE_CTRL_CQ_UPDATE: u8 = 2 << 2;
 const WQE_SEGMENTS: u32 = 3;
 
 /// A packed mlx5 RDMA READ WQE: ctrl, data, then remote-address segment.
@@ -19,7 +21,9 @@ pub struct Mlx5RdmaReadWqe {
     /// `qpn_ds`, big-endian: QPN bits 31:8, DS bits 5:0.
     pub ctrl_qpn_ds: [u8; 4],
     pub ctrl_signature: u8,
-    pub ctrl_reserved: [u8; 3],
+    pub ctrl_rsvd: [u8; 2],
+    /// Fence / CQ-update / solicited bits (`fm_ce_se`).
+    pub ctrl_fm_ce_se: u8,
     pub ctrl_imm: [u8; 4],
     /// Data segment: byte count, local key, local address.
     pub byte_count: [u8; 4],
@@ -34,7 +38,7 @@ pub struct Mlx5RdmaReadWqe {
 const _: () = assert!(core::mem::size_of::<Mlx5RdmaReadWqe>() == 48);
 
 impl Mlx5RdmaReadWqe {
-    /// Build one-signature-less RDMA READ WQE.
+    /// Build one RDMA READ WQE with CQ update requested.
     ///
     /// `wqe_counter` is the producer index assigned by the QP; `qpn` must fit
     /// the 24-bit field prescribed by the mlx5 control segment.
@@ -54,7 +58,8 @@ impl Mlx5RdmaReadWqe {
             ctrl_opmod_idx_opcode: opmod_idx_opcode.to_be_bytes(),
             ctrl_qpn_ds: qpn_ds.to_be_bytes(),
             ctrl_signature: 0,
-            ctrl_reserved: [0; 3],
+            ctrl_rsvd: [0; 2],
+            ctrl_fm_ce_se: MLX5_WQE_CTRL_CQ_UPDATE,
             ctrl_imm: [0; 4],
             byte_count: byte_count.to_be_bytes(),
             lkey: lkey.to_be_bytes(),
@@ -73,6 +78,11 @@ impl Mlx5RdmaReadWqe {
     /// Number of 16-byte segments consumed by this WQE.
     pub fn segment_count(self) -> u8 {
         (u32::from_be_bytes(self.ctrl_qpn_ds) & 0x3f) as u8
+    }
+
+    /// True when CQ update is requested.
+    pub fn requests_cq_update(self) -> bool {
+        self.ctrl_fm_ce_se & MLX5_WQE_CTRL_CQ_UPDATE != 0
     }
 }
 
@@ -107,6 +117,7 @@ mod tests {
         );
         assert_eq!(wqe.qpn(), 0x12_3456);
         assert_eq!(wqe.segment_count(), 3);
+        assert!(wqe.requests_cq_update());
         assert_eq!(u32::from_be_bytes(wqe.ctrl_opmod_idx_opcode), 0x0000_4210);
         assert_eq!(u32::from_be_bytes(wqe.byte_count), 4096);
         assert_eq!(u64::from_be_bytes(wqe.remote_address), 0x9000_a000);

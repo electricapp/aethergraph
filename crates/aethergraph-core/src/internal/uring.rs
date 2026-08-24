@@ -46,10 +46,11 @@ struct ProvidedBufferRing {
     spec: ProvidedBufferRingSpec,
     ring: NonNull<BufRingEntry>,
     ring_layout: Layout,
+    buf_len: u32,
     /// One contiguous allocation, split conceptually into `entries` buffers.
     /// Keeping it here proves every published address remains valid while the
     /// kernel can select this buffer group.
-    _buffers: Vec<u8>,
+    buffers: Vec<u8>,
 }
 
 // SAFETY: The allocation addresses remain stable if this owner moves, and all
@@ -121,7 +122,8 @@ impl ProvidedBufferRing {
             spec,
             ring,
             ring_layout,
-            _buffers: buffers,
+            buf_len,
+            buffers,
         })
     }
 
@@ -137,6 +139,33 @@ impl ProvidedBufferRing {
             )
         }
         .context("failed to register provided-buffer ring")
+    }
+
+    /// Return `bid` to the provided-buffer ring so the kernel can select it again.
+    fn republish(&self, bid: u16) -> Result<()> {
+        anyhow::ensure!(
+            bid < self.spec.entries,
+            "buffer id {bid} out of range for {}-entry ring",
+            self.spec.entries
+        );
+        let mask = self.spec.entries - 1;
+        // SAFETY: `ring` is the live descriptor array.
+        let tail_ptr = unsafe { BufRingEntry::tail(self.ring.as_ptr()) };
+        // SAFETY: `tail` aliases the ring's properly aligned `u16` field.
+        let tail_atom = unsafe { &*tail_ptr.cast::<AtomicU16>() };
+        let tail = tail_atom.load(Ordering::Relaxed);
+        let slot = usize::from(tail & mask);
+        // SAFETY: `slot < entries` because of the mask.
+        let entry_ptr = unsafe { self.ring.as_ptr().add(slot) };
+        // SAFETY: `entry_ptr` points inside the descriptor ring.
+        let entry = unsafe { &mut *entry_ptr };
+        let offset = usize::from(bid) * self.buf_len as usize;
+        entry.set_addr(self.buffers.as_ptr().wrapping_add(offset) as u64);
+        entry.set_len(self.buf_len);
+        entry.set_bid(bid);
+        core::sync::atomic::fence(Ordering::Release);
+        tail_atom.store(tail.wrapping_add(1), Ordering::Release);
+        Ok(())
     }
 }
 
@@ -912,8 +941,13 @@ impl UringHandle {
     /// Submit one `Read` with `IOSQE_BUFFER_SELECT` against the registered
     /// provided-buffer group. Returns the CQE buffer id on success.
     ///
-    /// Requires a prior [`Self::register_provided_buffer_ring`]. The kernel
-    /// picks a landing buffer; userspace does not pass a destination pointer.
+    /// The selected buffer stays checked out until
+    /// [`Self::republish_provided_buffer`] — do not republish before copying
+    /// the payload out, or the kernel may overwrite it.
+    ///
+    /// Requires a prior [`Self::register_provided_buffer_ring`]. Completions
+    /// are matched by `user_data` so a shared ring with prior CQEs cannot
+    /// return the wrong entry.
     #[allow(dead_code)]
     pub fn read_buffer_select(
         &mut self,
@@ -926,11 +960,14 @@ impl UringHandle {
         let bgid = self
             .provided_buffer_ring_bgid()
             .context("no provided-buffer ring registered")?;
+        // Unique cookie for this SQE; avoid colliding with other submitters.
+        let user_data = 0xAE71_B5E1_0001u64;
         let read = opcode::Read::new(types::Fd(fd), std::ptr::null_mut(), len)
             .offset(offset)
             .buf_group(bgid)
             .build()
-            .flags(squeue::Flags::BUFFER_SELECT);
+            .flags(squeue::Flags::BUFFER_SELECT)
+            .user_data(user_data);
         // SAFETY: SQE is fully initialized; BUFFER_SELECT makes `buf` unused.
         unsafe {
             self.ring
@@ -938,12 +975,18 @@ impl UringHandle {
                 .push(&read)
                 .context("submission queue full")?;
         }
-        self.ring.submit_and_wait(1)?;
-        let cqe = self
-            .ring
-            .completion()
-            .next()
-            .context("missing completion for buffer-select read")?;
+
+        let cqe = loop {
+            if let Some(cqe) = self.ring.completion().next() {
+                anyhow::ensure!(
+                    cqe.user_data() == user_data,
+                    "buffer-select read saw foreign CQE user_data={:#x}; drain the ring first",
+                    cqe.user_data()
+                );
+                break cqe;
+            }
+            self.ring.submit_and_wait(1)?;
+        };
         let res = cqe.result();
         if res < 0 {
             return Err(std::io::Error::from_raw_os_error(-res))
@@ -951,6 +994,17 @@ impl UringHandle {
         }
         let bid = cqueue::buffer_select(cqe.flags()).context("CQE missing buffer id")?;
         Ok(bid)
+    }
+
+    /// Return a buffer id from [`Self::read_buffer_select`] to the PBUF ring
+    /// after the caller has finished reading its payload.
+    #[allow(dead_code)]
+    pub fn republish_provided_buffer(&self, bid: u16) -> Result<()> {
+        let ring = self
+            .provided_buf_ring
+            .as_ref()
+            .context("no provided-buffer ring registered")?;
+        ring.republish(bid)
     }
 
     /// Registered fixed-buffer region as (base address, length), if any.
@@ -1677,6 +1731,9 @@ mod tests {
         match handle.read_buffer_select(file.as_raw_fd(), 4096, 0) {
             Ok(bid) => {
                 assert!(bid < spec.entries, "bid {bid} within ring");
+                // Smoke path: no payload inspect; return the bid so the ring
+                // does not permanently drain under repeated calls.
+                handle.republish_provided_buffer(bid).unwrap();
             }
             Err(e) => {
                 // Some kernels register PBUF but reject BUFFER_SELECT on

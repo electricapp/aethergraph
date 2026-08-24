@@ -4,6 +4,9 @@
 //! [`PersistentWork`] entries until the host sets a stop flag. Three warps
 //! specialize into fetch / transform / compute roles over shared queues so
 //! the next ring claim overlaps in-flight local work.
+//!
+//! Host control traffic (post / stop) uses a **separate** CUDA stream from the
+//! drain kernel so memcpys are not stuck behind the infinite spin.
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
@@ -54,7 +57,10 @@ impl PersistentWork {
 
 /// Host-side controller for a draining persistent kernel.
 pub struct PersistentWorker {
-    stream: Arc<CudaStream>,
+    /// Stream the long-lived drain kernel runs on.
+    drain_stream: Arc<CudaStream>,
+    /// Stream for host↔device copies (must not be `drain_stream`).
+    control_stream: Arc<CudaStream>,
     func: CudaFunction,
     ring: CudaSlice<PersistentWork>,
     head: CudaSlice<u32>,
@@ -67,6 +73,10 @@ pub struct PersistentWorker {
 
 impl PersistentWorker {
     /// Compile the drain kernel and allocate a power-of-two ring.
+    ///
+    /// `stream` is used for the drain kernel. A second stream is created on
+    /// `ctx` for posts/stop so control memcpys can progress while the kernel
+    /// spins.
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
@@ -75,26 +85,37 @@ impl PersistentWorker {
         if capacity == 0 || !capacity.is_power_of_two() {
             return Err("persistent ring capacity must be a non-zero power of two".into());
         }
+        // Allocations live on the control stream (host posts + stop signals).
+        // The drain kernel runs on `stream` but only after `start()`; posting
+        // never races an unfinished async zero-fill on another stream.
+        let control_stream = ctx.new_stream()?;
         let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let ring = control_stream.alloc_zeros(capacity as usize)?;
+        let head = control_stream.alloc_zeros(1)?;
+        let tail = control_stream.alloc_zeros(1)?;
+        let stop = control_stream.alloc_zeros(1)?;
+        let completed = control_stream.alloc_zeros(1)?;
+        control_stream.synchronize()?;
         Ok(Self {
-            stream: stream.clone(),
+            drain_stream: stream.clone(),
+            control_stream,
             func: module.load_function(KERNEL_NAME)?,
-            ring: stream.alloc_zeros(capacity as usize)?,
-            head: stream.alloc_zeros(1)?,
-            tail: stream.alloc_zeros(1)?,
-            stop: stream.alloc_zeros(1)?,
-            completed: stream.alloc_zeros(1)?,
+            ring,
+            head,
+            tail,
+            stop,
+            completed,
             capacity,
             host_tail: 0,
         })
     }
 
-    /// Launch the persistent drain on `stream` (returns immediately).
+    /// Launch the persistent drain on the drain stream (returns immediately).
     pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let capacity = self.capacity as i32;
         // SAFETY: arguments match persistent.cu; allocations outlive the kernel.
         unsafe {
-            self.stream
+            self.drain_stream
                 .launch_builder(&self.func)
                 .arg(&self.ring)
                 .arg(&self.head)
@@ -115,26 +136,32 @@ impl PersistentWorker {
     /// Post one work item. Returns false if the ring is full.
     pub fn post(&mut self, work: PersistentWork) -> Result<bool, Box<dyn std::error::Error>> {
         let mut head = [0u32];
-        self.stream.memcpy_dtoh(&self.head, &mut head)?;
+        self.control_stream.memcpy_dtoh(&self.head, &mut head)?;
+        self.control_stream.synchronize()?;
         if self.host_tail.wrapping_sub(head[0]) >= self.capacity {
             return Ok(false);
         }
         let slot = (self.host_tail & (self.capacity - 1)) as usize;
         {
             let mut view = self.ring.slice_mut(slot..slot + 1);
-            self.stream.memcpy_htod(&[work], &mut view)?;
+            self.control_stream.memcpy_htod(&[work], &mut view)?;
         }
         self.host_tail = self.host_tail.wrapping_add(1);
-        self.stream.memcpy_htod(&[self.host_tail], &mut self.tail)?;
+        self.control_stream
+            .memcpy_htod(&[self.host_tail], &mut self.tail)?;
+        self.control_stream.synchronize()?;
         Ok(true)
     }
 
-    /// Ask the kernel to exit its spin loop, then synchronize the stream.
+    /// Ask the kernel to exit its spin loop, then join the drain stream.
     pub fn stop_and_join(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
-        self.stream.memcpy_htod(&[1i32], &mut self.stop)?;
-        self.stream.synchronize()?;
+        self.control_stream.memcpy_htod(&[1i32], &mut self.stop)?;
+        self.control_stream.synchronize()?;
+        self.drain_stream.synchronize()?;
         let mut completed = [0u64];
-        self.stream.memcpy_dtoh(&self.completed, &mut completed)?;
+        self.control_stream
+            .memcpy_dtoh(&self.completed, &mut completed)?;
+        self.control_stream.synchronize()?;
         Ok(completed[0])
     }
 }

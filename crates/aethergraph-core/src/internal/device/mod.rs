@@ -29,7 +29,7 @@ pub use rdma::devx::{DevxGpuEthPlan, MockDevxBackend};
 pub use rdma::dpa::DpaParsePipeline;
 pub use rdma::flexio::FlexIoHost;
 pub use rdma::gpu_eth::{FlowSteeringRule, GpuRingPlacement};
-pub use rdma::ibgda::IbgdaQueue;
+pub use rdma::ibgda::{IbgdaError, IbgdaQueue};
 pub use rdma::mlx5_wqe::Mlx5RdmaReadWqe;
 
 /// Compatibility path used by `uring` before the nest.

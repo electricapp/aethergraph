@@ -3,9 +3,15 @@
 //! Writers build [`super::ZoneAppendSqe`] commands against a fixed zone start.
 //! Completions carry the LBA the controller assigned; [`ZoneAppendWal`] records
 //! those LBAs without a shared bump allocator.
+//!
+//! `durable_high_water` advances only over a **contiguous** prefix of completed
+//! ranges starting at the previous durable cursor, so out-of-order CQEs cannot
+//! expose unfinished LBAs to readers.
 
 use super::ZoneAppendSqe;
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use parking_lot::Mutex;
+use std::collections::BTreeMap;
 
 /// One completed append: device LBA + writer-visible cookie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,27 +22,30 @@ pub struct ZoneAppendCompletion {
     pub nlb: u16,
 }
 
-/// Lockless multi-writer WAL state for a single open zone.
+/// Multi-writer WAL state for a single open zone.
 ///
-/// The only shared mutable state is a command-id counter and a completion
-/// cursor. Write offsets come from the drive.
+/// Command ids are allocated atomically (no shared bump of LBA). Durable
+/// high-water merges completed ranges under a short mutex so OOO CQEs stay
+/// correct.
 #[derive(Debug)]
 pub struct ZoneAppendWal {
     pub nsid: u32,
     pub zone_start_lba: u64,
     next_cid: AtomicU16,
-    /// Highest exclusive end LBA observed from completions (telemetry).
     high_water: AtomicU64,
+    /// Pending completed ranges keyed by start LBA → exclusive end.
+    pending: Mutex<BTreeMap<u64, u64>>,
 }
 
 impl ZoneAppendWal {
     /// Open a WAL on `zone_start_lba` of `nsid`.
-    pub const fn new(nsid: u32, zone_start_lba: u64) -> Self {
+    pub fn new(nsid: u32, zone_start_lba: u64) -> Self {
         Self {
             nsid,
             zone_start_lba,
             next_cid: AtomicU16::new(1),
             high_water: AtomicU64::new(zone_start_lba),
+            pending: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -47,24 +56,21 @@ impl ZoneAppendWal {
         (cid, sqe)
     }
 
-    /// Record a controller completion. Updates the high-water mark.
+    /// Record a controller completion. Advances durable high-water only for
+    /// the contiguous prefix of completed ranges.
     pub fn complete(&self, cqe: ZoneAppendCompletion) {
+        let start = cqe.assigned_lba;
         let end = cqe.assigned_lba.saturating_add(u64::from(cqe.nlb) + 1);
-        let mut cur = self.high_water.load(Ordering::Relaxed);
-        while end > cur {
-            match self.high_water.compare_exchange_weak(
-                cur,
-                end,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(v) => cur = v,
-            }
+        let mut pending = self.pending.lock();
+        pending.insert(start, end);
+        let mut hw = self.high_water.load(Ordering::Relaxed);
+        while let Some(next_end) = pending.remove(&hw) {
+            hw = next_end;
+            self.high_water.store(hw, Ordering::Release);
         }
     }
 
-    /// Exclusive end of the highest completed append (for readers).
+    /// Exclusive end of the contiguous durable prefix (safe for readers).
     pub fn durable_high_water(&self) -> u64 {
         self.high_water.load(Ordering::Acquire)
     }
@@ -96,6 +102,24 @@ mod tests {
             command_id: 2,
             assigned_lba: 104,
             nlb: 0,
+        });
+        assert_eq!(wal.durable_high_water(), 105);
+    }
+
+    #[test]
+    fn out_of_order_completion_does_not_skip_gap() {
+        let wal = ZoneAppendWal::new(1, 100);
+        // Later LBA completes first.
+        wal.complete(ZoneAppendCompletion {
+            command_id: 2,
+            assigned_lba: 104,
+            nlb: 0,
+        });
+        assert_eq!(wal.durable_high_water(), 100);
+        wal.complete(ZoneAppendCompletion {
+            command_id: 1,
+            assigned_lba: 100,
+            nlb: 3,
         });
         assert_eq!(wal.durable_high_water(), 105);
     }

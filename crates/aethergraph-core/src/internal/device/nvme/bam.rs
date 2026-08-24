@@ -66,14 +66,44 @@ impl BamQueuePair {
         })
     }
 
-    /// Slot index for the next SQE (`tail & (depth-1)`).
-    pub fn sq_slot(&self) -> u32 {
-        self.sq_tail.load(Ordering::Relaxed) & (self.depth - 1)
+    /// In-flight SQEs: `sq_tail - cq_head`.
+    pub fn in_flight(&self) -> u32 {
+        self.sq_tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.cq_head.load(Ordering::Acquire))
     }
 
-    /// Advance the software SQ tail after writing an SQE into the ring.
-    pub fn advance_sq_tail(&self) -> u32 {
-        self.sq_tail.fetch_add(1, Ordering::Release).wrapping_add(1)
+    /// True when another submit would overwrite an uncompleted slot.
+    pub fn is_full(&self) -> bool {
+        self.in_flight() >= self.depth
+    }
+
+    /// Atomically claim the next SQ slot index, or `None` if the queue is full.
+    ///
+    /// Returns the pre-claim tail (slot = `prev & (depth-1)`). Concurrent
+    /// submitters cannot share a slot.
+    pub fn try_claim_sq_slot(&self) -> Option<u32> {
+        loop {
+            let prev = self.sq_tail.load(Ordering::Acquire);
+            let head = self.cq_head.load(Ordering::Acquire);
+            if prev.wrapping_sub(head) >= self.depth {
+                return None;
+            }
+            match self.sq_tail.compare_exchange_weak(
+                prev,
+                prev.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(prev),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Retire `n` completed commands (advances CQ head).
+    pub fn retire(&self, n: u32) {
+        self.cq_head.fetch_add(n, Ordering::Release);
     }
 
     /// Masked doorbell value (NVMe uses the raw tail counter modulo 2^16
@@ -132,7 +162,8 @@ impl BamController {
         if self.bar0.is_null() {
             return Err(BamError::BarNotMapped);
         }
-        let slot = self.qp.sq_slot() as usize;
+        let prev = self.qp.try_claim_sq_slot().ok_or(BamError::QueueFull)?;
+        let slot = (prev & (self.qp.depth - 1)) as usize;
         // SAFETY: caller guarantees `sq_ring` covers `depth` entries.
         let dst = unsafe { sq_ring.add(slot) };
         // SAFETY: `dst` is within the caller-provided ring.
@@ -141,9 +172,14 @@ impl BamController {
         }
         // Ensure the SQE is visible to the controller before the doorbell.
         core::sync::atomic::fence(Ordering::Release);
-        let tail = self.qp.advance_sq_tail();
+        let tail = prev.wrapping_add(1);
         self.ring_sq_doorbell((tail & 0xffff) as u16)?;
         Ok((tail & 0xffff) as u16)
+    }
+
+    /// Retire completed CQ entries so new submits can reuse SQ slots.
+    pub fn retire_completions(&self, n: u32) {
+        self.qp.retire(n);
     }
 
     /// `st.relaxed.mmio` equivalent: volatile 32-bit store to SQ TDBL.
@@ -187,11 +223,10 @@ mod tests {
     }
 
     #[test]
-    fn queue_advances_power_of_two_slots() {
+    fn claim_advances_distinct_slots() {
         let qp = BamQueuePair::new(1, 16).unwrap();
-        assert_eq!(qp.sq_slot(), 0);
-        qp.advance_sq_tail();
-        assert_eq!(qp.sq_slot(), 1);
+        assert_eq!(qp.try_claim_sq_slot(), Some(0));
+        assert_eq!(qp.try_claim_sq_slot(), Some(1));
     }
 
     #[test]
@@ -200,5 +235,22 @@ mod tests {
         let mut ring = [NvmeRwSqe::read(1, 0, 0, 0, NvmeDataPointer::Prp { prp1: 0, prp2: 0 }); 8];
         let err = unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) };
         assert_eq!(err, Err(BamError::BarNotMapped));
+    }
+
+    #[test]
+    fn submit_rejects_when_full_until_retire() {
+        let mut ctl = BamController::new(0, 4, NvmeDoorbellLayout::legacy()).unwrap();
+        let mut bar = [0u8; 0x2000];
+        unsafe { ctl.attach_bar0(bar.as_mut_ptr(), bar.len()) };
+        let mut ring = [NvmeRwSqe::read(1, 0, 0, 0, NvmeDataPointer::Prp { prp1: 0, prp2: 0 }); 4];
+        for _ in 0..4 {
+            assert!(unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) }.is_ok());
+        }
+        assert_eq!(
+            unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) },
+            Err(BamError::QueueFull)
+        );
+        ctl.retire_completions(2);
+        assert!(unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) }.is_ok());
     }
 }

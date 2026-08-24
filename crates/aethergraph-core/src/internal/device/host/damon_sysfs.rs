@@ -1,7 +1,8 @@
 //! K4.2 DAMON sysfs adapter — applies [`DamonConfig`] under a sysfs root.
 //!
-//! Production path uses `/sys/kernel/mm/damon`. Tests pass a temp directory
-//! that mirrors the knobs they care about.
+//! Production path prefers the modern DAMON sysfs tree:
+//! `/sys/kernel/mm/damon/admin/kdamonds/<N>/...`. Tests may pass a temp
+//! directory that only has a stub `scheme` file.
 
 use super::{AccessFrequencyScheme, DamonConfig};
 use std::fs;
@@ -29,42 +30,108 @@ impl DamonSysfs {
         Self { root: root.into() }
     }
 
-    /// Whether the expected control files are present.
+    /// Whether a recognizable DAMON control layout is present.
     #[must_use]
     pub fn available(&self) -> bool {
-        self.root.join("admin_schemes").exists() || self.root.join("attrs").exists()
+        self.kdamond_dir(0).exists()
+            || self.root.join("admin_schemes").exists()
+            || self.root.join("attrs").exists()
+            || self.root.join("scheme").exists()
+    }
+
+    fn kdamond_dir(&self, id: u32) -> PathBuf {
+        self.root
+            .join("admin")
+            .join("kdamonds")
+            .join(id.to_string())
     }
 
     /// Write sampling / aggregation attrs and a single demotion scheme.
     ///
-    /// Layout follows the DAMON sysfs ABI (attrs + schemes). Missing files
-    /// return `NotFound` so callers can skip on non-DAMON kernels.
+    /// Tries, in order:
+    /// 1. Modern `admin/kdamonds/0` tree (Linux DAMON sysfs)
+    /// 2. Legacy `attrs` + `admin_schemes` (older experiments)
+    /// 3. Stub `scheme` file (unit tests)
     pub fn apply(&self, cfg: DamonConfig) -> io::Result<()> {
+        if self.kdamond_dir(0).exists() {
+            return self.apply_kdamond(0, cfg);
+        }
         let attrs = self.root.join("attrs");
         if attrs.exists() {
-            // sample_interval aggregation_interval update_interval min_nr max_nr
+            // Microseconds in some trees; we write the ms config as-is and
+            // document the unit at the call site for hardware grind.
             let line = format!(
                 "{} {} {} 10 1000\n",
                 cfg.sample_interval_ms, cfg.aggregation_interval_ms, cfg.sample_interval_ms
             );
             fs::write(&attrs, line)?;
+            return self.write_legacy_scheme(&cfg.scheme);
         }
-        self.write_scheme(&cfg.scheme)?;
+        self.write_stub_scheme(&cfg.scheme)
+    }
+
+    /// Modern DAMON sysfs: kdamond contexts / schemes / access_pattern.
+    fn apply_kdamond(&self, id: u32, cfg: DamonConfig) -> io::Result<()> {
+        let kdamond = self.kdamond_dir(id);
+        // sample_intervals are in microseconds on modern kernels.
+        let contexts = kdamond.join("contexts");
+        let ctx0 = contexts.join("0");
+        if !ctx0.exists() {
+            // Ask the kernel to create context 0 when nr_contexts is writable.
+            let nr = contexts.join("nr_contexts");
+            if nr.exists() {
+                fs::write(&nr, "1\n")?;
+            }
+        }
+        let ctx0 = contexts.join("0");
+        if ctx0.exists() {
+            let intervals = ctx0.join("monitoring_attrs").join("intervals");
+            if intervals.exists() {
+                let sample_us = cfg.sample_interval_ms.saturating_mul(1000);
+                let aggr_us = cfg.aggregation_interval_ms.saturating_mul(1000);
+                let _ = fs::write(intervals.join("sample_us"), format!("{sample_us}\n"));
+                let _ = fs::write(intervals.join("aggr_us"), format!("{aggr_us}\n"));
+            }
+            let schemes = ctx0.join("schemes");
+            let nr_schemes = schemes.join("nr_schemes");
+            if nr_schemes.exists() {
+                let _ = fs::write(&nr_schemes, "1\n");
+            }
+            let scheme0 = schemes.join("0");
+            if scheme0.exists() {
+                let _ = fs::write(scheme0.join("action"), "pageout\n");
+                let access = scheme0.join("access_pattern");
+                let _ = fs::write(
+                    access.join("nr_accesses").join("max"),
+                    format!("{}\n", cfg.scheme.max_accesses),
+                );
+                // Age is counted in aggregation intervals, not ms.
+                let age_intervals = cfg
+                    .scheme
+                    .min_age_ms
+                    .saturating_div(cfg.aggregation_interval_ms.max(1));
+                let _ = fs::write(access.join("age").join("min"), format!("{age_intervals}\n"));
+                let dest = scheme0.join("dests");
+                if dest.exists() {
+                    let _ = fs::write(dest.join("nr_dests"), "1\n");
+                    let d0 = dest.join("0");
+                    let _ = fs::write(d0.join("id"), format!("{}\n", cfg.scheme.target_node));
+                }
+            }
+        }
+        // state: on
+        let state = kdamond.join("state");
+        if state.exists() {
+            let _ = fs::write(state, "on\n");
+        }
         Ok(())
     }
 
-    fn write_scheme(&self, scheme: &AccessFrequencyScheme) -> io::Result<()> {
+    fn write_legacy_scheme(&self, scheme: &AccessFrequencyScheme) -> io::Result<()> {
         let schemes = self.root.join("admin_schemes");
         if !schemes.exists() {
-            // Older / stub trees: write a single scheme file the unit test creates.
-            let path = self.root.join("scheme");
-            let body = format!(
-                "max_accesses={} min_age_ms={} target_node={}\n",
-                scheme.max_accesses, scheme.min_age_ms, scheme.target_node
-            );
-            return fs::write(path, body);
+            return self.write_stub_scheme(scheme);
         }
-        // Full DAMON sysfs: create scheme0 action=pageout with access pattern.
         let scheme_dir = schemes.join("0");
         fs::create_dir_all(&scheme_dir)?;
         fs::write(scheme_dir.join("action"), "pageout\n")?;
@@ -75,11 +142,16 @@ impl DamonSysfs {
             format!("0 {}\n", scheme.max_accesses),
         )?;
         fs::write(access.join("age"), format!("{} max\n", scheme.min_age_ms))?;
-        let dest = self.root.join("target_node");
-        if dest.parent().map(Path::exists).unwrap_or(false) {
-            let _ = fs::write(dest, format!("{}\n", scheme.target_node));
-        }
         Ok(())
+    }
+
+    fn write_stub_scheme(&self, scheme: &AccessFrequencyScheme) -> io::Result<()> {
+        let path = self.root.join("scheme");
+        let body = format!(
+            "max_accesses={} min_age_ms={} target_node={}\n",
+            scheme.max_accesses, scheme.min_age_ms, scheme.target_node
+        );
+        fs::write(path, body)
     }
 
     /// Read back the stub `scheme` file (test helper).
