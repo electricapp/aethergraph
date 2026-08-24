@@ -19,8 +19,8 @@
 //!   [`qp::RdmaQp::post_recv_sentinels`] — push-mode publication.
 //! - [`srq`] and [`qp::RdmaQp::create_with_cqs_srq`] — one receive queue
 //!   shared across many client QPs, which pays off server-side.
-//! - [`context::RdmaContext::reg_mr_implicit_odp`] and
-//!   [`context::RdmaContext::odp_caps`] — registration without pinning.
+//! - [`context::RdmaContext::reg_mr_implicit_odp`] — whole-address-space
+//!   ODP (range ODP is already wired via [`context::RdmaContext::reg_feature_mr`]).
 //!
 //! They are kept rather than deleted because each is a load-bearing piece
 //! of a design already sketched (see the roadmap), the FFI and safety work

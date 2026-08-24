@@ -112,12 +112,12 @@ impl RdmaFeatureClient {
     /// Handles seqlock validation and automatic retry for torn reads.
     pub fn gather(&mut self, node_ids: &[u32]) -> Result<(), Box<dyn std::error::Error>> {
         if node_ids.len() > self.buffer.max_batch_size() {
-            return Err(format!(
-                "node_ids.len() {} exceeds buffer.max_batch_size() {}",
-                node_ids.len(),
-                self.buffer.max_batch_size()
-            )
-            .into());
+            // One amortized re-reg + VRAM realloc — not per tensor, only when
+            // the connect-time ceiling is actually exceeded.
+            let stream = self.validator.stream().clone();
+            self.buffer
+                .ensure_capacity(&self.ctx, &stream, node_ids.len(), &self.schema)?;
+            self.validator.ensure_capacity(node_ids.len())?;
         }
 
         let batch_size = node_ids.len();

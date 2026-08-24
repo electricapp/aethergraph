@@ -64,6 +64,21 @@ impl SeqlockValidator {
         })
     }
 
+    /// Grow host-visible validation buffers so `needed` rows fit.
+    ///
+    /// The compiled kernel is reused; only device scratch grows. Called from
+    /// the gather path when a batch exceeds the connect-time max.
+    pub fn ensure_capacity(&mut self, needed: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if needed <= self.max_batch_size {
+            return Ok(());
+        }
+        let new_max = needed.next_power_of_two().max(needed);
+        self.output = self.stream.alloc_zeros::<f32>(new_max * self.feature_dim)?;
+        self.retry_mask = self.stream.alloc_zeros::<i32>(new_max)?;
+        self.max_batch_size = new_max;
+        Ok(())
+    }
+
     /// Launch validation kernel against two raw VRAM staging pointers.
     /// Returns the number of slots the kernel flagged for retry.
     ///

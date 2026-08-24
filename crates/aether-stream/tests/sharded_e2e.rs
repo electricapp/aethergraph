@@ -54,14 +54,16 @@ fn sharded_concurrent_gather_correctness() {
     let server_total = server_table.total_size();
     // SAFETY: `server_table` owns the registered range and outlives
     // `server_mr` (both live to end of test; MR drops first in scope order).
-    let server_mr = unsafe {
-        server_ctx.reg_mr(
+    let feature_mr = unsafe {
+        server_ctx.reg_feature_mr(
             server_base as *mut u8,
             server_total,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
+            aether_stream::rdma::context::FeatureMrPolicy::Auto,
         )
     }
-    .expect("server reg_mr");
+    .expect("server reg_feature_mr");
+    let server_mr = feature_mr.mr;
     let server_rkey = server_mr.rkey();
 
     // Server: NUM_SHARDS standalone QPs (one per client shard).

@@ -62,7 +62,7 @@ impl NvmeTier {
         #[cfg(target_os = "linux")]
         let (file, record_bytes, direct_io) = {
             use crate::internal::uring::{
-                DIRECT_IO_OFFSET_ALIGNMENT, direct_io_offset_alignment, open_direct_or_fallback,
+                DIRECT_IO_OFFSET_ALIGNMENT, direct_io_offset_alignment, open_direct_rw_or_fallback,
             };
 
             // Truncate via a buffered open first so we can probe alignment,
@@ -80,7 +80,9 @@ impl NvmeTier {
             let record_bytes = (payload_bytes.div_ceil(align) * align) as u64;
             drop(probe);
 
-            let (file, direct) = open_direct_or_fallback(&path)?;
+            // Spill tiers write; must use the rw O_DIRECT helper — a
+            // read-only O_DIRECT fd returns EBADF on pwrite (CI failure mode).
+            let (file, direct) = open_direct_rw_or_fallback(&path)?;
             // O_DIRECT only sticks when the padded stride matches the device
             // alignment the open path expects; otherwise fall back to the
             // buffered fd (still usable with io_uring scratch gathers).
@@ -194,6 +196,19 @@ impl NvmeTier {
     fn read_record(&self, node: NodeId, dest: &mut [u8]) -> Result<()> {
         debug_assert_eq!(dest.len(), self.payload_bytes);
         let offset = u64::from(node) * self.record_bytes;
+        #[cfg(target_os = "linux")]
+        if self.direct_io {
+            let mut slot = crate::internal::aligned::AlignedBuffer::try_new_default(
+                self.record_bytes as usize,
+            )
+            .context("aligned O_DIRECT spill read buffer")?;
+            let n = self.record_bytes as usize;
+            self.file
+                .read_exact_at(&mut slot.as_mut_slice()[..n], offset)
+                .with_context(|| format!("failed to read NVMe slot for node {node}"))?;
+            dest.copy_from_slice(&slot.as_slice()[..self.payload_bytes]);
+            return Ok(());
+        }
         self.file
             .read_exact_at(dest, offset)
             .with_context(|| format!("failed to read NVMe slot for node {node}"))
@@ -274,11 +289,19 @@ impl NvmeTier {
         // O_DIRECT writes need a full aligned slot; pad with zeros past the
         // payload so the kernel accepts the transfer length.
         #[cfg(target_os = "linux")]
-        if self.direct_io && self.record_bytes as usize > self.payload_bytes {
-            let mut slot = vec![0u8; self.record_bytes as usize];
-            slot[..self.payload_bytes].copy_from_slice(bytemuck::cast_slice(features));
+        if self.direct_io {
+            // O_DIRECT needs an address-aligned buffer of aligned length.
+            let mut slot = crate::internal::aligned::AlignedBuffer::try_new_default(
+                self.record_bytes as usize,
+            )
+            .context("aligned O_DIRECT spill write buffer")?;
+            slot.as_mut_slice()[..self.payload_bytes]
+                .copy_from_slice(bytemuck::cast_slice(features));
+            // Write exactly one stride — AlignedBuffer may round the
+            // allocation up past `record_bytes`.
+            let n = self.record_bytes as usize;
             self.file
-                .write_all_at(&slot, offset)
+                .write_all_at(&slot.as_slice()[..n], offset)
                 .with_context(|| format!("failed to write NVMe slot for node {node}"))?;
         } else {
             self.file

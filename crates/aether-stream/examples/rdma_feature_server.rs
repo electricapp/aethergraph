@@ -100,14 +100,24 @@ fn main() {
     let ctx = RdmaContext::open(256, ROCE_V2_GID_INDEX).expect("RdmaContext::open");
     // SAFETY: `table` is Arc-held to the end of main (see the final `let _`),
     // so the registered range outlives the MR and all remote reads.
-    let mr = unsafe {
-        ctx.reg_mr(
+    // `reg_feature_mr(Auto)` prefers range ODP when the HCA supports RC READ
+    // on ODP MRs; otherwise pins and touches every page so bring-up pays the
+    // cost, not the first client gather.
+    let feature_mr = unsafe {
+        ctx.reg_feature_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
+            aether_stream::rdma::context::FeatureMrPolicy::Auto,
         )
     }
-    .expect("reg_mr");
+    .expect("reg_feature_mr");
+    eprintln!(
+        "rdma_feature_server: MR kind={:?} rkey={}",
+        feature_mr.kind,
+        feature_mr.mr.rkey()
+    );
+    let mr = feature_mr.mr;
 
     let adv = RdmaAdvertisement {
         base_addr: table.base_addr(),

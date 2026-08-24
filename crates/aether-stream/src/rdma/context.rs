@@ -119,10 +119,114 @@ impl OdpCaps {
     }
 
     /// Whether RC RDMA READ may target an ODP MR — the bit the gather
-    /// path needs.
+    /// path needs. [`RdmaContext::reg_feature_mr`] uses this under
+    /// [`FeatureMrPolicy::Auto`].
     pub fn rc_read(&self) -> bool {
         self.rc_odp_caps & IBV_ODP_SUPPORT_READ != 0
     }
+}
+
+/// How [`RdmaContext::reg_feature_mr`] registers a feature-table (or other
+/// long-lived host) region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeatureMrPolicy {
+    /// Prefer range ODP when [`OdpCaps::rc_read`] is set (fast register,
+    /// HCA faults pages on first touch). Otherwise pin and
+    /// [`touch_mr_pages`] so bring-up pays the pin cost, not the first gather.
+    #[default]
+    Auto,
+    /// Always `ibv_reg_mr` pin + touch every page.
+    Pinned,
+    /// Require range ODP; error if the device cannot RC-READ an ODP MR.
+    Odp,
+}
+
+/// Which registration path [`RdmaContext::reg_feature_mr`] took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureMrKind {
+    /// Fully pinned MR; pages were touched at register time.
+    Pinned,
+    /// On-demand MR (`IBV_ACCESS_ON_DEMAND`); first HCA touch faults pages.
+    Odp,
+}
+
+/// Result of [`RdmaContext::reg_feature_mr`].
+pub struct FeatureMr {
+    pub mr: RegisteredMr,
+    pub kind: FeatureMrKind,
+}
+
+/// Touch every page in `[addr, addr + len)` so a freshly pinned MR pays its
+/// soft-fault / pin cost at register time instead of on the first RDMA READ.
+///
+/// # Safety
+/// `[addr, addr + len)` must be a readable mapping owned by the caller for
+/// the duration of this call.
+pub unsafe fn touch_mr_pages(addr: *mut u8, len: usize) {
+    if addr.is_null() || len == 0 {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let mut off = 0usize;
+    while off < len {
+        // SAFETY: `off < len` and `addr` is the caller's live mapping.
+        unsafe {
+            std::ptr::read_volatile(addr.add(off));
+        }
+        off = off.saturating_add(PAGE);
+    }
+}
+
+/// Current `RLIMIT_MEMLOCK` soft limit, or `None` if unlimited / unreadable.
+pub fn memlock_soft_limit_bytes() -> Option<usize> {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rlim` is a valid out-pointer.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim) };
+    if rc != 0 {
+        return None;
+    }
+    if rlim.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    Some(rlim.rlim_cur as usize)
+}
+
+/// Fail early when a pinned registration of `len` bytes cannot fit under
+/// the process memlock limit — the usual silent `ibv_reg_mr` death on HPC
+/// nodes that still have the default `ulimit -l`.
+pub fn check_memlock_for(len: usize) -> io::Result<()> {
+    let Some(limit) = memlock_soft_limit_bytes() else {
+        return Ok(());
+    };
+    if len <= limit {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "pinned RDMA registration needs {len} bytes but RLIMIT_MEMLOCK soft limit is {limit}; \
+             run `ulimit -l unlimited` (or raise memlock in limits.conf) before registering large tables"
+        ),
+    ))
+}
+
+fn enrich_reg_mr_error(err: io::Error, len: usize) -> io::Error {
+    let kind = err.kind();
+    let base = err.to_string();
+    let memlock = match memlock_soft_limit_bytes() {
+        None => "RLIMIT_MEMLOCK=unlimited".to_string(),
+        Some(n) => format!("RLIMIT_MEMLOCK soft={n} bytes"),
+    };
+    io::Error::new(
+        kind,
+        format!(
+            "ibv_reg_mr({len} bytes) failed: {base} ({memlock}); \
+             if this is EPERM/ENOMEM, raise memlock (`ulimit -l unlimited`) and retry"
+        ),
+    )
 }
 
 /// mlx5 direct-verbs capabilities, from `mlx5dv_query_device`.
@@ -348,10 +452,8 @@ impl RdmaContext {
     /// per-verb bits before relying on a path — a device may fault READs
     /// but not atomics.
     ///
-    /// TODO(deferred): queried only by `tests/softroce_e2e.rs` today.
-    /// Fold into the capability report in `open_on_device` once
-    /// [`Self::reg_mr_implicit_odp`] has a product caller, so the log line
-    /// reflects a path the process can actually take.
+    /// [`RdmaContext::reg_feature_mr`] with [`FeatureMrPolicy::Auto`] is the
+    /// product consumer of [`OdpCaps::rc_read`].
     pub fn odp_caps(&self) -> io::Result<OdpCaps> {
         let mut general_caps: u64 = 0;
         let mut rc_odp_caps: u32 = 0;
@@ -378,12 +480,13 @@ impl RdmaContext {
     /// otherwise. Same Drop-order contract as [`Self::reg_mr`].
     ///
     /// TODO(deferred): no product caller yet — exercised only by
-    /// `tests/softroce_e2e.rs`. Switching the feature server to implicit
-    /// ODP would drop its registration cache entirely, but it trades
-    /// pinned-memory cost for HCA page faults on first touch, so it needs
-    /// measurement on real ConnectX (rxe reports the capability without
-    /// the fault behaviour that makes the trade real) before becoming the
-    /// default registration path.
+    /// `tests/softroce_e2e.rs`. Range ODP is already the Auto path in
+    /// [`Self::reg_feature_mr`]. Switching the feature server to *implicit*
+    /// (whole-address-space) ODP would drop any remaining registration
+    /// cache entirely, but it trades pinned-memory cost for HCA page
+    /// faults on first touch, so it needs measurement on real ConnectX
+    /// (rxe reports the capability without the fault behaviour that makes
+    /// the trade real) before becoming the default.
     pub fn reg_mr_implicit_odp(&self, access: i32) -> io::Result<RegisteredMr> {
         // SAFETY: null addr + SIZE_MAX length is the documented implicit-
         // ODP registration form; no memory is pinned or aliased by it.
@@ -443,6 +546,69 @@ impl RdmaContext {
         })
     }
 
+    /// Register a long-lived feature-table (or similar) host region.
+    ///
+    /// This is the product registration entry point for feature servers:
+    /// - [`FeatureMrPolicy::Auto`]: range ODP when [`OdpCaps::rc_read`], else
+    ///   pin + [`touch_mr_pages`] so huge-table bring-up does not stall the
+    ///   first gather.
+    /// - [`FeatureMrPolicy::Pinned`] / [`FeatureMrPolicy::Odp`]: force a path.
+    ///
+    /// Checks `RLIMIT_MEMLOCK` before pinning. Prefer this over raw
+    /// [`Self::reg_mr`] for table advertisement.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::reg_mr`]: the range must outlive the MR and
+    /// every in-flight WR that references it.
+    pub unsafe fn reg_feature_mr(
+        &self,
+        addr: *mut u8,
+        len: usize,
+        access: i32,
+        policy: FeatureMrPolicy,
+    ) -> io::Result<FeatureMr> {
+        let want_odp = match policy {
+            FeatureMrPolicy::Odp => true,
+            FeatureMrPolicy::Pinned => false,
+            FeatureMrPolicy::Auto => self
+                .odp_caps()
+                .map(|c| c.supported() && c.rc_read())
+                .unwrap_or(false),
+        };
+
+        if want_odp {
+            // SAFETY: caller owns `[addr, addr+len)` for the MR lifetime.
+            match unsafe { self.reg_mr(addr, len, access | IBV_ACCESS_ON_DEMAND) } {
+                Ok(mr) => {
+                    debug!(len, "feature MR registered via range ODP");
+                    return Ok(FeatureMr {
+                        mr,
+                        kind: FeatureMrKind::Odp,
+                    });
+                }
+                Err(e) if matches!(policy, FeatureMrPolicy::Odp) => {
+                    return Err(io::Error::other(format!(
+                        "ODP feature MR required but ibv_reg_mr(ON_DEMAND) failed: {e}"
+                    )));
+                }
+                Err(e) => {
+                    debug!(error = %e, "ODP feature MR failed; falling back to pinned");
+                }
+            }
+        }
+
+        check_memlock_for(len)?;
+        // SAFETY: caller owns the range for the MR lifetime.
+        let mr = unsafe { self.reg_mr(addr, len, access) }?;
+        // SAFETY: same live mapping we just registered.
+        unsafe { touch_mr_pages(addr, len) };
+        debug!(len, "feature MR registered pinned + pages touched");
+        Ok(FeatureMr {
+            mr,
+            kind: FeatureMrKind::Pinned,
+        })
+    }
+
     /// Register memory for RDMA access (host or GPU via nvidia-peermem).
     ///
     /// Returns an RAII `RegisteredMr` that calls `ibv_dereg_mr` on drop. The
@@ -451,6 +617,9 @@ impl RdmaContext {
     /// fails with EBUSY at context drop). Storing it in the same struct as the
     /// context, declared *before* the context field, gives the right Drop order
     /// (Rust drops fields in declaration order).
+    ///
+    /// For feature-table advertisement prefer [`Self::reg_feature_mr`], which
+    /// applies ODP/pin policy and memlock preflight.
     ///
     /// # Safety
     /// `[addr, addr + len)` must be a valid, registerable memory range, and it
@@ -469,7 +638,7 @@ impl RdmaContext {
         // SAFETY: `self.pd` is alive; `addr/len/access` are the caller's contract.
         let mr = unsafe { ibv_reg_mr(self.pd, addr as *mut libc::c_void, len, access) };
         if mr.is_null() {
-            return Err(io::Error::last_os_error());
+            return Err(enrich_reg_mr_error(io::Error::last_os_error(), len));
         }
         Ok(RegisteredMr { mr })
     }
@@ -706,5 +875,24 @@ impl Drop for RegisteredMr {
         unsafe {
             ibv_dereg_mr(self.mr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_memlock_accepts_when_under_limit_or_unlimited() {
+        // Unlimited → Ok. Finite limit larger than a tiny request → Ok.
+        // We only assert the helper does not spuriously fail for 1 byte.
+        check_memlock_for(1).expect("1-byte registration must clear memlock check");
+    }
+
+    #[test]
+    fn enrich_reg_mr_error_mentions_ulimit() {
+        let e = enrich_reg_mr_error(io::Error::from_raw_os_error(libc::EPERM), 1 << 30);
+        let msg = e.to_string();
+        assert!(msg.contains("ulimit") || msg.contains("MEMLOCK"), "{msg}");
     }
 }

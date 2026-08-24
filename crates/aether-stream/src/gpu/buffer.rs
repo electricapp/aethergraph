@@ -69,7 +69,9 @@ pub unsafe fn reg_mr_cuda(
         return Err(io::Error::other(format!(
             "CUDA MR registration failed on both paths: \
              peermem ibv_reg_mr: {peermem_err}; \
-             cuMemGetHandleForAddressRange: {res:?}"
+             cuMemGetHandleForAddressRange: {res:?}. \
+             peermem typically needs bare metal + `nvidia-peermem` loaded; \
+             dma-buf needs driver ≥ 515 and rdma-core ≥ v34"
         )));
     }
 
@@ -81,7 +83,9 @@ pub unsafe fn reg_mr_cuda(
         io::Error::other(format!(
             "CUDA MR registration failed on both paths: \
              peermem ibv_reg_mr: {peermem_err}; \
-             dmabuf ibv_reg_dmabuf_mr: {dmabuf_err}"
+             dmabuf ibv_reg_dmabuf_mr: {dmabuf_err}. \
+             peermem typically needs bare metal + `nvidia-peermem` loaded; \
+             dma-buf needs driver ≥ 515 and rdma-core ≥ v34 (VM/IOMMU fallback)"
         ))
     })
 }
@@ -222,6 +226,56 @@ impl GpuGatherBuffer {
     /// Maximum batch size.
     pub fn max_batch_size(&self) -> usize {
         self.max_batch_size
+    }
+
+    /// Grow staging VRAM + re-register once so `needed` slots fit.
+    ///
+    /// Registration stays off the per-gather hot path except when capacity
+    /// actually increases (amortized). Existing gathers keep working at the
+    /// old size until this returns.
+    pub fn ensure_capacity(
+        &mut self,
+        rdma_ctx: &RdmaContext,
+        stream: &Arc<CudaStream>,
+        needed: usize,
+        schema: &FeatureSchema,
+    ) -> io::Result<()> {
+        if needed <= self.max_batch_size {
+            return Ok(());
+        }
+        let new_max = needed.next_power_of_two().max(needed);
+        let slot_size = schema.slot_size;
+        let feature_bytes = schema.feature_dim * std::mem::size_of::<f32>();
+        let total_bytes = slot_size
+            .checked_mul(new_max)
+            .and_then(|b| b.checked_mul(2))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "staging grow overflow: slot_size {slot_size} * max_batch_size {new_max} * 2"
+                    ),
+                )
+            })?;
+
+        let allocation: CudaSlice<u8> = stream
+            .alloc_zeros(total_bytes)
+            .map_err(|e| io::Error::other(format!("cuMemAlloc failed during staging grow: {e}")))?;
+        let device_ptr = {
+            let (ptr, _guard) = allocation.device_ptr(stream);
+            ptr
+        };
+        let access = ffi::IBV_ACCESS_LOCAL_WRITE;
+        // SAFETY: new allocation outlives the MR via field order below.
+        let mr = unsafe { reg_mr_cuda(rdma_ctx, device_ptr, total_bytes, access)? };
+
+        self.mr = mr;
+        self.device_ptr = device_ptr;
+        self.slot_size = slot_size;
+        self.max_batch_size = new_max;
+        self.feature_bytes = feature_bytes;
+        self._allocation = allocation;
+        Ok(())
     }
 }
 

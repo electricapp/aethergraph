@@ -75,7 +75,6 @@ impl AlignedBuffer {
     }
 
     /// Get a mutable slice of the buffer.
-    #[cfg(test)]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: ptr is valid for len bytes, properly aligned
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }

@@ -146,6 +146,52 @@ pub fn open_direct_or_fallback(path: impl AsRef<Path>) -> Result<(File, bool)> {
     }
 }
 
+/// Open with O_DIRECT for read+write. Spill tiers must use this — a
+/// read-only O_DIRECT fd returns `EBADF` on `pwrite`.
+pub fn open_direct_rw(path: impl AsRef<Path>) -> Result<File> {
+    let path = path.as_ref();
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .with_context(|| format!("failed to open {} with O_DIRECT (rw)", path.display()))
+}
+
+/// Like [`open_direct_or_fallback`], but always opens read+write.
+pub fn open_direct_rw_or_fallback(path: impl AsRef<Path>) -> Result<(File, bool)> {
+    let path = path.as_ref();
+
+    match open_direct_rw(path) {
+        Ok(file) => {
+            debug!("Opened {} with O_DIRECT (rw)", path.display());
+            Ok((file, true))
+        }
+        Err(e) => {
+            let is_unsupported = e
+                .downcast_ref::<std::io::Error>()
+                .map(|io_err| io_err.raw_os_error() == Some(libc::EINVAL))
+                .unwrap_or(false);
+
+            if is_unsupported {
+                warn!(
+                    "O_DIRECT not supported for {}, falling back to buffered I/O (rw)",
+                    path.display()
+                );
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .with_context(|| format!("failed to open {} buffered (rw)", path.display()))?;
+                Ok((file, false))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// One ring plus its reusable landing buffers.
 ///
 /// The landing buffers live with the ring under one lock, so per-batch
