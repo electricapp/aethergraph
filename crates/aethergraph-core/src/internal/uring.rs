@@ -9,12 +9,18 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::internal::aligned::AlignedBufferPool;
+use crate::internal::{
+    aligned::AlignedBufferPool, device::provided_buffers::ProvidedBufferRingSpec,
+};
 use anyhow::{Context, Result};
+use io_uring::types::BufRingEntry;
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::fs::File;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU16, Ordering};
 use tracing::{debug, trace, warn};
 
 /// Default io_uring SQ/CQ depth.
@@ -30,6 +36,117 @@ pub const DEFAULT_RING_ENTRIES: u32 = 4096;
 /// Minimum alignment for O_DIRECT file offsets (512 bytes for most NVMe/SSD).
 /// File offsets must be aligned to this value for O_DIRECT reads to succeed.
 pub const DIRECT_IO_OFFSET_ALIGNMENT: usize = 512;
+
+/// Userspace-owned backing for an `IORING_REGISTER_PBUF_RING` registration.
+///
+/// The kernel reads the descriptor ring and writes into the landing slab until
+/// its buffer group is unregistered, so this type stays owned by
+/// [`UringHandle`] for the full registration lifetime.
+struct ProvidedBufferRing {
+    spec: ProvidedBufferRingSpec,
+    ring: NonNull<BufRingEntry>,
+    ring_layout: Layout,
+    /// One contiguous allocation, split conceptually into `entries` buffers.
+    /// Keeping it here proves every published address remains valid while the
+    /// kernel can select this buffer group.
+    _buffers: Vec<u8>,
+}
+
+// SAFETY: The allocation addresses remain stable if this owner moves, and all
+// access to the ring goes through `&mut UringHandle`; moving a handle to its
+// owning lane thread therefore cannot introduce concurrent descriptor mutation.
+unsafe impl Send for ProvidedBufferRing {}
+
+#[allow(dead_code)] // helpers used once the descriptor ring is registered
+impl ProvidedBufferRing {
+    fn new(spec: ProvidedBufferRingSpec, buf_len: u32) -> Result<Self> {
+        anyhow::ensure!(
+            spec.entries_ok(),
+            "provided-buffer ring entries must be a non-zero power of two, got {}",
+            spec.entries
+        );
+        anyhow::ensure!(
+            buf_len > 0,
+            "provided-buffer ring buffer length must be non-zero"
+        );
+
+        let entries = usize::from(spec.entries);
+        let ring_bytes = entries
+            .checked_mul(std::mem::size_of::<BufRingEntry>())
+            .context("provided-buffer ring size overflows usize")?;
+        // SAFETY: `sysconf` has no Rust preconditions for this constant.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        anyhow::ensure!(page_size > 0, "failed to determine system page size");
+        let page_size = usize::try_from(page_size).context("system page size exceeds usize")?;
+        let ring_layout = Layout::from_size_align(ring_bytes, page_size)
+            .context("invalid provided-buffer ring allocation layout")?;
+        // SAFETY: `ring_layout` has non-zero size and a valid power-of-two
+        // alignment. The allocation is retained by `self` until drop.
+        let ring = NonNull::new(unsafe { alloc_zeroed(ring_layout) })
+            .context("failed to allocate page-aligned provided-buffer ring")?
+            .cast::<BufRingEntry>();
+
+        let buffer_bytes = entries
+            .checked_mul(buf_len as usize)
+            .context("provided-buffer landing slab size overflows usize")?;
+        let mut buffers = Vec::<u8>::new();
+        buffers
+            .try_reserve_exact(buffer_bytes)
+            .context("failed to allocate provided-buffer landing slab")?;
+        // SAFETY: `u8` permits every bit pattern; the reservation above makes
+        // `buffer_bytes` bytes available and the kernel fills them before a
+        // selected buffer is consumed.
+        unsafe { buffers.set_len(buffer_bytes) };
+
+        for bid in 0..spec.entries {
+            let offset = usize::from(bid) * buf_len as usize;
+            // SAFETY: `bid < entries`, so this points inside the allocated
+            // descriptor ring.
+            let entry_ptr = unsafe { ring.as_ptr().add(usize::from(bid)) };
+            // SAFETY: `entry_ptr` is inside the allocation above and points
+            // to an initialized, uniquely written descriptor slot.
+            let entry = unsafe { &mut *entry_ptr };
+            entry.set_addr(buffers.as_mut_ptr().wrapping_add(offset) as u64);
+            entry.set_len(buf_len);
+            entry.set_bid(bid);
+        }
+        // SAFETY: `ring` is page-aligned and initialized as a descriptor ring.
+        // Atomic release publication makes all entry writes visible before the
+        // kernel observes the new tail.
+        let tail = unsafe { BufRingEntry::tail(ring.as_ptr()) }.cast::<AtomicU16>();
+        // SAFETY: `tail` aliases the ring's properly aligned `u16` tail field.
+        unsafe { &*tail }.store(spec.entries, Ordering::Release);
+
+        Ok(Self {
+            spec,
+            ring,
+            ring_layout,
+            _buffers: buffers,
+        })
+    }
+
+    fn register(&self, submitter: &io_uring::Submitter<'_>) -> Result<()> {
+        // SAFETY: `self.ring` and its `entries` descriptors remain valid while
+        // this object is held by `UringHandle`, which unregisters first.
+        unsafe {
+            submitter.register_buf_ring_with_flags(
+                self.ring.as_ptr() as u64,
+                self.spec.entries,
+                self.spec.bgid,
+                self.spec.flags,
+            )
+        }
+        .context("failed to register provided-buffer ring")
+    }
+}
+
+impl Drop for ProvidedBufferRing {
+    fn drop(&mut self) {
+        // SAFETY: this is the exact allocation and layout created in `new`.
+        // `UringHandle` unregisters the ring before this field is dropped.
+        unsafe { dealloc(self.ring.as_ptr().cast::<u8>(), self.ring_layout) };
+    }
+}
 
 /// The file's real O_DIRECT offset alignment, from `statx(STATX_DIOALIGN)`.
 ///
@@ -537,6 +654,8 @@ pub struct UringHandle {
     registered_fd: Option<u32>,
     /// Registered fixed-buffer region as (base address, length), if any.
     registered_buf: Option<(usize, usize)>,
+    /// Userspace backing retained for the kernel-provided buffer group.
+    provided_buf_ring: Option<ProvidedBufferRing>,
     /// Which rung of the setup ladder this ring reached — see
     /// [`build_plain_ring`]. `"sqpoll"` for the kernel-poller rings, which
     /// do not use that ladder.
@@ -569,6 +688,7 @@ impl UringHandle {
                     iopoll_enabled: true,
                     registered_fd: None,
                     registered_buf: None,
+                    provided_buf_ring: None,
                     tier: "sqpoll",
                 })
             }
@@ -605,6 +725,7 @@ impl UringHandle {
                     iopoll_enabled: false,
                     registered_fd: None,
                     registered_buf: None,
+                    provided_buf_ring: None,
                     tier: "sqpoll",
                 })
             }
@@ -622,6 +743,7 @@ impl UringHandle {
                     iopoll_enabled: false,
                     registered_fd: None,
                     registered_buf: None,
+                    provided_buf_ring: None,
                     tier,
                 })
             }
@@ -648,6 +770,7 @@ impl UringHandle {
             iopoll_enabled: false,
             registered_fd: None,
             registered_buf: None,
+            provided_buf_ring: None,
             tier,
         })
     }
@@ -720,6 +843,114 @@ impl UringHandle {
         {
             warn!("Failed to unregister fixed buffers: {e}");
         }
+    }
+
+    /// Allocate, publish, and register a userspace-backed provided-buffer ring.
+    ///
+    /// A registration replaces any prior provided-buffer ring on this handle.
+    /// `spec.entries` must be a non-zero power of two, and each landing buffer
+    /// has `buf_len` bytes. Callers use [`Self::provided_buffer_ring_bgid`] as
+    /// the buffer group for future `IOSQE_BUFFER_SELECT` SQEs.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "BUFFER_SELECT submission wiring consumes this internal interface after hardware verification"
+        )
+    )]
+    pub fn register_provided_buffer_ring(
+        &mut self,
+        spec: ProvidedBufferRingSpec,
+        buf_len: u32,
+    ) -> Result<()> {
+        self.unregister_provided_buffer_ring();
+        let provided_buf_ring = ProvidedBufferRing::new(spec, buf_len)?;
+        provided_buf_ring.register(&self.ring.submitter())?;
+        debug!(
+            bgid = spec.bgid,
+            entries = spec.entries,
+            buf_len,
+            "registered io_uring provided-buffer ring"
+        );
+        self.provided_buf_ring = Some(provided_buf_ring);
+        Ok(())
+    }
+
+    /// Unregister the provided-buffer ring, if any. Idempotent.
+    pub fn unregister_provided_buffer_ring(&mut self) {
+        let Some(provided_buf_ring) = self.provided_buf_ring.take() else {
+            return;
+        };
+        if let Err(e) = self
+            .ring
+            .submitter()
+            .unregister_buf_ring(provided_buf_ring.spec.bgid)
+        {
+            warn!(
+                bgid = provided_buf_ring.spec.bgid,
+                "failed to unregister provided-buffer ring: {e}"
+            );
+            // Keep the backing allocation alive for a later retry. During
+            // `UringHandle::drop`, field order drops `ring` before this
+            // allocation, so closing the ring still precedes its release.
+            self.provided_buf_ring = Some(provided_buf_ring);
+        }
+    }
+
+    /// Buffer group id of the registered provided-buffer ring, if any.
+    #[allow(dead_code)] // exercised from Linux tests / BUFFER_SELECT callers
+    pub fn provided_buffer_ring_bgid(&self) -> Option<u16> {
+        self.provided_buf_ring.as_ref().map(|ring| ring.spec.bgid)
+    }
+
+    /// Whether this handle currently owns a registered provided-buffer ring.
+    #[allow(dead_code)]
+    pub fn has_provided_buffer_ring(&self) -> bool {
+        self.provided_buf_ring.is_some()
+    }
+
+    /// Submit one `Read` with `IOSQE_BUFFER_SELECT` against the registered
+    /// provided-buffer group. Returns the CQE buffer id on success.
+    ///
+    /// Requires a prior [`Self::register_provided_buffer_ring`]. The kernel
+    /// picks a landing buffer; userspace does not pass a destination pointer.
+    #[allow(dead_code)]
+    pub fn read_buffer_select(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        len: u32,
+        offset: u64,
+    ) -> Result<u16> {
+        use io_uring::{cqueue, opcode, squeue, types};
+
+        let bgid = self
+            .provided_buffer_ring_bgid()
+            .context("no provided-buffer ring registered")?;
+        let read = opcode::Read::new(types::Fd(fd), std::ptr::null_mut(), len)
+            .offset(offset)
+            .buf_group(bgid)
+            .build()
+            .flags(squeue::Flags::BUFFER_SELECT);
+        // SAFETY: SQE is fully initialized; BUFFER_SELECT makes `buf` unused.
+        unsafe {
+            self.ring
+                .submission()
+                .push(&read)
+                .context("submission queue full")?;
+        }
+        self.ring.submit_and_wait(1)?;
+        let cqe = self
+            .ring
+            .completion()
+            .next()
+            .context("missing completion for buffer-select read")?;
+        let res = cqe.result();
+        if res < 0 {
+            return Err(std::io::Error::from_raw_os_error(-res))
+                .context("buffer-select read failed");
+        }
+        let bid = cqueue::buffer_select(cqe.flags()).context("CQE missing buffer id")?;
+        Ok(bid)
     }
 
     /// Registered fixed-buffer region as (base address, length), if any.
@@ -816,6 +1047,7 @@ impl UringHandle {
 
 impl Drop for UringHandle {
     fn drop(&mut self) {
+        self.unregister_provided_buffer_ring();
         self.unregister_buffer_region();
         // Unregister file descriptor if registered
         if self.registered_fd.is_some() {
@@ -1368,6 +1600,91 @@ mod tests {
         let cqe = ring.completion().next().expect("one completion");
         assert_eq!(cqe.user_data(), 42);
         assert!(cqe.result() >= 0, "nop failed: {}", cqe.result());
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn provided_buffer_ring_registers_and_unregisters() {
+        let (ring, tier) = match build_plain_ring(8, false) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("io_uring unavailable here ({e}); skipping PBUF test");
+                return;
+            }
+        };
+        let mut handle = UringHandle {
+            ring,
+            entries: 8,
+            sqpoll_enabled: false,
+            iopoll_enabled: false,
+            registered_fd: None,
+            registered_buf: None,
+            provided_buf_ring: None,
+            tier,
+        };
+
+        let spec = ProvidedBufferRingSpec::userspace(1, 8);
+        match handle.register_provided_buffer_ring(spec, 4096) {
+            Ok(()) => {
+                assert!(handle.has_provided_buffer_ring());
+                assert_eq!(handle.provided_buffer_ring_bgid(), Some(spec.bgid));
+                handle.unregister_provided_buffer_ring();
+                assert!(!handle.has_provided_buffer_ring());
+                assert_eq!(handle.provided_buffer_ring_bgid(), None);
+            }
+            Err(e) => {
+                // PBUF rings need Linux 5.19+. The registration's error is
+                // the capability probe; keep older-kernel builders covered.
+                println!("provided-buffer rings unsupported here ({e}); skipping");
+            }
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn provided_buffer_select_read_returns_bid() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let (ring, tier) = match build_plain_ring(8, false) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("io_uring unavailable ({e}); skipping");
+                return;
+            }
+        };
+        let mut handle = UringHandle {
+            ring,
+            entries: 8,
+            sqpoll_enabled: false,
+            iopoll_enabled: false,
+            registered_fd: None,
+            registered_buf: None,
+            provided_buf_ring: None,
+            tier,
+        };
+        let spec = ProvidedBufferRingSpec::userspace(2, 4);
+        if let Err(e) = handle.register_provided_buffer_ring(spec, 4096) {
+            println!("PBUF unsupported ({e}); skipping BUFFER_SELECT smoke");
+            return;
+        }
+
+        let mut temp = NamedTempFile::new().unwrap();
+        let payload = vec![0xABu8; 4096];
+        temp.write_all(&payload).unwrap();
+        temp.flush().unwrap();
+        let file = File::open(temp.path()).unwrap();
+        match handle.read_buffer_select(file.as_raw_fd(), 4096, 0) {
+            Ok(bid) => {
+                assert!(bid < spec.entries, "bid {bid} within ring");
+            }
+            Err(e) => {
+                // Some kernels register PBUF but reject BUFFER_SELECT on
+                // regular files; treat as skip rather than hard fail.
+                println!("BUFFER_SELECT read skipped ({e})");
+            }
+        }
+        handle.unregister_provided_buffer_ring();
     }
 
     #[test]

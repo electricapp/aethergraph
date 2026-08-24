@@ -105,6 +105,21 @@ impl EliasFano {
         self.universe
     }
 
+    /// Low-bit width used by the encoding (device decoders need this).
+    pub fn low_bits(&self) -> u32 {
+        self.low_bits
+    }
+
+    /// Packed low parts (`low_bits` each, little-endian bit order).
+    pub fn low_words(&self) -> &[u64] {
+        &self.low
+    }
+
+    /// High-bits unary bitvector words.
+    pub fn high_words(&self) -> &[u64] {
+        &self.high
+    }
+
     /// The `i`-th element, or `None` for `i >= len`.
     ///
     /// `select` walks the high-bits words from the start, so this is
@@ -346,6 +361,21 @@ impl StreamVByte {
             control,
             data,
         }
+    }
+
+    /// First value of the encoded sequence.
+    pub fn first(&self) -> u32 {
+        self.first
+    }
+
+    /// Control stream (2 bits per delta).
+    pub fn control(&self) -> &[u8] {
+        &self.control
+    }
+
+    /// Delta data bytes.
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 
     /// Number of encoded values.

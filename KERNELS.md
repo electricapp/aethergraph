@@ -222,6 +222,42 @@ layer. Like the rest of K4 they need a rooted Linux VM and nothing else.
 
 ---
 
+## Layout
+
+| Layer                  | Path                                                                                                                                                                  |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tier A CUDA kernels    | [`crates/aether-stream/src/gpu/kernels/`](crates/aether-stream/src/gpu/kernels/) (`validate`, `seqlock`, `sampler`, `decompress`, `persistent`, `tma`, `ibgda`, `coherent` + `common.cuh`) |
+| GPU infra (non-kernel) | [`crates/aether-stream/src/gpu/`](crates/aether-stream/src/gpu/) (`buffer`, `pool`, `uvm`, `vmm`, `ipc`, `gdrcopy`)                                                   |
+| Tier B device paths    | [`crates/aethergraph-core/src/internal/device/`](crates/aethergraph-core/src/internal/device/) + [`modules/aether_p2pdma/`](modules/aether_p2pdma/) + [`modules/aether_dpa/`](modules/aether_dpa/) |
+| CUDA harness           | [`crates/aether-stream/tests/kernels/`](crates/aether-stream/tests/kernels/), [`benches/kernels/`](crates/aether-stream/benches/kernels/)                             |
+| herd7 litmus (K5.3)    | [`crates/aether-stream/litmus/k5_3/`](crates/aether-stream/litmus/k5_3/)                                                                                              |
+| Grind entrypoint       | [`scripts/kernels-verify.sh`](scripts/kernels-verify.sh)                                                                                                              |
+
+CUDA units compile via NVRTC `include_str!` under the `gpudirect` feature — no
+nvcc fatbin step in `build.rs`.
+
+---
+
+## How to grind
+
+On a CUDA box (Tier A):
+
+```bash
+scripts/kernels-verify.sh
+# or manually:
+cargo test  -p aether-stream --features gpudirect --test kernels -- --nocapture
+cargo bench -p aether-stream --features gpudirect --bench kernels
+```
+
+Optional: `compute-sanitizer --tool racecheck …` and
+`herd7 -model nvidia crates/aether-stream/litmus/k5_3/*.litmus` when those tools
+are on `PATH`.
+
+On a rooted Linux VM (K4): the same script runs PBUF / policy unit tests; load
+`sched_ext_bpf` / live DAMON under `TODO(HARDWARE)`.
+
+---
+
 ## Verification
 
 The reason device work is slow is not that iteration is slow — on Tier A it
@@ -233,8 +269,8 @@ be observed**, until only a few hundred bytes of it remain.
 | ------------------------------- | ----------------------- | ------------------------------------------------------------ |
 | CPU reference model + diff test | K5.2, K5.5, K1.x codecs | Bit-exact oracle; Philox keying makes the sampler comparable |
 | Pure-logic command builders     | K1.1 NVMe SQE, K2.1 WQE | Struct layout unit-tests on any machine against the spec     |
-| `compute-sanitizer`             | all of Tier A           | racecheck / initcheck / synccheck in CI                      |
-| herd7 litmus tests              | K5.3, ring protocols    | Memory-model claims proved, not asserted                     |
+| `compute-sanitizer`             | all of Tier A           | racecheck / initcheck / synccheck via `kernels-verify.sh`    |
+| herd7 litmus tests              | K5.3, ring protocols    | Sources in `litmus/k5_3/`; run when herd7 is installed       |
 | syzkaller + KASAN/KCSAN         | K3.1                    | Module fuzzed before it touches a real namespace             |
 | virtme-ng / QEMU harness        | K3.1, K4.x              | Module crash-iterate without reprovisioning                  |
 
@@ -259,27 +295,53 @@ command builder is the difference between a week and a month on each.
 
 ## Sequencing
 
-1. **K5.0** first — the cheapest item on the list, and it fixes the launch
-   cadence that K5.1 later has to justify replacing.
-2. **K5.3** — smallest self-contained piece of device code, and it establishes
-   the memory-model discipline the rest of the compute plane assumes.
-3. **K5.2, K5.5, K5.6, K5.1** — Tier A in dependency order; each has a CPU
-   oracle.
-4. **K4.1, K4.2, K4.3** — cheap, rooted-VM, independent of everything else. Good
-   parallel track.
-5. **K3.1** — the first Tier B item and the topology canary. If a candidate box
-   cannot run this, it cannot run K1.1 or K2.2 either.
-6. **K1.1** on top of K3.1; **K1.2/K1.3** alongside it once the namespace is in
-   hand.
-7. **K2.2**, then **K2.1** — DEVX QP construction is the apprenticeship for
-   GPU-side WQE construction.
-8. **K5.4**, **K2.3**, **K3.3**, **K3.2** — hardware-gated, schedule them when
-   the part is available.
+1. **K5.0** — done: graph replay + mapped pinned `retry_count` (device
+   fallback).
+2. **K5.3** — done: PTX acquire reader + litmus sources; herd7 run is
+   `TODO(HARDWARE)`.
+3. **K5.2, K5.5, K5.6, K5.1** — roofline-shaped device code landed (warp
+   prefetch sampler, warp StreamVByte + parallel EF, `ld.cs` gather, 3-warp
+   persistent roles). C-tree arena / RDMA-forward-progress / Blackwell engine
+   remain `TODO(HARDWARE)`.
+4. **K4.1, K4.2, K4.3** — `SchedExtLoader` + BPF struct_ops source, DAMON sysfs
+   adapter, PBUF register + `read_buffer_select`; live attach / DAMON / load
+   test remain `TODO(HARDWARE)`.
+5. **K3.1** — `modules/aether_p2pdma/` + userspace ioctl client; virtme-ng
+   crash-iterate `TODO(HARDWARE)`.
+6. **K1.1** / **K1.2** / **K1.3** — `BamController`, FDP on SQE,
+   `ZoneAppendWal`; BAR/doorbell / FDP drive / ZNS CQ `TODO(HARDWARE)`.
+7. **K2.2**, then **K2.1** — `DevxGpuEthPlan` + `IbgdaQueue` + GPU WQE kernel;
+   DEVX/IBGDA on ConnectX `TODO(HARDWARE)`.
+8. **K5.4**, **K2.3**, **K3.3**, **K3.2** — GEMV + `FlexIoHost`/`aether_dpa` +
+   CXL `mbind` apply + coherent hints; ISA/BF3/Grace/CXL box `TODO(HARDWARE)`.
 
 The single highest-leverage action is securing one bare-metal box with a
 ConnectX and a spare NVMe namespace, and verifying its ACS/IOMMU topology before
-any Tier B code is written. That fact determines whether the crown-jewel items
-are days-hard or months-hard.
+any Tier B doorbell code is written. That fact determines whether the
+crown-jewel items are days-hard or months-hard.
+
+---
+
+## Implementation status (grind pass)
+
+| Item      | Code                                                          | Verification                                               |
+| --------- | ------------------------------------------------------------- | ---------------------------------------------------------- |
+| K5.0      | `kernels/validate` — CUDA graph + mapped `retry_count`        | `tests/kernels` + graph unit tests                         |
+| K5.1      | `kernels/persistent` — 3-warp fetch/xform/compute             | `persistent_drain_counts_posted_work`                      |
+| K5.2      | `kernels/sampler` — warp + `ld.cs` window + Philox R          | GPU↔CPU bit-diff in `tests/kernels`                        |
+| K5.3      | `kernels/seqlock` + `litmus/k5_3`                             | Oracle tests; herd7 `TODO(HARDWARE)`                       |
+| K5.4      | `kernels/tma` smem-B + `ld.cs.v4` GEMV                        | Smoke test; TMA/WGMMA ISA `TODO(HARDWARE)`                 |
+| K5.5      | `kernels/decompress` warp SVB + parallel EF                   | GPU↔CPU oracle tests                                       |
+| K5.6      | `ld.global.cs` / v4 in `validate_and_compact.cu`              | Covered by validate tests                                  |
+| K1.1–K1.3 | `device/nvme/` BaM + FDP-on-SQE + `ZoneAppendWal`             | Layout/unit tests; BAR/ZNS/FDP `TODO(HARDWARE)`            |
+| K2.1–K2.3 | `device/rdma/` IBGDA + DEVX + FlexIO + `modules/aether_dpa`   | Unit + mock DEVX; ConnectX/BF3 `TODO(HARDWARE)`            |
+| K3.1–K3.3 | `modules/aether_p2pdma/` + ioctl + CXL apply + coherent hints | Unit tests; module/CXL/GH `TODO(HARDWARE)`                 |
+| K4.1      | `SchedExtLoader` + `bpf/src/sched_ext_aether.c`               | Missing-object test; load on VM `TODO(HARDWARE)`           |
+| K4.2      | `DamonSysfs` adapter                                          | Temp-root unit test; live DAMON `TODO(HARDWARE)`           |
+| K4.3      | `register_provided_buffer_ring` + `read_buffer_select`        | Register + BUFFER_SELECT smoke; load test `TODO(HARDWARE)` |
+
+`TODO:` marks code still to write. `TODO(HARDWARE):` marks rig verification
+only.
 
 ---
 

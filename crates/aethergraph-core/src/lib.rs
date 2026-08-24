@@ -61,11 +61,21 @@ pub use internal::mmap_hetero::{load_hetero_graph, save_hetero_graph};
 pub use internal::parquet_import::{from_parquet, from_parquet_files};
 #[cfg(all(target_os = "linux", feature = "perf"))]
 pub use internal::perf::{Counter, CounterReadings, CounterSet};
+/// Counter-based RNG shared by CPU sampling oracles and GPU kernels.
+pub use internal::philox::{philox_u32, philox4x32_10, reservoir_sample};
+/// Portable predicate shared by host and device seqlock readers.
+pub use internal::seqlock::cpu_seqlock_accept;
 #[cfg(all(target_os = "linux", feature = "shm"))]
 pub use internal::shm::{SharedRegion, recv_fd, send_fd, socket_pair};
 // Vectorized bf16 → f32 conversion with runtime SIMD dispatch (AVX2, scalar
 // fallback). The f16 path is reached through `FeatureDtype::row_decoder`,
 // which resolves its dispatch once per batch rather than per call.
+/// KERNELS.md Tier B / K4 device-path types (builders + loaders).
+pub use internal::device::{
+    BamController, CoherentAllocation, CoherentPlacementHint, CxlNumaBinding, DamonConfig,
+    DamonSysfs, DevxGpuEthPlan, FdpPlacementId, FlexIoHost, IbgdaQueue, Mlx5RdmaReadWqe, NvmeRwSqe,
+    P2pdmaPath, P2pdmaPolicy, SchedExtLoader, SchedExtPolicy, ZoneAppendWal, validate_p2pdma_path,
+};
 pub use internal::simd::bf16_le_to_f32;
 pub use internal::succinct::{EliasFano, StreamVByte};
 pub use internal::telemetry::{SamplingTelemetry, TelemetrySummary};

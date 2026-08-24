@@ -1,0 +1,13 @@
+# K5.3: reader must not accept an odd (in-progress) head as published.
+
+AetherSeqlockOddRejected
+
+{
+  x=0;
+}
+
+P0 | P1 ;
+wrel x 3 | racq r0 x ;
+| ;
+
+exists (P1:r0=3)

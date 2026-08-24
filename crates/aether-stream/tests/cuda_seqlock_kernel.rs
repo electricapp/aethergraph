@@ -116,3 +116,50 @@ fn seqlock_kernel_flags_torn_and_compacts_valid() {
         "valid slot not compacted correctly"
     );
 }
+
+#[test]
+fn seqlock_kernel_replays_cuda_graph_on_second_validate() {
+    // K5.0: first validate captures; second with the same signature replays.
+    let ctx = CudaContext::new(0).expect("CUDA init — check nvidia-smi + driver");
+    let stream = ctx.default_stream();
+
+    let snap = pack_slot(2, [1.0, 2.0, 3.0, 4.0], 2);
+    let mut host = Vec::with_capacity(SLOT_SIZE * BATCH * 2);
+    for _ in 0..BATCH {
+        host.extend_from_slice(&snap);
+    }
+    for _ in 0..BATCH {
+        host.extend_from_slice(&snap);
+    }
+
+    let mut staging: CudaSlice<u8> = stream
+        .alloc_zeros(SLOT_SIZE * BATCH * 2)
+        .expect("alloc VRAM staging");
+    stream.memcpy_htod(&host, &mut staging).expect("H2D memcpy");
+    let staging1_ptr = {
+        let (p, _g) = staging.device_ptr_mut(&stream);
+        p
+    };
+    let staging2_ptr = staging1_ptr + (SLOT_SIZE * BATCH) as u64;
+
+    let mut validator = SeqlockValidator::new(&ctx, &stream, BATCH, FEATURE_DIM)
+        .expect("SeqlockValidator nvrtc compile");
+    assert!(!validator.has_captured_graph());
+
+    let r1 = validator
+        .validate(staging1_ptr, staging2_ptr, SLOT_SIZE, BATCH)
+        .expect("first validate (capture)");
+    assert_eq!(r1, 0);
+    assert!(
+        validator.has_captured_graph(),
+        "first validate should leave a captured graph"
+    );
+    // Mapped retry_count is preferred; device fallback is still correct.
+    let _ = validator.has_mapped_retry_count();
+
+    let r2 = validator
+        .validate(staging1_ptr, staging2_ptr, SLOT_SIZE, BATCH)
+        .expect("second validate (replay)");
+    assert_eq!(r2, 0);
+    assert!(validator.has_captured_graph());
+}

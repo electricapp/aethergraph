@@ -13,6 +13,9 @@
 //   - the payload bytes of the two snapshots are identical.
 // Accepted rows are compacted from snapshot 1 into the output tensor;
 // everything else is flagged for retry (both snapshots re-read).
+//
+// K5.6: payload traffic is once-touched — ld.global.cs (and v4) so version
+// working set is not evicted by feature bytes.
 
 extern "C" __global__ void validate_and_compact(
     const char* staging1,
@@ -30,11 +33,10 @@ extern "C" __global__ void validate_and_compact(
     const char* slot1 = staging1 + ((long long)idx * slot_size);
     const char* slot2 = staging2 + ((long long)idx * slot_size);
 
-    // Head version is at offset 0
+    // Version words stay ordinary loads (ordering matters for the seqlock).
     unsigned long long head1 = *(const unsigned long long*)(slot1);
     unsigned long long head2 = *(const unsigned long long*)(slot2);
 
-    // Tail version is at offset 8 + feature_dim * 4, rounded to 8-byte align
     int feature_bytes = feature_dim * 4;
     int tail_offset = 8 + feature_bytes;
     tail_offset = (tail_offset + 7) & ~7;
@@ -45,28 +47,40 @@ extern "C" __global__ void validate_and_compact(
         && (head1 & 1) == 0 && head1 != 0;
 
     if (ok) {
-        // Payload bytes must match between the snapshots. Word-wise compare
-        // is exact: the payload is feature_dim 4-byte elements.
         const unsigned int* feat1 = (const unsigned int*)(slot1 + 8);
         const unsigned int* feat2 = (const unsigned int*)(slot2 + 8);
-        for (int i = 0; i < feature_dim; i++) {
-            if (feat1[i] != feat2[i]) {
+        int i = 0;
+        for (; i + 3 < feature_dim; i += 4) {
+            const uint4 a = ld_cs_v4u32(feat1 + i);
+            const uint4 b = ld_cs_v4u32(feat2 + i);
+            if (a.x != b.x || a.y != b.y || a.z != b.z || a.w != b.w) {
                 ok = false;
                 break;
+            }
+        }
+        for (; ok && i < feature_dim; ++i) {
+            if (ld_cs_u32(feat1 + i) != ld_cs_u32(feat2 + i)) {
+                ok = false;
             }
         }
     }
 
     if (ok) {
-        // Consistent across both snapshots — compact snapshot 1 to output.
         const float* feat = (const float*)(slot1 + 8);
         float* dst = output + ((long long)idx * feature_dim);
-        for (int i = 0; i < feature_dim; i++) {
-            dst[i] = feat[i];
+        int i = 0;
+        for (; i + 3 < feature_dim; i += 4) {
+            const float4 v = ld_cs_v4f32(feat + i);
+            dst[i] = v.x;
+            dst[i + 1] = v.y;
+            dst[i + 2] = v.z;
+            dst[i + 3] = v.w;
+        }
+        for (; i < feature_dim; ++i) {
+            dst[i] = ld_cs_f32(feat + i);
         }
         retry_mask[idx] = 0;
     } else {
-        // Torn, in-progress, or uninitialized — mark for retry.
         retry_mask[idx] = 1;
         atomicAdd(retry_count, 1);
     }

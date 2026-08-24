@@ -107,4 +107,27 @@ fn main() {
             ),
         }
     }
+
+    // K4.1: track the sched_ext skeleton so edits rebuild; optional compile
+    // when `sched_ext_bpf` is enabled (soft-fail if clang/bpf headers missing).
+    println!("cargo:rerun-if-changed=bpf/src/sched_ext_aether.c");
+    if cfg!(all(target_os = "linux", feature = "sched_ext_bpf")) {
+        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+        let obj = format!("{out_dir}/sched_ext_aether.bpf.o");
+        let src = "bpf/src/sched_ext_aether.c";
+        let status = std::process::Command::new("clang")
+            .args(["-O2", "-g", "-target", "bpf", "-c", src, "-o", &obj])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("cargo:rustc-env=AETHER_SCHED_EXT_BPF_OBJ={obj}");
+            }
+            Ok(_) | Err(_) => {
+                println!(
+                    "cargo:warning=sched_ext_bpf: clang --target=bpf compile skipped/failed; \
+                     skeleton left as source-only"
+                );
+            }
+        }
+    }
 }

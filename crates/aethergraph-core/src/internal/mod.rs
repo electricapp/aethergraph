@@ -5,6 +5,9 @@
 #[cfg(target_os = "linux")]
 pub mod aligned;
 pub mod compressed_graph;
+/// Pure-logic device protocol layouts and hardware-gated integration plans
+/// from `KERNELS.md`.
+pub mod device;
 pub mod genstamp;
 pub mod hint;
 pub mod mmap;
@@ -16,8 +19,10 @@ pub mod nvme;
 pub mod parquet_import;
 #[cfg(all(target_os = "linux", feature = "perf"))]
 pub mod perf;
+pub mod philox;
 pub mod prefetch;
 pub mod probe;
+pub mod seqlock;
 #[cfg(all(target_os = "linux", feature = "shm"))]
 pub mod shm;
 pub mod simd;

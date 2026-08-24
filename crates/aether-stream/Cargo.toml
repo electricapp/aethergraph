@@ -30,6 +30,9 @@ efa = ["rdma"]
 # is compiled by `build.rs` via `clang --target=bpf`; users without that
 # toolchain should just leave the feature off.
 xdp_bpf = ["dep:aya"]
+# K4.1 sched_ext BPF object compile path (clang --target=bpf). Loader is
+# userspace; the .bpf.o is produced by build.rs when this feature is on.
+sched_ext_bpf = []
 
 [build-dependencies]
 cc = "1"
@@ -41,7 +44,19 @@ criterion = "0.8"
 name = "feature_table_bench"
 harness = false
 
+[[bench]]
+name = "kernels"
+path = "benches/kernels/main.rs"
+harness = false
+required-features = ["gpudirect"]
+
+[[test]]
+name = "kernels"
+path = "tests/kernels/main.rs"
+required-features = ["gpudirect"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
+aethergraph-core  = { path = "../aethergraph-core", version = "0.1" }
 aether-mem        = { path = "../aether-mem", version = "0.1", features = ["parallel-prefault", "tracing"] }
 libc              = "0.2"
 core_affinity     = "0.8"

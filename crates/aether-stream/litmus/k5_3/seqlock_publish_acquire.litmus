@@ -1,0 +1,19 @@
+# K5.3 litmus: seqlock head/tail publication vs acquire load.
+# Run: herd7 -model nvidia crates/aether-stream/litmus/k5_3/*.litmus
+#
+# Models the writer Release stores (tail then head) against a reader that
+# does Acquire loads of head then tail. A valid published even version must
+# not be observed with a mismatched tail under the PTX sys scope.
+
+AetherSeqlockPublishAcquire
+
+{
+  x=0; y=0;
+}
+
+P0 | P1 ;
+wrel x 2 | racq r0 x ;
+wrel y 2 | racq r1 y ;
+| ;
+
+exists (P1:r0=2 /\ P1:r1=0)
