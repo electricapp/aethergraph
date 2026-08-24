@@ -57,6 +57,18 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::trace;
 
+/// Derive a per-batch RNG seed so multi-worker prefetch yields the same
+/// subgraph for `(base_seed, batch_idx, seeds)` regardless of which worker
+/// thread claims the work item.
+#[inline]
+pub fn batch_seed(base: u64, batch_idx: usize) -> u64 {
+    // SplitMix64 finalizer over base XOR index-scaled golden ratio.
+    let mut z = base ^ (batch_idx as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
 /// Configuration for neighborhood sampling
 #[derive(Debug, Clone)]
 pub struct SamplingConfig {
@@ -305,6 +317,16 @@ impl<'a> NeighborSampler<'a> {
         }
     }
 
+    /// Reset the RNG to `seed` without rebuilding scratch buffers.
+    ///
+    /// Prefetch workers call this with [`batch_seed`] so each `(base_seed,
+    /// batch_idx)` pair draws the same samples regardless of which worker
+    /// thread claims the work item.
+    #[inline]
+    pub fn reseed(&mut self, seed: u64) {
+        self.rng = WyRand::new(seed);
+    }
+
     #[inline(always)]
     fn insert_node(&mut self, id: NodeId) -> u32 {
         let (idx, is_new) = self.dedup.probe_or_insert(id, self.node_vec.len() as u32);
@@ -315,16 +337,22 @@ impl<'a> NeighborSampler<'a> {
     }
 
     /// Register `id`, pushing it onto the next frontier when new. Returns
-    /// its local index either way — the caller records it for the edge's
-    /// endpoint without any later lookup.
+    /// `None` when `id` is outside the graph (corrupt edge body under
+    /// `OffsetsOnly` loads) so callers can skip the edge instead of
+    /// panicking the dense dedup table. Returns its local index either way
+    /// when in range — the caller records it for the edge's endpoint
+    /// without any later lookup.
     #[inline(always)]
-    fn insert_node_frontier(&mut self, id: NodeId) -> (u32, bool) {
+    fn insert_node_frontier(&mut self, id: NodeId) -> Option<(u32, bool)> {
+        if (id as usize) >= self.graph.num_nodes() {
+            return None;
+        }
         let (idx, is_new) = self.dedup.probe_or_insert(id, self.node_vec.len() as u32);
         if is_new {
             self.node_vec.push(id);
             self.next_frontier.push((id, idx));
         }
-        (idx, is_new)
+        Some((idx, is_new))
     }
 
     /// Sample k-hop neighborhoods for a batch of seed nodes.
@@ -817,13 +845,15 @@ impl<'a> NeighborSampler<'a> {
         // Emit from sample_buf with time recording — single pass, no redundant lookups
         for j in 0..self.sample_buf.len() {
             let (neighbor, csr_idx) = self.sample_buf[j];
+            let Some((dst_local, is_new)) = self.insert_node_frontier(neighbor) else {
+                continue;
+            };
             self.edge_src_buf.push(node);
             self.edge_dst_buf.push(neighbor);
             self.src_local_buf.push(node_local);
             if self.config.track_edge_ids {
                 self.edge_ids_buf.push(edge_offset + csr_idx as u64);
             }
-            let (dst_local, is_new) = self.insert_node_frontier(neighbor);
             self.dst_local_buf.push(dst_local);
             if is_new {
                 // Use ts directly (already borrowed above, same lifetime)
@@ -853,13 +883,15 @@ impl<'a> NeighborSampler<'a> {
             let track = self.config.track_edge_ids;
             for i in 0..self.sample_buf.len() {
                 let (neighbor, local_idx) = self.sample_buf[i];
+                let Some((dst_local, _)) = self.insert_node_frontier(neighbor) else {
+                    continue;
+                };
                 self.edge_src_buf.push(node);
                 self.edge_dst_buf.push(neighbor);
                 self.src_local_buf.push(node_local);
                 if track {
                     self.edge_ids_buf.push(edge_offset + local_idx as u64);
                 }
-                let (dst_local, _) = self.insert_node_frontier(neighbor);
                 self.dst_local_buf.push(dst_local);
             }
         } else {
@@ -889,7 +921,10 @@ impl<'a> NeighborSampler<'a> {
     }
 
     /// Push one sampled edge (with its emit-time local endpoint indices) to
-    /// the output buffers.
+    /// the output buffers. Destination IDs outside `[0, num_nodes)` are
+    /// skipped — `OffsetsOnly` loads leave edge bodies unchecked, and a
+    /// corrupt destination must not panic the dense dedup table or invent
+    /// phantom nodes in map mode.
     #[inline(always)]
     fn emit_edge(
         &mut self,
@@ -900,13 +935,15 @@ impl<'a> NeighborSampler<'a> {
         idx: usize,
         track: bool,
     ) {
+        let Some((dst_local, _)) = self.insert_node_frontier(neighbor) else {
+            return;
+        };
         self.edge_src_buf.push(src);
         self.edge_dst_buf.push(neighbor);
         self.src_local_buf.push(src_local);
         if track {
             self.edge_ids_buf.push(edge_offset + idx as u64);
         }
-        let (dst_local, _) = self.insert_node_frontier(neighbor);
         self.dst_local_buf.push(dst_local);
     }
 
@@ -1082,6 +1119,10 @@ impl<'a> NeighborSampler<'a> {
 /// indices derived for [`SampledSubgraph::from_parts`] subgraphs are owned.
 pub type LocalEdgeIndex<'a> = (Cow<'a, [u32]>, Cow<'a, [u32]>);
 
+/// Local seed indices into [`SampledSubgraph::nodes`], borrowed when the
+/// sampler recorded them at emit time.
+pub type SeedIndicesLocal<'a> = Cow<'a, [u32]>;
+
 /// Local-index data carried by a [`SampledSubgraph`], discriminated by
 /// provenance.
 ///
@@ -1247,17 +1288,17 @@ impl SampledSubgraph {
     /// Local seed indices (position of each seed in the nodes array).
     /// Useful for identifying which nodes in the subgraph were the original seeds.
     ///
-    /// Sampler-produced subgraphs (disjoint included) return the indices
-    /// recorded at seed registration; subgraphs built via
-    /// [`SampledSubgraph::from_parts`] derive them from a transient per-call
-    /// map. Repeated calls return the same answer on every provenance.
+    /// Sampler-produced subgraphs (disjoint included) return a borrowed slice of
+    /// the indices recorded at seed registration; subgraphs built via
+    /// [`SampledSubgraph::from_parts`] derive an owned vector from a transient
+    /// per-call map. Repeated calls return the same answer on every provenance.
     ///
     /// # Errors
     /// Only [`SampledSubgraph::from_parts`] subgraphs can fail, when a seed
     /// is missing from `nodes` — inconsistent reconstruction input.
-    pub fn seed_indices_local(&self) -> Result<Vec<u32>, String> {
+    pub fn seed_indices_local(&self) -> Result<SeedIndicesLocal<'_>, String> {
         match &self.locals {
-            Locals::Recorded { seeds, .. } => Ok(seeds.clone()),
+            Locals::Recorded { seeds, .. } => Ok(Cow::Borrowed(seeds)),
             Locals::Lazy => {
                 let local_index = self.lazy_local_index();
                 self.seeds
@@ -1268,7 +1309,8 @@ impl SampledSubgraph {
                             .copied()
                             .ok_or_else(|| format!("seed {id} not in subgraph nodes"))
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Cow::Owned)
             }
         }
     }
@@ -1665,6 +1707,41 @@ mod tests {
         assert_eq!(subgraph.num_seeds(), 1);
         assert_eq!(subgraph.num_nodes(), 1); // Only the seed node
         assert_eq!(subgraph.num_edges(), 0); // No edges sampled
+    }
+
+    #[test]
+    fn corrupt_destination_is_skipped_not_panic() {
+        // Simulate an OffsetsOnly-loaded CSR whose edge body has an
+        // out-of-range destination. Sampling must skip it, not panic the
+        // dense dedup table.
+        let graph = Graph::from_csr_arrays(3, vec![0u64, 2, 2, 2], vec![1u32, 99u32], None);
+        let config = SamplingConfig {
+            fanout: vec![10],
+            replace: false,
+            seed: Some(1),
+            max_degree: None,
+            cumulative: true,
+            weighted: false,
+            subgraph_type: SubgraphType::Directional,
+            track_edge_ids: true,
+            temporal_strategy: None,
+            disjoint: false,
+            deterministic: false,
+            telemetry: None,
+        };
+        let mut sampler = NeighborSampler::new(&graph, config);
+        let sub = sampler.sample_neighbors(&[0]);
+        assert!(sub.nodes.iter().all(|&n| (n as usize) < 3));
+        assert!(sub.edge_dst.iter().all(|&d| (d as usize) < 3));
+        // Only the in-range neighbor (1) should have been emitted.
+        assert_eq!(sub.num_edges(), 1);
+    }
+
+    #[test]
+    fn batch_seed_is_stable_and_distinct() {
+        assert_eq!(batch_seed(42, 0), batch_seed(42, 0));
+        assert_ne!(batch_seed(42, 0), batch_seed(42, 1));
+        assert_ne!(batch_seed(1, 0), batch_seed(2, 0));
     }
 
     #[test]

@@ -215,7 +215,7 @@ impl PyFeatureStore {
     /// # Performance
     /// - Vectorized batch loading (better than individual gets)
     /// - ~1-10ms for 1000 nodes depending on cache hits
-    /// - Accepts numpy arrays directly (zero-copy on the input side)
+    /// - Accepts numpy arrays directly (copied before detach for free-threaded safety)
     ///
     /// # Example
     /// ```python
@@ -223,22 +223,16 @@ impl PyFeatureStore {
     /// batch = store.get_batch(sampled_nodes)  # shape: [4, feature_dim]
     /// ```
     fn get_batch(&self, py: Python, nodes: numpy::PyReadonlyArray1<i64>) -> PyResult<Py<PyAny>> {
-        let nodes_slice = nodes.as_slice()?;
+        // Own NodeIds before detach: one pass from int64 (free-threaded
+        // safe) — no intermediate Vec<i64> then per-element TryInto.
+        let nodes_vec = crate::error::copy_node_ids_i64(nodes)?;
+        let num_nodes = nodes_vec.len();
 
-        // The core `get_batch<T>` is generic over `T: TryInto<NodeId>` and
-        // returns a clear error per-element. So negatives, out-of-range
-        // values, and out-of-graph IDs all surface as Python ValueError.
-        //
-        // A cold mmap page fault during the gather can block; release the GIL
-        // across the gather so other Python threads run. The store and the
-        // input slice are plain memory (no Python objects), and the numpy
-        // array is built afterward, back under the GIL.
         let store = &self.inner;
         let features = py
-            .detach(|| store.get_batch(nodes_slice))
+            .detach(|| store.get_batch(&nodes_vec))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?;
 
-        let num_nodes = nodes_slice.len();
         let feature_dim = self.inner.feature_dim();
 
         let array = PyArray1::from_vec(py, features);

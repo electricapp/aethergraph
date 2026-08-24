@@ -9,6 +9,9 @@ Run under a free-threaded CPython (``python3.14t``). It proves two things:
 2. N threads sampling one shared graph concurrently produce correct
    results with no crashes or data races. The sampler releases the GIL for
    the Rust work, so on a free-threaded build these run in true parallel.
+3. Returned numpy arrays stay valid after further sampling on other threads
+   (regression for "borrow across ``py.detach``" UAF under ``gil_used =
+   false`` — accessors must hand back owned copies, not views into Rust).
 
 Imports ``aethergraph._core`` directly (not the torch-dependent
 ``aethergraph.pytorch``), so it needs only numpy — which ships
@@ -49,6 +52,9 @@ def main() -> None:
     iters = 200
     errors: list[str] = []
     barrier = threading.Barrier(n_threads)
+    # (3) Snapshots of returned arrays kept alive across concurrent samples.
+    snapshots: list[tuple[np.ndarray, np.ndarray]] = []
+    snap_lock = threading.Lock()
 
     def worker(tid: int) -> None:
         try:
@@ -56,13 +62,26 @@ def main() -> None:
             sampler = NeighborSampler(graph, config)
             seeds = rng.integers(0, num_nodes, size=64, dtype=np.int64)
             barrier.wait()  # maximize real overlap under no-GIL
-            for _ in range(iters):
+            for i in range(iters):
                 sub = sampler.sample(seeds)
                 n = sub.num_nodes
                 # Every seed is always present, so the subgraph is never
                 # smaller than the seed set.
                 if n < len(seeds):
                     raise AssertionError(f"num_nodes {n} < seeds {len(seeds)}")
+                nodes = np.array(sub.nodes, copy=True)
+                edge_index = np.array(sub.edge_index, copy=True)
+                if i == 0:
+                    # Keep a live reference without copying so a borrowed
+                    # view into freed Rust memory would be detectable when
+                    # we re-check after the barrier below.
+                    with snap_lock:
+                        snapshots.append((sub.nodes, sub.edge_index))
+                # Touch the arrays again after more Rust work on this thread.
+                if nodes.shape[0] != n:
+                    raise AssertionError("nodes length drifted after copy")
+                if edge_index.ndim != 2:
+                    raise AssertionError("edge_index rank drifted after copy")
         except Exception as e:  # noqa: BLE001 - report, don't crash the run
             errors.append(f"thread {tid}: {e!r}")
 
@@ -76,7 +95,13 @@ def main() -> None:
         for e in errors:
             print("ERROR:", e)
         raise SystemExit(1)
-    print(f"{n_threads} threads x {iters} samples: OK")
+
+    # After all workers finish, held arrays must still be readable and sane.
+    for nodes, edge_index in snapshots:
+        _ = int(nodes.sum()) + int(edge_index.sum())
+        if nodes.ndim != 1 or edge_index.ndim != 2:
+            raise SystemExit("held sample arrays corrupted after concurrent sampling")
+    print(f"{n_threads} threads x {iters} samples: OK ({len(snapshots)} held arrays)")
 
 
 if __name__ == "__main__":

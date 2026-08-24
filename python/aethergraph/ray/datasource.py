@@ -125,7 +125,11 @@ class AetherGraphDatasource(Datasource):
             self._input_nodes = None
             self._num_input_nodes = graph.num_nodes
         else:
-            self._input_nodes = np.asarray(input_nodes, dtype=np.int64)
+            from aethergraph import Graph
+            from aethergraph.pytorch.loader import normalize_input_nodes
+
+            graph = Graph.load(self.graph_path, storage="mmap", validation="header_only")
+            self._input_nodes = normalize_input_nodes(input_nodes, num_nodes=graph.num_nodes)
             self._num_input_nodes = len(self._input_nodes)
 
     def get_read_tasks(
@@ -315,7 +319,7 @@ def _run_neighbor_loader(
 
     batches_yielded = 0
     try:
-        graph = Graph.load(graph_path)
+        graph = Graph.load(graph_path, storage="mmap", validation="offsets_only")
         loader = NeighborLoader(
             graph,
             num_neighbors=num_neighbors,
@@ -364,10 +368,22 @@ def _numpy_to_list_array(arr: npt.NDArray[Any], value_type: pa.DataType) -> pa.L
 
     Returns:
         ListArray containing one element (the input array as a list).
+
+    Raises:
+        ValueError: If the array length exceeds the int32 offset limit used by
+            the shared Ray row schema (``list<item: …>``, not large_list).
     """
     arr = np.ascontiguousarray(arr)
     values = pa.array(arr, type=value_type)
-    offsets = pa.array([0, len(arr)], type=pa.int32())
+    # Schema contract is int32 list offsets; refuse cells that would need
+    # large_list rather than silently promoting and drifting from `_schema`.
+    n = len(arr)
+    max_off = int(np.iinfo(np.int32).max)
+    if n > max_off:
+        raise ValueError(
+            f"list cell has {n} values; exceeds int32 Arrow list offset limit ({max_off})"
+        )
+    offsets = pa.array([0, n], type=pa.int32())
     return pa.ListArray.from_arrays(offsets, values)
 
 

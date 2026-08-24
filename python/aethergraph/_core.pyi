@@ -609,6 +609,8 @@ class HeteroSampledSubgraph:
     def seed_type(self) -> str: ...
     @property
     def seeds(self) -> npt.NDArray[np.int64]: ...
+    @property
+    def seed_indices(self) -> npt.NDArray[np.int64]: ...
     def nodes(self, node_type: str) -> npt.NDArray[np.int64]: ...
     def nodes_u32(self, node_type: str) -> npt.NDArray[np.uint32]: ...
     def edge_index_local(self, src: str, rel: str, dst: str) -> npt.NDArray[np.int64]: ...
@@ -627,10 +629,11 @@ class HeteroNeighborLoader:
     """Prefetching heterogeneous neighbor loader. Spawns `sampler_threads`
     worker threads over an MPMC work queue — the same pipeline as
     `NeighborLoader`; bounded submission and result channels apply
-    backpressure both ways. Results arrive unordered across the pool —
-    each subgraph carries its own seed type and seeds, so consumers never
-    rely on arrival order. Every submitted batch is rooted at the
-    `seed_type` fixed at construction."""
+    backpressure both ways. When constructed with a seed, results are
+    reordered by `batch_idx` so multi-worker pools stay bit-identical to a
+    single worker; without a seed, delivery order across the pool is
+    unordered. Every submitted batch is rooted at the `seed_type` fixed at
+    construction."""
 
     def __init__(
         self,

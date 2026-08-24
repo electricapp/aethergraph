@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::error::graph_load_error;
+use crate::error::{copy_array1, graph_load_error};
 
 const FULL_VALIDATION_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -123,22 +123,20 @@ impl PyCsrGraph {
         dst: PyReadonlyArray1<u32>,
         weights: Option<PyReadonlyArray1<f32>>,
     ) -> PyResult<Self> {
-        let src_slice = src.as_slice()?;
-        let dst_slice = dst.as_slice()?;
-        if src_slice.len() != dst_slice.len() {
+        let src_vec = copy_array1(src)?;
+        let dst_vec = copy_array1(dst)?;
+        if src_vec.len() != dst_vec.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "src and dst must have the same length, got {} and {}",
-                src_slice.len(),
-                dst_slice.len()
+                src_vec.len(),
+                dst_vec.len()
             )));
         }
-        let w = weights.as_ref().map(|w| w.as_slice()).transpose()?;
-        // The O(E) CSR build reads the numpy-backed src/dst/weight slices
-        // directly (kept alive by the readonly guards above) — no
-        // interleaved (src, dst) tuple copy of the edge list is
-        // materialized. Release the GIL across the build.
+        let w = weights.map(copy_array1).transpose()?;
+        // Own the edge arrays before detach so free-threaded Python cannot
+        // free them mid-build; release the GIL across the O(E) CSR construct.
         let graph = py
-            .detach(|| Graph::from_src_dst(num_nodes, src_slice, dst_slice, w))
+            .detach(|| Graph::from_src_dst(num_nodes, &src_vec, &dst_vec, w.as_deref()))
             .map_err(|e| graph_load_error(format!("Failed to create graph: {e}")))?;
         Ok(Self {
             inner: Arc::new(graph),
@@ -162,12 +160,11 @@ impl PyCsrGraph {
     /// Returns:
     ///     CsrGraph: Reordered graph with improved cache locality.
     fn permute(&self, py: Python<'_>, perm: PyReadonlyArray1<u32>) -> PyResult<Self> {
-        let perm_slice = perm.as_slice()?;
-        // The O(V + E) rebuild reads only the shared graph and the
-        // numpy-backed permutation slice (kept alive by the readonly guard);
-        // release the GIL across it.
+        let perm_vec = copy_array1(perm)?;
+        // Own the permutation before detach (free-threaded safety), then
+        // release the GIL across the O(V + E) rebuild.
         let new_graph = py
-            .detach(|| self.inner.permute(perm_slice))
+            .detach(|| self.inner.permute(&perm_vec))
             .map_err(|e| graph_load_error(format!("Permutation failed: {e}")))?;
         Ok(Self {
             inner: Arc::new(new_graph),
@@ -249,10 +246,10 @@ impl PyCsrGraph {
         py: Python<'py>,
         nodes: PyReadonlyArray1<'py, u32>,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
-        let nodes = nodes.as_slice()?;
-        // Scattered offsets lookups over a possibly-mmap'd array; release
-        // the GIL so other Python threads run through the cache misses.
-        let degrees = py.detach(|| self.inner.degrees_of(nodes));
+        let nodes = copy_array1(nodes)?;
+        // Own the ID list before detach; release the GIL across scattered
+        // offsets lookups on a possibly-mmap'd array.
+        let degrees = py.detach(|| self.inner.degrees_of(&nodes));
         Ok(PyArray1::from_vec(py, degrees))
     }
 

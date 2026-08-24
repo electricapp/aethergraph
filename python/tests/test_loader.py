@@ -370,10 +370,6 @@ class TestNeighborLoaderFailureHandling:
         import aethergraph.pytorch.loader as loader_module
         from aethergraph.pytorch import NeighborLoader
 
-        class _FakeSamplingConfig:
-            def __init__(self, **_kwargs: object) -> None:
-                pass
-
         class _FakeStats:
             hit_rate = 0.0
             hits = 0
@@ -395,7 +391,6 @@ class TestNeighborLoaderFailureHandling:
             def shutdown(self) -> None:
                 return None
 
-        monkeypatch.setattr(loader_module, "RustSamplingConfig", _FakeSamplingConfig)
         monkeypatch.setattr(loader_module, "RustNeighborLoader", _FakeRustNeighborLoader)
 
         loader = NeighborLoader(
@@ -436,12 +431,25 @@ class TestSamplingConfigValidation:
         with pytest.raises(ValueError, match="non-empty"):
             SamplingConfig(num_neighbors=[])
 
+    def test_loader_rejects_empty_num_neighbors(self, small_graph: Graph) -> None:
+        """NeighborLoader must reject empty fanout at construction, not at iter."""
+        from aethergraph.pytorch import NeighborLoader
+
+        with pytest.raises(ValueError, match="non-empty"):
+            NeighborLoader(small_graph, num_neighbors=[], batch_size=1)
+
     def test_negative_num_neighbors(self) -> None:
         """Negative values in num_neighbors should raise ValueError."""
         from aethergraph import SamplingConfig
 
         with pytest.raises(ValueError, match="non-negative"):
             SamplingConfig(num_neighbors=[10, -5])
+
+    def test_loader_rejects_negative_num_neighbors(self, small_graph: Graph) -> None:
+        from aethergraph.pytorch import NeighborLoader
+
+        with pytest.raises(ValueError, match="non-negative"):
+            NeighborLoader(small_graph, num_neighbors=[-1], batch_size=1)
 
     def test_invalid_max_degree(self) -> None:
         """Invalid max_degree should raise ValueError."""
@@ -511,3 +519,68 @@ class TestSamplingConfigValidation:
         assert config.seed == 42
         assert config.max_degree == 1000
         assert config.cumulative is False
+
+
+class TestBoundaryParsing:
+    """Parse-at-edge contracts for seeds and features."""
+
+    def test_normalize_rejects_float_ids(self, small_graph: Graph) -> None:
+        from aethergraph.pytorch.loader import normalize_input_nodes
+
+        with pytest.raises(ValueError, match="integer or bool"):
+            normalize_input_nodes(
+                np.array([1.9, 2.1], dtype=np.float64),
+                num_nodes=small_graph.num_nodes,
+            )
+
+    def test_parse_features_rejects_float64(self, small_graph: Graph) -> None:
+        from aethergraph.pytorch.loader import _parse_features
+
+        bad = np.zeros((small_graph.num_nodes, 4), dtype=np.float64)
+        with pytest.raises(ValueError, match="float32"):
+            _parse_features(bad, small_graph.num_nodes)
+
+    def test_multi_worker_seed_content_stable(self, medium_graph: Graph) -> None:
+        """Same seed + multi-worker → bit-identical ordered epoch stream."""
+        from aethergraph.pytorch import NeighborLoader
+
+        g = medium_graph
+
+        def epoch(workers: int) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+            ld = NeighborLoader(
+                g,
+                num_neighbors=[10, 10],
+                batch_size=8,
+                seed=42,
+                num_workers=workers,
+                shuffle=False,
+                replace=True,
+                input_nodes=np.arange(min(40, g.num_nodes), dtype=np.int64),
+            )
+            return [
+                (
+                    tuple(d.n_id.tolist()),
+                    tuple(d.edge_index.reshape(-1).tolist()),
+                )
+                for d in ld
+            ]
+
+        a = epoch(1)
+        assert a == epoch(1)
+        assert a == epoch(4)
+
+
+class TestTrackEdgeIds:
+    def test_track_edge_ids_false_sets_e_id_none(self, small_graph: Graph) -> None:
+        from aethergraph.pytorch import NeighborLoader
+
+        ld = NeighborLoader(
+            small_graph,
+            num_neighbors=[5],
+            batch_size=4,
+            track_edge_ids=False,
+            shuffle=False,
+        )
+        batch = next(iter(ld))
+        assert batch.get("e_id") is None
+        assert batch.edge_index.shape[1] >= 0

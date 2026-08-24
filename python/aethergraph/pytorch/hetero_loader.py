@@ -190,6 +190,26 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         # pipeline (sampling still overlaps training).
         self._sampler_threads: int = max(1, num_workers)
 
+        if not num_neighbors:
+            raise ValueError("num_neighbors must be a non-empty dict")
+        hop_lens = {len(hops) for hops in num_neighbors.values()}
+        if len(hop_lens) != 1:
+            raise ValueError(
+                "all edge types in num_neighbors must have the same number of hops, "
+                f"got lengths {sorted(hop_lens)}"
+            )
+        for edge_type, hops in num_neighbors.items():
+            if not hops:
+                raise ValueError(
+                    f"num_neighbors[{edge_type!r}] must be a non-empty list, got {hops!r}"
+                )
+            if any(n < 0 for n in hops):
+                raise ValueError(
+                    f"num_neighbors values must be non-negative, got {hops} for {edge_type!r}"
+                )
+        if max_degree is not None and max_degree <= 0:
+            raise ValueError(f"max_degree must be > 0 if specified, got {max_degree}")
+
         if input_nodes is None:
             raise ValueError(
                 "input_nodes is required for HeteroNeighborLoader. "
@@ -297,7 +317,8 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                 - data[node_type].x: Node features (if available)
                 - data[src, rel, dst].edge_index: Local edge connectivity
                 - data[seed_type].batch_size: Number of seed nodes
-                - data[seed_type].input_id: Global IDs of seed nodes
+                - data[seed_type].input_id: Local indices of seeds in
+                  ``n_id`` (homo contract; globals are ``n_id[input_id]``)
         """
         batch_size = self.batch_size
         num_batches = len(self)
@@ -413,7 +434,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                     out = torch.empty(
                         (len(nodes), feat.shape[1]), dtype=torch.float32, pin_memory=pin
                     )
-                    torch.index_select(feat, 0, torch.from_numpy(nodes), out=out)
+                    torch.index_select(feat, 0, n_id, out=out)
                     store.x = out
 
         for src, rel, dst in edge_types:
@@ -422,15 +443,15 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                 edge_index = edge_index.pin_memory()
             data[src, rel, dst].edge_index = edge_index
 
-        # Set batch_size and input_id for the seed node type
+        # Homo contract: input_id = local seed indices, batch_size = len(seeds)
+        # including duplicates. seed_indices preserves one entry per input seed.
         seed_type = subgraph.seed_type
-        seeds = subgraph.seeds
-        input_id = torch.from_numpy(seeds)
+        seed_indices = torch.from_numpy(subgraph.seed_indices)
         if pin:
-            input_id = input_id.pin_memory()
+            seed_indices = seed_indices.pin_memory()
         seed_store = data[seed_type]
-        seed_store.batch_size = len(seeds)
-        seed_store.input_id = input_id
+        seed_store.batch_size = len(seed_indices)
+        seed_store.input_id = seed_indices
 
         return data
 

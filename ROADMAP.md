@@ -97,9 +97,8 @@ single-worker baseline.
 
 Remaining larger redesigns; land each with its own tests.
 
-| Area                   | Change                                                                                                              |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| FeatureCache NVMe tier | Route the slot file through the io_uring lane with `O_DIRECT` (it uses positional reads on the blocking pool today) |
+_(none outstanding — FeatureCache NVMe spill now gathers through io_uring
+with O_DIRECT when the padded slot stride allows.)_
 
 ---
 

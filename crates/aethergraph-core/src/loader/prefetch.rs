@@ -36,7 +36,7 @@
 //!    - Still faster than sequential sync I/O due to batching
 
 use super::hetero_sampler::{HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig};
-use super::sampler::{NeighborSampler, SampledSubgraph, SamplingConfig};
+use super::sampler::{NeighborSampler, SampledSubgraph, SamplingConfig, batch_seed};
 use crate::features::header::{FeatureDtype, parse_feature_header};
 use crate::graph::hetero::{HeteroGraph, NodeTypeId};
 use crate::graph::{Graph, NodeId};
@@ -44,12 +44,14 @@ use crate::graph::{Graph, NodeId};
 use crate::internal::genstamp::WyRand;
 use crate::internal::hint;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use std::os::unix::fs::FileExt;
@@ -77,6 +79,23 @@ const PREFETCH_SPAN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// How long a blocking consumer call waits for the worker before reporting
 /// [`PrefetchError::Timeout`].
 const RECV_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Holds out-of-order prefetch results until `next_idx` is ready.
+/// Used when the loader was constructed with a seed so yield order matches
+/// submit order even with a multi-worker pool.
+struct BatchReorder<T> {
+    next_idx: usize,
+    pending: BTreeMap<usize, T>,
+}
+
+impl<T> BatchReorder<T> {
+    fn new() -> Self {
+        Self {
+            next_idx: 0,
+            pending: BTreeMap::new(),
+        }
+    }
+}
 
 /// Work item for the prefetch thread.
 #[derive(Debug)]
@@ -538,6 +557,7 @@ fn worker_loop_sampler(
     stats: Arc<PrefetchStats>,
 ) {
     debug!("Sampler thread started");
+    let base_seed = config.seed;
     let mut sampler = NeighborSampler::new(&graph, config);
 
     loop {
@@ -555,6 +575,9 @@ fn worker_loop_sampler(
             seeds = work.seeds.len(),
             "sampling"
         );
+        if let Some(base) = base_seed {
+            sampler.reseed(batch_seed(base, work.batch_idx));
+        }
         let t0 = std::time::Instant::now();
         let subgraph = sampler.sample_neighbors(&work.seeds);
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
@@ -587,6 +610,7 @@ fn worker_loop_hetero(
     stats: Arc<PrefetchStats>,
 ) {
     debug!("Hetero sampler thread started");
+    let base_seed = config.seed;
     let mut sampler = HeteroNeighborSampler::new(&graph, config);
 
     loop {
@@ -604,6 +628,9 @@ fn worker_loop_hetero(
             seeds = work.seeds.len(),
             "hetero sampling"
         );
+        if let Some(base) = base_seed {
+            sampler.reseed(super::sampler::batch_seed(base, work.batch_idx));
+        }
         let t0 = std::time::Instant::now();
         let subgraph = sampler.sample_neighbors(seed_type, &work.seeds);
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
@@ -721,6 +748,10 @@ pub struct NeighborLoader {
     feature_dim: Option<usize>,
     /// Why a worker exited on its own (captured panic or error), if it did
     worker_fault: Arc<OnceLock<String>>,
+    /// When true (seeded construction), `next*` yields in `batch_idx` order
+    /// so multi-worker pools stay bit-identical to a single worker.
+    order_by_batch: bool,
+    reorder: Mutex<BatchReorder<PrefetchResult>>,
 }
 
 impl NeighborLoader {
@@ -754,6 +785,7 @@ impl NeighborLoader {
             ));
         }
         let sampler_threads = sampler_threads.max(1);
+        let order_by_batch = config.seed.is_some();
 
         // Both channels bounded:
         //   - work channel  : producer blocks when the workers fall behind
@@ -809,6 +841,8 @@ impl NeighborLoader {
             prefetch_depth,
             feature_dim: None,
             worker_fault,
+            order_by_batch,
+            reorder: Mutex::new(BatchReorder::new()),
         })
     }
 
@@ -838,6 +872,7 @@ impl NeighborLoader {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(prefetch_depth > 0, "prefetch_depth must be >= 1");
         let sampler_threads = sampler_threads.max(1);
+        let order_by_batch = config.seed.is_some();
 
         // Load feature store to get metadata
         let feature_store = SyncFeatureStore::load(feature_path.as_ref())?;
@@ -920,6 +955,8 @@ impl NeighborLoader {
             prefetch_depth,
             feature_dim: Some(feature_dim),
             worker_fault,
+            order_by_batch,
+            reorder: Mutex::new(BatchReorder::new()),
         })
     }
 
@@ -1012,6 +1049,7 @@ impl NeighborLoader {
             ));
         }
         Self::validate_nvme_config(&config)?;
+        let order_by_batch = config.seed.is_some();
 
         // Same bounding strategy as the other constructors: bounded work
         // channel applies producer-side backpressure so a runaway submit
@@ -1060,6 +1098,8 @@ impl NeighborLoader {
             prefetch_depth,
             feature_dim,
             worker_fault,
+            order_by_batch,
+            reorder: Mutex::new(BatchReorder::new()),
         })
     }
 
@@ -1106,7 +1146,56 @@ impl NeighborLoader {
         };
         self.stats.total.fetch_add(1, Ordering::Relaxed);
 
-        // Try non-blocking first to track hit rate
+        if !self.order_by_batch {
+            return self.recv_unordered(result_rx, timeout);
+        }
+
+        // Seeded runs: buffer until `next_idx` arrives so multi-worker
+        // completion order cannot scramble the epoch stream.
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let mut buf = self.reorder.lock();
+                let idx = buf.next_idx;
+                if let Some(r) = buf.pending.remove(&idx) {
+                    buf.next_idx = idx + 1;
+                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(r));
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    "Prefetch timeout after {:?} waiting for ordered batch - worker may have deadlocked or I/O is very slow",
+                    timeout
+                );
+                return Err(PrefetchError::Timeout { waited: timeout });
+            }
+
+            match result_rx.recv_timeout(remaining) {
+                Ok(r) => {
+                    self.reorder.lock().pending.insert(r.batch_idx, r);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    warn!(
+                        "Prefetch timeout after {:?} - worker may have deadlocked or I/O is very slow",
+                        timeout
+                    );
+                    return Err(PrefetchError::Timeout { waited: timeout });
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return self.disconnected();
+                }
+            }
+        }
+    }
+
+    fn recv_unordered(
+        &self,
+        result_rx: &Receiver<PrefetchResult>,
+        timeout: Duration,
+    ) -> Result<Option<PrefetchResult>, PrefetchError> {
         match result_rx.try_recv() {
             Ok(result) => {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -1114,7 +1203,6 @@ impl NeighborLoader {
                 Ok(Some(result))
             }
             Err(TryRecvError::Empty) => {
-                // Cache miss - need to wait (with timeout to detect issues)
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
                 trace!("prefetch miss - blocking");
                 match result_rx.recv_timeout(timeout) {
@@ -1155,6 +1243,25 @@ impl NeighborLoader {
         let Some(result_rx) = self.result_rx.as_ref() else {
             return Ok(None);
         };
+        if self.order_by_batch {
+            while let Ok(r) = result_rx.try_recv() {
+                self.reorder.lock().pending.insert(r.batch_idx, r);
+            }
+            let mut buf = self.reorder.lock();
+            let idx = buf.next_idx;
+            if let Some(r) = buf.pending.remove(&idx) {
+                buf.next_idx = idx + 1;
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.total.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(r.subgraph));
+            }
+            return match result_rx.try_recv() {
+                Err(TryRecvError::Disconnected) => {
+                    self.disconnected().map(|r| r.map(|r| r.subgraph))
+                }
+                _ => Ok(None),
+            };
+        }
         match result_rx.try_recv() {
             Ok(result) => {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -1247,6 +1354,7 @@ impl NeighborLoader {
             "In-memory prefetch worker started (with lookahead)"
         );
 
+        let base_seed = config.seed;
         let mut sampler = NeighborSampler::new(&graph, config);
         let mut feature_store = feature_store;
 
@@ -1270,6 +1378,9 @@ impl NeighborLoader {
                             seeds = work.seeds.len(),
                             "sampling"
                         );
+                        if let Some(base) = base_seed {
+                            sampler.reseed(batch_seed(base, work.batch_idx));
+                        }
                         let subgraph = sampler.sample_neighbors(&work.seeds);
                         (work, subgraph)
                     }
@@ -1281,6 +1392,9 @@ impl NeighborLoader {
             // Issue prefetch hints for N+1 while we load N's features
             if let Ok(next_work) = work_rx.try_recv() {
                 trace!(batch_idx = next_work.batch_idx, "lookahead sampling");
+                if let Some(base) = base_seed {
+                    sampler.reseed(batch_seed(base, next_work.batch_idx));
+                }
                 let next_subgraph = sampler.sample_neighbors(&next_work.seeds);
 
                 // Issue kernel prefetch hints for next batch's features
@@ -1488,7 +1602,15 @@ impl NeighborLoader {
                 "NVMe sampling"
             );
 
-            // Sample using io_uring batch reads
+            // Per-batch reseed matches the in-memory worker path so a shared
+            // config.seed stays reproducible across multi-worker pools.
+            let mut sample_config = config.clone();
+            sample_config.seed = Some(
+                config
+                    .seed
+                    .map(|base| batch_seed(base, work.batch_idx))
+                    .unwrap_or_else(rand::random),
+            );
             let subgraph = sample_with_uring(
                 &mut handle,
                 fd,
@@ -1496,7 +1618,7 @@ impl NeighborLoader {
                 edges_start,
                 num_nodes,
                 &work.seeds,
-                &config,
+                &sample_config,
             )?;
 
             let (features, feature_dim) = if let Some(ref mut store) = feature_store {
@@ -1539,9 +1661,10 @@ impl Drop for NeighborLoader {
 /// Same pipeline shape as [`NeighborLoader`]: `sampler_threads` worker
 /// threads pull seed batches from a bounded MPMC work channel, sample with
 /// their own [`HeteroNeighborSampler`], and deliver results tagged with
-/// their `batch_idx` — unordered across the pool, no reorder buffer. The
-/// seed node type is fixed at construction; every submitted batch is rooted
-/// at it.
+/// their `batch_idx`. When `config.seed` is set, `next*` reorders by
+/// `batch_idx` so multi-worker pools stay bit-identical to a single worker.
+/// The seed node type is fixed at construction; every submitted batch is
+/// rooted at it.
 pub struct HeteroNeighborLoader {
     /// Send work to the sampler pool (Option so we can take it on shutdown)
     work_tx: Option<Sender<PrefetchWork>>,
@@ -1558,6 +1681,9 @@ pub struct HeteroNeighborLoader {
     prefetch_depth: usize,
     /// Why a worker exited on its own (captured panic or error), if it did
     worker_fault: Arc<OnceLock<String>>,
+    /// When true (seeded construction), `next*` yields in `batch_idx` order.
+    order_by_batch: bool,
+    reorder: Mutex<BatchReorder<HeteroPrefetchResult>>,
 }
 
 impl HeteroNeighborLoader {
@@ -1605,6 +1731,7 @@ impl HeteroNeighborLoader {
             ));
         }
         let sampler_threads = sampler_threads.max(1);
+        let order_by_batch = config.seed.is_some();
 
         // Same bounding strategy as `NeighborLoader::new`:
         //   - work channel  : producer blocks when the workers fall behind
@@ -1663,6 +1790,8 @@ impl HeteroNeighborLoader {
             stats,
             prefetch_depth,
             worker_fault,
+            order_by_batch,
+            reorder: Mutex::new(BatchReorder::new()),
         })
     }
 
@@ -1704,7 +1833,54 @@ impl HeteroNeighborLoader {
         };
         self.stats.total.fetch_add(1, Ordering::Relaxed);
 
-        // Try non-blocking first to track hit rate
+        if !self.order_by_batch {
+            return self.recv_unordered(result_rx, timeout);
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let mut buf = self.reorder.lock();
+                let idx = buf.next_idx;
+                if let Some(r) = buf.pending.remove(&idx) {
+                    buf.next_idx = idx + 1;
+                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(r));
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    "Hetero prefetch timeout after {:?} waiting for ordered batch - workers may have deadlocked or are very slow",
+                    timeout
+                );
+                return Err(PrefetchError::Timeout { waited: timeout });
+            }
+
+            match result_rx.recv_timeout(remaining) {
+                Ok(r) => {
+                    self.reorder.lock().pending.insert(r.batch_idx, r);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    warn!(
+                        "Hetero prefetch timeout after {:?} - workers may have deadlocked or are very slow",
+                        timeout
+                    );
+                    return Err(PrefetchError::Timeout { waited: timeout });
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return self.disconnected();
+                }
+            }
+        }
+    }
+
+    fn recv_unordered(
+        &self,
+        result_rx: &Receiver<HeteroPrefetchResult>,
+        timeout: Duration,
+    ) -> Result<Option<HeteroPrefetchResult>, PrefetchError> {
         match result_rx.try_recv() {
             Ok(result) => {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -1712,7 +1888,6 @@ impl HeteroNeighborLoader {
                 Ok(Some(result))
             }
             Err(TryRecvError::Empty) => {
-                // Cache miss - need to wait (with timeout to detect issues)
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
                 trace!("hetero prefetch miss - blocking");
                 match result_rx.recv_timeout(timeout) {
@@ -1753,6 +1928,25 @@ impl HeteroNeighborLoader {
         let Some(result_rx) = self.result_rx.as_ref() else {
             return Ok(None);
         };
+        if self.order_by_batch {
+            while let Ok(r) = result_rx.try_recv() {
+                self.reorder.lock().pending.insert(r.batch_idx, r);
+            }
+            let mut buf = self.reorder.lock();
+            let idx = buf.next_idx;
+            if let Some(r) = buf.pending.remove(&idx) {
+                buf.next_idx = idx + 1;
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.total.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(r.subgraph));
+            }
+            return match result_rx.try_recv() {
+                Err(TryRecvError::Disconnected) => {
+                    self.disconnected().map(|r| r.map(|r| r.subgraph))
+                }
+                _ => Ok(None),
+            };
+        }
         match result_rx.try_recv() {
             Ok(result) => {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -1829,9 +2023,12 @@ fn sample_with_uring(
     let mut num_sampled_nodes = Vec::with_capacity(num_hops);
     let mut num_sampled_edges = Vec::with_capacity(num_hops);
 
-    // Match the in-memory sampler: fall back to system entropy when no seed is
-    // given, instead of a fixed constant.
-    let mut rng = WyRand::new(config.seed.unwrap_or_else(rand::random::<u64>));
+    // Caller installs a concrete seed (batch_seed or entropy) on `config.seed`.
+    let mut rng = WyRand::new(
+        config
+            .seed
+            .expect("NVMe sample_with_uring requires config.seed"),
+    );
 
     for hop in 0..num_hops {
         let fanout = config.fanout[hop];
@@ -2279,6 +2476,8 @@ mod tests {
             prefetch_depth: 1,
             feature_dim: None,
             worker_fault,
+            order_by_batch: false,
+            reorder: Mutex::new(BatchReorder::new()),
         };
 
         match loader.next() {

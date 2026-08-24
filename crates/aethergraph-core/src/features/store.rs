@@ -792,7 +792,11 @@ impl FeatureStore {
             row_starts.push(node_idx * row_bytes);
         }
 
-        let mut result = Vec::with_capacity(nodes.len() * self.feature_dim);
+        let total = nodes
+            .len()
+            .checked_mul(self.feature_dim)
+            .ok_or_else(|| anyhow::anyhow!("nodes.len() * feature_dim overflows usize"))?;
+        let mut result = Vec::with_capacity(total);
         let decoder = self.dtype.row_decoder();
         if decoder.is_f32_passthrough() {
             for (i, &byte_start) in row_starts.iter().enumerate() {
@@ -803,7 +807,7 @@ impl FeatureStore {
                 result.extend_from_slice(bytemuck::cast_slice::<u8, f32>(row));
             }
         } else {
-            result.resize(nodes.len() * self.feature_dim, 0.0);
+            result.resize(total, 0.0);
             for (i, &byte_start) in row_starts.iter().enumerate() {
                 if let Some(&ahead) = row_starts.get(i + rows_ahead) {
                     Self::prefetch_row(raw, ahead, row_bytes);
@@ -822,7 +826,7 @@ impl FeatureStore {
                 .fetch_add(nodes.len() as u64, Ordering::Relaxed);
             stats
                 .total_features_loaded
-                .fetch_add((nodes.len() * self.feature_dim) as u64, Ordering::Relaxed);
+                .fetch_add(total as u64, Ordering::Relaxed);
             stats.total_bytes_loaded.fetch_add(
                 result.len() as u64 * std::mem::size_of::<f32>() as u64,
                 Ordering::Relaxed,

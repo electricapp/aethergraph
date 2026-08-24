@@ -123,6 +123,11 @@ impl PySamplingConfig {
         deterministic: bool,
         telemetry: Option<PySamplingTelemetry>,
     ) -> PyResult<Self> {
+        if num_neighbors.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "num_neighbors must be a non-empty list",
+            ));
+        }
         let subgraph_type = match subgraph_type {
             "directional" => SubgraphType::Directional,
             "induced" => SubgraphType::Induced,
@@ -342,7 +347,7 @@ impl PySampledSubgraph {
         // ushll.2d/ushll2.2d, widening eight lanes per unrolled iteration.
         let nodes_i64: Vec<i64> = subgraph.nodes.iter().map(|&n| i64::from(n)).collect();
         let seeds_i64: Vec<i64> = subgraph.seeds.iter().map(|&s| i64::from(s)).collect();
-        let seed_indices_i64: Vec<i64> = seed_indices_local.into_iter().map(i64::from).collect();
+        let seed_indices_i64: Vec<i64> = seed_indices_local.iter().map(|&e| i64::from(e)).collect();
         let edge_ids_i64: Vec<i64> = subgraph.edge_ids.iter().map(|&e| e as i64).collect();
 
         let nodes = PyArray1::from_vec(py, nodes_i64).unbind();

@@ -75,12 +75,14 @@ impl EpochClock {
         Epoch(self.counter.load(Ordering::Acquire))
     }
 
-    /// Increment and return the new epoch. Releases prior writes so that a
-    /// reader observing the returned epoch via [`current`](Self::current)'s
-    /// Acquire load is guaranteed to see them.
+    /// Increment and return the new epoch. AcqRel so that (1) a reader
+    /// observing the returned epoch via [`current`](Self::current)'s Acquire
+    /// load sees this publisher's prior writes, and (2) this RMW Acquires
+    /// earlier publishers' Release/AcqRel advances — multi-subsystem clocks
+    /// stay transitively synchronized.
     #[inline]
     pub fn advance(&self) -> Epoch {
-        Epoch(self.counter.fetch_add(1, Ordering::Release) + 1)
+        Epoch(self.counter.fetch_add(1, Ordering::AcqRel) + 1)
     }
 }
 

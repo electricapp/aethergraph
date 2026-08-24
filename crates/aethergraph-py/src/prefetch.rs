@@ -589,12 +589,19 @@ impl PyNeighborLoader {
     /// Args:
     ///     nodes: Node IDs the upcoming batch will read (uint32)
     #[cfg(all(target_os = "linux", feature = "gpudirect"))]
-    fn prefetch_upcoming(&self, nodes: numpy::PyReadonlyArray1<'_, u32>) -> PyResult<bool> {
+    fn prefetch_upcoming(
+        &self,
+        py: Python<'_>,
+        nodes: numpy::PyReadonlyArray1<'_, u32>,
+    ) -> PyResult<bool> {
         let Some(rdma) = self.rdma_gather.as_ref() else {
             return Ok(false);
         };
-        rdma.prefetch_next(nodes.as_slice()?).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("UVM prefetch failed: {e}"))
+        let nodes = crate::error::copy_array1(nodes)?;
+        py.detach(|| {
+            rdma.prefetch_next(&nodes).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("UVM prefetch failed: {e}"))
+            })
         })
     }
 

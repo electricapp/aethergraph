@@ -464,11 +464,13 @@ class TestHeteroNeighborLoader:
         assert len(batches) == 6
 
         # Delivery order across the pool is unordered; each subgraph carries
-        # its own seeds, so collecting every batch's seeds must reproduce the
-        # input set exactly once each.
+        # its own seeds. input_id is local indices (homo contract); recover
+        # globals via n_id[input_id].
         seen: list[int] = []
         for batch in batches:
-            seen.extend(batch["user"].input_id.tolist())
+            n_id = batch["user"].n_id
+            input_id = batch["user"].input_id
+            seen.extend(n_id[input_id].tolist())
         assert sorted(seen) == list(range(60))
 
     def test_pin_memory(self, reddit_hetero_graph: HeteroGraph) -> None:
@@ -494,3 +496,98 @@ class TestHeteroNeighborLoader:
 
         batch = next(iter(loader))
         assert batch["user"].n_id.is_pinned()
+
+    def test_duplicate_seeds_preserve_batch_size(self, reddit_hetero_graph: HeteroGraph) -> None:
+        """Duplicate input seeds must not shrink batch_size vs n_id contract."""
+        import torch
+
+        from aethergraph.pytorch import HeteroNeighborLoader
+
+        loader = HeteroNeighborLoader(
+            reddit_hetero_graph,
+            num_neighbors={
+                ("user", "votes", "post"): [5],
+                ("user", "writes", "comment"): [3],
+                ("comment", "reply_to", "comment"): [2],
+                ("post", "belongs_to", "subreddit"): [1],
+            },
+            input_nodes=("user", torch.tensor([1, 1, 2])),
+            batch_size=3,
+            shuffle=False,
+        )
+        batch = next(iter(loader))
+        u = batch["user"]
+        assert u.batch_size == 3
+        assert len(u.input_id) == 3
+        # Locals: first two seeds collide → same local index.
+        assert u.input_id[0].item() == u.input_id[1].item()
+        assert u.n_id[u.input_id].tolist() == [1, 1, 2]
+
+    def test_rejects_empty_and_negative_fanout(self, reddit_hetero_graph: HeteroGraph) -> None:
+        import torch
+
+        from aethergraph.pytorch import HeteroNeighborLoader
+
+        with pytest.raises(ValueError, match="non-empty"):
+            HeteroNeighborLoader(
+                reddit_hetero_graph,
+                num_neighbors={},
+                input_nodes=("user", torch.arange(4)),
+            )
+        with pytest.raises(ValueError, match="non-empty"):
+            HeteroNeighborLoader(
+                reddit_hetero_graph,
+                num_neighbors={("user", "votes", "post"): []},
+                input_nodes=("user", torch.arange(4)),
+            )
+        with pytest.raises(ValueError, match="non-negative"):
+            HeteroNeighborLoader(
+                reddit_hetero_graph,
+                num_neighbors={("user", "votes", "post"): [5, -1]},
+                input_nodes=("user", torch.arange(4)),
+            )
+        with pytest.raises(ValueError, match="max_degree"):
+            HeteroNeighborLoader(
+                reddit_hetero_graph,
+                num_neighbors={("user", "votes", "post"): [5]},
+                input_nodes=("user", torch.arange(4)),
+                max_degree=0,
+            )
+
+    def test_multi_worker_seed_content_stable(self, reddit_hetero_graph: HeteroGraph) -> None:
+        """Same seed + multi-worker → bit-identical ordered epoch stream."""
+        import torch
+
+        from aethergraph.pytorch import HeteroNeighborLoader
+
+        g = reddit_hetero_graph
+        fanout = {
+            ("user", "votes", "post"): [5, 3],
+            ("user", "writes", "comment"): [3, 2],
+            ("comment", "reply_to", "comment"): [2, 2],
+            ("post", "belongs_to", "subreddit"): [1, 1],
+        }
+        seeds = torch.arange(40)
+
+        def epoch(workers: int) -> list[tuple[tuple[int, ...], ...]]:
+            ld = HeteroNeighborLoader(
+                g,
+                num_neighbors=fanout,
+                input_nodes=("user", seeds),
+                batch_size=8,
+                seed=42,
+                num_workers=workers,
+                shuffle=False,
+                replace=True,
+            )
+            out: list[tuple[tuple[int, ...], ...]] = []
+            for batch in ld:
+                u = batch["user"]
+                globals_ = tuple(u.n_id[u.input_id].tolist())
+                n_id = tuple(u.n_id.tolist())
+                out.append((globals_, n_id))
+            return out
+
+        a = epoch(1)
+        assert a == epoch(1)
+        assert a == epoch(4)

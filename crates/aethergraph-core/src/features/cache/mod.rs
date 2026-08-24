@@ -411,53 +411,34 @@ impl FeatureCache {
             }
         }
 
-        // NVMe for the distinct cold misses. A bounded set of chunked
-        // blocking tasks rather than one spawn per node: NVME_FANOUT tasks
-        // keep the device at a healthy queue depth, each chunk runs as ONE
-        // blocking-pool dispatch issuing sequential positional reads, and
-        // the spawn/JoinHandle overhead stays constant instead of scaling
-        // with the miss count.
+        // NVMe spill: one blocking task runs a pipelined batch gather
+        // (io_uring + O_DIRECT on Linux) instead of N spawn_blocking
+        // sequential preads.
         #[cfg(feature = "zstd-tier")]
         let mut cold_missing: Vec<NodeId> = Vec::new();
         if !missing.is_empty() {
-            const NVME_FANOUT: usize = 64;
-            let n_tasks = missing.len().min(NVME_FANOUT);
-            let per_task = missing.len().div_ceil(n_tasks);
-            let fetches: Vec<_> = missing
-                .chunks(per_task)
-                .map(|chunk| {
-                    let tier = Arc::clone(&self.nvme);
-                    let chunk = chunk.to_vec();
-                    tokio::task::spawn_blocking(move || {
-                        chunk
-                            .into_iter()
-                            .map(|node| {
-                                let result = tier.load_blocking(node);
-                                (node, result)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            for fetch in fetches {
-                for (node, result) in fetch.await.context("task panicked")? {
-                    match result? {
-                        Some(features) => {
-                            self.stats.nvme_hits.fetch_add(1, Ordering::Relaxed);
-                            self.promote_to_cpu(node, &features).await;
-                            resolved.insert(node, features);
+            let tier = Arc::clone(&self.nvme);
+            let chunk = missing.clone();
+            let fetched = tokio::task::spawn_blocking(move || tier.load_batch(&chunk))
+                .await
+                .context("task panicked")??;
+            for (node, result) in fetched {
+                match result {
+                    Some(features) => {
+                        self.stats.nvme_hits.fetch_add(1, Ordering::Relaxed);
+                        self.promote_to_cpu(node, &features).await;
+                        resolved.insert(node, features);
+                    }
+                    None => {
+                        #[cfg(feature = "zstd-tier")]
+                        if self.cold.is_some() {
+                            cold_missing.push(node);
+                            continue;
                         }
-                        None => {
-                            #[cfg(feature = "zstd-tier")]
-                            if self.cold.is_some() {
-                                cold_missing.push(node);
-                                continue;
-                            }
-                            self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                            return Err(anyhow::anyhow!(
-                                "features for node {node} are in no cache tier"
-                            ));
-                        }
+                        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                        return Err(anyhow::anyhow!(
+                            "features for node {node} are in no cache tier"
+                        ));
                     }
                 }
             }

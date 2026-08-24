@@ -56,15 +56,15 @@ pub struct FeatureSchema {
 
 /// RAII guard armed during the odd-head window of a seqlock write. If the
 /// writer panics between `head→odd` and `head→even`, this guard's `Drop`
-/// runs as the stack unwinds and forces head to an even target value,
-/// releasing readers that would otherwise spin forever.
+/// poisons the slot to version 0 (even, uninitialized), releasing readers
+/// that would otherwise spin forever without publishing torn payload as a
+/// successful generation.
 ///
 /// `disarmed = true` is set explicitly on the success path so the guard's
-/// Drop is a no-op (the writer already wrote the final `target` value).
+/// Drop is a no-op (the writer already wrote the final even version).
 struct SeqlockWriteGuard<'a> {
     head: &'a AtomicU64,
     tail: &'a AtomicU64,
-    target: u64,
     disarmed: bool,
 }
 
@@ -74,13 +74,13 @@ impl Drop for SeqlockWriteGuard<'_> {
             return;
         }
         // We're unwinding from a panic between the head→odd RMW and
-        // head→even store. Force tail then head to `target` (even) — the
-        // feature payload is logically abandoned (readers will see a
-        // valid-version copy of whatever was in the slot last). Without
-        // this, the odd head would trap every future reader in the
-        // spin-on-odd loop.
-        self.tail.store(self.target, Ordering::Release);
-        self.head.store(self.target, Ordering::Release);
+        // head→even store. Poison the slot to version 0 (uninitialized):
+        // an even head releases readers from the spin-on-odd loop, but we
+        // must not publish the intended next version — that would mark a
+        // torn payload as a successful new generation. Version 0 makes
+        // `read_node` return false until a later successful write.
+        self.tail.store(0, Ordering::Release);
+        self.head.store(0, Ordering::Release);
     }
 }
 
@@ -240,10 +240,10 @@ impl FeatureTable {
     /// # Panic safety
     /// If the user-supplied `features` slice access — or any code path inside
     /// this function — panics between steps 1 and 4, an internal
-    /// `SeqlockWriteGuard` still runs and forces head to an even value
-    /// (`prev + 2`, abandoning the in-progress generation). Without this,
-    /// any reader that observed the odd head would spin forever waiting for
-    /// the write to complete.
+    /// `SeqlockWriteGuard` poisons the slot to version 0 (even, uninitialized).
+    /// That releases any reader spinning on the odd head without publishing
+    /// a torn payload as a successful new generation. Without the guard,
+    /// readers that observed the odd head would spin forever.
     ///
     /// # Concurrency
     /// Writers to the *same* node serialize on the head CAS below: a second
@@ -293,12 +293,11 @@ impl FeatureTable {
         let target = prev + 2;
 
         // Arm the panic-recovery guard. From here through the explicit
-        // disarm below, ANY panic restores head to `target` (even),
-        // releasing waiting readers.
+        // disarm below, ANY panic poisons the slot to version 0 (even),
+        // releasing waiting readers without publishing torn data.
         let guard = SeqlockWriteGuard {
             head,
             tail,
-            target,
             disarmed: false,
         };
 
@@ -513,14 +512,12 @@ mod tests {
             // SAFETY: `tail_ptr` refs the tail AtomicU64.
             let tail = unsafe { &*tail_ptr };
             {
-                let prev = head.fetch_add(1, Ordering::AcqRel);
-                let target = prev + 2;
+                let _prev = head.fetch_add(1, Ordering::AcqRel);
                 // Arm the guard but don't disarm — `panic!` below triggers
-                // the guard's Drop, which must restore head to `target`.
+                // the guard's Drop, which must poison the slot to version 0.
                 let _guard = SeqlockWriteGuard {
                     head,
                     tail,
-                    target,
                     disarmed: false,
                 };
                 panic!("simulated mid-write panic");
@@ -528,11 +525,14 @@ mod tests {
         }));
         assert!(result.is_err(), "the simulated panic should propagate");
 
-        // After unwinding, the guard's Drop should have left head at the
-        // post-write even value. A reader must NOT spin forever.
+        // After unwinding, the guard's Drop poisons the slot. A reader must
+        // NOT spin forever, and must NOT treat the torn payload as valid.
         let mut out = vec![0.0_f32; 4];
         let got = table.read_node(0, &mut out);
-        assert!(got, "reader must complete (not spin) after writer panic");
+        assert!(
+            !got,
+            "poisoned slot must read as uninitialized, not torn-valid"
+        );
     }
 
     #[test]

@@ -35,5 +35,5 @@ pub use prefetch::{
 };
 pub use sampler::{
     LocalEdgeIndex, NeighborSampler, ParallelBatchSampler, SampledSubgraph, SamplingConfig,
-    SubgraphType, TemporalSamplingError, TemporalStrategy,
+    SeedIndicesLocal, SubgraphType, TemporalSamplingError, TemporalStrategy, batch_seed,
 };

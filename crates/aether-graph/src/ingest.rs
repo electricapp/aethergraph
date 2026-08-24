@@ -290,7 +290,7 @@ pub fn spawn(
             let mut local = LocalCounts::default();
             let mut guard_edges = 0usize;
             let mut idle_spins = 0u32;
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Acquire) {
                 match next_edge() {
                     Some((src, dst)) => {
                         idle_spins = 0;
@@ -368,7 +368,7 @@ pub fn drain_channel(
     let mut local = LocalCounts::default();
     let mut writer = graph.writer()?;
     let mut guard_edges = 0usize;
-    'outer: while !stop.load(Ordering::Relaxed) {
+    'outer: while !stop.load(Ordering::Acquire) {
         // One blocking receive arms the drain; everything already queued
         // is then pulled with non-blocking try_recv — a timeout-armed recv
         // per edge (deadline construction + park/unpark) would cap
@@ -481,7 +481,7 @@ pub fn spawn_channel(
             };
             let mut local = LocalCounts::default();
             let mut guard_edges = 0usize;
-            'outer: while !stop.load(Ordering::Relaxed) {
+            'outer: while !stop.load(Ordering::Acquire) {
                 // Same drain pattern as `drain_channel`: block once, then
                 // pull everything queued with non-blocking try_recv.
                 let first = match rx.recv_timeout(Duration::from_millis(50)) {
@@ -595,7 +595,7 @@ mod tests {
         .unwrap();
 
         std::thread::sleep(Duration::from_millis(50));
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::Release);
         handle.thread().unpark();
         handle.join().unwrap();
 
@@ -683,7 +683,7 @@ mod tests {
         );
 
         // Cleanly shut down.
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::Release);
         drop(bundle.sender);
         bundle.handle.join().unwrap();
     }

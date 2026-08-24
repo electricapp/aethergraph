@@ -188,3 +188,34 @@ class TestGraphRepr:
     def test_len(self, small_graph: Graph) -> None:
         """Test len(graph)."""
         assert len(small_graph) == small_graph.num_nodes
+
+
+class TestOffsetsOnlyCorruptDst:
+    """OffsetsOnly loads skip edge-body validation; sampling must skip OOB dsts."""
+
+    def test_sample_skips_corrupt_destination(self, small_graph: Graph, temp_dir: Path) -> None:
+        import struct
+
+        from aethergraph.sampler import NeighborSampler, SamplingConfig
+
+        path = temp_dir / "corrupt_dst.bin"
+        small_graph.save(path)
+
+        blob = bytearray(path.read_bytes())
+        num_nodes = small_graph.num_nodes
+        offsets_start = 32
+        edges_start = offsets_start + (num_nodes + 1) * 8
+        # Corrupt every outgoing edge of node 0 so the sampler must hit them.
+        off0 = struct.unpack_from("<Q", blob, offsets_start)[0]
+        off1 = struct.unpack_from("<Q", blob, offsets_start + 8)[0]
+        assert off1 > off0, "fixture node 0 must have outgoing edges"
+        for i in range(off0, off1):
+            struct.pack_into("<I", blob, edges_start + i * 4, num_nodes + 999)
+        path.write_bytes(blob)
+
+        loaded = Graph.load(path, storage="mmap", validation="offsets_only")
+        sampler = NeighborSampler(loaded, SamplingConfig(num_neighbors=[32], seed=1, replace=False))
+        sub = sampler.sample(np.array([0], dtype=np.int64))
+        assert all(0 <= int(n) < num_nodes for n in sub.nodes)
+        assert sub.num_edges == 0
+        assert list(sub.nodes) == [0]

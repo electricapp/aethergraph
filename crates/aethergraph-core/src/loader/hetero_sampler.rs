@@ -44,6 +44,10 @@ pub struct HeteroSampledSubgraph {
     pub edge_dst_local: Vec<Vec<u32>>,
     pub seed_type: NodeTypeId,
     pub seeds: Vec<NodeId>,
+    /// Local index of each seed into `nodes[seed_type]`, one entry per
+    /// input seed (duplicates preserved). Matches homogeneous
+    /// [`crate::loader::SampledSubgraph::seed_indices_local`].
+    pub seed_indices: Vec<u32>,
 }
 
 /// Heterogeneous neighborhood sampler.
@@ -77,6 +81,8 @@ pub struct HeteroNeighborSampler<'a> {
     floyd: FloydStamps,
     /// Reusable Floyd set (large degree).
     floyd_set: FxHashSet<usize>,
+    /// Local indices of the seeds, captured at registration.
+    seed_indices_buf: Vec<u32>,
 }
 
 impl<'a> HeteroNeighborSampler<'a> {
@@ -130,7 +136,14 @@ impl<'a> HeteroNeighborSampler<'a> {
             dst_types,
             floyd: FloydStamps::new(),
             floyd_set: FxHashSet::with_capacity_and_hasher(max_fanout * 2, Default::default()),
+            seed_indices_buf: Vec::with_capacity(512),
         }
+    }
+
+    /// Reset the RNG without rebuilding scratch (see [`super::batch_seed`]).
+    #[inline]
+    pub fn reseed(&mut self, seed: u64) {
+        self.rng = WyRand::new(seed);
     }
 
     pub fn sample_neighbors(
@@ -153,10 +166,13 @@ impl<'a> HeteroNeighborSampler<'a> {
             v.clear();
         }
         self.frontier.clear();
+        self.seed_indices_buf.clear();
 
-        // Register seeds with local indices
+        // Register seeds with local indices (duplicates keep distinct
+        // seed_indices entries pointing at the same local slot).
         for &seed in seeds {
             let (idx, _) = self.insert_node(seed, seed_type);
+            self.seed_indices_buf.push(idx);
             self.frontier.push((seed_type, seed, idx));
         }
 
@@ -271,17 +287,23 @@ impl<'a> HeteroNeighborSampler<'a> {
             edge_dst.push(d);
         }
 
+        let mut seed_indices = Vec::with_capacity(seeds.len());
+        std::mem::swap(&mut self.seed_indices_buf, &mut seed_indices);
+
         HeteroSampledSubgraph {
             nodes,
             edge_src_local: edge_src,
             edge_dst_local: edge_dst,
             seed_type,
             seeds: seeds.to_vec(),
+            seed_indices,
         }
     }
 
     /// Insert a node of `node_type`, assigning a local index if new.
-    /// Returns `(local index, is_new)`.
+    /// Returns `(local index, is_new)`. Caller must ensure `id` is in range
+    /// for `node_type` (seeds are range-checked at the loader edge;
+    /// [`insert_dst`] checks destinations).
     #[inline(always)]
     fn insert_node(&mut self, id: NodeId, node_type: NodeTypeId) -> (u32, bool) {
         let nt = node_type as usize;
@@ -293,20 +315,25 @@ impl<'a> HeteroNeighborSampler<'a> {
     }
 
     /// Insert a destination node, assigning a local index if new.
-    /// Returns the local index. Pushes to next_frontier if newly discovered.
+    /// Returns `None` when `dst_id` is out of range for `dst_type`.
     #[inline(always)]
-    fn insert_dst(&mut self, dst_id: NodeId, dst_type: NodeTypeId) -> u32 {
+    fn insert_dst(&mut self, dst_id: NodeId, dst_type: NodeTypeId) -> Option<u32> {
+        if (dst_id as usize) >= self.graph.num_nodes(dst_type) {
+            return None;
+        }
         let (idx, is_new) = self.insert_node(dst_id, dst_type);
         if is_new {
             self.next_frontier.push((dst_type, dst_id, idx));
         }
-        idx
+        Some(idx)
     }
 
     #[inline]
     fn take_all(&mut self, neighbors: &[NodeId], src_local: u32, et: usize, dst_type: NodeTypeId) {
         for &dst_id in neighbors {
-            let dst_local = self.insert_dst(dst_id, dst_type);
+            let Some(dst_local) = self.insert_dst(dst_id, dst_type) else {
+                continue;
+            };
             self.edge_src_buf[et].push(src_local);
             self.edge_dst_buf[et].push(dst_local);
         }
@@ -325,7 +352,9 @@ impl<'a> HeteroNeighborSampler<'a> {
         for _ in 0..k {
             let idx = (u64::from(self.rng.next_u32()).wrapping_mul(n) >> 32) as usize;
             let dst_id = neighbors[idx];
-            let dst_local = self.insert_dst(dst_id, dst_type);
+            let Some(dst_local) = self.insert_dst(dst_id, dst_type) else {
+                continue;
+            };
             self.edge_src_buf[et].push(src_local);
             self.edge_dst_buf[et].push(dst_local);
         }
@@ -355,7 +384,9 @@ impl<'a> HeteroNeighborSampler<'a> {
                     self.floyd.test_and_set(i);
                     i
                 };
-                let dst_local = self.insert_dst(neighbors[pick], dst_type);
+                let Some(dst_local) = self.insert_dst(neighbors[pick], dst_type) else {
+                    continue;
+                };
                 self.edge_src_buf[et].push(src_local);
                 self.edge_dst_buf[et].push(dst_local);
             }
@@ -371,7 +402,9 @@ impl<'a> HeteroNeighborSampler<'a> {
                     self.floyd_set.insert(i);
                     i
                 };
-                let dst_local = self.insert_dst(neighbors[pick], dst_type);
+                let Some(dst_local) = self.insert_dst(neighbors[pick], dst_type) else {
+                    continue;
+                };
                 self.edge_src_buf[et].push(src_local);
                 self.edge_dst_buf[et].push(dst_local);
             }

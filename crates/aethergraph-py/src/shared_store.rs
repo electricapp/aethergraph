@@ -1,6 +1,6 @@
 //! Python bindings for the cross-process shared feature store.
 
-use aethergraph_core::{NodeId, ShareHandle, SharedFeatureStore};
+use aethergraph_core::{ShareHandle, SharedFeatureStore};
 use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1};
 use pyo3::prelude::*;
 
@@ -120,15 +120,7 @@ impl PySharedFeatureStore {
         py: Python<'py>,
         nodes: PyReadonlyArray1<'py, i64>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let nodes = nodes.as_slice()?;
-        let ids: Vec<NodeId> = nodes
-            .iter()
-            .map(|&n| {
-                NodeId::try_from(n).map_err(|_| {
-                    pyo3::exceptions::PyValueError::new_err(format!("node id {n} out of range"))
-                })
-            })
-            .collect::<PyResult<_>>()?;
+        let ids = crate::error::copy_node_ids_i64(nodes)?;
 
         let flat = py
             .detach(|| self.inner.get_batch(&ids))

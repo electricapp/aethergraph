@@ -59,10 +59,10 @@ impl PyHeteroCsrGraph {
         let mut et_vec: Vec<(String, String, String, Graph)> = Vec::with_capacity(edge_types.len());
 
         for (src_type, rel, dst_type, src_arr, dst_arr) in edge_types {
-            let src_slice = src_arr.as_slice()?;
-            let dst_slice = dst_arr.as_slice()?;
+            let src_vec = crate::error::copy_array1(src_arr)?;
+            let dst_vec = crate::error::copy_array1(dst_arr)?;
 
-            if src_slice.len() != dst_slice.len() {
+            if src_vec.len() != dst_vec.len() {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "src and dst arrays must have the same length for ({src_type}, {rel}, {dst_type})"
                 )));
@@ -83,21 +83,21 @@ impl PyHeteroCsrGraph {
             // node count. Without this, an out-of-range edge would silently
             // become an unreachable phantom node in the CSR and reads of that
             // node would return empty neighbor lists — confusing failure.
-            if let Some(&bad) = src_slice.iter().find(|&&s| (s as usize) >= num_src) {
+            if let Some(&bad) = src_vec.iter().find(|&&s| (s as usize) >= num_src) {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "src node {bad} >= num_{src_type} ({num_src}) in ({src_type}, {rel}, {dst_type})"
                 )));
             }
-            if let Some(&bad) = dst_slice.iter().find(|&&d| (d as usize) >= num_dst) {
+            if let Some(&bad) = dst_vec.iter().find(|&&d| (d as usize) >= num_dst) {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "dst node {bad} >= num_{dst_type} ({num_dst}) in ({src_type}, {rel}, {dst_type})"
                 )));
             }
 
             let csr_num_nodes = num_src.max(num_dst);
-            let edges: Vec<(NodeId, NodeId)> = src_slice
+            let edges: Vec<(NodeId, NodeId)> = src_vec
                 .iter()
-                .zip(dst_slice.iter())
+                .zip(dst_vec.iter())
                 .map(|(&s, &d)| (s, d))
                 .collect();
 
@@ -214,9 +214,19 @@ impl PyHeteroSamplingConfig {
         }
         let mut hop_counts = num_neighbors.values().map(std::vec::Vec::len);
         let first_hops = hop_counts.next().unwrap_or(0);
+        if first_hops == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "num_neighbors hop lists must be non-empty",
+            ));
+        }
         if hop_counts.any(|h| h != first_hops) {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "all edge types must have the same number of hops",
+            ));
+        }
+        if matches!(max_degree, Some(0)) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_degree must be > 0 if specified",
             ));
         }
         Ok(Self {
@@ -402,6 +412,20 @@ impl PyHeteroSampledSubgraph {
     #[getter]
     fn seeds<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
         let arr: Vec<i64> = self.inner.seeds.iter().map(|&s| i64::from(s)).collect();
+        PyArray1::from_vec(py, arr)
+    }
+
+    /// Local indices of each seed into `nodes(seed_type)`, one per input
+    /// seed (duplicates preserved). Same contract as homogeneous
+    /// `SampledSubgraph.seed_indices`.
+    #[getter]
+    fn seed_indices<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
+        let arr: Vec<i64> = self
+            .inner
+            .seed_indices
+            .iter()
+            .map(|&s| i64::from(s))
+            .collect();
         PyArray1::from_vec(py, arr)
     }
 

@@ -35,10 +35,10 @@ except ImportError as e:
 from aethergraph._core import HAS_GPUDIRECT
 from aethergraph._core import NeighborLoader as RustNeighborLoader
 from aethergraph._core import SampledSubgraph as RustSampledSubgraph
-from aethergraph._core import SamplingConfig as RustSamplingConfig
 from aethergraph._types import SubgraphType, TemporalStrategy
 from aethergraph.dynamic_graph import DynamicGraph
 from aethergraph.pytorch.device_pipeline import DeviceTransferPipeline
+from aethergraph.sampler import SamplingConfig
 from aethergraph.tracing import get_tracer
 
 if TYPE_CHECKING:
@@ -73,20 +73,25 @@ def normalize_input_nodes(
         Contiguous 1D ``int64`` array of in-range node IDs.
 
     Raises:
-        ValueError: If the input is not 1D after mask conversion, or contains
-            IDs outside ``[0, num_nodes)``.
+        ValueError: If the input is not 1D after mask conversion, has a
+            non-integer dtype (floats are rejected — no silent truncation),
+            or contains IDs outside ``[0, num_nodes)``.
     """
     if isinstance(input_nodes, torch.Tensor):
         if input_nodes.dtype == torch.bool:
             arr: npt.NDArray[np.int64] = np.nonzero(input_nodes.cpu().numpy())[0].astype(np.int64)
+        elif input_nodes.dtype.is_floating_point:
+            raise ValueError(f"{what} must be integer or bool IDs, got dtype {input_nodes.dtype}")
         else:
-            arr = input_nodes.cpu().numpy().astype(np.int64)
+            arr = input_nodes.cpu().numpy().astype(np.int64, copy=False)
     else:
         a = np.asarray(input_nodes)
         if a.dtype == np.bool_:
             arr = np.nonzero(a)[0].astype(np.int64)
+        elif np.issubdtype(a.dtype, np.integer):
+            arr = a.astype(np.int64, copy=False)
         else:
-            arr = a.astype(np.int64)
+            raise ValueError(f"{what} must be integer or bool IDs, got dtype {a.dtype}")
     if arr.ndim != 1:
         raise ValueError(f"{what} must be a 1D array-like, got shape {arr.shape}")
     if arr.size > 0:
@@ -186,10 +191,16 @@ def _parse_features(features: npt.NDArray[Any], num_nodes: int) -> torch.Tensor:
     consumes, so no batch ever re-converts dtype or layout.
 
     Raises:
-        ValueError: If the array is not 2D or its row count does not match
-            the graph.
+        ValueError: If the array is not 2D, not ``float32``, or its row count
+            does not match the graph. Callers that hold float64 must cast
+            explicitly before this boundary.
     """
-    arr = np.ascontiguousarray(features, dtype=np.float32)
+    arr = np.asarray(features)
+    if arr.dtype != np.float32:
+        raise ValueError(
+            f"features must be float32 (got {arr.dtype}); cast explicitly before passing"
+        )
+    arr = np.ascontiguousarray(arr)
     if arr.ndim != 2:
         raise ValueError(f"features must be 2D, got shape {arr.shape}")
     if arr.shape[0] != num_nodes:
@@ -433,7 +444,12 @@ class NeighborLoader(IterableDataset[Data]):
                 mapping each node to its seed index.
             seed: Random seed. Controls both seed-node shuffling (a fresh
                 child generator is derived per epoch, so epochs are
-                reproducible) and the Rust sampler's neighbor selection. None
+                reproducible) and the Rust sampler's neighbor selection.
+                When set, each submitted batch reseeds from
+                ``mix(seed, batch_idx)`` so multi-worker pools produce the
+                same subgraph content for the same seeds, and the Rust
+                prefetch layer reorders yields by ``batch_idx`` so the
+                epoch stream is bit-identical to ``num_workers=1``. None
                 uses OS entropy (non-reproducible).
             generator: Explicit numpy ``Generator`` for seed-node shuffling.
                 Takes precedence over ``seed`` for shuffling. The Rust sampler
@@ -502,6 +518,21 @@ class NeighborLoader(IterableDataset[Data]):
         self._track_edge_ids = track_edge_ids
         self._neighbor_sampler = neighbor_sampler
 
+        # Parse fanout / strategy once at construction so illegal configs
+        # fail here rather than on the first ``__iter__``.
+        self._sampling = SamplingConfig(
+            num_neighbors=num_neighbors,
+            replace=replace,
+            seed=seed,
+            max_degree=max_degree,
+            cumulative=cumulative,
+            weighted=weighted,
+            subgraph_type=subgraph_type,
+            track_edge_ids=track_edge_ids,
+            temporal_strategy=temporal_strategy,
+            disjoint=disjoint,
+            deterministic=False,
+        )
         if features is not None and feature_path is not None:
             raise ValueError("pass either `features` or `feature_path`, not both")
         self._feature_path: Path | None = Path(feature_path) if feature_path is not None else None
@@ -639,18 +670,7 @@ class NeighborLoader(IterableDataset[Data]):
                 yield data
             return
 
-        rust_config = RustSamplingConfig(
-            num_neighbors=self.num_neighbors,
-            replace=self.replace,
-            seed=self._seed,
-            max_degree=self._max_degree,
-            cumulative=self._cumulative,
-            weighted=self.weighted,
-            subgraph_type=self._subgraph_type,
-            track_edge_ids=self._track_edge_ids,
-            temporal_strategy=self._temporal_strategy,
-            disjoint=self._disjoint,
-        )
+        rust_config = self._sampling._to_rust()
 
         if self._rdma is not None:
             # Upper bound on nodes per batch: batch_size * product of the
@@ -816,7 +836,11 @@ class NeighborLoader(IterableDataset[Data]):
 
         edge_index = torch.from_numpy(subgraph.edge_index_local)
 
-        e_id = torch.from_numpy(subgraph.edge_ids)
+        e_id: torch.Tensor | None
+        if self._track_edge_ids:
+            e_id = torch.from_numpy(subgraph.edge_ids)
+        else:
+            e_id = None
 
         seed_indices_arr: npt.NDArray[np.int64] = subgraph.seed_indices
         input_id = torch.from_numpy(seed_indices_arr)
@@ -837,7 +861,8 @@ class NeighborLoader(IterableDataset[Data]):
 
         if self._pin:
             edge_index = edge_index.pin_memory()
-            e_id = e_id.pin_memory()
+            if e_id is not None:
+                e_id = e_id.pin_memory()
             n_id = n_id.pin_memory()
             input_id = input_id.pin_memory()
 
@@ -895,8 +920,10 @@ class NeighborLoader(IterableDataset[Data]):
         num_edges = local_edge_index.shape[1]
         n_eid = edge_ids_arr.shape[0]
         n_seed = seed_indices_arr.shape[0]
+        batch_arr = subgraph.batch
+        n_batch = 0 if batch_arr is None else int(batch_arr.shape[0])
 
-        total = num_nodes + 2 * num_edges + n_eid + n_seed
+        total = num_nodes + 2 * num_edges + n_eid + n_seed + n_batch
         stage = torch.empty(total, dtype=torch.int64, pin_memory=True)
         stage_np = stage.numpy()
         pos = 0
@@ -907,6 +934,9 @@ class NeighborLoader(IterableDataset[Data]):
         stage_np[pos : pos + n_eid] = edge_ids_arr
         pos += n_eid
         stage_np[pos : pos + n_seed] = seed_indices_arr
+        pos += n_seed
+        if batch_arr is not None:
+            stage_np[pos : pos + n_batch] = np.ascontiguousarray(batch_arr, dtype=np.int64)
 
         device = x_gpu.device
         packed = stage.to(device, non_blocking=True)
@@ -916,14 +946,15 @@ class NeighborLoader(IterableDataset[Data]):
         pos += num_nodes
         edge_index = packed[pos : pos + 2 * num_edges].view(2, num_edges)
         pos += 2 * num_edges
-        e_id = packed[pos : pos + n_eid]
+        e_id_view = packed[pos : pos + n_eid]
         pos += n_eid
         input_id = packed[pos : pos + n_seed]
+        pos += n_seed
 
-        return Data(
+        data = Data(
             x=x_gpu,
             edge_index=edge_index,
-            e_id=e_id,
+            e_id=e_id_view if self._track_edge_ids else None,
             n_id=n_id,
             batch_size=n_seed,
             input_id=input_id,
@@ -931,6 +962,11 @@ class NeighborLoader(IterableDataset[Data]):
             num_sampled_nodes=subgraph.num_sampled_nodes_per_hop,
             num_sampled_edges=subgraph.num_sampled_edges_per_hop,
         )
+
+        if batch_arr is not None:
+            data.batch = packed[pos : pos + n_batch]
+
+        return data
 
     def __len__(self) -> int:
         """Return the number of batches per epoch.

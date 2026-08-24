@@ -77,16 +77,51 @@ macro_rules! py_err {
     };
 }
 
+/// Copy a contiguous NumPy 1-d array into an owned `Vec`.
+///
+/// Callers that release the GIL / detach under `gil_used = false` must not
+/// borrow the ndarray buffer across the detach — another free-threaded
+/// Python thread can resize or free it. Own the bytes first; the copy is the
+/// price of soundness on the free-threaded build (and is cheap relative to
+/// the O(E)/gather work that follows).
+pub fn copy_array1<T>(arr: numpy::PyReadonlyArray1<'_, T>) -> PyResult<Vec<T>>
+where
+    T: Copy + numpy::Element,
+{
+    Ok(arr.as_slice()?.to_vec())
+}
+
+/// Parse an int64 NumPy ID array into owned [`NodeId`]s in one pass.
+///
+/// Owns the result before any `py.detach`, and avoids a temporary `Vec<i64>`
+/// plus a second conversion inside the core gather.
+pub fn copy_node_ids_i64(
+    arr: numpy::PyReadonlyArray1<'_, i64>,
+) -> PyResult<Vec<aethergraph_core::NodeId>> {
+    use aethergraph_core::NodeId;
+    arr.as_slice()?
+        .iter()
+        .map(|&x| {
+            NodeId::try_from(x).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "node id {x} out of u32 range [0, {}]",
+                    u32::MAX
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Coerce a Python seed argument into `Vec<u32>`.
 ///
-/// Accepts (in order): `numpy.ndarray[uint32]` (zero-copy), `numpy.ndarray[int64]`
+/// Accepts (in order): `numpy.ndarray[uint32]` (copied), `numpy.ndarray[int64]`
 /// (range-checked), or any `Sequence[int]` extractable as `Vec<u32>`. Returns a
 /// [`SamplingError`] on out-of-range i64 values so the caller never silently
 /// truncates negatives or values > u32::MAX.
 pub fn extract_seeds(seeds: &pyo3::Bound<'_, pyo3::PyAny>) -> PyResult<Vec<u32>> {
     use numpy::PyReadonlyArray1;
     if let Ok(arr) = seeds.extract::<PyReadonlyArray1<u32>>() {
-        return Ok(arr.as_slice()?.to_vec());
+        return copy_array1(arr);
     }
     if let Ok(arr) = seeds.extract::<PyReadonlyArray1<i64>>() {
         return arr
