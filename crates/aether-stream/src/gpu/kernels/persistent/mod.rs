@@ -10,6 +10,7 @@
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
+    ValidAsZeroBits,
 };
 use std::sync::Arc;
 
@@ -42,6 +43,8 @@ pub struct PersistentWork {
 
 // SAFETY: plain POD matching the CUDA struct layout.
 unsafe impl DeviceRepr for PersistentWork {}
+// SAFETY: all-zero is a valid descriptor (kind 0 = Idle, null payload, len 0).
+unsafe impl ValidAsZeroBits for PersistentWork {}
 
 impl PersistentWork {
     /// Build a work item from a typed kind.

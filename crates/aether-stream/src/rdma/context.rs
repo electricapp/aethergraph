@@ -169,9 +169,11 @@ pub unsafe fn touch_mr_pages(addr: *mut u8, len: usize) {
     const PAGE: usize = 4096;
     let mut off = 0usize;
     while off < len {
-        // SAFETY: `off < len` and `addr` is the caller's live mapping.
+        // `off < len`, so this stays inside the caller's mapping.
+        let page = addr.wrapping_add(off);
+        // SAFETY: `page` is in-bounds of the caller's live mapping.
         unsafe {
-            std::ptr::read_volatile(addr.add(off));
+            std::ptr::read_volatile(page);
         }
         off = off.saturating_add(PAGE);
     }

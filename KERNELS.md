@@ -224,14 +224,14 @@ layer. Like the rest of K4 they need a rooted Linux VM and nothing else.
 
 ## Layout
 
-| Layer                  | Path                                                                                                                                                                  |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Tier A CUDA kernels    | [`crates/aether-stream/src/gpu/kernels/`](crates/aether-stream/src/gpu/kernels/) (`validate`, `seqlock`, `sampler`, `decompress`, `persistent`, `tma`, `ibgda`, `coherent` + `common.cuh`) |
-| GPU infra (non-kernel) | [`crates/aether-stream/src/gpu/`](crates/aether-stream/src/gpu/) (`buffer`, `pool`, `uvm`, `vmm`, `ipc`, `gdrcopy`)                                                   |
+| Layer                  | Path                                                                                                                                                                                               |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tier A CUDA kernels    | [`crates/aether-stream/src/gpu/kernels/`](crates/aether-stream/src/gpu/kernels/) (`validate`, `seqlock`, `sampler`, `decompress`, `persistent`, `tma`, `ibgda`, `coherent` + `common.cuh`)         |
+| GPU infra (non-kernel) | [`crates/aether-stream/src/gpu/`](crates/aether-stream/src/gpu/) (`buffer`, `pool`, `uvm`, `vmm`, `ipc`, `gdrcopy`)                                                                                |
 | Tier B device paths    | [`crates/aethergraph-core/src/internal/device/`](crates/aethergraph-core/src/internal/device/) + [`modules/aether_p2pdma/`](modules/aether_p2pdma/) + [`modules/aether_dpa/`](modules/aether_dpa/) |
-| CUDA harness           | [`crates/aether-stream/tests/kernels/`](crates/aether-stream/tests/kernels/), [`benches/kernels/`](crates/aether-stream/benches/kernels/)                             |
-| herd7 litmus (K5.3)    | [`crates/aether-stream/litmus/k5_3/`](crates/aether-stream/litmus/k5_3/)                                                                                              |
-| Grind entrypoint       | [`scripts/kernels-verify.sh`](scripts/kernels-verify.sh)                                                                                                              |
+| CUDA harness           | [`crates/aether-stream/tests/kernels/`](crates/aether-stream/tests/kernels/), [`benches/kernels/`](crates/aether-stream/benches/kernels/)                                                          |
+| herd7 litmus (K5.3)    | [`crates/aether-stream/litmus/k5_3/`](crates/aether-stream/litmus/k5_3/)                                                                                                                           |
+| Grind entrypoint       | [`scripts/kernels-verify.sh`](scripts/kernels-verify.sh)                                                                                                                                           |
 
 CUDA units compile via NVRTC `include_str!` under the `gpudirect` feature — no
 nvcc fatbin step in `build.rs`.

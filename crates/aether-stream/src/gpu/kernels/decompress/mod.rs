@@ -5,7 +5,7 @@
 
 use aethergraph_core::EliasFano;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use std::sync::Arc;
 
@@ -160,7 +160,7 @@ impl EliasFanoDecoder {
         stream: &Arc<CudaStream>,
         max_len: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let module: CudaModule = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
         Ok(Self {
             stream: stream.clone(),
             func: module.load_function("elias_fano_decode_all")?,

@@ -1,7 +1,6 @@
 use aether_stream::gpu::kernels::WarpSampler;
 use aether_stream::gpu::kernels::harness::cuda_or_skip;
 use aethergraph_core::reservoir_sample;
-use cudarc::driver::DevicePtr;
 
 #[test]
 fn sampler_matches_cpu_reservoir_oracle() {

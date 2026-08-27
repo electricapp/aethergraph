@@ -176,9 +176,12 @@ mod tests {
     fn post_advances_doorbell_at_64b_stride() {
         let q = IbgdaQueue::new(0x42, 8).unwrap();
         let mut ring = vec![0u8; 8 * MLX5_WQE_BB];
+        // SAFETY: `ring` is 8 work-queue BBs — the queue's depth — and outlives the call.
         let idx = unsafe { q.post_rdma_read(ring.as_mut_ptr(), 0x1000, 1, 64, 0x2000, 2) }.unwrap();
         assert_eq!(idx, 0);
         assert_eq!(q.dbr.send_index(), 1);
+        // SAFETY: the post above initialized BB 0 as a valid WQE, and
+        // `Mlx5RdmaReadWqe` is POD no larger than one BB.
         let wqe = unsafe { *(ring.as_ptr() as *const Mlx5RdmaReadWqe) };
         assert_eq!(wqe.qpn(), 0x42);
     }
@@ -188,13 +191,16 @@ mod tests {
         let q = IbgdaQueue::new(0x42, 4).unwrap();
         let mut ring = vec![0u8; 4 * MLX5_WQE_BB];
         for _ in 0..4 {
+            // SAFETY: `ring` is 4 work-queue BBs — the queue's depth — and outlives the call.
             assert!(unsafe { q.post_rdma_read(ring.as_mut_ptr(), 0, 0, 0, 0, 0) }.is_ok());
         }
         assert_eq!(
+            // SAFETY: as above.
             unsafe { q.post_rdma_read(ring.as_mut_ptr(), 0, 0, 0, 0, 0) },
             Err(IbgdaError::QueueFull)
         );
         q.retire(2);
+        // SAFETY: as above.
         assert!(unsafe { q.post_rdma_read(ring.as_mut_ptr(), 0, 0, 0, 0, 0) }.is_ok());
     }
 

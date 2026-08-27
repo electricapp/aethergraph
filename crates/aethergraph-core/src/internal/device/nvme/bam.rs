@@ -233,6 +233,7 @@ mod tests {
     fn submit_requires_bar() {
         let ctl = BamController::new(0, 8, NvmeDoorbellLayout::legacy()).unwrap();
         let mut ring = [NvmeRwSqe::read(1, 0, 0, 0, NvmeDataPointer::Prp { prp1: 0, prp2: 0 }); 8];
+        // SAFETY: `ring` outlives the call and has the queue's slot count.
         let err = unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) };
         assert_eq!(err, Err(BamError::BarNotMapped));
     }
@@ -241,16 +242,21 @@ mod tests {
     fn submit_rejects_when_full_until_retire() {
         let mut ctl = BamController::new(0, 4, NvmeDoorbellLayout::legacy()).unwrap();
         let mut bar = [0u8; 0x2000];
+        // SAFETY: `bar` is a live 0x2000 buffer covering every doorbell
+        // offset the legacy layout addresses, and outlives `ctl`.
         unsafe { ctl.attach_bar0(bar.as_mut_ptr(), bar.len()) };
         let mut ring = [NvmeRwSqe::read(1, 0, 0, 0, NvmeDataPointer::Prp { prp1: 0, prp2: 0 }); 4];
         for _ in 0..4 {
+            // SAFETY: `ring` outlives the call and has the queue's slot count.
             assert!(unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) }.is_ok());
         }
         assert_eq!(
+            // SAFETY: as above.
             unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) },
             Err(BamError::QueueFull)
         );
         ctl.retire_completions(2);
+        // SAFETY: as above.
         assert!(unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) }.is_ok());
     }
 }

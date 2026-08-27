@@ -46,6 +46,12 @@ if ! limactl shell "$VM" bash -c 'command -v cargo >/dev/null 2>&1 || test -x "$
   limactl shell "$VM" bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
 fi
 
+# Provision only — used by check-linux.sh before its VM gates.
+if [ "${1:-}" = --ensure-vm ]; then
+  echo "==> VM '$VM' ready"
+  exit 0
+fi
+
 ARGS=("$@")
 if [ ${#ARGS[@]} -eq 0 ]; then
   ARGS=(--workspace)

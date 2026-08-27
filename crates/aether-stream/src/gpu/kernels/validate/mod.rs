@@ -42,6 +42,13 @@ struct CapturedValidate {
     graph: CudaGraph,
 }
 
+// SAFETY: the graph and its exec handle are owned for the struct's lifetime
+// and only launched through `&mut SeqlockValidator` on the owning context,
+// which CUDA makes thread-safe after creation.
+unsafe impl Send for CapturedValidate {}
+// SAFETY: see the Send impl above.
+unsafe impl Sync for CapturedValidate {}
+
 /// Device-visible retry counter. Prefers host-mapped memory so the host can
 /// read the result after synchronize without a D2H copy.
 enum RetryCount {
@@ -123,13 +130,13 @@ impl RetryCount {
 
     /// Zero before enqueue. Mapped path writes the host view; device path
     /// uses a stream-ordered DtoD from a permanent zero scratch.
-    fn clear(&mut self, stream: &CudaStream) -> Result<(), Box<dyn std::error::Error>> {
+    fn clear(&mut self, stream: &Arc<CudaStream>) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Mapped { host, .. } => {
                 // SAFETY: exclusive host mapping; kernel is not running yet
                 // (caller clears before launch / outside the captured graph).
                 unsafe {
-                    *host = 0;
+                    **host = 0;
                 }
                 Ok(())
             }
@@ -147,7 +154,7 @@ impl RetryCount {
         match self {
             Self::Mapped { host, .. } => {
                 // SAFETY: caller synchronized the stream; kernel writes are visible.
-                Ok(unsafe { *host })
+                Ok(unsafe { **host })
             }
             Self::Device { .. } => {
                 Err("device retry_count requires D2H via SeqlockValidator::finish_validate".into())
@@ -310,7 +317,7 @@ impl SeqlockValidator {
                 .arg(&mut self.retry_mask);
             match &mut self.retry_count {
                 RetryCount::Mapped { device, .. } => {
-                    launch.arg(device);
+                    launch.arg(&*device);
                 }
                 RetryCount::Device { slice, .. } => {
                     launch.arg(slice);

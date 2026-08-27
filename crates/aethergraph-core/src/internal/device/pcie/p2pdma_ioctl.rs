@@ -100,10 +100,10 @@ pub fn validate_p2pdma_path(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (device, producer_bdf, consumer_bdf, dmabuf_fd, policy);
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "aether_p2pdma ioctl is Linux-only",
-        ));
+        ))
     }
 
     #[cfg(target_os = "linux")]

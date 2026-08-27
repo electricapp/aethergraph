@@ -101,10 +101,10 @@ impl SchedExtLoader {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            return Err(std::io::Error::new(
+            Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "sched_ext attach is Linux-only",
-            ));
+            ))
         }
         #[cfg(target_os = "linux")]
         {
