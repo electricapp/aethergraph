@@ -38,7 +38,7 @@ impl OwnedGpuFeatures {
     }
 }
 
-/// A batch of features living in the gather's [`FeaturePool`].
+/// A batch of features living in the gather's [`crate::gpu::FeaturePool`].
 ///
 /// Unlike [`OwnedGpuFeatures`], this **borrows** the pool's VRAM: the next
 /// [`RdmaFeatureGather::gather_pooled`] overwrites it. That is the whole
@@ -94,7 +94,7 @@ impl RdmaFeatureGather {
         })
     }
 
-    /// Switch gathers onto a reusable [`FeaturePool`] sized for
+    /// Switch gathers onto a reusable [`crate::gpu::FeaturePool`] sized for
     /// `max_batch_nodes`.
     ///
     /// After this, [`Self::gather_pooled`] writes each batch into the same

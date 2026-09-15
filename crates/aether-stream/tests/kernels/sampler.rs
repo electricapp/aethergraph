@@ -1,5 +1,5 @@
-use aether_stream::gpu::kernels::WarpSampler;
 use aether_stream::gpu::kernels::harness::cuda_or_skip;
+use aether_stream::gpu::kernels::{SampleRequest, WarpSampler};
 use aethergraph_core::reservoir_sample;
 
 #[test]
@@ -29,7 +29,18 @@ fn sampler_matches_cpu_reservoir_oracle() {
 
     let sampler = WarpSampler::new(&ctx, &stream).expect("nvrtc");
     sampler
-        .sample(&d_off, &d_nbr, &d_nodes, &mut d_out, 1, fanout, seed, layer)
+        .sample(
+            &d_off,
+            &d_nbr,
+            &d_nodes,
+            &mut d_out,
+            SampleRequest {
+                node_count: 1,
+                fanout,
+                seed,
+                layer,
+            },
+        )
         .unwrap();
     stream.synchronize().unwrap();
     let mut got = vec![0u32; fanout];

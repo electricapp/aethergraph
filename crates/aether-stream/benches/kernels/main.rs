@@ -4,9 +4,11 @@
 
 use aether_stream::gpu::kernels::harness::cuda_or_skip;
 use aether_stream::gpu::kernels::{
-    PersistentWork, PersistentWorkKind, PersistentWorker, SeqlockValidator, WarpSampler,
+    FeatureDequantizer, PersistentWork, PersistentWorkKind, PersistentWorker, QuantizedRowsDevice,
+    SampleRequest, SeqlockValidator, WarpSampler,
 };
-use criterion::{Criterion, criterion_group, criterion_main};
+use aethergraph_core::BlockScaledI8;
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use cudarc::driver::DevicePtrMut;
 
 fn validate_graph_replay(c: &mut Criterion) {
@@ -14,14 +16,17 @@ fn validate_graph_replay(c: &mut Criterion) {
         eprintln!("bench skip: no CUDA");
         return;
     };
-    const FEATURE_DIM: usize = 32;
-    const SLOT_SIZE: usize = 8 + FEATURE_DIM * 4 + 8;
+    // 384 exercises the vector gather's unrolled in-flight group; 32 would
+    // sit entirely in the scalar tail and measure the wrong path.
+    const FEATURE_DIM: usize = 384;
+    const SLOT_SIZE: usize = aethergraph_core::feature_slot_stride(FEATURE_DIM);
+    const TAIL: usize = aethergraph_core::feature_slot_tail_offset(FEATURE_DIM);
     const BATCH: usize = 256;
     let mut host = vec![0u8; SLOT_SIZE * BATCH * 2];
     for slot in 0..BATCH * 2 {
         let base = slot * SLOT_SIZE;
         host[base..base + 8].copy_from_slice(&2u64.to_le_bytes());
-        host[base + SLOT_SIZE - 8..base + SLOT_SIZE].copy_from_slice(&2u64.to_le_bytes());
+        host[base + TAIL..base + TAIL + 8].copy_from_slice(&2u64.to_le_bytes());
     }
     let mut staging = stream.alloc_zeros::<u8>(host.len()).unwrap();
     stream.memcpy_htod(&host, &mut staging).unwrap();
@@ -70,7 +75,18 @@ fn sampler_reservoir(c: &mut Criterion) {
     c.bench_function("sampler_reservoir", |b| {
         b.iter(|| {
             sampler
-                .sample(&d_off, &d_nbr, &d_nodes, &mut d_out, n_nodes, fanout, 1, 0)
+                .sample(
+                    &d_off,
+                    &d_nbr,
+                    &d_nodes,
+                    &mut d_out,
+                    SampleRequest {
+                        node_count: n_nodes,
+                        fanout,
+                        seed: 1,
+                        layer: 0,
+                    },
+                )
                 .unwrap();
             stream.synchronize().unwrap();
         })
@@ -82,15 +98,42 @@ fn persistent_drain(c: &mut Criterion) {
         eprintln!("bench skip: no CUDA");
         return;
     };
+    // The ring is single-shot, so each iteration needs a fresh worker, and
+    // building one runs NVRTC — which dwarfs the drain unless it is setup.
     c.bench_function("persistent_drain_64", |b| {
+        b.iter_batched(
+            || PersistentWorker::new(&ctx, &stream, 128).unwrap(),
+            |mut w| {
+                w.start().unwrap();
+                for i in 0..64u64 {
+                    let _ = w.post(PersistentWork::new(PersistentWorkKind::Complete, i, 1));
+                }
+                let n = w.stop_and_join().unwrap();
+                std::hint::black_box(n);
+            },
+            BatchSize::PerIteration,
+        )
+    });
+}
+
+/// Decode a batch-sized block of quantized rows. Against
+/// `validate_graph_replay` the number to watch is bytes moved, not wall
+/// clock: 1.125 B/feature here against 4 B/feature there.
+fn feature_dequant(c: &mut Criterion) {
+    let Some((ctx, stream)) = cuda_or_skip() else {
+        eprintln!("bench skip: no CUDA");
+        return;
+    };
+    const DIM: usize = 384;
+    const ROWS: usize = 4096;
+    let src: Vec<f32> = (0..ROWS * DIM).map(|i| (i % 251) as f32 - 125.0).collect();
+    let enc = BlockScaledI8::encode_rows(&src, DIM).unwrap();
+    let dev = QuantizedRowsDevice::upload(&stream, &enc).unwrap();
+    let mut dq = FeatureDequantizer::new(&ctx, &stream, ROWS * DIM).unwrap();
+    c.bench_function("feature_dequant_4096x384", |b| {
         b.iter(|| {
-            let mut w = PersistentWorker::new(&ctx, &stream, 128).unwrap();
-            w.start().unwrap();
-            for i in 0..64u64 {
-                let _ = w.post(PersistentWork::new(PersistentWorkKind::Complete, i, 1));
-            }
-            let n = w.stop_and_join().unwrap();
-            std::hint::black_box(n);
+            dq.decode(&dev).unwrap();
+            stream.synchronize().unwrap();
         })
     });
 }
@@ -99,6 +142,7 @@ criterion_group!(
     kernels,
     validate_graph_replay,
     sampler_reservoir,
-    persistent_drain
+    persistent_drain,
+    feature_dequant
 );
 criterion_main!(kernels);

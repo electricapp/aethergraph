@@ -1,6 +1,6 @@
 //! PTX-acquire seqlock snapshot reader (K5.3).
 //!
-//! Unlike [`super::kernel::SeqlockValidator`], this reads one device-resident
+//! Unlike [`super::validate::SeqlockValidator`], this reads one device-resident
 //! FeatureTable image. Callers that need protection from independently DMAed
 //! snapshots should continue to use the two-snapshot validator.
 
@@ -9,7 +9,11 @@ use cudarc::driver::{
 };
 use std::sync::Arc;
 
-const KERNEL_SRC: &str = include_str!("seqlock_reader.cu");
+pub(super) const KERNEL_SRC: &str = concat!(
+    include_str!("../common.cuh"),
+    "\n",
+    include_str!("seqlock_reader.cu")
+);
 const KERNEL_NAME: &str = "seqlock_snapshot_rows";
 
 /// Portable acceptance oracle; implemented in aethergraph-core so it is
@@ -34,7 +38,7 @@ impl SeqlockSnapshotReader {
         max_rows: usize,
         feature_dim: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let module = ctx.load_module(super::compile_for_device(ctx, KERNEL_SRC)?)?;
         let func = module.load_function(KERNEL_NAME)?;
         Ok(Self {
             stream: stream.clone(),
@@ -62,9 +66,11 @@ impl SeqlockSnapshotReader {
         let feature_dim = i32::try_from(self.feature_dim)?;
         let row_count_i32 = i32::try_from(row_count)?;
         let slot_size_i32 = i32::try_from(slot_size)?;
-        let threads = 256;
+        // One warp per row; the kernel grid-strides past the cap.
+        let threads = 256u32;
+        let blocks = (row_count as u32).div_ceil(threads / 32).clamp(1, 4096);
         let cfg = LaunchConfig {
-            grid_dim: ((row_count as u32).div_ceil(threads), 1, 1),
+            grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };

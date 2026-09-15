@@ -9,7 +9,7 @@ use cudarc::driver::{
 };
 use std::sync::Arc;
 
-const KERNEL_SRC: &str = concat!(
+pub(super) const KERNEL_SRC: &str = concat!(
     include_str!("../common.cuh"),
     "\n",
     include_str!("decompress.cu")
@@ -66,7 +66,7 @@ impl StreamVByteDecoder {
         stream: &Arc<CudaStream>,
         max_len: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let module = ctx.load_module(super::compile_for_device(ctx, KERNEL_SRC)?)?;
         Ok(Self {
             stream: stream.clone(),
             func: module.load_function("streamvbyte_delta_decode")?,
@@ -127,7 +127,13 @@ impl EliasFanoDeviceParts {
         stream: &Arc<CudaStream>,
         ef: &EliasFano,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // SAFETY: `alloc` hands back uninitialized device memory, never read
+        // host-side. The memcpys below fill every word the kernel is told
+        // about; the `.max(1)` placeholder for an empty array is unreachable
+        // because `low_bits == 0` and `high_words == 0` short-circuit the
+        // reads.
         let mut low = unsafe { stream.alloc::<u64>(ef.low_words().len().max(1))? };
+        // SAFETY: as above.
         let mut high = unsafe { stream.alloc::<u64>(ef.high_words().len().max(1))? };
         if !ef.low_words().is_empty() {
             stream.memcpy_htod(ef.low_words(), &mut low)?;
@@ -160,7 +166,7 @@ impl EliasFanoDecoder {
         stream: &Arc<CudaStream>,
         max_len: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let module = ctx.load_module(super::compile_for_device(ctx, KERNEL_SRC)?)?;
         Ok(Self {
             stream: stream.clone(),
             func: module.load_function("elias_fano_decode_all")?,

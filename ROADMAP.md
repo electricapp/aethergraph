@@ -4,21 +4,24 @@ Outstanding work only. Delete rows from these tables as they land.
 
 ## Status
 
-| ID  | What                                  | Code written? | Blocker to run                            |
-| --- | ------------------------------------- | ------------- | ----------------------------------------- |
-| R6  | T4.3 Ray Data multi-GPU               | Yes           | ≥2 GPUs (Modal `gpu="T4:2"` suffices)     |
-| H1  | GPU orchestration paths               | Yes           | Any CUDA GPU                              |
-| H2  | NVMe passthrough gather               | Yes           | A drive exposing `/dev/ng*`               |
-| H3  | NUMA placement chooses a node         | Yes           | A 2-socket host                           |
-| H4  | USDT probe arguments                  | Yes           | Linux + `bpftrace`                        |
-| H5  | io_uring setup wins                   | Bench only    | NVMe host under load                      |
-| H6  | Native InfiniBand addressing          | Yes           | IB fabric + subnet manager                |
-| H7  | AVX-512 / F16C f16 upcast             | Yes           | An x86-64 host with AVX-512               |
-| H8  | Huge-page backing for in-memory CSR   | Yes           | Linux with `transparent_hugepage=madvise` |
-| P1  | Whether node ordering speeds sampling | Bench only    | A quiet host with headroom to spare       |
+| ID  | What                           | Code written? | Blocker to run              |
+| --- | ------------------------------ | ------------- | --------------------------- |
+| H2  | NVMe passthrough gather (live) | Yes           | A drive exposing `/dev/ng*` |
+| H3  | NUMA placement chooses a node  | Yes           | A 2-socket host             |
+| H6  | Native InfiniBand addressing   | Yes           | IB fabric + subnet manager  |
 
-All test code is written and gated. What's left is _running_ it on the right
-hardware.
+Closed on 2026-09-02 (Modal T4:2 + Lambda `gpu_1x_a10`): **R6**, **H1** (seqlock
+validate + snapshot reader), **H4**, **H5** (tier=`deferred`; async io_uring vs
+pread on the A10 root volume), **H7**, **H8** (THP=`madvise`, CSR advise path
+exercised), **P1** (Rabbit faster on both arms across 3 runs).
+
+Still open inside H1: GDRCopy BAR1 stamping and UVM `prefetch_rows` need a live
+RDMA feature server + `gdrdrv` (not exercised on this pass). CUDA graph capture
+soft-falls back to eager launch on the A10; kernel correctness holds.
+
+Lambda A10 is virtio root (`vda`), not NVMe — no `/dev/ng*`, so H2 live
+`read_batch` remains open (MDTS / layout unit tests already pass). Single NUMA
+node — H3 inert, same as CI.
 
 ---
 
@@ -30,22 +33,15 @@ because every one of these is a path where the code can look finished and do
 nothing: a fallback that silently degrades, a placement call that is inert on
 one socket, a probe that fires without its arguments.
 
-| ID  | Never executed                                                                                           | Why CI cannot cover it                                                                                           | Rig                         |
-| --- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------- |
-| H1  | `gpu/gdrcopy.rs` BAR1 stores, `gpu/kernel.rs` seqlock validation, the CUDA half of `gpu/uvm.rs` prefetch | `gpudirect-check` runs `cargo check` in a CUDA container with no device — type-checked, never run                | Any CUDA GPU                |
-| H2  | `NvmeReader::read_batch` submission and completion; MDTS rejection of an oversized command               | Runners have no NVMe character device, so `NvmeReader::open_for` returns `None` and the gather takes the fs path | Drive with `/dev/ng*`       |
-| H3  | `interleave_region` spreading pages, `pin_current_thread` binding a worker to one socket's cores         | Runners are single-node: `nodes_online().len() < 2`, so both calls short-circuit before the syscall              | 2-socket host               |
-| H4  | A tracer reading `arg1`…`arg4` off a probe                                                               | CI asserts the ELF note carries descriptors; nothing attaches to confirm a consumer resolves them                | Linux + `bpftrace`          |
-| H5  | Whether `DEFER_TASKRUN` and the coalesced UVM prefetch are actually faster, not merely selected          | The tier assertion proves the setup was chosen; it says nothing about throughput                                 | NVMe host, GPU host         |
-| H6  | A QP reaching a peer over LID routing, and `LinkLayer::InfiniBand` being taken at all                    | Every fabric available is Ethernet-link-layer — SoftRoCE, ConnectX-6 RoCE, EFA — so the IB branch never runs     | IB fabric + subnet manager  |
-| H7  | `f16_le_to_f32_avx512` and `f16_le_to_f32_f16c`; the AVX2 bf16 kernel                                    | Development is on aarch64, where those blocks are `cfg`'d out entirely and NEON is the only path compiled        | x86-64 host with AVX-512    |
-| H8  | Whether `MADV_HUGEPAGE` on the in-memory CSR arrays changes anything                                     | `advise_hugepage` compiles to a no-op off Linux, and is redundant under `transparent_hugepage=always`            | Linux, THP set to `madvise` |
-| P1  | Whether Rabbit ordering makes sampling faster at all                                                     | Not a hardware gap — a noise-floor one; see below                                                                | Quiet host, ≥32 GB          |
+| ID  | Never executed                                                                                   | Why CI cannot cover it                                                                                           | Rig                        |
+| --- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| H2  | `NvmeReader::read_batch` submission and completion                                               | Runners have no NVMe character device, so `NvmeReader::open_for` returns `None` and the gather takes the fs path | Drive with `/dev/ng*`      |
+| H3  | `interleave_region` spreading pages, `pin_current_thread` binding a worker to one socket's cores | Runners are single-node: `nodes_online().len() < 2`, so both calls short-circuit before the syscall              | 2-socket host              |
+| H6  | A QP reaching a peer over LID routing, and `LinkLayer::InfiniBand` being taken at all            | Every fabric available is Ethernet-link-layer — SoftRoCE, ConnectX-6 RoCE, EFA — so the IB branch never runs     | IB fabric + subnet manager |
 
 **H3 is not covered by the Lambda A10** — that instance is single-socket, so it
-exercises H1 and H2 but leaves NUMA placement inert exactly as CI does. A
-separate 2-socket box is the only thing that shows `interleave_region` choosing
-between nodes.
+leaves NUMA placement inert exactly as CI does. A separate 2-socket box is the
+only thing that shows `interleave_region` choosing between nodes.
 
 H6 is worth stating precisely, because "uses libibverbs" reads as "supports
 InfiniBand" and does not mean it. The verbs API is common to IB, RoCE, iWARP,
@@ -55,41 +51,31 @@ addressing path is written and its decision logic is unit tested — same subnet
 routes on the LID, crossing subnets adds a GRH — but no IB fabric has executed
 it.
 
-For H5, the numbers worth capturing are per-tier: run the feature gather with
-the ring forced down each rung (`UringHandle::tier()` reports which one took
-effect) and with prefetch coalescing disabled, so the claim is a measured delta
-rather than a plausible mechanism.
+### P1 result (2026-09-02, Lambda A10, quiet)
 
-P1 is a measurement gap, not a hardware one, and it is open in both directions —
-no result yet shows reordering helping _or_ not helping.
-`benches/sampling_locality.rs` is the instrument: two isomorphic R-MAT graphs,
-one randomly permuted and one Rabbit-reordered, asserted to emit the same edge
-count and visit the same node count before it reports, so a timing gap can only
-be layout. Its one-hop arm reproduces to ~1%; its multi-hop arm does not, and
-has returned differences of both signs across runs of the same binary. That arm
-holds hundreds of thousands of output elements and dedup slots, which makes it
-sensitive to memory pressure and to competing load. Read it only where repeated
-runs agree on the sign and their intervals stay apart.
+`benches/sampling_locality.rs`, three consecutive runs. Rabbit faster on both
+arms every time; one-hop intervals stay apart.
 
-Two things to hold separate when it is run. The benchmark draws seeds uniformly,
-which is the ordering-unfriendly case — at the first hop, consecutive frontier
-entries are unrelated whatever the numbering, so only later hops have locality
-to win back. And `partition_aligned_batches` would show a larger number, but it
-samples a denser subgraph: part of that gain is doing less work, not touching
-less memory, and it changes batch gradient statistics. Those are two claims, not
-one.
+| Arm        | shuffled (median)      | rabbit (median)        |
+| ---------- | ---------------------- | ---------------------- |
+| 25 (1-hop) | ~68.6 / 68.7 / 69.2 µs | ~63.0 / 63.2 / 63.7 µs |
+| 15×10      | ~944 / 928 / 921 µs    | ~896 / 891 / 876 µs    |
 
----
+Two things to hold separate when reading it. The benchmark draws seeds
+uniformly, which is the ordering-unfriendly case — at the first hop, consecutive
+frontier entries are unrelated whatever the numbering, so only later hops have
+locality to win back. And `partition_aligned_batches` would show a larger
+number, but it samples a denser subgraph: part of that gain is doing less work,
+not touching less memory, and it changes batch gradient statistics. Those are
+two claims, not one.
 
-## R6 — T4.3 Ray Data multi-GPU
+### H5 result (2026-09-02, Lambda A10)
 
-Skips unless `torch.cuda.device_count() >= 2`. Builds a sampling dataset at
-parallelism = GPU count and asserts aggregate batches/sec is at least 1.5× the
-single-worker baseline.
-
-| File                                 |
-| ------------------------------------ |
-| `python/tests/test_ray_multi_gpu.py` |
+- Ladder: `io_uring setup tier reached: deferred` (SINGLE_ISSUER +
+  DEFER_TASKRUN).
+- `async_io_benchmark` on the root volume (virtio, not NVMe): async io_uring
+  ~408 µs vs sync pread ~429 µs for 1k nodes — small win, not a cold-NVMe claim.
+  Per-rung forced deltas still unmeasured.
 
 ---
 
@@ -139,6 +125,8 @@ the failure mode these paths actually have:
 | `ibv_reg_mr` on CUDA VAs EFAULTs in VMs           | nvidia-peermem needs bare metal; `reg_mr_cuda` falls back to dma-buf and names both failures + driver/rdma-core requirements      |
 | auditwheel-bundled libibverbs sees 0 devices      | Bundled lib can't load the mlx5 provider plugin — build the extension with `maturin develop` so it links system libibverbs        |
 | torch wheel CUDA flavor must match the driver     | e.g. driver 570 = CUDA 12.8 → install `+cu128` wheels from `download.pytorch.org/whl/cu128`                                       |
+| Lambda A10 root disk is virtio, not NVMe          | No `/dev/ng*` — H2 live passthrough cannot run; use a box with a real NVMe namespace char device                                  |
+| Seqlock feature bytes start at offset 8           | `ld.global.*.v4` needs 16-byte alignment — validate kernel uses scalar `.cs` loads                                                |
 
 ---
 

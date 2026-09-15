@@ -63,8 +63,12 @@ pub use internal::parquet_import::{from_parquet, from_parquet_files};
 pub use internal::perf::{Counter, CounterReadings, CounterSet};
 /// Counter-based RNG shared by CPU sampling oracles and GPU kernels.
 pub use internal::philox::{philox_u32, philox4x32_10, reservoir_sample};
-/// Portable predicate shared by host and device seqlock readers.
-pub use internal::seqlock::cpu_seqlock_accept;
+/// Portable predicate and slot geometry shared by host and device seqlock
+/// readers.
+pub use internal::seqlock::{
+    FEATURE_SLOT_HEAD_BYTES, FEATURE_SLOT_STRIDE_ALIGN, cpu_seqlock_accept, feature_slot_size,
+    feature_slot_stride, feature_slot_tail_offset,
+};
 #[cfg(all(target_os = "linux", feature = "shm"))]
 pub use internal::shm::{SharedRegion, recv_fd, send_fd, socket_pair};
 // Vectorized bf16 → f32 conversion with runtime SIMD dispatch (AVX2, scalar
@@ -76,6 +80,9 @@ pub use internal::device::{
     DamonSysfs, DevxGpuEthPlan, FdpPlacementId, FlexIoHost, IbgdaQueue, Mlx5RdmaReadWqe, NvmeRwSqe,
     P2pdmaPath, P2pdmaPolicy, SchedExtLoader, SchedExtPolicy, ZoneAppendWal, validate_p2pdma_path,
 };
+/// Block-scaled int8 codec for the feature payload — the per-batch term the
+/// succinct topology codecs above do not touch.
+pub use internal::feature_codec::{BlockScaledI8, FeatureCodecError};
 pub use internal::simd::bf16_le_to_f32;
 pub use internal::succinct::{EliasFano, StreamVByte};
 pub use internal::telemetry::{SamplingTelemetry, TelemetrySummary};

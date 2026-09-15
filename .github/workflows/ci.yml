@@ -55,7 +55,11 @@ jobs:
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         with:
           key: gpudirect-check
-      - run: cargo check -p aether-stream --tests --features "rdma gpudirect"
+      - run: scripts/cu-syntax-check.sh
+      - run: cargo clippy -p aether-stream --all-targets --features "rdma gpudirect" -- -D warnings
+      - env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p aether-stream --no-deps --features "rdma gpudirect"
       # GDRCopy binds libgpudirect at link time only; `cargo check` type-
       # checks the FFI + orchestration modules without the library present.
       - run: cargo check -p aether-stream --features "rdma gpudirect gdrcopy"

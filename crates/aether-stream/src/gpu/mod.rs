@@ -2,7 +2,7 @@
 //!
 //! Device kernels live under [`kernels`] (KERNELS.md Tier A). Orchestration
 //! primitives that drive the GPU without writing kernels: [`uvm`], [`vmm`],
-//! [`ipc`], [`gdrcopy`]. [`pool`] composes those into the gather allocation.
+//! [`ipc`], `gdrcopy`. [`pool`] composes those into the gather allocation.
 
 pub mod buffer;
 #[cfg(feature = "gdrcopy")]

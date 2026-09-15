@@ -5,10 +5,15 @@
 
 #pragma once
 
-// FeatureTable slot: u64 head @ 0, f32 features @ 8, u64 tail at
-// align_up(8 + feature_dim * 4, 8).
+// FeatureTable slot: u64 head @ 0, pad, f32 features @ AETHER_FEATURE_OFFSET,
+// u64 tail at align_up(AETHER_FEATURE_OFFSET + feature_dim * 4, 8). 16 not 8
+// so the payload base is 16B-aligned under the 64B slot stride, which is what
+// licenses the `.v4` loads. Mirrors core's FEATURE_SLOT_HEAD_BYTES; drift
+// fails `common_cuh_matches_core_layout`.
+#define AETHER_FEATURE_OFFSET 16
+
 __device__ __forceinline__ int feature_tail_offset(int feature_dim) {
-    return (8 + feature_dim * 4 + 7) & ~7;
+    return (AETHER_FEATURE_OFFSET + feature_dim * 4 + 7) & ~7;
 }
 
 // K5.6: streaming / read-only global loads. `.cs` = cache-streaming
@@ -48,6 +53,41 @@ __device__ __forceinline__ uint4 ld_cs_v4u32(const unsigned int* p) {
                  : "l"(p));
     return v;
 }
+
+// Output is written once and consumed by a later kernel: evict-first on the
+// way out too, or a compacted batch displaces the next batch's offsets in L2.
+
+__device__ __forceinline__ void st_cs_u32(unsigned int* p, unsigned int v) {
+    asm volatile("st.global.cs.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+}
+
+__device__ __forceinline__ void st_cs_v4u32(unsigned int* p, uint4 v) {
+    asm volatile("st.global.cs.v4.u32 [%0], {%1,%2,%3,%4};"
+                 :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+}
+
+__device__ __forceinline__ void st_cs_v4f32(float* p, float4 v) {
+    asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};"
+                 :: "l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
+                 : "memory");
+}
+
+__device__ __forceinline__ void st_cs_f32(float* p, float v) {
+    asm volatile("st.global.cs.f32 [%0], %1;" :: "l"(p), "f"(v) : "memory");
+}
+
+// Rounds a warp keeps in flight before consuming any. Sized from the
+// bandwidth-delay product, not reuse depth — each row is touched once, so
+// depth buys in-flight bytes, not hits. ~5 KB/SM BDP on an A10 over 8 resident
+// warps is ~640 B/warp; 3 rounds of 32 lanes x 16 B is ~2.4x headroom, at 12
+// uint4 registers per lane instead of shared memory.
+#define AETHER_GATHER_IN_FLIGHT 3
+
+// Elements per scale in the int8 feature codec. Mirrors core's
+// BlockScaledI8::BLOCK (drift fails `common_cuh_matches_core_layout`); a
+// multiple of the 16 codes a lane pulls per `.v4`, so no load straddles two.
+#define AETHER_QUANT_BLOCK 32
 
 // Warp inclusive scan (Hillis–Steele) over the calling warp's 32 lanes.
 __device__ __forceinline__ unsigned int warp_inclusive_scan_u32(unsigned int v) {

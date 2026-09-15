@@ -15,7 +15,7 @@ use cudarc::driver::{
 };
 use std::sync::Arc;
 
-const KERNEL_SRC: &str = concat!(
+pub(super) const KERNEL_SRC: &str = concat!(
     include_str!("../common.cuh"),
     "\n",
     include_str!("sampler.cu")
@@ -24,6 +24,20 @@ const KERNEL_NAME: &str = "warp_sample_neighbors";
 
 /// CPU reference RNG used by the sampler device code.
 pub use aethergraph_core::philox4x32_10 as philox;
+
+/// One sample request's scalars. Grouped so the four `usize`/`u64`/`u32`
+/// values cannot be transposed at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleRequest {
+    /// Seeds to sample, one warp each.
+    pub node_count: usize,
+    /// Neighbors drawn per seed. `<= 32` takes the Algorithm R path.
+    pub fanout: usize,
+    /// Philox key, with `layer`, making the draw reproducible on the CPU.
+    pub seed: u64,
+    /// Sampling layer, part of the Philox key.
+    pub layer: u32,
+}
 
 /// Compiled warp sampler (opt-in; not the production C-tree path yet).
 pub struct WarpSampler {
@@ -37,7 +51,7 @@ impl WarpSampler {
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let module = ctx.load_module(super::compile_for_device(ctx, KERNEL_SRC)?)?;
         Ok(Self {
             stream: stream.clone(),
             func: module.load_function(KERNEL_NAME)?,
@@ -47,26 +61,24 @@ impl WarpSampler {
     /// Enqueue a warp-per-row sample.
     ///
     /// `offsets` is a u64 CSR offset table, `nodes` identifies source rows,
-    /// and `output` must contain `node_count * fanout` u32 elements.
+    /// and `output` must contain `req.node_count * req.fanout` u32 elements.
     pub fn sample(
         &self,
         offsets: &CudaSlice<u64>,
         neighbors: &CudaSlice<u32>,
         nodes: &CudaSlice<u64>,
         output: &mut CudaSlice<u32>,
-        node_count: usize,
-        fanout: usize,
-        seed: u64,
-        layer: u32,
+        req: SampleRequest,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if node_count == 0 || fanout == 0 {
+        if req.node_count == 0 || req.fanout == 0 {
             return Ok(());
         }
-        let node_count_i32 = i32::try_from(node_count)?;
-        let fanout_i32 = i32::try_from(fanout)?;
+        let node_count_i32 = i32::try_from(req.node_count)?;
+        let fanout_i32 = i32::try_from(req.fanout)?;
+        let (seed, layer) = (req.seed, req.layer);
         let threads = 256u32;
         let cfg = LaunchConfig {
-            grid_dim: ((node_count as u32 * 32).div_ceil(threads), 1, 1),
+            grid_dim: ((req.node_count as u32 * 32).div_ceil(threads), 1, 1),
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };

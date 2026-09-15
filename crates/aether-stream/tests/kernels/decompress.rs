@@ -12,7 +12,11 @@ fn streamvbyte_device_matches_cpu() {
     let svb = StreamVByte::encode_deltas(&values);
     let expect = svb.decode();
 
+    // SAFETY: `alloc` returns uninitialized device memory; the memcpys below
+    // fill both buffers before the decoder reads them, and neither is read
+    // host-side.
     let mut d_ctrl = unsafe { stream.alloc::<u8>(svb.control().len().max(1)).unwrap() };
+    // SAFETY: as above.
     let mut d_data = unsafe { stream.alloc::<u8>(svb.data().len().max(1)).unwrap() };
     if !svb.control().is_empty() {
         stream.memcpy_htod(svb.control(), &mut d_ctrl).unwrap();

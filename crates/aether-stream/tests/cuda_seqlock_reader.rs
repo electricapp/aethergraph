@@ -6,16 +6,17 @@ use aether_stream::gpu::seqlock_reader::SeqlockSnapshotReader;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtrMut};
 
 const FEATURE_DIM: usize = 3;
-const TAIL_OFFSET: usize = (8 + FEATURE_DIM * 4 + 7) & !7;
-const SLOT_SIZE: usize = TAIL_OFFSET + 8;
+const FEAT: usize = aethergraph_core::FEATURE_SLOT_HEAD_BYTES;
+const TAIL_OFFSET: usize = aethergraph_core::feature_slot_tail_offset(FEATURE_DIM);
+const SLOT_SIZE: usize = aethergraph_core::feature_slot_stride(FEATURE_DIM);
 
 fn slot(head: u64, features: [f32; FEATURE_DIM], tail: u64) -> [u8; SLOT_SIZE] {
     let mut bytes = [0; SLOT_SIZE];
     bytes[..8].copy_from_slice(&head.to_le_bytes());
     for (index, value) in features.into_iter().enumerate() {
-        bytes[8 + index * 4..12 + index * 4].copy_from_slice(&value.to_le_bytes());
+        bytes[FEAT + index * 4..FEAT + 4 + index * 4].copy_from_slice(&value.to_le_bytes());
     }
-    bytes[TAIL_OFFSET..].copy_from_slice(&tail.to_le_bytes());
+    bytes[TAIL_OFFSET..TAIL_OFFSET + 8].copy_from_slice(&tail.to_le_bytes());
     bytes
 }
 

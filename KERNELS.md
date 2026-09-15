@@ -40,21 +40,56 @@ cost of every node in that sequence on every batch. Pair it with
 `cudaMallocAsync`/`cudaFreeAsync` so scratch allocation joins the stream
 timeline instead of forcing a host synchronization to reclaim.
 
-K5.1 subsumes this — a persistent kernel has no per-batch launch left to
-amortize — but a captured graph reaches most of the same win without the
-forward-progress reasoning. That makes it both the cheapest item here and the
-baseline K5.1 has to beat to justify its complexity.
+A captured graph reaches the launch-cost win without the forward-progress
+reasoning a persistent kernel needs, which makes it both the cheapest item here
+and — as K5.1 records — the reason the launch-cost case for K5.1 is already
+spent. What a graph cannot do is branch on a device-computed value; that is the
+boundary between the two.
 
-### K5.1 Persistent-kernel loader with warp specialization
+### K5.1 Persistent megakernel loader with warp specialization
 
 One long-lived kernel replaces per-batch launches. Warps are specialized into
 roles — fetch, transform, compute — communicating through a ring in VRAM, so the
 gather for batch _n+1_ overlaps the aggregation of batch _n_ without stream
-ping-pong or launch latency between them.
+ping-pong or launch latency between them. The hard part is forward-progress
+reasoning: a persistent kernel that blocks on an empty ring must not starve the
+producer warps on the same SM.
 
-Displaces the per-batch H2D/launch cadence in the loader path. The hard part is
-forward-progress reasoning: a persistent kernel that blocks on an empty ring
-must not starve the producer warps on the same SM.
+**The launch-cost argument for this does not hold here, and it is worth being
+precise about why.** A megakernel earns its complexity when overhead swamps the
+work it wraps — a per-op transformer decode stack issues hundreds of launches
+against tens of microseconds of arithmetic, so deleting the launches is the
+whole optimization. AetherGraph's device sequence is one kernel per batch
+against a ~240 µs batch, and K5.0 already captured it. The overhead ratio is
+~1.01, not ~27. Sizing K5.1 against launch cost would be optimizing a bubble
+that is not there.
+
+Two things _do_ justify it, and they are what it should be built against:
+
+- **Data-dependent control flow.** A captured graph cannot branch on a value the
+  device computed. Today the sequence is static, so K5.0 covers it. The moment
+  K5.2 puts sampling on-device and K1.1/K2.1 make a cache miss a device-issued
+  fetch, the per-batch sequence becomes _sample → gather → miss? → fetch →
+  validate → sample → …_ with the branch decided in VRAM. That is the point
+  where graphs stop being expressible and persistence is the only remaining
+  answer.
+- **Occupancy.** A batch of a few thousand rows cannot fill a modern part from
+  one operation's tile count, however well that operation is written. The fix is
+  to source parallelism from several batches in flight rather than from one
+  batch's row count — which is what a resident kernel with a work ring gives and
+  a launch-per-batch cadence cannot.
+
+What exists today is a correctness scaffold, not that kernel:
+`kernels/persistent/persistent.cu` runs one CTA (`blockIdx.x != 0` returns) with
+three warps whose queue operations all happen on `lane == 0`. It is the right
+shape for reasoning about forward progress and the wrong shape for bandwidth.
+The version worth building partitions roles by cluster rank across the whole
+device, uses arrival barriers rather than polled flags, and carries a heartbeat
+counter in L2 that the host polls — because a persistent kernel that deadlocks
+on a barrier-parity mismatch presents as "still working", and is the failure
+mode that costs the most days.
+
+`TODO:` build that on top of K5.2/K1.1/K2.1, not before them.
 
 ### K5.2 Warp-cooperative C-tree sampler
 
@@ -70,9 +105,14 @@ offsets out, no round trip.
 ### K5.3 PTX seqlock reader
 
 The feature table's head/tail seqlock read from device code with correct
-acquire/release semantics (`ld.acquire.sys`, `fence.acq_rel.sys`). Lets a kernel
-snapshot a live-updating feature table without host mediation, matching the
-guarantee the host-side reader already provides.
+acquire/release semantics (`ld.acquire.sys`). Lets a kernel snapshot a
+live-updating feature table without host mediation, matching the guarantee the
+host-side reader already provides.
+
+`.acquire` is PTX ISA 6.0, so this unit is the one that sets `NVRTC_ARCH_FLOOR`.
+A volatile load would compile anywhere and is not an acquire load, so the unit
+`#error`s below sm_70 rather than quietly weakening the property the litmus
+tests check.
 
 This is the smallest item on the list and the highest-value one to do first: it
 is the memory-model proof-of-competence that everything else in the compute
@@ -97,7 +137,29 @@ engine is the vendor path for LZ-family formats.
 Pairs directly with the succinct codecs already used for the version-2
 compressed graph file.
 
-### K5.6 Non-coherent and streaming loads for the sparse gather
+**Those codecs compress the wrong half of the batch.** Split a batch's bytes
+into a term that is roughly constant and a term that scales with batch size.
+Adjacency is the constant-ish one; the feature payload is the one that scales,
+and it is the larger of the two — a 128-seed `15×10` sample touches ~19k nodes,
+so at `feature_dim = 128` the gather moves ~9.8 MB of features against ~1.5 MB
+of adjacency. Compressing the constant term buys latency at small batch;
+compressing the per-batch term is what moves the streaming asymptote. Only the
+second one changes what the loader converges to.
+
+So K5.5 has two halves:
+
+- **Topology** — `kernels/decompress`, StreamVByte + Elias-Fano, landed.
+- **Payload** — `kernels/quant`, `aethergraph_core::BlockScaledI8`: symmetric
+  int8 with an `f32` scale per 32 elements, 1.125 bytes per feature against
+  `f32`'s 4. Decode is `q as f32 * scale`, one IEEE multiply, so the device
+  output is bit-identical to the CPU codec rather than close to it; a lane's
+  16-code `.v4` load sits inside one block and costs one scale fetch.
+
+The open question on the payload half is accuracy, not throughput: whether GNN
+quality survives int8 features is a sweep nobody has run. `TODO:` run it, per
+layer and per feature-column distribution, before this is on by default.
+
+### K5.6 Coalescing, streaming qualifiers, and in-flight depth
 
 A feature row is read once per batch and never reused inside the kernel, so
 routing it through L1 evicts the offsets and node ids that _are_ reused.
@@ -107,6 +169,35 @@ then stops competing with the working set that has to stay resident.
 
 One qualifier per load site, applied only where the read is provably read-only
 for the kernel's lifetime.
+
+**A qualifier on an uncoalesced access is a rounding error on a factor of
+eight**, and that is the order in which these have to be fixed:
+
+- **One warp per row, not one thread per row.** Thread-per-row puts consecutive
+  lanes a `slot_size` apart, so each lane lands in its own 32-byte sector and a
+  warp fetches 32 sectors where four would do. `validate_and_compact` and
+  `seqlock_snapshot_rows` are warp-per-row; so are the sampler and the feature
+  dequantizer. Grids are sized in warps and grid-stride over the batch, so a
+  small batch spreads across SMs instead of landing on one CTA.
+- **Alignment is a format decision, not a kernel one.** The payload base sits at
+  `FEATURE_SLOT_HEAD_BYTES` = 16, not 8, which is what makes `ld.global.cs.v4`
+  legal at all; the 64-byte slot stride absorbs the pad, so it costs no DRAM.
+  `aethergraph_core::feature_slot_stride` is the one definition,
+  `SeqlockValidator::validate` rejects staging that violates it, and
+  `common_cuh_matches_core_layout` fails if the device constant drifts.
+- **Depth comes from the bandwidth-delay product, not from reuse.** There is no
+  reuse to stage for — every feature row is touched once — so shared memory
+  would buy nothing but in-flight bytes, and registers buy those more cheaply
+  because nothing here is shared between lanes. `AETHER_GATHER_IN_FLIGHT` = 3
+  rounds of 512 B per warp is ~2.4× the ~5 KB/SM the BDP asks for on an
+  A10-class part. This is the knob to turn if a profile shows the DRAM
+  controllers idling mid-batch.
+- **Aggregate the atomics.** `retry_count` takes one `atomicAdd` per warp per
+  grid-stride run, not one per torn row.
+
+`TODO(HARDWARE):` confirm sector efficiency and achieved bandwidth with
+`ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld` before and after,
+rather than inferring the win from the access pattern.
 
 ---
 
@@ -224,21 +315,45 @@ layer. Like the rest of K4 they need a rooted Linux VM and nothing else.
 
 ## Layout
 
-| Layer                  | Path                                                                                                                                                                                               |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Tier A CUDA kernels    | [`crates/aether-stream/src/gpu/kernels/`](crates/aether-stream/src/gpu/kernels/) (`validate`, `seqlock`, `sampler`, `decompress`, `persistent`, `tma`, `ibgda`, `coherent` + `common.cuh`)         |
-| GPU infra (non-kernel) | [`crates/aether-stream/src/gpu/`](crates/aether-stream/src/gpu/) (`buffer`, `pool`, `uvm`, `vmm`, `ipc`, `gdrcopy`)                                                                                |
-| Tier B device paths    | [`crates/aethergraph-core/src/internal/device/`](crates/aethergraph-core/src/internal/device/) + [`modules/aether_p2pdma/`](modules/aether_p2pdma/) + [`modules/aether_dpa/`](modules/aether_dpa/) |
-| CUDA harness           | [`crates/aether-stream/tests/kernels/`](crates/aether-stream/tests/kernels/), [`benches/kernels/`](crates/aether-stream/benches/kernels/)                                                          |
-| herd7 litmus (K5.3)    | [`crates/aether-stream/litmus/k5_3/`](crates/aether-stream/litmus/k5_3/)                                                                                                                           |
-| Grind entrypoint       | [`scripts/kernels-verify.sh`](scripts/kernels-verify.sh)                                                                                                                                           |
+| Layer                  | Path                                                                                                                                                                                                |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tier A CUDA kernels    | [`crates/aether-stream/src/gpu/kernels/`](crates/aether-stream/src/gpu/kernels/) (`validate`, `seqlock`, `sampler`, `decompress`, `quant`, `persistent`, `tma`, `ibgda`, `coherent` + `common.cuh`) |
+| GPU infra (non-kernel) | [`crates/aether-stream/src/gpu/`](crates/aether-stream/src/gpu/) (`buffer`, `pool`, `uvm`, `vmm`, `ipc`, `gdrcopy`)                                                                                 |
+| Tier B device paths    | [`crates/aethergraph-core/src/internal/device/`](crates/aethergraph-core/src/internal/device/) + [`modules/aether_p2pdma/`](modules/aether_p2pdma/) + [`modules/aether_dpa/`](modules/aether_dpa/)  |
+| CUDA harness           | [`crates/aether-stream/tests/kernels/`](crates/aether-stream/tests/kernels/), [`benches/kernels/`](crates/aether-stream/benches/kernels/)                                                           |
+| herd7 litmus (K5.3)    | [`crates/aether-stream/litmus/k5_3/`](crates/aether-stream/litmus/k5_3/)                                                                                                                            |
+| Grind entrypoint       | [`scripts/kernels-verify.sh`](scripts/kernels-verify.sh)                                                                                                                                            |
 
 CUDA units compile via NVRTC `include_str!` under the `gpudirect` feature — no
-nvcc fatbin step in `build.rs`.
+nvcc fatbin step in `build.rs`, so the toolkit is never a build dependency and
+each unit is compiled for the compute capability of the device that will run it
+(`compile_for_device`), not for NVRTC's default floor.
+
+The cost is that `cargo` never reads a `.cu` file, so three gates stand in for
+it, none of which needs a GPU:
+
+| Gate                         | Needs      | Catches                             |
+| ---------------------------- | ---------- | ----------------------------------- |
+| `scripts/cu-syntax-check.sh` | clang only | C++ syntax and types                |
+| `nvrtc_compiles_every_unit`  | `libnvrtc` | CUDA semantics, arch-gated builtins |
+| `ptxas_assembles_every_unit` | `ptxas`    | the inline PTX bodies               |
+
+The third is not redundant. NVRTC copies `asm volatile` bodies into its output
+verbatim and never assembles them, and cudarc only ever asks it for PTX — so a
+typo'd mnemonic clears both earlier gates and first appears as
+`CUDA_ERROR_INVALID_PTX` when the driver JITs the module on the rig. `ptxas` is
+that assembler, minus the rig. None of the three says anything about whether a
+kernel computes the right answer.
 
 ---
 
 ## How to grind
+
+On any box, before touching a `.cu` file:
+
+```bash
+scripts/cu-syntax-check.sh   # clang parses every unit; no CUDA, no GPU
+```
 
 On a CUDA box (Tier A):
 
@@ -265,14 +380,18 @@ isn't — but that a wedged NVMe controller or a silently-dropped WQE emits no
 signal. The strategy is therefore to **shrink the surface that needs hardware to
 be observed**, until only a few hundred bytes of it remain.
 
-| Technique                       | Applies to              | Effect                                                       |
-| ------------------------------- | ----------------------- | ------------------------------------------------------------ |
-| CPU reference model + diff test | K5.2, K5.5, K1.x codecs | Bit-exact oracle; Philox keying makes the sampler comparable |
-| Pure-logic command builders     | K1.1 NVMe SQE, K2.1 WQE | Struct layout unit-tests on any machine against the spec     |
-| `compute-sanitizer`             | all of Tier A           | racecheck / initcheck / synccheck via `kernels-verify.sh`    |
-| herd7 litmus tests              | K5.3, ring protocols    | Sources in `litmus/k5_3/`; run when herd7 is installed       |
-| syzkaller + KASAN/KCSAN         | K3.1                    | Module fuzzed before it touches a real namespace             |
-| virtme-ng / QEMU harness        | K3.1, K4.x              | Module crash-iterate without reprovisioning                  |
+| Technique                       | Applies to               | Effect                                                       |
+| ------------------------------- | ------------------------ | ------------------------------------------------------------ |
+| CPU reference model + diff test | K5.2, K5.5, K1.x codecs  | Bit-exact oracle; Philox keying makes the sampler comparable |
+| Pure-logic command builders     | K1.1 NVMe SQE, K2.1 WQE  | Struct layout unit-tests on any machine against the spec     |
+| clang nvptx parse               | every `.cu` unit         | Syntax + types with no CUDA toolkit; `cu-syntax-check.sh`    |
+| NVRTC compile, no device        | every `.cu` unit         | CUDA semantics wherever `libnvrtc` exists, GPU or not        |
+| `ptxas` assemble, no device     | every inline `asm` body  | Bad opcodes, which NVRTC passes through untouched            |
+| Shared-geometry drift test      | slot layout, quant block | `common.cuh` constants checked against `aethergraph-core`    |
+| `compute-sanitizer`             | all of Tier A            | racecheck / initcheck / synccheck via `kernels-verify.sh`    |
+| herd7 litmus tests              | K5.3, ring protocols     | Sources in `litmus/k5_3/`; run when herd7 is installed       |
+| syzkaller + KASAN/KCSAN         | K3.1                     | Module fuzzed before it touches a real namespace             |
+| virtme-ng / QEMU harness        | K3.1, K4.x               | Module crash-iterate without reprovisioning                  |
 
 Building K1.1 and K2.1 as an untestable doorbell ring around a fully unit-tested
 command builder is the difference between a week and a month on each.
@@ -299,20 +418,25 @@ command builder is the difference between a week and a month on each.
    fallback).
 2. **K5.3** — done: PTX acquire reader + litmus sources; herd7 run is
    `TODO(HARDWARE)`.
-3. **K5.2, K5.5, K5.6, K5.1** — roofline-shaped device code landed (warp
-   prefetch sampler, warp StreamVByte + parallel EF, `ld.cs` gather, 3-warp
-   persistent roles). C-tree arena / RDMA-forward-progress / Blackwell engine
-   remain `TODO(HARDWARE)`.
-4. **K4.1, K4.2, K4.3** — `SchedExtLoader` + BPF struct_ops source, DAMON sysfs
+3. **K5.6, K5.2, K5.5** — warp-per-row gather with 16-byte-aligned payloads and
+   BDP in-flight depth; warp prefetch sampler; warp StreamVByte + parallel EF
+   for topology and block-scaled int8 for the payload. C-tree arena and the
+   Blackwell decompression engine remain `TODO(HARDWARE)`; the int8 accuracy
+   sweep is `TODO:`.
+4. **K5.1** — deferred on purpose. The launch-cost case for it is spent (K5.0),
+   and the cases that remain — device-computed control flow, multi-batch
+   occupancy — only exist once K5.2 and K1.1/K2.1 land. Today's `persistent.cu`
+   is a one-CTA forward-progress scaffold, not the kernel.
+5. **K4.1, K4.2, K4.3** — `SchedExtLoader` + BPF struct_ops source, DAMON sysfs
    adapter, PBUF register + `read_buffer_select`; live attach / DAMON / load
    test remain `TODO(HARDWARE)`.
-5. **K3.1** — `modules/aether_p2pdma/` + userspace ioctl client; virtme-ng
+6. **K3.1** — `modules/aether_p2pdma/` + userspace ioctl client; virtme-ng
    crash-iterate `TODO(HARDWARE)`.
-6. **K1.1** / **K1.2** / **K1.3** — `BamController`, FDP on SQE,
+7. **K1.1** / **K1.2** / **K1.3** — `BamController`, FDP on SQE,
    `ZoneAppendWal`; BAR/doorbell / FDP drive / ZNS CQ `TODO(HARDWARE)`.
-7. **K2.2**, then **K2.1** — `DevxGpuEthPlan` + `IbgdaQueue` + GPU WQE kernel;
+8. **K2.2**, then **K2.1** — `DevxGpuEthPlan` + `IbgdaQueue` + GPU WQE kernel;
    DEVX/IBGDA on ConnectX `TODO(HARDWARE)`.
-8. **K5.4**, **K2.3**, **K3.3**, **K3.2** — GEMV + `FlexIoHost`/`aether_dpa` +
+9. **K5.4**, **K2.3**, **K3.3**, **K3.2** — GEMV + `FlexIoHost`/`aether_dpa` +
    CXL `mbind` apply + coherent hints; ISA/BF3/Grace/CXL box `TODO(HARDWARE)`.
 
 The single highest-leverage action is securing one bare-metal box with a
@@ -327,12 +451,12 @@ crown-jewel items are days-hard or months-hard.
 | Item      | Code                                                          | Verification                                               |
 | --------- | ------------------------------------------------------------- | ---------------------------------------------------------- |
 | K5.0      | `kernels/validate` — CUDA graph + mapped `retry_count`        | `tests/kernels` + graph unit tests                         |
-| K5.1      | `kernels/persistent` — 3-warp fetch/xform/compute             | `persistent_drain_counts_posted_work`                      |
+| K5.1      | `kernels/persistent` — 1-CTA 3-warp scaffold, deferred        | `persistent_drain_counts_posted_work`                      |
 | K5.2      | `kernels/sampler` — warp + `ld.cs` window + Philox R          | GPU↔CPU bit-diff in `tests/kernels`                        |
-| K5.3      | `kernels/seqlock` + `litmus/k5_3`                             | Oracle tests; herd7 `TODO(HARDWARE)`                       |
+| K5.3      | `kernels/seqlock` — warp-per-row snapshot + `litmus/k5_3`     | Oracle tests; herd7 `TODO(HARDWARE)`                       |
 | K5.4      | `kernels/tma` smem-B + `ld.cs.v4` GEMV                        | Smoke test; TMA/WGMMA ISA `TODO(HARDWARE)`                 |
-| K5.5      | `kernels/decompress` warp SVB + parallel EF                   | GPU↔CPU oracle tests                                       |
-| K5.6      | `ld.global.cs` / v4 in `validate_and_compact.cu`              | Covered by validate tests                                  |
+| K5.5      | `kernels/decompress` (topology) + `kernels/quant` (payload)   | GPU↔CPU oracle tests; int8 accuracy sweep `TODO:`          |
+| K5.6      | warp-per-row `.cs`/`.v4` gather, 16B payload base, BDP depth  | Validate + dequant tests; `ncu` sectors `TODO(HARDWARE)`   |
 | K1.1–K1.3 | `device/nvme/` BaM + FDP-on-SQE + `ZoneAppendWal`             | Layout/unit tests; BAR/ZNS/FDP `TODO(HARDWARE)`            |
 | K2.1–K2.3 | `device/rdma/` IBGDA + DEVX + FlexIO + `modules/aether_dpa`   | Unit + mock DEVX; ConnectX/BF3 `TODO(HARDWARE)`            |
 | K3.1–K3.3 | `modules/aether_p2pdma/` + ioctl + CXL apply + coherent hints | Unit tests; module/CXL/GH `TODO(HARDWARE)`                 |

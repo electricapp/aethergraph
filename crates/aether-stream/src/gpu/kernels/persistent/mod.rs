@@ -14,7 +14,7 @@ use cudarc::driver::{
 };
 use std::sync::Arc;
 
-const KERNEL_SRC: &str = include_str!("persistent.cu");
+pub(super) const KERNEL_SRC: &str = include_str!("persistent.cu");
 const KERNEL_NAME: &str = "persistent_work_drain";
 
 /// Work classes the persistent drain kernel recognizes.
@@ -92,7 +92,7 @@ impl PersistentWorker {
         // The drain kernel runs on `stream` but only after `start()`; posting
         // never races an unfinished async zero-fill on another stream.
         let control_stream = ctx.new_stream()?;
-        let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let module = ctx.load_module(super::compile_for_device(ctx, KERNEL_SRC)?)?;
         let ring = control_stream.alloc_zeros(capacity as usize)?;
         let head = control_stream.alloc_zeros(1)?;
         let tail = control_stream.alloc_zeros(1)?;

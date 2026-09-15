@@ -8,6 +8,7 @@ pub mod compressed_graph;
 /// Pure-logic device protocol layouts and hardware-gated integration plans
 /// from `KERNELS.md`.
 pub mod device;
+pub mod feature_codec;
 pub mod genstamp;
 pub mod hint;
 pub mod mmap;

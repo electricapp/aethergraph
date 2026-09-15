@@ -20,7 +20,7 @@
 //! - [`ipc`] exports the pool's physical handle so a second process maps
 //!   the same VRAM: one copy of a cached feature block per GPU rather
 //!   than per worker.
-//! - [`gdrcopy`] gives the CPU a BAR1 window into the pool's header, so a
+//! - `gdrcopy` gives the CPU a BAR1 window into the pool's header, so a
 //!   generation stamp is a store, not a kernel launch or a
 //!   `cudaMemcpy` — sub-microsecond, and orderable against RDMA writes.
 //!
@@ -221,7 +221,7 @@ impl FeaturePool {
         Ok(Some(self.generation))
     }
 
-    /// The generation last published by [`Self::stamp_generation`].
+    /// The generation last published by `stamp_generation`.
     pub fn generation(&self) -> u64 {
         self.generation
     }

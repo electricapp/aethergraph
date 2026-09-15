@@ -18,24 +18,30 @@ use aether_mem::{MemoryHook, SharedMemoryRing};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Feature offset within a slot (immediately after head_version u64).
-const FEATURE_OFFSET: usize = 8;
+/// Feature offset within a slot: `u64` head plus 8 bytes of pad. Owned by
+/// `aethergraph-core` so host, wire, and device readers share one geometry.
+const FEATURE_OFFSET: usize = aethergraph_core::FEATURE_SLOT_HEAD_BYTES;
 
 /// Per-node slot layout:
 /// ```text
-/// [0..8]         head_version: AtomicU64  (odd=writing, even=ready, 0=uninit)
-/// [8..8+N]       features: [f32; feature_dim]   (N = feature_dim * 4)
-/// [8+N+P..16+N+P] tail_version: AtomicU64       (P = padding to 8-byte align)
+/// [0..8]           head_version: AtomicU64 (odd=writing, even=ready, 0=uninit)
+/// [8..16]          pad
+/// [16..16+N]       features: [f32; feature_dim]   (N = feature_dim * 4)
+/// [16+N+P..24+N+P] tail_version: AtomicU64        (P = padding to 8-byte align)
 /// ```
 ///
-/// Logical slot size = 16 + N + P. There is no inter-field cache-line padding:
-/// the head and tail counters sit directly around the feature payload so a
-/// single one-sided RDMA READ of the slot fetches both version stamps. The
-/// stored stride (`schema.slot_size`) rounds the compact size up to a
-/// 64-byte cache line — the table registers one MR and addresses slots by
-/// offset, so page-strided slots would only waste DRAM on dead padding.
-/// The gather reads only the live prefix of each slot (through
-/// `tail_offset_in_slot + 8`).
+/// Logical slot size = 24 + N + P. The pad after the head keeps the payload
+/// 16-byte aligned under the 64-byte stride below, which is what the device
+/// gather's `ld.global.cs.v4.f32` requires; the stride rounding absorbs it for
+/// every dim not already a multiple of 64, so it costs no DRAM.
+///
+/// There is no inter-field cache-line padding: the head and tail counters sit
+/// directly around the feature payload so a single one-sided RDMA READ of the
+/// slot fetches both version stamps. The stored stride (`schema.slot_size`)
+/// rounds the compact size up to a 64-byte cache line — the table registers
+/// one MR and addresses slots by offset, so page-strided slots would only
+/// waste DRAM on dead padding. The gather reads only the live prefix of each
+/// slot (through `tail_offset_in_slot + 8`).
 pub struct FeatureTable {
     ring: SharedMemoryRing,
     node_count: usize,
@@ -86,18 +92,17 @@ impl Drop for SeqlockWriteGuard<'_> {
 
 /// Compute tail version offset for a given feature_dim.
 ///
-/// tail_offset = 8 (head) + feature_dim * 4, rounded up to 8-byte alignment.
+/// tail_offset = `FEATURE_OFFSET` + feature_dim * 4, rounded up to 8-byte
+/// alignment for the `AtomicU64`.
 #[inline]
 fn compute_tail_offset(feature_dim: usize) -> usize {
-    let after_features = FEATURE_OFFSET + feature_dim * std::mem::size_of::<f32>();
-    // Round up to 8-byte alignment for AtomicU64
-    (after_features + 7) & !7
+    aethergraph_core::feature_slot_tail_offset(feature_dim)
 }
 
-/// Compute raw slot size (before page-rounding by SharedMemoryRing).
+/// Compute raw slot size (before stride-rounding by SharedMemoryRing).
 #[inline]
 fn compute_slot_size(feature_dim: usize) -> usize {
-    compute_tail_offset(feature_dim) + 8 // tail_version is 8 bytes
+    aethergraph_core::feature_slot_size(feature_dim)
 }
 
 // The u64-packed volatile copies below assemble two adjacent f32s into one
@@ -111,8 +116,8 @@ compile_error!("feature_table's packed seqlock copies assume a little-endian tar
 /// Only the slot side of the copy races (readers and the remote HCA pull
 /// it mid-write by design; the version checks arbitrate validity), so only
 /// the slot access is volatile — the source slice is exclusively owned.
-/// Pairs move as single 8-byte volatile stores: the payload starts at
-/// `FEATURE_OFFSET` = 8 inside an aligned slot, so `dst` is 8-aligned, and
+/// Pairs move as single 8-byte volatile stores: `FEATURE_OFFSET` is a
+/// multiple of 8 inside an aligned slot, so `dst` is 8-aligned, and
 /// halving the volatile-op count roughly halves the copy cost the
 /// element-wise version paid (volatile forbids the compiler from widening
 /// it).
@@ -207,12 +212,12 @@ impl FeatureTable {
 
         // Slots pack at cache-line stride, not page stride: the table
         // registers one MR and addresses slots by offset, so per-slot page
-        // alignment would only round a 3088-byte dim-768 slot up to 4096 —
+        // alignment would only round a 3096-byte dim-768 slot up to 4096 —
         // ~25% of table DRAM spent on dead padding.
         let (ring, hook_failures) = SharedMemoryRing::new_with_slot_align(
             slot_count,
             slot_size,
-            NonZeroUsize::new(64),
+            NonZeroUsize::new(aethergraph_core::FEATURE_SLOT_STRIDE_ALIGN),
             hooks,
         )
         .ok()?;
@@ -307,8 +312,8 @@ impl FeatureTable {
         // SAFETY: FEATURE_OFFSET is within the slot.
         let feat_ptr = unsafe { base.add(FEATURE_OFFSET) } as *mut f32;
         // SAFETY: `feat_ptr` points to `feature_dim` f32 slots inside the
-        // slot and is 8-aligned (FEATURE_OFFSET = 8 inside an aligned
-        // slot); `features` has the same length (asserted above).
+        // slot and is 8-aligned (FEATURE_OFFSET is a multiple of 8 inside
+        // an aligned slot); `features` has the same length (asserted above).
         unsafe {
             volatile_store_payload(features, feat_ptr);
         }
@@ -404,8 +409,8 @@ impl FeatureTable {
             // SAFETY: FEATURE_OFFSET is within the slot.
             let feat_ptr = unsafe { base.add(FEATURE_OFFSET) } as *const f32;
             // SAFETY: `feat_ptr` covers `feature_dim` f32s and is 8-aligned
-            // (FEATURE_OFFSET = 8 inside an aligned slot); `out` has
-            // `>= feature_dim` slots (asserted above).
+            // (FEATURE_OFFSET is a multiple of 8 inside an aligned slot);
+            // `out` has `>= feature_dim` slots (asserted above).
             unsafe {
                 volatile_load_payload(feat_ptr, &mut out[..self.feature_dim]);
             }
@@ -579,32 +584,76 @@ mod tests {
         let schema = table.schema();
         assert_eq!(schema.node_count, 100);
         assert_eq!(schema.feature_dim, 768);
-        assert_eq!(schema.feature_offset_in_slot, 8);
-        // 768 * 4 = 3072, 8 + 3072 = 3080, aligned to 8 = 3080
-        assert_eq!(schema.tail_offset_in_slot, 3080);
+        assert_eq!(schema.feature_offset_in_slot, 16);
+        // 768 * 4 = 3072, 16 + 3072 = 3088, aligned to 8 = 3088
+        assert_eq!(schema.tail_offset_in_slot, 3088);
     }
 
     #[test]
     fn tail_offset_alignment() {
         // Even feature_dim (common for GNN): N is divisible by 8, no padding
-        assert_eq!(compute_tail_offset(128), 8 + 128 * 4); // 520
-        assert_eq!(compute_tail_offset(256), 8 + 256 * 4); // 1032
-        assert_eq!(compute_tail_offset(512), 8 + 512 * 4); // 2056
-        assert_eq!(compute_tail_offset(768), 8 + 768 * 4); // 3080
+        assert_eq!(compute_tail_offset(128), 16 + 128 * 4); // 528
+        assert_eq!(compute_tail_offset(256), 16 + 256 * 4); // 1040
+        assert_eq!(compute_tail_offset(512), 16 + 512 * 4); // 2064
+        assert_eq!(compute_tail_offset(768), 16 + 768 * 4); // 3088
 
         // Odd feature_dim: needs padding to 8-byte align
-        // feature_dim=3: after_features = 8 + 12 = 20, round to 24
-        assert_eq!(compute_tail_offset(3), 24);
-        // feature_dim=5: after_features = 8 + 20 = 28, round to 32
-        assert_eq!(compute_tail_offset(5), 32);
+        // feature_dim=3: after_features = 16 + 12 = 28, round to 32
+        assert_eq!(compute_tail_offset(3), 32);
+        // feature_dim=5: after_features = 16 + 20 = 36, round to 40
+        assert_eq!(compute_tail_offset(5), 40);
+    }
+
+    #[test]
+    fn common_cuh_matches_core_layout() {
+        // Nothing but this test connects the device constants to the host
+        // ones. Ungated on purpose: drift fails the default Linux job, not
+        // only a run on a box with a GPU.
+        let cuh = include_str!("gpu/kernels/common.cuh");
+        let define = |name: &str| -> usize {
+            let needle = format!("#define {name} ");
+            cuh.lines()
+                .find_map(|l| l.trim().strip_prefix(&needle))
+                .unwrap_or_else(|| panic!("common.cuh must define {name}"))
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is an integer"))
+        };
+        assert_eq!(
+            define("AETHER_FEATURE_OFFSET"),
+            FEATURE_OFFSET,
+            "drifted from aethergraph_core::FEATURE_SLOT_HEAD_BYTES"
+        );
+        assert_eq!(
+            define("AETHER_QUANT_BLOCK"),
+            aethergraph_core::BlockScaledI8::BLOCK,
+            "drifted from aethergraph_core::BlockScaledI8::BLOCK"
+        );
+    }
+
+    #[test]
+    fn payload_base_is_sixteen_byte_aligned() {
+        // What licenses `ld.global.cs.v4.f32`: a 64-byte stride plus a
+        // 16-byte head keeps every payload base 16-aligned, at every dim.
+        for dim in [1usize, 3, 4, 5, 128, 768] {
+            let table = FeatureTable::new(8, dim, vec![]).unwrap();
+            let schema = table.schema();
+            assert_eq!(schema.slot_size % 16, 0, "stride for dim {dim}");
+            assert_eq!(
+                schema.feature_offset_in_slot % 16,
+                0,
+                "offset for dim {dim}"
+            );
+            assert_eq!(table.base_addr() % 16, 0, "base for dim {dim}");
+        }
     }
 
     #[test]
     fn slot_size_computation() {
-        // feature_dim=4: tail_offset = 8 + 16 = 24, slot_size = 24 + 8 = 32
-        assert_eq!(compute_slot_size(4), 32);
-        // feature_dim=768: tail_offset = 3080, slot_size = 3088
-        assert_eq!(compute_slot_size(768), 3088);
+        // feature_dim=4: tail_offset = 16 + 16 = 32, slot_size = 32 + 8 = 40
+        assert_eq!(compute_slot_size(4), 40);
+        // feature_dim=768: tail_offset = 3088, slot_size = 3096
+        assert_eq!(compute_slot_size(768), 3096);
     }
 
     #[test]

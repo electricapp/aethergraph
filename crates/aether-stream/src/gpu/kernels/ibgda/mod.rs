@@ -5,7 +5,7 @@ use cudarc::driver::{
 };
 use std::sync::Arc;
 
-const KERNEL_SRC: &str = include_str!("ibgda_post.cu");
+pub(super) const KERNEL_SRC: &str = include_str!("ibgda_post.cu");
 const KERNEL_NAME: &str = "ibgda_post_rdma_read";
 
 /// Compiled IBGDA post kernel.
@@ -19,7 +19,7 @@ impl IbgdaPoster {
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let module = ctx.load_module(super::compile_for_device(ctx, KERNEL_SRC)?)?;
         Ok(Self {
             stream: stream.clone(),
             func: module.load_function(KERNEL_NAME)?,

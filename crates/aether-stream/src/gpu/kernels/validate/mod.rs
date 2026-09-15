@@ -9,6 +9,12 @@
 //!
 //! The CUDA source lives in `validate_and_compact.cu` alongside this file.
 //!
+//! One warp per row, so both snapshot reads and the compacted write are
+//! coalesced; the grid is sized in warps and grid-strides. Rows flagged in
+//! [`SeqlockValidator::retry_indices`] hold undefined bytes in
+//! [`SeqlockValidator::output`]: the compare aborts on the first mismatching
+//! chunk rather than pay a second pass to keep them pristine.
+//!
 //! # K5.0 — captured launch graphs + mapped retry_count
 //!
 //! Steady-state validates with a fixed `(staging1, staging2, slot_size,
@@ -26,12 +32,42 @@ use cudarc::driver::{
 };
 use std::sync::Arc;
 
-const KERNEL_SRC: &str = concat!(
+pub(super) const KERNEL_SRC: &str = concat!(
     include_str!("../common.cuh"),
     "\n",
     include_str!("validate_and_compact.cu")
 );
 const KERNEL_NAME: &str = "validate_and_compact";
+
+/// Ceiling on the validate grid; 4096 blocks of 8 warps oversubscribes any
+/// current part, and the kernel's grid-stride loop takes the rest.
+const MAX_VALIDATE_BLOCKS: u32 = 4096;
+
+/// The vector gather needs every slot's payload base 16-byte aligned, which
+/// holds for staging built at [`aethergraph_core::feature_slot_stride`] from
+/// any allocator giving 16 bytes (`cuMemAlloc` gives 256). Staging built
+/// another way fails here, not as `CUDA_ERROR_MISALIGNED_ADDRESS` inside a
+/// captured graph.
+fn check_gather_alignment(
+    staging1_ptr: u64,
+    staging2_ptr: u64,
+    slot_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ALIGN: usize = 16;
+    if !slot_size.is_multiple_of(ALIGN) {
+        return Err(format!(
+            "slot_size {slot_size} must be a multiple of {ALIGN}; \
+             use aethergraph_core::feature_slot_stride"
+        )
+        .into());
+    }
+    for (name, ptr) in [("staging1", staging1_ptr), ("staging2", staging2_ptr)] {
+        if !(ptr as usize).is_multiple_of(ALIGN) {
+            return Err(format!("{name} pointer {ptr:#x} is not {ALIGN}-byte aligned").into());
+        }
+    }
+    Ok(())
+}
 
 /// Cached CUDA graph for one validate signature (K5.0).
 struct CapturedValidate {
@@ -65,6 +101,7 @@ enum RetryCount {
 // SAFETY: the pointer is exclusively owned by SeqlockValidator and only
 // touched on the CUDA context's thread after stream synchronization.
 unsafe impl Send for RetryCount {}
+// SAFETY: as above — no shared mutation without stream synchronization.
 unsafe impl Sync for RetryCount {}
 
 impl Drop for RetryCount {
@@ -95,9 +132,13 @@ impl RetryCount {
             )
         };
         if let Err(e) = status.result() {
+            // SAFETY: host is the live allocation from malloc_host above, and
+            // nothing else has taken ownership of it on this path.
             let _ = unsafe { result::free_host(host as *mut _) };
             return Err(e.into());
         }
+        // SAFETY: host is a live, suitably aligned i32 allocation not yet
+        // shared with the device.
         unsafe {
             *host = 0;
         }
@@ -186,7 +227,7 @@ impl SeqlockValidator {
         max_batch_size: usize,
         feature_dim: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let ptx = cudarc::nvrtc::compile_ptx(KERNEL_SRC)?;
+        let ptx = super::compile_for_device(ctx, KERNEL_SRC)?;
         let module = ctx.load_module(ptx)?;
         let func = module.load_function(KERNEL_NAME)?;
 
@@ -252,6 +293,7 @@ impl SeqlockValidator {
         if batch_size == 0 {
             return Ok(0);
         }
+        check_gather_alignment(staging1_ptr, staging2_ptr, slot_size)?;
 
         // Zero the counter on the host (mapped) or via DtoD (fallback) before
         // any capture/replay so the graph body is just the kernel launch.
@@ -295,8 +337,12 @@ impl SeqlockValidator {
         slot_size: usize,
         batch_size: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Sized in warps, capped, and grid-strided past the cap.
         let threads_per_block = 256u32;
-        let blocks = (batch_size as u32).div_ceil(threads_per_block);
+        let warps_per_block = threads_per_block / 32;
+        let blocks = (batch_size as u32)
+            .div_ceil(warps_per_block)
+            .clamp(1, MAX_VALIDATE_BLOCKS);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads_per_block, 1, 1),
@@ -386,6 +432,8 @@ impl SeqlockValidator {
     }
 
     /// Get the output CudaSlice directly (caller manages stream ordering).
+    ///
+    /// Rows listed by [`Self::retry_indices`] hold undefined bytes here.
     pub fn output(&self) -> &CudaSlice<f32> {
         &self.output
     }

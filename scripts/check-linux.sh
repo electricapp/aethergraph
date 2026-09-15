@@ -92,6 +92,8 @@ if [ "$RUN_HOST" = 1 ]; then
   stage "rust:rustdoc (with features)" \
     cargo doc --workspace --no-deps --features "$MATRIX_FEATURES"
   stage "rust:bench compile check" cargo check --workspace --benches
+  # The .cu units compile at runtime, so nothing above looks at them.
+  stage "cuda syntax" "$REPO_ROOT/scripts/cu-syntax-check.sh"
 
   if command -v prettier >/dev/null 2>&1; then
     stage "prettier markdown" prettier --check '**/*.md'
@@ -191,8 +193,11 @@ if [ "$RUN_VM" = 1 ]; then
       cargo check -p aether-stream --tests --features xdp_bpf
     vm_stage "rust:mlx5dv compile check" \
       cargo check -p aether-stream --tests --features mlx5dv
-    vm_stage "cargo check (rdma + gpudirect)" \
-      cargo check -p aether-stream --tests --features "rdma gpudirect"
+    vm_stage "cargo check (rdma + gpudirect) [clippy]" \
+      cargo clippy -p aether-stream --all-targets --features "rdma gpudirect" -- -D warnings
+    vm_stage "cargo check (rdma + gpudirect) [rustdoc]" \
+      env RUSTDOCFLAGS=-D\ warnings \
+      cargo doc -p aether-stream --no-deps --features "rdma gpudirect"
     vm_stage "cargo check (rdma + gpudirect) [gdrcopy]" \
       cargo check -p aether-stream --features "rdma gpudirect gdrcopy"
     vm_stage "cargo check (rdma + gpudirect) [py]" \

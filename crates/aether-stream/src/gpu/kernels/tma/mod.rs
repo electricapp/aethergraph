@@ -9,7 +9,7 @@ use cudarc::driver::{
 };
 use std::sync::Arc;
 
-const KERNEL_SRC: &str = concat!(
+pub(super) const KERNEL_SRC: &str = concat!(
     include_str!("../common.cuh"),
     "\n",
     include_str!("tma_wgmma.cu")
@@ -49,7 +49,7 @@ impl TmaAggregator {
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let module = ctx.load_module(cudarc::nvrtc::compile_ptx(KERNEL_SRC)?)?;
+        let module = ctx.load_module(super::compile_for_device(ctx, KERNEL_SRC)?)?;
         Ok(Self {
             stream: stream.clone(),
             func: module.load_function(KERNEL_NAME)?,
