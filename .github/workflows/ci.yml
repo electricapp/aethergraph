@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bunx prettier --check '**/*.md'
 
   gpudirect-check:
@@ -37,7 +37,7 @@ jobs:
     permissions:
       contents: read
     container:
-      image: nvidia/cuda:12.5.0-devel-ubuntu22.04
+      image: nvidia/cuda:12.5.0-devel-ubuntu22.04@sha256:4b46c69e223d971f0fb279fd6381a0f3a057e09ba6de08bfbf7db751b1ad6db1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,7 +52,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: gpudirect-check
       - run: scripts/cu-syntax-check.sh
@@ -92,11 +92,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.label }}
 
@@ -125,9 +125,11 @@ jobs:
 
       - name: clippy (with features)
         if: matrix.features != ''
+        env:
+          FEATURES: ${{ matrix.features }}
         run: |
           cargo clippy --workspace --all-targets --no-deps \
-            --features "${{ matrix.features }}" -- -D warnings
+            --features "$FEATURES" -- -D warnings
 
       - name: rustdoc (no features)
         env:
@@ -138,7 +140,8 @@ jobs:
         if: matrix.features != ''
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --features "${{ matrix.features }}"
+          FEATURES: ${{ matrix.features }}
+        run: cargo doc --workspace --no-deps --features "$FEATURES"
 
       - name: xdp_bpf compile check
         if: matrix.os == 'ubuntu-latest'
@@ -174,15 +177,18 @@ jobs:
           cargo test -p aethergraph-core features::store
       - name: Record which SIMD paths this runner exercised
         if: always()
+        env:
+          RUNNER_OS_NAME: ${{ runner.os }}
+          LABEL: ${{ matrix.label }}
         run: |
-          if [ "${{ runner.os }}" = "Linux" ]; then
+          if [ "$RUNNER_OS_NAME" = "Linux" ]; then
             isa=$(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' \
                     | grep -E '^(avx2|avx512f|f16c)$' | sort | tr '\n' ' ')
           else
             isa="neon (aarch64 baseline)"
           fi
           {
-            echo "## simd — ${{ matrix.label }}"
+            echo "## simd — $LABEL"
             echo ""
             echo "Dispatch-vs-scalar equivalence tests ran against: ${isa:-scalar only}"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -192,17 +198,21 @@ jobs:
         run: cargo check -p aether-stream --tests --features mlx5dv
 
       - name: cargo test --lib
+        env:
+          FEATURES: ${{ matrix.features }}
         run: |
-          if [ -n "${{ matrix.features }}" ]; then
-            cargo test --workspace --lib --features "${{ matrix.features }}"
+          if [ -n "$FEATURES" ]; then
+            cargo test --workspace --lib --features "$FEATURES"
           else
             cargo test --workspace --lib
           fi
 
       - name: cargo test --tests
+        env:
+          FEATURES: ${{ matrix.features }}
         run: |
-          if [ -n "${{ matrix.features }}" ]; then
-            cargo test --workspace --tests --features "${{ matrix.features }}"
+          if [ -n "$FEATURES" ]; then
+            cargo test --workspace --tests --features "$FEATURES"
           else
             cargo test --workspace --tests
           fi
@@ -216,8 +226,12 @@ jobs:
 
       - name: Coverage summary
         if: always()
+        env:
+          FEATURES: ${{ matrix.features }}
+          LABEL: ${{ matrix.label }}
+          OS_NAME: ${{ matrix.os }}
         run: |
-          features="${{ matrix.features }}"
+          features="$FEATURES"
           [ -z "$features" ] && features="(none)"
           ts=$(find target/debug/deps -maxdepth 1 -type f \
                   -name '*-*' \
@@ -226,11 +240,11 @@ jobs:
                   ! -name '*.rmeta' \
                   2>/dev/null | wc -l | tr -d ' ')
           {
-            echo "## ${{ matrix.label }}"
+            echo "## $LABEL"
             echo ""
             echo "| metric | value |"
             echo "|---|---|"
-            echo "| os | ${{ matrix.os }} |"
+            echo "| os | $OS_NAME |"
             echo "| features | $features |"
             echo "| compiled test binaries | $ts |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -245,11 +259,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: nightly
-          components: miri
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust nightly
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri --no-self-update
+          rustup default nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: miri
       - run: cargo +nightly miri test -p aether-graph --test miri_smoke
@@ -279,10 +293,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: wal
       - run: cargo test -p aether-graph --features wal
@@ -312,11 +327,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-          components: clippy
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: numa
       - run: cargo clippy -p aethergraph-core --features numa --all-targets -- -D warnings
@@ -345,10 +360,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: uffd
       - name: Enable unprivileged userfaultfd
@@ -379,10 +395,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: perf
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -443,10 +460,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: loom
       - run: cargo test -p aether-graph --features loom --test loom_writer_guard
@@ -474,10 +492,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: supply-chain
       - name: Install cargo-deny + cargo-audit
@@ -515,10 +534,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: nightly
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install Rust nightly
+        run: |
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup default nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: fuzz
       - run: cargo install cargo-fuzz --locked
@@ -549,13 +569,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: python-${{ matrix.os }}
       - name: Sync test deps
@@ -604,13 +625,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: wheel-${{ matrix.level }}
       - name: Sync build deps
@@ -618,9 +640,10 @@ jobs:
         run: uv sync --group dev --no-install-project
       - name: Build wheel
         working-directory: python
-        run: uv run --no-sync maturin build --release --out ${{ matrix.out_dir }}
+        run: uv run --no-sync maturin build --release --out "$OUT_DIR"
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+          OUT_DIR: ${{ matrix.out_dir }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aethergraph-wheel-${{ matrix.level }}
@@ -636,9 +659,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
@@ -647,7 +671,7 @@ jobs:
           uv venv --python 3.14t "$RUNNER_TEMP/ft-venv"
           echo "$RUNNER_TEMP/ft-venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$RUNNER_TEMP/ft-venv" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: wheel-freethreaded
       - name: Confirm free-threaded interpreter
@@ -686,14 +710,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
-          components: llvm-tools
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools --no-self-update
+          rustup default stable
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: wheel-pgo
       - name: Install BOLT
@@ -732,7 +756,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: rdma-hw
       - name: Verify rxe module
@@ -767,6 +791,9 @@ jobs:
           tar -xzf actionlint.tgz actionlint
           ./actionlint
 
+      - name: Run zizmor (SHA-pinned download + checksum)
+        run: scripts/zizmor-check.sh
+
   summary:
     name: coverage summary
     runs-on: ubuntu-latest
@@ -777,27 +804,44 @@ jobs:
     if: always()
     steps:
       - name: Render summary
+        env:
+          R_MARKDOWN: ${{ needs.markdown-format.result }}
+          R_GPUDIRECT: ${{ needs.gpudirect-check.result }}
+          R_RUST: ${{ needs.rust.result }}
+          R_MIRI: ${{ needs.miri.result }}
+          R_LOOM: ${{ needs.loom.result }}
+          R_WAL: ${{ needs.wal.result }}
+          R_NUMA: ${{ needs.numa.result }}
+          R_PYTHON: ${{ needs.python.result }}
+          R_WHEEL: ${{ needs.python-wheel.result }}
+          R_WHEEL_PGO: ${{ needs.python-wheel-pgo.result }}
+          R_WHEEL_FT: ${{ needs.python-wheel-freethreaded.result }}
         run: |
+          # Pads every cell so the emitted markdown lines up as source, not
+          # just as a rendered table. Unfinished jobs report as "skipped".
+          row() {
+            printf '| %-26s | %-12s | %-22s | %-9s |\n' "$1" "$2" "$3" "${4:-skipped}"
+          }
           {
             echo "# AetherGraph CI coverage"
             echo ""
-            echo "| job | platform | features | result |"
-            echo "|---|---|---|---|"
-            echo "| markdown-format | Linux x86_64 | prettier | ${{ needs.markdown-format.result }} |"
-            echo "| gpudirect-check | Linux x86_64 | rdma + gpudirect (cargo check) | ${{ needs.gpudirect-check.result }} |"
-            echo "| rust macos-stable-default | macOS arm64 | (none) | ${{ needs.rust.result }} |"
-            echo "| rust ubuntu-stable-default | Linux x86_64 | (none) | ${{ needs.rust.result }} |"
-            echo "| rust ubuntu-stable-rdma | Linux x86_64 | rdma | ${{ needs.rust.result }} |"
-            echo "| miri | Linux x86_64 | nightly + miri | ${{ needs.miri.result }} |"
-            echo "| loom | Linux x86_64 | loom feature | ${{ needs.loom.result }} |"
-            echo "| wal  | Linux x86_64 | wal feature  | ${{ needs.wal.result }} |"
-            echo "| numa | Linux x86_64 | numa feature | ${{ needs.numa.result }} |"
-            echo "| python ubuntu | Linux x86_64 | test group | ${{ needs.python.result }} |"
-            echo "| python macos | macOS arm64 | test group | ${{ needs.python.result }} |"
-            echo "| wheel x86-64 | Linux x86_64 | portable baseline | ${{ needs.python-wheel.result }} |"
-            echo "| wheel x86-64-v3 | Linux x86_64 | target-cpu=x86-64-v3 | ${{ needs.python-wheel.result }} |"
-            echo "| wheel x86-64 pgo | Linux x86_64 | PGO + BOLT | ${{ needs.python-wheel-pgo.result }} |"
-            echo "| wheel cp314t | Linux x86_64 | free-threaded, no abi3 | ${{ needs.python-wheel-freethreaded.result }} |"
+            row "job"                        "platform"     "features"               "result"
+            row "--------------------------" "------------" "----------------------" "---------"
+            row "markdown-format"            "Linux x86_64" "prettier"               "$R_MARKDOWN"
+            row "gpudirect-check"            "Linux x86_64" "rdma + gpudirect"       "$R_GPUDIRECT"
+            row "rust macos-stable-default"  "macOS arm64"  "(none)"                 "$R_RUST"
+            row "rust ubuntu-stable-default" "Linux x86_64" "(none)"                 "$R_RUST"
+            row "rust ubuntu-stable-rdma"    "Linux x86_64" "rdma"                   "$R_RUST"
+            row "miri"                       "Linux x86_64" "nightly + miri"         "$R_MIRI"
+            row "loom"                       "Linux x86_64" "loom feature"           "$R_LOOM"
+            row "wal"                        "Linux x86_64" "wal feature"            "$R_WAL"
+            row "numa"                       "Linux x86_64" "numa feature"           "$R_NUMA"
+            row "python ubuntu"              "Linux x86_64" "test group"             "$R_PYTHON"
+            row "python macos"               "macOS arm64"  "test group"             "$R_PYTHON"
+            row "wheel x86-64"               "Linux x86_64" "portable baseline"      "$R_WHEEL"
+            row "wheel x86-64-v3"            "Linux x86_64" "target-cpu=x86-64-v3"   "$R_WHEEL"
+            row "wheel x86-64 pgo"           "Linux x86_64" "PGO + BOLT"             "$R_WHEEL_PGO"
+            row "wheel cp314t"               "Linux x86_64" "free-threaded, no abi3" "$R_WHEEL_FT"
             echo ""
             echo "Hardware-gated tests (SoftRoCE micro-bench, SRD loopback,"
             echo "billion-node scale) run only on the self-hosted \`rdma-hardware\`"

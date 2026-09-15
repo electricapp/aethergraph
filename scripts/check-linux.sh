@@ -95,6 +95,8 @@ if [ "$RUN_HOST" = 1 ]; then
   # The .cu units compile at runtime, so nothing above looks at them.
   stage "cuda syntax" "$REPO_ROOT/scripts/cu-syntax-check.sh"
 
+  stage "actionlint (zizmor)" "$REPO_ROOT/scripts/zizmor-check.sh"
+
   if command -v prettier >/dev/null 2>&1; then
     stage "prettier markdown" prettier --check '**/*.md'
   elif command -v bunx >/dev/null 2>&1; then

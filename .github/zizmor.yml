@@ -1,0 +1,14 @@
+rules:
+  superfluous-actions:
+    ignore:
+      # Two jobs keep dtolnay/rust-toolchain because their runner does not
+      # ship rustup: gpudirect-check runs inside the nvidia/cuda image, and
+      # rdma-hardware is self-hosted. Every GitHub-hosted job installs the
+      # toolchain with rustup directly.
+      - ci.yml
+  self-hosted-runner:
+    ignore:
+      # rdma-hardware needs a physical ConnectX NIC — SoftRoCE on a hosted
+      # runner cannot exercise the paths it covers. Opt-in only, via `[rdma]`
+      # in the commit message or workflow_dispatch.
+      - ci.yml

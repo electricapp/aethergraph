@@ -23,21 +23,21 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=2.2.6",
-    "rich>=15.0.0",
-    "typer>=0.27.2",
+    "numpy==2.2.6",
+    "rich==15.0.0",
+    "typer==0.27.2",
 ]
 
 [project.optional-dependencies]
-torch = ["torch>=2.14.0"]
-ray = ["ray[data]>=2.58.0"]
-pytorch-geometric = ["torch-geometric>=2.8.0.post1", "torch>=2.14.0"]
+torch = ["torch==2.14.0"]
+ray = ["ray[data]==2.58.0"]
+pytorch-geometric = ["torch-geometric==2.8.0.post1", "torch==2.14.0"]
 otel = [
-    "opentelemetry-api>=1.44.0",
-    "opentelemetry-sdk>=1.44.0",
-    "opentelemetry-exporter-otlp>=1.44.0",
+    "opentelemetry-api==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-exporter-otlp==1.44.0",
 ]
-all = ["torch>=2.14.0", "ray[data]>=2.58.0", "torch-geometric>=2.8.0.post1"]
+all = ["torch==2.14.0", "ray[data]==2.58.0", "torch-geometric==2.8.0.post1"]
 
 [project.scripts]
 aethergraph = "aethergraph.cli:main"
@@ -48,7 +48,7 @@ Repository = "https://github.com/electricapp/aethergraph"
 Documentation = "https://github.com/electricapp/aethergraph#readme"
 
 [build-system]
-requires = ["maturin>=1.14.0,<2.0"]
+requires = ["maturin==1.14.1"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -122,18 +122,18 @@ ignore_missing_imports = true
 
 [dependency-groups]
 dev = [
-    "hypothesis>=6.168.0",
-    "maturin>=1.14.0",
-    "mypy>=2.3.1",
-    "opentelemetry-api>=1.44.0",
-    "opentelemetry-exporter-otlp>=1.44.0",
-    "opentelemetry-sdk>=1.44.0",
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.7",
+    "hypothesis==6.168.0",
+    "maturin==1.14.1",
+    "mypy==2.3.1",
+    "opentelemetry-api==1.44.0",
+    "opentelemetry-exporter-otlp==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.16.7",
 ]
 test = [
-    "torch>=2.14.0",
-    "torch-geometric>=2.8.0.post1",
-    "ray[data]>=2.58.0",
+    "torch==2.14.0",
+    "torch-geometric==2.8.0.post1",
+    "ray[data]==2.58.0",
 ]
