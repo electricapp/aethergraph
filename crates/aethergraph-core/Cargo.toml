@@ -64,7 +64,7 @@ libc = "0.2"
 parquet = { version = "59", optional = true, default-features = false, features = ["arrow"] }
 arrow-array = { version = "59", optional = true }
 arrow-schema = { version = "59", optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5"
