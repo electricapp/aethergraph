@@ -76,8 +76,8 @@ pyo3 = { version = "0.29", features = [] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 
 # Apache Arrow for zero-copy data transfer
-arrow-array = "59"
-arrow-schema = "59"
+arrow-array = "60"
+arrow-schema = "60"
 
 # Numpy integration
 numpy = "0.29"

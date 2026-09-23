@@ -61,9 +61,9 @@ tokio = { workspace = true, features = ["test-util"] }
 ndarray.workspace = true
 half.workspace = true
 libc = "0.2"
-parquet = { version = "59", optional = true, default-features = false, features = ["arrow"] }
-arrow-array = { version = "59", optional = true }
-arrow-schema = { version = "59", optional = true }
+parquet = { version = "60", optional = true, default-features = false, features = ["arrow"] }
+arrow-array = { version = "60", optional = true }
+arrow-schema = { version = "60", optional = true }
 zstd = { version = "0.14", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
