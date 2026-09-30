@@ -6,6 +6,9 @@ format and inspecting graph files.
 
 from __future__ import annotations
 
+import itertools
+import warnings
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -166,14 +169,9 @@ def convert(
     log.debug(f"Output: {resolved_output}")
     log.debug(f"Nodes: {num_nodes}")
 
-    edges: list[tuple[int, int]] = []
-    errors: list[str] = []
-    max_errors = 10  # Collect up to this many errors before stopping
-
-    # Delimiter is detected once from the first data line and reused for the
-    # whole file, so a stray tab/comma in one row can't switch the parser
-    # mid-stream.
-    delim: str | None = delimiter
+    src_chunks: list[npt.NDArray[np.uint32]] = []
+    dst_chunks: list[npt.NDArray[np.uint32]] = []
+    num_edges = 0
 
     with Progress(
         SpinnerColumn(),
@@ -184,60 +182,26 @@ def convert(
         task = progress.add_task("Reading edges...", total=None)
 
         with open(resolved_input) as f:
-            for i, line in enumerate(f):
-                if i < skip_lines:
-                    continue
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
+            try:
+                for src, dst in _read_edge_chunks(f, delimiter, skip_lines, num_nodes):
+                    src_chunks.append(src)
+                    dst_chunks.append(dst)
+                    num_edges += len(src)
+                    progress.update(task, description=f"Read {num_edges:,} edges")
+                    log.trace(f"Read {num_edges:,} edges")
+            except _EdgeListError as e:
+                for error in e.errors:
+                    _print_error(error)
+                if len(e.errors) >= _MAX_REPORTED_ERRORS:
+                    _print_error(f"... stopping after {_MAX_REPORTED_ERRORS} errors")
+                raise typer.Exit(1) from None
 
-                if delim is None:
-                    delim = _detect_delimiter(line, delimiter)
-
-                parts = line.split(delim)
-                if len(parts) < 2:
-                    _print_error(
-                        f"invalid edge format at line {i + 1} (expected at least "
-                        f"2 fields separated by {delim!r}): {line}"
-                    )
-                    raise typer.Exit(1)
-
-                try:
-                    src, dst = int(parts[0]), int(parts[1])
-                except ValueError:
-                    errors.append(
-                        f"bad token at line {i + 1}: could not parse "
-                        f"'{parts[0]}' / '{parts[1]}' as integers"
-                    )
-                    if len(errors) >= max_errors:
-                        break
-                    continue
-
-                error = _validate_edge(src, dst, num_nodes, i + 1)
-                if error:
-                    errors.append(error)
-                    if len(errors) >= max_errors:
-                        break
-                else:
-                    edges.append((src, dst))
-
-                if len(edges) % 100_000 == 0:
-                    progress.update(task, description=f"Read {len(edges):,} edges")
-                    log.trace(f"Read {len(edges):,} edges")
-
-    # Report all collected errors
-    if errors:
-        for error in errors:
-            _print_error(error)
-        if len(errors) >= max_errors:
-            _print_error(f"... stopping after {max_errors} errors")
-        raise typer.Exit(1)
-
-    log.info(f"Read {len(edges):,} edges from input file")
+    log.info(f"Read {num_edges:,} edges from input file")
 
     log.debug("Building CSR graph structure")
-    src_arr: npt.NDArray[np.uint32] = np.array([e[0] for e in edges], dtype=np.uint32)
-    dst_arr: npt.NDArray[np.uint32] = np.array([e[1] for e in edges], dtype=np.uint32)
+    src_arr = np.concatenate(src_chunks) if src_chunks else np.empty(0, dtype=np.uint32)
+    dst_arr = np.concatenate(dst_chunks) if dst_chunks else np.empty(0, dtype=np.uint32)
+    del src_chunks, dst_chunks
     graph = Graph.from_edges(num_nodes, src_arr, dst_arr)
 
     log.debug("Writing binary file")
@@ -251,6 +215,104 @@ def convert(
 
     file_size = resolved_output.stat().st_size
     log.info(f"  File size: {file_size / 1_000_000:.2f} MB")
+
+
+# Lines parsed per chunk: large enough that the per-chunk numpy parse
+# dominates, small enough that one chunk's text stays a few hundred MB.
+_CHUNK_LINES = 1 << 20
+
+# Parse errors collected before conversion stops.
+_MAX_REPORTED_ERRORS = 10
+
+
+class _EdgeListError(Exception):
+    """The edge list has malformed lines; ``errors`` names each one."""
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+def _read_edge_chunks(
+    lines: Iterator[str],
+    delimiter: str | None,
+    skip_lines: int,
+    num_nodes: int,
+) -> Iterator[tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]]:
+    """Stream an edge list as validated ``(src, dst)`` uint32 chunks.
+
+    Each chunk of lines is parsed by numpy in one call, so memory stays at
+    the arrays themselves rather than a Python object per edge. The
+    delimiter is detected once, from the first data line, so a stray tab or
+    comma later can't switch the parser mid-stream. A chunk that fails to
+    parse or holds an out-of-range ID is re-read line by line only to name
+    the offending lines.
+
+    Raises:
+        _EdgeListError: A line is malformed or an ID is outside
+            ``[0, num_nodes)``.
+    """
+    for _ in itertools.islice(lines, skip_lines):
+        pass
+    line_no = skip_lines
+    delim = delimiter
+    while chunk := list(itertools.islice(lines, _CHUNK_LINES)):
+        first_line = line_no + 1
+        line_no += len(chunk)
+        if delim is None:
+            data_line = next((s for s in (c.strip() for c in chunk) if s and s[0] != "#"), None)
+            if data_line is None:
+                continue
+            delim = _detect_delimiter(data_line, None)
+        try:
+            with warnings.catch_warnings():
+                # An all-comment chunk is empty, not an error.
+                warnings.simplefilter("ignore", UserWarning)
+                edges = np.loadtxt(
+                    chunk,
+                    dtype=np.int64,
+                    comments="#",
+                    delimiter=None if delim == " " else delim,
+                    usecols=(0, 1),
+                    ndmin=2,
+                )
+        except ValueError:
+            raise _EdgeListError(_describe_bad_lines(chunk, first_line, delim, num_nodes)) from None
+        if edges.size and (edges.min() < 0 or edges.max() >= num_nodes):
+            raise _EdgeListError(_describe_bad_lines(chunk, first_line, delim, num_nodes))
+        if edges.size:
+            yield edges[:, 0].astype(np.uint32), edges[:, 1].astype(np.uint32)
+
+
+def _describe_bad_lines(chunk: list[str], first_line: int, delim: str, num_nodes: int) -> list[str]:
+    """Name the malformed lines of a chunk that failed to parse or validate."""
+    errors: list[str] = []
+    for offset, raw in enumerate(chunk):
+        line_num = first_line + offset
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split() if delim == " " else line.split(delim)
+        if len(parts) < 2:
+            errors.append(
+                f"invalid edge format at line {line_num} (expected at least "
+                f"2 fields separated by {delim!r}): {line}"
+            )
+        else:
+            try:
+                src, dst = int(parts[0]), int(parts[1])
+            except ValueError:
+                errors.append(
+                    f"bad token at line {line_num}: could not parse "
+                    f"'{parts[0]}' / '{parts[1]}' as integers"
+                )
+            else:
+                error = _validate_edge(src, dst, num_nodes, line_num)
+                if error:
+                    errors.append(error)
+        if len(errors) >= _MAX_REPORTED_ERRORS:
+            break
+    return errors
 
 
 def _detect_delimiter(line: str, explicit_delimiter: str | None) -> str:

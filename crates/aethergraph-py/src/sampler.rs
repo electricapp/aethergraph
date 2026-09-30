@@ -1,8 +1,8 @@
 use aethergraph_core::{
     Graph, NeighborSampler, ParallelBatchSampler, SampledSubgraph, SamplingConfig,
-    SamplingTelemetry, SubgraphType, TemporalStrategy,
+    SamplingTelemetry, Seeds, SubgraphType, TemporalStrategy,
 };
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{RecordBatch, UInt32Array, UInt64Array};
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -81,20 +81,25 @@ pub struct PySamplingConfig {
 impl PySamplingConfig {
     /// Create a new sampling configuration.
     ///
+    /// This constructor is the one runtime check for every field; the
+    /// Python `aethergraph.SamplingConfig` dataclass builds one to validate.
+    ///
     /// Args:
     ///     num_neighbors: List of neighbor counts to sample per hop (e.g., [25, 10] for 2-hop sampling)
     ///     replace: Whether to sample with replacement (default: False)
     ///     seed: Random seed for reproducibility (default: None for random)
-    ///     max_degree: Maximum degree cap for hub nodes (default: 10000)
-    ///     cumulative: Whether to use cumulative sampling (PyG-style, default: True)
-    ///         - True: Sample from all nodes seen so far at each hop (larger subgraphs)
-    ///         - False: Sample only from new frontier at each hop (smaller subgraphs)
+    ///     max_degree: Degree above which a node counts as a hub (default:
+    ///         None). Uniform draws never cap; weighted and uniform-temporal
+    ///         sampling draw from `max_degree` random positions of a hub's row.
+    ///     cumulative: Whether every hop re-expands all nodes seen so far
+    ///         (default: False, PyG semantics: each hop expands only the
+    ///         previous hop's new nodes). No edge is emitted twice either way.
     ///     weighted: Whether to use edge weights for sampling (default: False)
     ///         When True, neighbors are sampled proportionally to their edge weights.
     ///     subgraph_type: Type of subgraph to extract (default: "directional")
-    ///         - "directional": Return edges as sampled (default)
-    ///         - "induced": Only edges where both endpoints are in sampled nodes
-    ///         - "bidirectional": Add reverse edges for undirected graphs
+    ///         - "directional": Edges exactly as sampled
+    ///         - "induced": Every graph edge between sampled nodes
+    ///         - "bidirectional": Sampled edges plus reverses, each ordered pair once
     ///     track_edge_ids: Whether to track global edge IDs for e_id (default: True)
     ///         Set to False for ~10-15% speedup if you don't need edge features.
     ///     temporal_strategy: Temporal sampling strategy (default: None = disabled)
@@ -102,18 +107,20 @@ impl PySamplingConfig {
     ///         - "last": Take the k most recent edges with timestamp < node time
     ///     disjoint: Whether to produce disjoint subgraphs per seed (default: False)
     ///         Each seed gets an isolated subgraph with no node dedup across seeds.
+    ///     deterministic: Has no effect; a fixed `seed` already gives
+    ///         bit-identical output at any thread count.
     ///     telemetry: Optional SamplingTelemetry for metrics collection (default: None)
     ///
     /// Returns:
     ///     SamplingConfig: Configuration object
     #[new]
-    #[pyo3(signature = (num_neighbors, replace=false, seed=None, max_degree=None, cumulative=true, weighted=false, subgraph_type="directional", track_edge_ids=true, temporal_strategy=None, disjoint=false, deterministic=false, telemetry=None))]
+    #[pyo3(signature = (num_neighbors, replace=false, seed=None, max_degree=None, cumulative=false, weighted=false, subgraph_type="directional", track_edge_ids=true, temporal_strategy=None, disjoint=false, deterministic=false, telemetry=None))]
     #[allow(clippy::too_many_arguments)] // Python API is explicit and mirrors documented kwargs.
     fn new(
-        num_neighbors: Vec<usize>,
+        num_neighbors: Vec<i64>,
         replace: bool,
         seed: Option<u64>,
-        max_degree: Option<usize>,
+        max_degree: Option<i64>,
         cumulative: bool,
         weighted: bool,
         subgraph_type: &str,
@@ -128,6 +135,24 @@ impl PySamplingConfig {
                 "num_neighbors must be a non-empty list",
             ));
         }
+        let fanout = num_neighbors
+            .iter()
+            .map(|&n| usize::try_from(n))
+            .collect::<Result<Vec<usize>, _>>()
+            .map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "num_neighbors values must be non-negative, got {num_neighbors:?}"
+                ))
+            })?;
+        let max_degree = match max_degree {
+            None => None,
+            Some(d) if d > 0 => Some(d as usize),
+            Some(d) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "max_degree must be > 0 if specified, got {d}"
+                )));
+            }
+        };
         let subgraph_type = match subgraph_type {
             "directional" => SubgraphType::Directional,
             "induced" => SubgraphType::Induced,
@@ -152,7 +177,7 @@ impl PySamplingConfig {
 
         Ok(Self {
             inner: SamplingConfig {
-                fanout: num_neighbors,
+                fanout,
                 replace,
                 seed,
                 max_degree,
@@ -168,9 +193,9 @@ impl PySamplingConfig {
         })
     }
 
-    /// Bit-deterministic mode. When True, parallel sampling paths
-    /// serialize so the same seed produces byte-identical output across
-    /// runs / machines / core counts. Default False.
+    /// The `deterministic` flag as given. It has no effect: a fixed `seed`
+    /// already produces byte-identical output across runs, machines, and
+    /// thread counts.
     #[getter]
     fn deterministic(&self) -> bool {
         self.inner.deterministic
@@ -267,7 +292,90 @@ impl PySamplingConfig {
     }
 }
 
+/// A sampled subgraph with every O(N + E) conversion already done: IDs
+/// widened to `int64` (PyTorch's index dtype) and the local edge index laid
+/// out in message-passing order.
+///
+/// Building one touches no Python state, so callers build it with the GIL
+/// released; [`PySampledSubgraph::from_prepared`] then only wraps the
+/// vectors, which `PyArray1::from_vec` does without copying.
+pub struct PreparedSubgraph {
+    nodes: Vec<i64>,
+    seeds: Vec<i64>,
+    seed_indices: Vec<i64>,
+    edge_ids: Vec<i64>,
+    /// `[2, num_edges]` row-major: sampled neighbors, then the nodes that
+    /// sampled them.
+    edge_index_local: Vec<i64>,
+    batch: Option<Vec<i64>>,
+    num_edges: usize,
+    num_sampled_nodes: Vec<usize>,
+    num_sampled_edges: Vec<usize>,
+    original_nodes: Vec<u32>,
+    original_seeds: Vec<u32>,
+    original_edge_src: Vec<u32>,
+    original_edge_dst: Vec<u32>,
+    original_edge_ids: Vec<u64>,
+}
+
+impl PreparedSubgraph {
+    /// Widen and reorient `subgraph`. The core records edges in stored
+    /// direction (`src` expanded, `dst` drawn from its row); Python sees
+    /// PyG's source-to-target order, so the rows swap here.
+    ///
+    /// # Errors
+    /// Only for `SampledSubgraph::from_parts` input whose edge endpoints or
+    /// seeds are missing from its node list.
+    pub fn new(subgraph: SampledSubgraph) -> Result<Self, String> {
+        let num_edges = subgraph.edge_src.len();
+
+        // u32 → i64 widening, one pass per buffer. The cast is monotonic and
+        // free of branches, so it vectorizes: on aarch64 the release build
+        // emits ushll.2d/ushll2.2d, widening eight lanes per unrolled
+        // iteration.
+        let mut edge_index_local: Vec<i64> = Vec::with_capacity(num_edges * 2);
+        let seed_indices: Vec<i64> = {
+            let (src_local, dst_local) = subgraph
+                .edge_index_local()
+                .map_err(|e| format!("failed to compute local edge indices: {e}"))?;
+            edge_index_local.extend(dst_local.iter().map(|&e| i64::from(e)));
+            edge_index_local.extend(src_local.iter().map(|&e| i64::from(e)));
+            subgraph
+                .seed_indices_local()
+                .map_err(|e| format!("failed to compute seed indices: {e}"))?
+                .iter()
+                .map(|&e| i64::from(e))
+                .collect()
+        };
+
+        Ok(Self {
+            nodes: subgraph.nodes.iter().map(|&n| i64::from(n)).collect(),
+            seeds: subgraph.seeds.iter().map(|&s| i64::from(s)).collect(),
+            seed_indices,
+            edge_ids: subgraph.edge_ids.iter().map(|&e| e as i64).collect(),
+            edge_index_local,
+            batch: subgraph
+                .batch
+                .map(|b| b.into_iter().map(i64::from).collect()),
+            num_edges,
+            num_sampled_nodes: subgraph.num_sampled_nodes,
+            num_sampled_edges: subgraph.num_sampled_edges,
+            // Move (not copy) the canonical buffers out of the core subgraph.
+            original_nodes: subgraph.nodes,
+            original_seeds: subgraph.seeds,
+            original_edge_src: subgraph.edge_src,
+            original_edge_dst: subgraph.edge_dst,
+            original_edge_ids: subgraph.edge_ids,
+        })
+    }
+}
+
 /// Python wrapper for SampledSubgraph.
+///
+/// Edge arrays follow PyG's source-to-target convention: row 0 of
+/// `edge_index` is the sampled neighbor (message source) and row 1 the node
+/// whose neighborhood was expanded, so messages flow toward the seeds.
+/// `edge_ids` name the stored edge from row 1 to row 0.
 ///
 /// Two storage layers:
 /// - `*_i64` numpy arrays — what Python sees on `.nodes()`, `.edges()` etc.
@@ -312,80 +420,40 @@ pub struct PySampledSubgraph {
 }
 
 impl PySampledSubgraph {
-    /// Create from SampledSubgraph, converting to int64 for PyTorch
-    /// compatibility. Local edge and seed indices come straight from the
-    /// core accessors, which behave identically on every sampler path
-    /// (disjoint included) and on `from_parts` reconstructions.
+    /// Convert a core subgraph with the GIL held. Callers that can release
+    /// the GIL build a [`PreparedSubgraph`] inside `py.detach` and call
+    /// [`Self::from_prepared`] instead.
     pub fn from_subgraph(py: Python<'_>, subgraph: SampledSubgraph) -> PyResult<Self> {
-        let num_nodes = subgraph.nodes.len();
-        let num_edges = subgraph.edge_src.len();
-        let num_seeds = subgraph.seeds.len();
-        let num_sampled_nodes = subgraph.num_sampled_nodes.clone();
-        let num_sampled_edges = subgraph.num_sampled_edges.clone();
+        let prepared = PreparedSubgraph::new(subgraph).map_err(sampling_error)?;
+        Self::from_prepared(py, prepared)
+    }
 
-        // Local edge_index (remapped to [0, num_nodes)), widened u32 → i64 in
-        // one pass while the borrow of `subgraph` is scoped. The global-ID
-        // variant is built lazily on first `.edge_index` access instead.
-        let mut edge_data_local: Vec<i64> = Vec::with_capacity(num_edges * 2);
-        {
-            let (src_local, dst_local) = subgraph.edge_index_local().map_err(|e| {
-                sampling_error(format!("Failed to compute local edge indices: {e}"))
-            })?;
-            edge_data_local.extend(src_local.iter().map(|&e| i64::from(e)));
-            edge_data_local.extend(dst_local.iter().map(|&e| i64::from(e)));
-        }
-
-        let seed_indices_local = subgraph
-            .seed_indices_local()
-            .map_err(|e| sampling_error(format!("Failed to compute seed indices: {e}")))?;
-
-        // u32 → i64 widening, one pass per buffer — the only per-buffer copy
-        // on this path; the source Vecs move into `original_*` below so
-        // `to_arrow()` and similar consumers can clone them on demand without
-        // an i64→u32 narrowing pass. The cast is monotonic and free of
-        // branches, so it vectorizes: on aarch64 the release build emits
-        // ushll.2d/ushll2.2d, widening eight lanes per unrolled iteration.
-        let nodes_i64: Vec<i64> = subgraph.nodes.iter().map(|&n| i64::from(n)).collect();
-        let seeds_i64: Vec<i64> = subgraph.seeds.iter().map(|&s| i64::from(s)).collect();
-        let seed_indices_i64: Vec<i64> = seed_indices_local.iter().map(|&e| i64::from(e)).collect();
-        let edge_ids_i64: Vec<i64> = subgraph.edge_ids.iter().map(|&e| e as i64).collect();
-
-        let nodes = PyArray1::from_vec(py, nodes_i64).unbind();
-        let seeds = PyArray1::from_vec(py, seeds_i64).unbind();
-        let seed_indices = PyArray1::from_vec(py, seed_indices_i64).unbind();
-        let edge_ids = PyArray1::from_vec(py, edge_ids_i64).unbind();
-
-        // Reshape to 2xN — `numpy` ndarray reshape is a view, not a copy.
-        let edge_array_local = PyArray1::from_vec(py, edge_data_local);
-        let edge_index_local = edge_array_local
+    /// Wrap already-converted buffers as numpy arrays — O(1) per array, no
+    /// element is touched.
+    pub fn from_prepared(py: Python<'_>, prepared: PreparedSubgraph) -> PyResult<Self> {
+        let num_edges = prepared.num_edges;
+        let edge_index_local = PyArray1::from_vec(py, prepared.edge_index_local)
             .reshape([2, num_edges])
             .map_err(|e| sampling_error(format!("Failed to reshape local edge index: {e}")))?
             .unbind();
-
-        let batch_vec = subgraph.batch.map(|b| {
-            let batch_i64: Vec<i64> = b.into_iter().map(i64::from).collect();
-            PyArray1::from_vec(py, batch_i64).unbind()
-        });
-
         Ok(Self {
-            nodes,
-            seeds,
+            num_nodes: prepared.nodes.len(),
+            num_seeds: prepared.seeds.len(),
+            num_edges,
+            nodes: PyArray1::from_vec(py, prepared.nodes).unbind(),
+            seeds: PyArray1::from_vec(py, prepared.seeds).unbind(),
             edge_index: OnceLock::new(),
             edge_index_local,
-            edge_ids,
-            seed_indices,
-            batch_vec,
-            num_nodes,
-            num_edges,
-            num_seeds,
-            num_sampled_nodes,
-            num_sampled_edges,
-            // Move (not copy) the canonical buffers out of the core subgraph.
-            original_nodes: subgraph.nodes,
-            original_seeds: subgraph.seeds,
-            original_edge_src: subgraph.edge_src,
-            original_edge_dst: subgraph.edge_dst,
-            original_edge_ids: subgraph.edge_ids,
+            edge_ids: PyArray1::from_vec(py, prepared.edge_ids).unbind(),
+            seed_indices: PyArray1::from_vec(py, prepared.seed_indices).unbind(),
+            batch_vec: prepared.batch.map(|b| PyArray1::from_vec(py, b).unbind()),
+            num_sampled_nodes: prepared.num_sampled_nodes,
+            num_sampled_edges: prepared.num_sampled_edges,
+            original_nodes: prepared.original_nodes,
+            original_seeds: prepared.original_seeds,
+            original_edge_src: prepared.original_edge_src,
+            original_edge_dst: prepared.original_edge_dst,
+            original_edge_ids: prepared.original_edge_ids,
         })
     }
 }
@@ -428,8 +496,9 @@ impl PySampledSubgraph {
     }
 
     /// Edge index in PyTorch Geometric COO format — shape `[2, num_edges]`,
-    /// dtype `int64`. Global node IDs. Built on first access and cached —
-    /// the standard training path only touches `edge_index_local`, so the
+    /// dtype `int64`. Global node IDs; row 0 is the sampled neighbor, row 1
+    /// the node that sampled it. Built on first access and cached — the
+    /// standard training path only touches `edge_index_local`, so the
     /// widening pass would otherwise be paid on every batch for nothing.
     #[getter]
     fn edge_index(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -437,8 +506,8 @@ impl PySampledSubgraph {
             return Ok(cached.clone_ref(py).into_any());
         }
         let mut edge_data: Vec<i64> = Vec::with_capacity(self.num_edges * 2);
-        edge_data.extend(self.original_edge_src.iter().map(|&e| i64::from(e)));
         edge_data.extend(self.original_edge_dst.iter().map(|&e| i64::from(e)));
+        edge_data.extend(self.original_edge_src.iter().map(|&e| i64::from(e)));
         let arr = PyArray1::from_vec(py, edge_data)
             .reshape([2, self.num_edges])
             .map_err(|e| sampling_error(format!("Failed to reshape edge index: {e}")))?
@@ -453,8 +522,8 @@ impl PySampledSubgraph {
     }
 
     /// Edge index with local IDs remapped to `[0, num_nodes)` — shape
-    /// `[2, num_edges]`, dtype `int64`. Use this for PyG models to avoid OOM
-    /// on large graphs.
+    /// `[2, num_edges]`, dtype `int64`, same orientation as `edge_index`.
+    /// Use this for PyG models to avoid OOM on large graphs.
     #[getter]
     fn edge_index_local(&self, py: Python<'_>) -> Py<PyAny> {
         self.edge_index_local.clone_ref(py).into_any()
@@ -482,27 +551,21 @@ impl PySampledSubgraph {
         self.batch_vec.as_ref().map(|b| b.clone_ref(py).into_any())
     }
 
-    /// Number of new nodes sampled at each hop (PyG-compatible).
+    /// Nodes each stage added, in PyG's `num_sampled_nodes` layout:
+    /// `[seed nodes, hop 1, ..., hop k]`.
     #[getter]
     fn num_sampled_nodes_per_hop(&self) -> Vec<usize> {
         self.num_sampled_nodes.clone()
     }
 
-    /// Number of edges sampled at each hop (PyG-compatible).
+    /// Edges each hop sampled, one entry per hop (PyG's
+    /// `num_sampled_edges`). Induced and bidirectional subgraphs rewrite the
+    /// edge arrays afterwards; these counts describe the sampling pass.
     #[getter]
     fn num_sampled_edges_per_hop(&self) -> Vec<usize> {
         self.num_sampled_edges.clone()
     }
 
-    /// Converts the subgraph to an Arrow RecordBatch for zero-copy data transfer.
-    ///
-    /// This is useful for integration with Ray Data and other Arrow-based systems.
-    ///
-    /// Returns:
-    ///     pyarrow.RecordBatch: Arrow record batch with columns:
-    ///         - edge_src: Source node IDs
-    ///         - edge_dst: Destination node IDs
-    ///         - nodes: All node IDs in subgraph
     /// Convert this subgraph to a dict of PyArrow `RecordBatch`es:
     /// ```python
     /// {"edges": RecordBatch(edge_src, edge_dst, edge_id),
@@ -510,14 +573,17 @@ impl PySampledSubgraph {
     ///  "seeds": RecordBatch(seeds)}
     /// ```
     ///
+    /// `edge_src`/`edge_dst` follow `edge_index` (source = sampled
+    /// neighbor); `edge_id` is `uint64`, node columns `uint32`.
+    ///
     /// Three batches rather than one because Arrow `RecordBatch` requires
     /// equal-length columns, and the edge / node / seed arrays have different
     /// lengths.
     fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let temp_subgraph = SampledSubgraph::from_parts(
             self.original_nodes.clone(),
-            self.original_edge_src.clone(),
             self.original_edge_dst.clone(),
+            self.original_edge_src.clone(),
             self.original_edge_ids.clone(),
             self.original_seeds.clone(),
             self.num_sampled_nodes.clone(),
@@ -527,37 +593,9 @@ impl PySampledSubgraph {
         let batches = crate::arrow_utils::subgraph_into_arrow(temp_subgraph)?;
 
         let pyarrow = py.import("pyarrow")?;
-        let rb_class = pyarrow.getattr("RecordBatch")?;
-        let schema_fn = pyarrow.getattr("schema")?;
-        let uint32_dt = pyarrow.getattr("uint32")?;
-
-        let edges_py = build_py_record_batch(
-            py,
-            &pyarrow,
-            &rb_class,
-            &schema_fn,
-            &uint32_dt,
-            &batches.edges,
-            &["edge_src", "edge_dst", "edge_id"],
-        )?;
-        let nodes_py = build_py_record_batch(
-            py,
-            &pyarrow,
-            &rb_class,
-            &schema_fn,
-            &uint32_dt,
-            &batches.nodes,
-            &["nodes"],
-        )?;
-        let seeds_py = build_py_record_batch(
-            py,
-            &pyarrow,
-            &rb_class,
-            &schema_fn,
-            &uint32_dt,
-            &batches.seeds,
-            &["seeds"],
-        )?;
+        let edges_py = build_py_record_batch(&pyarrow, &batches.edges)?;
+        let nodes_py = build_py_record_batch(&pyarrow, &batches.nodes)?;
+        let seeds_py = build_py_record_batch(&pyarrow, &batches.seeds)?;
 
         let dict = PyDict::new(py);
         dict.set_item("edges", edges_py)?;
@@ -594,7 +632,8 @@ impl PySampledSubgraph {
     }
 }
 
-/// Convert a Rust Arrow `RecordBatch` into a `pyarrow.RecordBatch`.
+/// Convert a Rust Arrow `RecordBatch` into a `pyarrow.RecordBatch`, keeping
+/// its column names and its `UInt32`/`UInt64` column types.
 ///
 /// arrow-rs and pyarrow share a binary buffer layout but no stable PyO3
 /// bridge, so we round-trip column buffers through Python lists. This is a
@@ -603,39 +642,47 @@ impl PySampledSubgraph {
 /// consumers (Ray Data, etc.) consume these infrequently. A zero-copy Arrow C
 /// Data Interface path would remove the element-by-element conversion.
 fn build_py_record_batch(
-    py: Python<'_>,
     pyarrow: &Bound<'_, pyo3::types::PyModule>,
-    rb_class: &Bound<'_, PyAny>,
-    schema_fn: &Bound<'_, PyAny>,
-    uint32_dt: &Bound<'_, PyAny>,
     batch: &RecordBatch,
-    field_names: &[&str],
 ) -> PyResult<Py<PyAny>> {
-    debug_assert_eq!(field_names.len(), batch.num_columns());
+    let py = pyarrow.py();
     let array_class = pyarrow.getattr("array")?;
+    let schema_fn = pyarrow.getattr("schema")?;
+    let field_fn = pyarrow.getattr("field")?;
 
+    let schema = batch.schema();
     let mut arrays = Vec::with_capacity(batch.num_columns());
     let mut fields = Vec::with_capacity(batch.num_columns());
-    for (i, name) in field_names.iter().enumerate() {
-        let column = batch.column(i);
-        let uint32_array = column
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| {
-                sampling_error(format!(
-                    "expected UInt32Array at column {i} ({name}), got {:?}",
-                    column.data_type()
-                ))
-            })?;
-        let values: Vec<u32> = uint32_array.values().to_vec();
-        let py_list = PyList::new(py, &values)?;
-        let py_array = array_class.call1((py_list, uint32_dt.clone()))?;
-        arrays.push(py_array);
-        fields.push(schema_fn.call_method1("field", (*name, uint32_dt.clone()))?);
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let name = field.name();
+        let any = column.as_any();
+        // `pyarrow.uint32` is a factory; the DataType is its return value.
+        let (values, dtype) = if let Some(a) = any.downcast_ref::<UInt32Array>() {
+            (
+                PyList::new(py, a.values().iter())?,
+                pyarrow.getattr("uint32")?.call0()?,
+            )
+        } else if let Some(a) = any.downcast_ref::<UInt64Array>() {
+            (
+                PyList::new(py, a.values().iter())?,
+                pyarrow.getattr("uint64")?.call0()?,
+            )
+        } else {
+            return Err(sampling_error(format!(
+                "unsupported Arrow column {name}: {:?}",
+                column.data_type()
+            )));
+        };
+        arrays.push(array_class.call1((values, dtype.clone()))?);
+        fields.push(field_fn.call1((name, dtype))?);
     }
 
-    let py_schema = schema_fn.call1((fields,))?;
-    let py_record_batch = rb_class.call_method1("from_arrays", (arrays, py_schema))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("schema", schema_fn.call1((fields,))?)?;
+    let py_record_batch =
+        pyarrow
+            .getattr("RecordBatch")?
+            .call_method("from_arrays", (arrays,), Some(&kwargs))?;
     Ok(py_record_batch.unbind())
 }
 
@@ -664,16 +711,39 @@ const _: () = {
     );
 };
 
+/// Erase the lifetime of a borrow of `arc`'s graph.
+///
+/// # Safety
+/// The caller must keep `arc` (or a clone) alive, and drop every value built
+/// from the returned reference before it.
+unsafe fn erase_graph_lifetime(arc: &Arc<Graph>) -> &'static Graph {
+    // SAFETY: `Arc::as_ptr` is stable for the allocation's lifetime, which
+    // the caller extends past every use of the reference.
+    unsafe { &*Arc::as_ptr(arc) }
+}
+
+/// Map a config/graph mismatch to `ValueError`.
+fn config_error(e: aethergraph_core::SamplerConfigError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+/// Borrow the graph handle's `Arc`, failing instead of panicking while
+/// another thread mutably borrows the graph object.
+fn graph_arc(py: Python<'_>, graph: &Py<PyCsrGraph>) -> PyResult<Arc<Graph>> {
+    Ok(graph
+        .try_borrow(py)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("graph is busy: {e}")))?
+        .inner_arc())
+}
+
 impl OwnedNeighborSampler {
-    fn new(arc: Arc<Graph>, config: SamplingConfig) -> Self {
-        // SAFETY: `Arc::as_ptr(&arc)` is stable for the allocation's
-        // lifetime; the Arc clone moved into `_arc` keeps it alive for
+    fn try_new(arc: Arc<Graph>, config: SamplingConfig) -> PyResult<Self> {
+        // SAFETY: the Arc clone moved into `_arc` keeps the graph alive for
         // `Self`'s lifetime, and `sampler` drops first (field order, guarded
-        // above), so the erased `'static` borrow never observes a freed
-        // graph. The Arc is private and never cloned out.
-        let graph_ref: &'static Graph = unsafe { &*Arc::as_ptr(&arc) };
-        let sampler = NeighborSampler::new(graph_ref, config);
-        Self { sampler, _arc: arc }
+        // above). The Arc is private and never cloned out.
+        let graph_ref = unsafe { erase_graph_lifetime(&arc) };
+        let sampler = NeighborSampler::try_new(graph_ref, config).map_err(config_error)?;
+        Ok(Self { sampler, _arc: arc })
     }
 }
 
@@ -697,26 +767,34 @@ impl PyNeighborSampler {
     ///
     /// Returns:
     ///     NeighborSampler: Sampler instance
+    ///
+    /// Raises:
+    ///     ValueError: `weighted` or `temporal_strategy` is set on a graph
+    ///         without edge weights or timestamps.
     #[new]
-    fn new(py: Python<'_>, graph: Py<PyCsrGraph>, config: PySamplingConfig) -> Self {
-        let graph_arc = graph.borrow(py).inner_arc();
-        let inner = OwnedNeighborSampler::new(graph_arc, config.inner.clone());
-        Self { inner, config }
+    fn new(py: Python<'_>, graph: Py<PyCsrGraph>, config: PySamplingConfig) -> PyResult<Self> {
+        let inner = OwnedNeighborSampler::try_new(graph_arc(py, &graph)?, config.inner.clone())?;
+        Ok(Self { inner, config })
     }
 
     /// Sample k-hop neighborhoods for a batch of seed nodes.
     ///
-    /// Automatically routes to temporal/disjoint paths based on config.
-    /// The persistent sampler's RNG advances across calls, so consecutive
+    /// Routes to the disjoint path when the config asks for it. The
+    /// persistent sampler's RNG advances across calls, so consecutive
     /// batches draw different samples (a fresh sampler with the same seed
     /// reproduces the same sequence from the start).
     ///
     /// Args:
-    ///     seeds: Seed node IDs as numpy array (int64) or list
-    ///     input_times: Per-seed timestamps (float64 array), required if temporal_strategy is set
+    ///     seeds: Seed node IDs as numpy array (uint32 or int64) or list
+    ///     input_times: Per-seed time bounds (float64, one per seed) under
+    ///         temporal sampling; None leaves every seed unbounded.
     ///
     /// Returns:
     ///     SampledSubgraph: Sampled subgraph containing nodes and edges
+    ///
+    /// Raises:
+    ///     SamplingError: A seed is outside the graph, or `input_times` is
+    ///         given without a temporal strategy or with the wrong length.
     #[pyo3(signature = (seeds, input_times=None))]
     fn sample(
         &mut self,
@@ -728,35 +806,22 @@ impl PyNeighborSampler {
         // per-seed timestamps. Once these are plain Rust data we can run the
         // sampler with the GIL released so background Python threads keep
         // running.
-        let seeds_vec: Vec<u32> = crate::error::extract_seeds(seeds)?;
+        let seeds = crate::error::extract_seed_batch(seeds, self.inner._arc.num_nodes())?;
         let times_vec: Option<Vec<f64>> = input_times
             .as_ref()
             .map(|t| t.as_slice().map(<[f64]>::to_vec))
             .transpose()?;
-        let disjoint = self.config.inner.disjoint;
-        let temporal = self.config.inner.temporal_strategy.is_some();
 
-        // Heavy sampling runs without the GIL. No Python object is touched
-        // inside this closure — it works purely on owned Rust data and returns
-        // a plain `SampledSubgraph`.
+        // Sampling and the int64 conversion run without the GIL. No Python
+        // object is touched inside this closure.
         let sampler = &mut self.inner.sampler;
-        let subgraph = py.detach(move || -> PyResult<SampledSubgraph> {
-            let subgraph = if disjoint {
-                sampler.sample_neighbors_disjoint(&seeds_vec, times_vec.as_deref())
-            } else if temporal {
-                let times = times_vec
-                    .as_deref()
-                    .ok_or_else(|| sampling_error("temporal_strategy requires input_times"))?;
-                sampler
-                    .sample_neighbors_temporal(&seeds_vec, times)
-                    .map_err(|e| sampling_error(e.to_string()))?
-            } else {
-                sampler.sample_neighbors(&seeds_vec)
-            };
-            Ok(subgraph)
-        })?;
-
-        PySampledSubgraph::from_subgraph(py, subgraph)
+        let prepared = py.detach(move || {
+            let subgraph = sampler
+                .sample(&seeds, times_vec.as_deref())
+                .map_err(|e| e.to_string())?;
+            PreparedSubgraph::new(subgraph)
+        });
+        PySampledSubgraph::from_prepared(py, prepared.map_err(sampling_error)?)
     }
 
     fn __repr__(&self) -> String {
@@ -767,10 +832,31 @@ impl PyNeighborSampler {
     }
 }
 
+/// Core parallel sampler bound to an owned graph handle; same construction
+/// and drop-order contract as [`OwnedNeighborSampler`].
+struct OwnedParallelBatchSampler {
+    sampler: ParallelBatchSampler<'static>,
+    // SAFETY-LOAD-BEARING: must drop AFTER `sampler`.
+    _arc: Arc<Graph>,
+}
+
+const _: () = {
+    let s = std::mem::offset_of!(OwnedParallelBatchSampler, sampler);
+    let a = std::mem::offset_of!(OwnedParallelBatchSampler, _arc);
+    assert!(
+        s < a,
+        "OwnedParallelBatchSampler field order violates the drop-before-arc invariant"
+    );
+};
+
 /// Python wrapper for ParallelBatchSampler.
+///
+/// The core sampler — its per-thread sampler pool and its position in the
+/// batch stream — lives as long as this object, so repeated calls reuse the
+/// node-sized dedup tables and keep drawing fresh samples.
 #[pyclass(name = "ParallelBatchSampler")]
 pub struct PyParallelBatchSampler {
-    graph: Py<PyCsrGraph>,
+    inner: OwnedParallelBatchSampler,
     config: PySamplingConfig,
 }
 
@@ -784,12 +870,30 @@ impl PyParallelBatchSampler {
     ///
     /// Returns:
     ///     ParallelBatchSampler: Parallel sampler instance
+    ///
+    /// Raises:
+    ///     ValueError: `weighted` or `temporal_strategy` is set on a graph
+    ///         without edge weights or timestamps.
     #[new]
-    fn new(graph: Py<PyCsrGraph>, config: PySamplingConfig) -> Self {
-        Self { graph, config }
+    fn new(py: Python<'_>, graph: Py<PyCsrGraph>, config: PySamplingConfig) -> PyResult<Self> {
+        let arc = graph_arc(py, &graph)?;
+        // SAFETY: `arc` moves into `_arc` below, and `sampler` drops first
+        // (field order, guarded above).
+        let graph_ref = unsafe { erase_graph_lifetime(&arc) };
+        let sampler =
+            ParallelBatchSampler::try_new(graph_ref, config.inner.clone()).map_err(config_error)?;
+        Ok(Self {
+            inner: OwnedParallelBatchSampler { sampler, _arc: arc },
+            config,
+        })
     }
 
     /// Sample neighborhoods for multiple batches in parallel.
+    ///
+    /// Each batch draws from its own RNG stream, derived from the config's
+    /// seed and the batch's position among every batch this sampler has
+    /// handled: a fixed seed reproduces the same sequence of calls exactly,
+    /// at any thread count.
     ///
     /// Args:
     ///     batches: One seed collection per batch. Numpy ``uint32`` /
@@ -799,32 +903,36 @@ impl PyParallelBatchSampler {
     ///
     /// Returns:
     ///     List[SampledSubgraph]: List of sampled subgraphs, one per batch
+    ///
+    /// Raises:
+    ///     SamplingError: A seed is outside the graph.
     fn sample_batches(
         &self,
         py: Python<'_>,
         batches: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PySampledSubgraph>> {
-        // Bulk-extract every batch's seeds while the GIL is held (numpy
-        // arrays land as single slice copies), then capture an owned graph
-        // handle and config so the parallel sweep runs with the GIL
-        // released.
-        let batches: Vec<Vec<u32>> = batches
+        // Parse every batch while the GIL is held (numpy arrays land as
+        // single slice copies); sampling and conversion then run detached.
+        let num_nodes = self.inner._arc.num_nodes();
+        let batches: Vec<Seeds> = batches
             .iter()
-            .map(crate::error::extract_seeds)
+            .map(|b| crate::error::extract_seed_batch(b, num_nodes))
             .collect::<PyResult<_>>()?;
-        let graph_arc = self.graph.borrow(py).inner_arc();
-        let config = self.config.inner.clone();
 
-        // The rayon-parallel batch sweep touches no Python state; run it
-        // detached and convert the plain `SampledSubgraph`s afterward.
-        let subgraphs = py.detach(move || {
-            let sampler = ParallelBatchSampler::new(&graph_arc, config);
-            sampler.sample_batches(&batches)
+        let sampler = &self.inner.sampler;
+        let prepared = py.detach(move || -> Result<Vec<PreparedSubgraph>, String> {
+            sampler
+                .sample_batches(&batches)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(PreparedSubgraph::new)
+                .collect()
         });
 
-        subgraphs
+        prepared
+            .map_err(sampling_error)?
             .into_iter()
-            .map(|sg| PySampledSubgraph::from_subgraph(py, sg))
+            .map(|p| PySampledSubgraph::from_prepared(py, p))
             .collect()
     }
 

@@ -118,6 +118,91 @@ fn concurrent_writer_and_reader_publication_is_clean() {
 }
 
 #[test]
+fn odd_capacity_keeps_interior_writes_aligned() {
+    // 1001 bytes is not a whole interior slot; the arena rounds it down so
+    // the interior region (counted from the top) stays 16-byte aligned.
+    let g = DynamicGraph::new(8, 1001);
+    let mut w = g.writer_or_panic();
+    for dst in 0..8u32 {
+        w.insert_edge(0, dst).unwrap();
+        w.insert_edge(1, dst).unwrap();
+    }
+    drop(w);
+    let mut buf = Vec::new();
+    g.neighbors_into(0, &mut buf);
+    assert_eq!(buf, (0..8).collect::<Vec<_>>());
+}
+
+#[test]
+fn recycling_under_shared_and_nested_guards_is_race_free() {
+    // A small arena forces slot reuse while two readers (sharing stripes
+    // with the main thread's nested guards) traverse; a slot rewritten
+    // under a live traversal is a data race miri reports.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    let g = Arc::new(DynamicGraph::new(8, 16 << 10));
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let g = Arc::clone(&g);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    g.for_each_chunk(0, |chunk| {
+                        if let Some(&x) = chunk.as_slice().first() {
+                            assert!(g.has_edge(0, x));
+                        }
+                    });
+                }
+            })
+        })
+        .collect();
+    for round in 0..6u32 {
+        let mut w = g.writer_or_panic();
+        for i in 0..20u32 {
+            let _ = w.insert_edge(0, (round * 20 + i) % 8);
+            let _ = w.insert_edge(1 + round % 7, i % 8);
+        }
+    }
+    done.store(true, Ordering::Release);
+    for r in readers {
+        r.join().unwrap();
+    }
+}
+
+#[test]
+fn batch_strategies_and_snapshot_reads_are_miri_clean() {
+    use aether_graph::SortedDsts;
+
+    let g = DynamicGraph::new(512, 1 << 18);
+    let wide: Vec<u32> = (0..200).collect();
+    {
+        let mut w = g.writer_or_panic();
+        // Rebuild path.
+        w.insert_edges_sorted(3, SortedDsts::new(&wide).unwrap())
+            .unwrap();
+    }
+    let before = g.acquire();
+    {
+        let mut w = g.writer_or_panic();
+        // Path-copy chain on the now-large tree.
+        w.insert_edges_sorted(3, SortedDsts::new(&[300, 301]).unwrap())
+            .unwrap();
+        let mut edges = vec![(9, 1), (8, 2), (9, 0)];
+        w.insert_edges(&mut edges).unwrap();
+    }
+    let after = g.acquire();
+    assert_eq!(before.degree(&g, 3), 200);
+    assert_eq!(after.degree(&g, 3), 202);
+    assert_eq!(after.degree(&g, 9), 2);
+    let mut buf = Vec::new();
+    after.neighbors_into(&g, 3, &mut buf);
+    assert_eq!(buf.len(), 202);
+}
+
+#[test]
 fn dynamic_graph_writer_path_is_miri_clean() {
     let g = DynamicGraph::new(64, 1 << 16);
     let mut w = g.writer_or_panic();

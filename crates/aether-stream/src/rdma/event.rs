@@ -13,22 +13,40 @@
 //! is for the idle side of an adaptive consumer, where burning a core to
 //! poll an empty CQ is pure waste.
 
-use super::context::{RdmaContext, RegisteredCq, create_cq_on_channel};
+use super::context::{ChannelBinding, Device, RdmaContext, RegisteredCq};
 use super::ffi::*;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Owns an `ibv_comp_channel`. Create the channel first, then CQs on it
-/// via [`Self::create_cq`]; drop those CQs before the channel, and the
-/// channel before its context.
-pub struct CompletionChannel {
+struct ChannelInner {
     channel: *mut IbvCompChannel,
+    // Released after `Drop::drop` destroys the channel.
+    _dev: Arc<Device>,
 }
 
 // SAFETY: ibverbs completion channels are thread-safe after creation.
-unsafe impl Send for CompletionChannel {}
+unsafe impl Send for ChannelInner {}
 // SAFETY: see Send impl above.
-unsafe impl Sync for CompletionChannel {}
+unsafe impl Sync for ChannelInner {}
+
+impl Drop for ChannelInner {
+    fn drop(&mut self) {
+        // SAFETY: created by ibv_create_comp_channel; every CQ on it holds
+        // this inner, so none is left.
+        let ret = unsafe { ibv_destroy_comp_channel(self.channel) };
+        if ret != 0 {
+            tracing::warn!(ret, "ibv_destroy_comp_channel failed");
+        }
+    }
+}
+
+/// Owns an `ibv_comp_channel`. Create the channel first, then CQs on it
+/// via [`Self::create_cq`]. Each CQ keeps the channel alive and the channel
+/// keeps its device alive, so handles may drop in any order.
+pub struct CompletionChannel {
+    inner: Arc<ChannelInner>,
+}
 
 impl CompletionChannel {
     pub fn create(ctx: &RdmaContext) -> io::Result<Self> {
@@ -37,19 +55,31 @@ impl CompletionChannel {
         if channel.is_null() {
             return Err(io::Error::other("ibv_create_comp_channel failed"));
         }
-        Ok(Self { channel })
+        Ok(Self {
+            inner: Arc::new(ChannelInner {
+                channel,
+                _dev: ctx.device().clone(),
+            }),
+        })
     }
 
     /// A CQ whose completions raise events on this channel.
     pub fn create_cq(&self, ctx: &RdmaContext, cq_size: i32) -> io::Result<RegisteredCq> {
-        create_cq_on_channel(ctx, cq_size, self.channel)
+        RegisteredCq::create(
+            ctx.device(),
+            cq_size,
+            Some(ChannelBinding {
+                channel: self.inner.channel,
+                owner: self.inner.clone(),
+            }),
+        )
     }
 
     /// The channel's file descriptor, for integration into an external
     /// event loop (epoll/poll). [`Self::wait`] polls it internally.
     pub fn fd(&self) -> i32 {
-        // SAFETY: `self.channel` is alive; `fd` is public ABI.
-        unsafe { (*self.channel).fd }
+        // SAFETY: the channel is alive; `fd` is public ABI.
+        unsafe { (*self.inner.channel).fd }
     }
 
     /// Arm `cq`: the next completion added to it raises one event on
@@ -106,24 +136,13 @@ impl CompletionChannel {
         // it so the CQ's event counter stays balanced for destroy.
         let mut cq: *mut IbvCq = std::ptr::null_mut();
         let mut cq_context: *mut libc::c_void = std::ptr::null_mut();
-        // SAFETY: `self.channel` is alive; both out-pointers are valid.
-        let ret = unsafe { ibv_get_cq_event(self.channel, &mut cq, &mut cq_context) };
+        // SAFETY: the channel is alive; both out-pointers are valid.
+        let ret = unsafe { ibv_get_cq_event(self.inner.channel, &mut cq, &mut cq_context) };
         if ret != 0 {
             return Err(io::Error::other(format!("ibv_get_cq_event failed: {ret}")));
         }
         // SAFETY: `cq` came from the event we just collected.
         unsafe { ibv_ack_cq_events(cq, 1) };
         Ok(true)
-    }
-}
-
-impl Drop for CompletionChannel {
-    fn drop(&mut self) {
-        // SAFETY: `self.channel` was created by ibv_create_comp_channel
-        // and every CQ on it has been dropped per the struct contract.
-        let ret = unsafe { ibv_destroy_comp_channel(self.channel) };
-        if ret != 0 {
-            tracing::warn!(ret, "ibv_destroy_comp_channel failed");
-        }
     }
 }

@@ -43,8 +43,8 @@ impl PyFeatureCacheConfig {
         gpu_capacity: usize,
         cpu_capacity: usize,
         feature_dim: usize,
-        nvme_path: Option<&str>,
-        cold_store_path: Option<&str>,
+        nvme_path: Option<PathBuf>,
+        cold_store_path: Option<PathBuf>,
         cold_level: i32,
     ) -> PyResult<Self> {
         if feature_dim == 0 {
@@ -73,10 +73,10 @@ impl PyFeatureCacheConfig {
                 gpu_capacity,
                 cpu_capacity,
                 feature_dim,
-                nvme_path: Some(PathBuf::from(nvme_path)),
+                nvme_path: Some(nvme_path),
                 warmup_frequencies: None,
                 pin_ratio: 0.8,
-                cold_store_path: cold_store_path.map(PathBuf::from),
+                cold_store_path,
                 cold_level,
             },
         })
@@ -208,6 +208,7 @@ impl PyFeatureCache {
     /// onto a different runtime, or `Python::attach` may panic.
     fn get_batch<'py>(&self, py: Python<'py>, nodes: Vec<u32>) -> PyResult<Bound<'py, PyAny>> {
         let cache = Arc::clone(&self.inner);
+        let feature_dim = self.inner.feature_dim();
 
         future_into_py(py, async move {
             let features_vec = cache
@@ -216,26 +217,10 @@ impl PyFeatureCache {
                 .map_err(|e| cache_error(format!("Failed to get batch features: {e}")))?;
 
             Python::attach(|py| {
+                // Every row is `feature_dim` wide: the cache checks widths
+                // where rows enter it.
                 let num_nodes = features_vec.len();
-                let feature_dim = if num_nodes > 0 {
-                    features_vec[0].len()
-                } else {
-                    0
-                };
-
-                // Pre-allocated single buffer + `extend_from_slice` per row:
-                // one allocation total, no per-element iterator state.
-                let mut flat: Vec<f32> = Vec::with_capacity(num_nodes * feature_dim);
-                for row in features_vec {
-                    if row.len() != feature_dim {
-                        return Err(cache_error(format!(
-                            "feature row length mismatch: row has {}, expected {}",
-                            row.len(),
-                            feature_dim
-                        )));
-                    }
-                    flat.extend_from_slice(&row);
-                }
+                let flat: Vec<f32> = features_vec.concat();
 
                 let array = PyArray1::from_vec(py, flat);
                 let array_2d = array

@@ -18,7 +18,6 @@
 //! `version` field is the dispatcher, and the checksum field covers the
 //! compressed payload here (v1 checksums the flat arrays instead).
 
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
@@ -26,17 +25,25 @@ use anyhow::{Context, Result};
 use bytemuck::cast_slice;
 use tracing::debug;
 
-use super::mmap::{Header, crc32_parts};
+use super::mmap::{Header, crc32_parts, write_atomically};
 use super::succinct::{EliasFano, StreamVByte};
-use crate::graph::{Graph, GraphValidationMode};
+use crate::graph::csr::alloc_hinted;
+use crate::graph::{EdgeOffset, Graph, GraphValidationMode, NodeId};
 
 /// `version` header value for this format. Version 1 is the flat format
 /// in [`super::mmap`].
 pub(crate) const COMPRESSED_VERSION: u32 = 2;
 
-/// Serialize `graph` to `path` in the compressed format.
+/// Serialize a homogeneous `graph` to `path` in the compressed format,
+/// atomically replacing any existing file.
 pub fn save_graph_compressed(graph: &Graph, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
+    anyhow::ensure!(
+        graph.is_homogeneous(),
+        "the graph file format has one node count; a bipartite CSR belongs in a hetero graph file"
+    );
+    // Encoding needs monotone offsets.
+    graph.validate_with_mode(GraphValidationMode::OffsetsOnly)?;
 
     let ef = EliasFano::encode(graph.offsets());
     let svb = StreamVByte::encode_deltas(graph.edges());
@@ -55,17 +62,13 @@ pub fn save_graph_compressed(graph: &Graph, path: impl AsRef<Path>) -> Result<()
         crc32_parts(&[&payload]),
     );
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .context("failed to create output file")?;
-    file.write_all(&header.to_bytes())
-        .context("failed to write header")?;
-    file.write_all(&payload)
-        .context("failed to write compressed payload")?;
-    file.sync_all().context("failed to sync file")?;
+    write_atomically(path, |file| {
+        file.write_all(&header.to_bytes())
+            .context("failed to write header")?;
+        file.write_all(&payload)
+            .context("failed to write compressed payload")?;
+        Ok(())
+    })?;
 
     let flat = graph.num_nodes() * 8 + 8 + graph.num_edges() * 4;
     debug!(
@@ -79,6 +82,11 @@ pub fn save_graph_compressed(graph: &Graph, path: impl AsRef<Path>) -> Result<()
 }
 
 /// Load a compressed graph from `path` into owned storage.
+///
+/// Decoding touches every value, so the graph is always proven `Full`
+/// (monotone offsets, destinations in range) and the checksum, when
+/// present, is always verified; `validation` changes nothing here and is
+/// accepted for symmetry with the flat loaders.
 pub fn load_graph_compressed(
     path: impl AsRef<Path>,
     validation: GraphValidationMode,
@@ -90,7 +98,7 @@ pub fn load_graph_compressed(
 /// Decode a compressed graph from in-memory file bytes.
 pub(crate) fn load_graph_compressed_from_bytes(
     bytes: &[u8],
-    validation: GraphValidationMode,
+    _validation: GraphValidationMode,
 ) -> Result<Graph> {
     let header = Header::from_bytes(bytes)?;
     header.validate_compressed()?;
@@ -125,17 +133,14 @@ pub(crate) fn load_graph_compressed_from_bytes(
         svb.len()
     );
 
-    let offsets = ef.to_vec();
-    let edges = svb.decode();
-
     let weights = if header.has_weights() {
         let raw = &payload[ef_len + svb_len..];
         anyhow::ensure!(
-            raw.len() == num_edges * 4,
+            Some(raw.len()) == num_edges.checked_mul(4),
             "weights section is {} bytes for {num_edges} edges",
             raw.len()
         );
-        let mut w: Vec<f32> = vec![0.0; num_edges];
+        let mut w: Vec<f32> = alloc_hinted(num_edges);
         bytemuck::cast_slice_mut::<f32, u8>(&mut w).copy_from_slice(raw);
         Some(w)
     } else {
@@ -146,9 +151,21 @@ pub(crate) fn load_graph_compressed_from_bytes(
         None
     };
 
-    let graph = Graph::from_csr_arrays(num_nodes, offsets, edges, weights);
-    graph.validate_with_mode(validation)?;
-    Ok(graph)
+    let mut offsets: Vec<EdgeOffset> = alloc_hinted(ef.len());
+    ef.decode_into(&mut offsets);
+    drop(ef);
+    let mut edges: Vec<NodeId> = alloc_hinted(svb.len());
+    svb.decode_into(&mut edges);
+    drop(svb);
+
+    Graph::from_csr_vecs(
+        num_nodes,
+        num_nodes,
+        offsets,
+        edges,
+        weights,
+        GraphValidationMode::Full,
+    )
 }
 
 #[cfg(test)]
@@ -174,7 +191,7 @@ mod tests {
         }
         let weights =
             weighted.then(|| (0..edges.len()).map(|i| i as f32 * 0.5).collect::<Vec<_>>());
-        Graph::from_csr_arrays(num_nodes, offsets, edges, weights)
+        Graph::from_csr_arrays(num_nodes, offsets, edges, weights).unwrap()
     }
 
     fn assert_same_graph(a: &Graph, b: &Graph) {

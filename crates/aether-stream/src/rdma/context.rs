@@ -1,18 +1,18 @@
 //! RDMA device context: device + protection domain + completion queue.
 //!
-//! `RdmaContext` owns the lifetime of the ibverbs resources and provides
-//! memory registration. One context per process; QPs are created from it.
+//! `RdmaContext` opens the device and provides memory registration; QPs are
+//! created from it. Every verbs object created on a device holds an `Arc` to
+//! the device that owns the context and PD, and a QP holds its CQs, so
+//! teardown runs child-before-parent regardless of which handle drops first.
 
 use super::ffi::*;
+use std::any::Any;
 use std::ffi::CStr;
 use std::io;
 use std::ptr;
+use std::sync::Arc;
 use tracing::debug;
 
-/// Owns an ibverbs device context, protection domain, and completion queue.
-///
-/// All RDMA resources (QPs, MRs) are created through this context.
-/// Dropped in reverse order: CQ → PD → device context.
 /// How a port reaches its peers, from `ibv_port_attr.link_layer`.
 ///
 /// This decides how an address handle is built, and the two fabrics want
@@ -65,10 +65,44 @@ impl LinkLayer {
     }
 }
 
-pub struct RdmaContext {
+/// An open verbs device and its protection domain.
+///
+/// Held behind an `Arc` by every object created on it (MRs, CQs, QPs, SRQs,
+/// completion channels), so the PD is deallocated and the device closed only
+/// after the last of them is destroyed.
+pub(crate) struct Device {
     context: *mut IbvContext,
-    pub pd: *mut IbvPd,
-    pub cq: *mut IbvCq,
+    pd: *mut IbvPd,
+}
+
+// SAFETY: ibverbs contexts and PDs are thread-safe after creation; the
+// pointers are only dereferenced by libibverbs.
+unsafe impl Send for Device {}
+// SAFETY: see Send impl above.
+unsafe impl Sync for Device {}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        // SAFETY: every object created on this PD holds an `Arc<Device>`, so
+        // none is left; the PD was allocated in `open_on_device`.
+        let rc = unsafe { ibv_dealloc_pd(self.pd) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_dealloc_pd failed");
+        }
+        // SAFETY: the context was opened in `open_on_device` and nothing
+        // created on it survives.
+        let rc = unsafe { ibv_close_device(self.context) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_close_device failed");
+        }
+    }
+}
+
+/// An opened RDMA port: device, protection domain, default completion queue,
+/// and the port's addressing.
+pub struct RdmaContext {
+    dev: Arc<Device>,
+    cq: RegisteredCq,
     /// How this port addresses peers, read from the port at open.
     pub link_layer: LinkLayer,
     /// Local port LID (for IB fabrics; 0 for RoCE).
@@ -78,15 +112,13 @@ pub struct RdmaContext {
     /// Index of `port_gid` in the device's GID table — must be passed to the
     /// remote QP's address handle (sgid_index) so packets carry the right SGID.
     pub gid_index: u8,
+    /// `ibv_port_attr.active_mtu` (an `IBV_MTU_*` code), the largest path
+    /// MTU the link carries.
+    active_mtu: u32,
     /// NUMA node of the opened device, read from sysfs at open time.
     /// `None` when sysfs doesn't expose it (VMs, SoftRoCE).
     numa_node: Option<i32>,
 }
-
-// SAFETY: ibverbs resources are thread-safe after creation.
-unsafe impl Send for RdmaContext {}
-// SAFETY: see Send impl above.
-unsafe impl Sync for RdmaContext {}
 
 /// Device atomic capabilities, from `ibv_query_device`.
 #[derive(Debug, Clone, Copy)]
@@ -196,23 +228,68 @@ pub fn memlock_soft_limit_bytes() -> Option<usize> {
     Some(rlim.rlim_cur as usize)
 }
 
-/// Fail early when a pinned registration of `len` bytes cannot fit under
-/// the process memlock limit — the usual silent `ibv_reg_mr` death on HPC
-/// nodes that still have the default `ulimit -l`.
-pub fn check_memlock_for(len: usize) -> io::Result<()> {
-    let Some(limit) = memlock_soft_limit_bytes() else {
+/// What the kernel's `ib_umem_get` charges a pinned registration against:
+/// nothing when the process holds `CAP_IPC_LOCK`, otherwise the pages it has
+/// already pinned (`VmPin`) plus the new ones, under `RLIMIT_MEMLOCK`.
+#[derive(Debug, Clone, Copy, Default)]
+struct PinState {
+    cap_ipc_lock: bool,
+    pinned_bytes: usize,
+}
+
+impl PinState {
+    /// Parse `CapEff` and `VmPin` from `/proc/self/status` text.
+    fn parse(status: &str) -> Self {
+        const CAP_IPC_LOCK: u32 = 14;
+        let mut state = Self::default();
+        for line in status.lines() {
+            if let Some(v) = line.strip_prefix("CapEff:") {
+                if let Ok(bits) = u64::from_str_radix(v.trim(), 16) {
+                    state.cap_ipc_lock = (bits >> CAP_IPC_LOCK) & 1 == 1;
+                }
+            } else if let Some(v) = line.strip_prefix("VmPin:")
+                && let Some(kb) = v
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+            {
+                state.pinned_bytes = kb.saturating_mul(1024);
+            }
+        }
+        state
+    }
+
+    fn current() -> Self {
+        std::fs::read_to_string("/proc/self/status")
+            .map(|s| Self::parse(&s))
+            .unwrap_or_default()
+    }
+}
+
+fn memlock_verdict(len: usize, limit: Option<usize>, state: PinState) -> io::Result<()> {
+    let Some(limit) = limit else {
         return Ok(());
     };
-    if len <= limit {
+    if state.cap_ipc_lock || state.pinned_bytes.saturating_add(len) <= limit {
         return Ok(());
     }
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "pinned RDMA registration needs {len} bytes but RLIMIT_MEMLOCK soft limit is {limit}; \
-             run `ulimit -l unlimited` (or raise memlock in limits.conf) before registering large tables"
+            "pinned RDMA registration needs {len} bytes on top of {} already pinned, but \
+             RLIMIT_MEMLOCK soft limit is {limit}; run `ulimit -l unlimited` (or raise memlock \
+             in limits.conf, or grant CAP_IPC_LOCK) before registering large tables",
+            state.pinned_bytes
         ),
     ))
+}
+
+/// Fail early when a pinned registration of `len` bytes cannot fit under
+/// the process memlock limit — the usual silent `ibv_reg_mr` death on HPC
+/// nodes that still have the default `ulimit -l`. Mirrors the kernel's own
+/// charge: exempt under `CAP_IPC_LOCK`, cumulative with pages already pinned.
+pub fn check_memlock_for(len: usize) -> io::Result<()> {
+    memlock_verdict(len, memlock_soft_limit_bytes(), PinState::current())
 }
 
 fn enrich_reg_mr_error(err: io::Error, len: usize) -> io::Error {
@@ -322,7 +399,6 @@ impl RdmaContext {
             return Err(io::Error::other("ibv_open_device failed"));
         }
 
-        // Allocate protection domain.
         // SAFETY: `context` is the just-opened device context.
         let pd = unsafe { ibv_alloc_pd(context) };
         if pd.is_null() {
@@ -330,40 +406,15 @@ impl RdmaContext {
             unsafe { ibv_close_device(context) };
             return Err(io::Error::other("ibv_alloc_pd failed"));
         }
+        // From here every early return unwinds through `Device`'s Drop.
+        let dev = Arc::new(Device { context, pd });
+        let cq = RegisteredCq::create(&dev, cq_size, None)?;
 
-        // Create completion queue.
-        // SAFETY: `context` is open; channel + cq_context null is allowed.
-        let cq = unsafe { ibv_create_cq(context, cq_size, ptr::null_mut(), ptr::null_mut(), 0) };
-        if cq.is_null() {
-            // SAFETY: pd/context still live, not yet freed.
-            unsafe {
-                ibv_dealloc_pd(pd);
-            }
-            // SAFETY: pd/context still live, not yet freed.
-            unsafe {
-                ibv_close_device(context);
-            }
-            return Err(io::Error::other("ibv_create_cq failed"));
-        }
-
-        // Query port 1 for LID.
         // SAFETY: zeroed init of POD struct is sound.
         let mut port_attr: IbvPortAttr = unsafe { std::mem::zeroed() };
         // SAFETY: `context` is open; `port_attr` is a valid out-param.
         let ret = unsafe { ibv_query_port(context, 1, &mut port_attr) };
         if ret != 0 {
-            // SAFETY: all three handles still live.
-            unsafe {
-                ibv_destroy_cq(cq);
-            }
-            // SAFETY: see above.
-            unsafe {
-                ibv_dealloc_pd(pd);
-            }
-            // SAFETY: see above.
-            unsafe {
-                ibv_close_device(context);
-            }
             return Err(io::Error::other("ibv_query_port failed"));
         }
 
@@ -374,18 +425,6 @@ impl RdmaContext {
         // SAFETY: `context` is open; `gid` is a valid out-param.
         let ret = unsafe { ibv_query_gid(context, 1, gid_index as i32, &mut gid) };
         if ret != 0 {
-            // SAFETY: all three handles still live.
-            unsafe {
-                ibv_destroy_cq(cq);
-            }
-            // SAFETY: see above.
-            unsafe {
-                ibv_dealloc_pd(pd);
-            }
-            // SAFETY: see above.
-            unsafe {
-                ibv_close_device(context);
-            }
             return Err(io::Error::other(format!(
                 "ibv_query_gid({gid_index}) failed"
             )));
@@ -393,19 +432,20 @@ impl RdmaContext {
 
         let link_layer = LinkLayer::from_port_attr(port_attr.link_layer);
         let ctx = Self {
-            context,
-            pd,
+            dev,
             cq,
             link_layer,
             port_lid: port_attr.lid,
             port_gid: gid,
             gid_index,
+            active_mtu: port_attr.active_mtu,
             numa_node,
         };
         debug!(
             ?link_layer,
             lid = ctx.port_lid,
             gid_index,
+            active_mtu = ctx.active_mtu,
             "RDMA port addressing"
         );
 
@@ -446,6 +486,27 @@ impl RdmaContext {
         self.numa_node
     }
 
+    /// The port's active path MTU as an `IBV_MTU_*` code.
+    pub fn active_mtu(&self) -> u32 {
+        self.active_mtu
+    }
+
+    /// The context's default completion queue.
+    pub fn cq(&self) -> &RegisteredCq {
+        &self.cq
+    }
+
+    /// Raw protection-domain pointer. Using it is `unsafe`; the PD lives as
+    /// long as this context or anything created on it.
+    pub fn pd_ptr(&self) -> *mut IbvPd {
+        self.dev.pd
+    }
+
+    /// Owner handle every child object keeps alive.
+    pub(crate) fn device(&self) -> &Arc<Device> {
+        &self.dev
+    }
+
     /// On-demand-paging capabilities of the opened device.
     ///
     /// ODP registration (`IBV_ACCESS_ON_DEMAND`) skips pinning: the HCA
@@ -459,9 +520,10 @@ impl RdmaContext {
     pub fn odp_caps(&self) -> io::Result<OdpCaps> {
         let mut general_caps: u64 = 0;
         let mut rc_odp_caps: u32 = 0;
-        // SAFETY: `self.context` is open; both out-pointers are valid.
-        let ret =
-            unsafe { aether_ibv_query_odp_caps(self.context, &mut general_caps, &mut rc_odp_caps) };
+        // SAFETY: the context is open; both out-pointers are valid.
+        let ret = unsafe {
+            aether_ibv_query_odp_caps(self.dev.context, &mut general_caps, &mut rc_odp_caps)
+        };
         if ret != 0 {
             return Err(io::Error::other(format!(
                 "ibv_query_device_ex failed: {ret}"
@@ -479,7 +541,7 @@ impl RdmaContext {
     /// them, so one registration covers every buffer the process will
     /// ever expose — no per-buffer `reg_mr` calls, no registration cache.
     /// Requires [`OdpCaps::implicit`]; the device rejects the call
-    /// otherwise. Same Drop-order contract as [`Self::reg_mr`].
+    /// otherwise.
     ///
     /// TODO(deferred): no product caller yet — exercised only by
     /// `tests/softroce_e2e.rs`. Range ODP is already the Auto path in
@@ -489,12 +551,20 @@ impl RdmaContext {
     /// faults on first touch, so it needs measurement on real ConnectX
     /// (rxe reports the capability without the fault behaviour that makes
     /// the trade real) before becoming the default.
-    pub fn reg_mr_implicit_odp(&self, access: i32) -> io::Result<RegisteredMr> {
+    ///
+    /// # Safety
+    /// The MR's lkey (and rkey, if `access` grants remote rights) reaches
+    /// every mapped byte of the process. Every work request posted against
+    /// it must target memory that is live and not concurrently borrowed by
+    /// Rust for the whole DMA, and a remote key must only be handed to
+    /// peers trusted with the entire address space.
+    pub unsafe fn reg_mr_implicit_odp(&self, access: i32) -> io::Result<RegisteredMr> {
         // SAFETY: null addr + SIZE_MAX length is the documented implicit-
-        // ODP registration form; no memory is pinned or aliased by it.
+        // ODP registration form; no memory is pinned by it, and what WRs
+        // may reach through it is the caller's contract above.
         let mr = unsafe {
             ibv_reg_mr(
-                self.pd,
+                self.dev.pd,
                 ptr::null_mut(),
                 usize::MAX,
                 access | IBV_ACCESS_ON_DEMAND,
@@ -503,7 +573,8 @@ impl RdmaContext {
         if mr.is_null() {
             return Err(io::Error::last_os_error());
         }
-        Ok(RegisteredMr { mr })
+        // SAFETY: `mr` is a fresh registration on this context's PD.
+        Ok(unsafe { RegisteredMr::from_raw(mr, self.dev.clone()) })
     }
 
     /// mlx5 direct-verbs capabilities, `Err` on non-mlx5 devices.
@@ -515,8 +586,9 @@ impl RdmaContext {
     pub fn mlx5_caps(&self) -> io::Result<Mlx5Caps> {
         let mut max_dynamic_bfregs: u32 = 0;
         let mut flags: u64 = 0;
-        // SAFETY: `self.context` is open; both out-pointers are valid.
-        let ret = unsafe { aether_mlx5dv_query(self.context, &mut max_dynamic_bfregs, &mut flags) };
+        // SAFETY: the context is open; both out-pointers are valid.
+        let ret =
+            unsafe { aether_mlx5dv_query(self.dev.context, &mut max_dynamic_bfregs, &mut flags) };
         if ret != 0 {
             return Err(io::Error::other(format!("mlx5dv_query_device: {ret}")));
         }
@@ -535,9 +607,9 @@ impl RdmaContext {
     pub fn device_atomic_caps(&self) -> io::Result<AtomicCaps> {
         let mut atomic_cap: i32 = 0;
         let mut max_qp_rd_atom: i32 = 0;
-        // SAFETY: `self.context` is open; both out-pointers are valid.
+        // SAFETY: the context is open; both out-pointers are valid.
         let ret = unsafe {
-            aether_ibv_query_atomic_caps(self.context, &mut atomic_cap, &mut max_qp_rd_atom)
+            aether_ibv_query_atomic_caps(self.dev.context, &mut atomic_cap, &mut max_qp_rd_atom)
         };
         if ret != 0 {
             return Err(io::Error::other(format!("ibv_query_device failed: {ret}")));
@@ -613,12 +685,9 @@ impl RdmaContext {
 
     /// Register memory for RDMA access (host or GPU via nvidia-peermem).
     ///
-    /// Returns an RAII `RegisteredMr` that calls `ibv_dereg_mr` on drop. The
-    /// caller must keep it alive while any QP holds references to its lkey/rkey,
-    /// and must drop it BEFORE this `RdmaContext` (otherwise `ibv_dealloc_pd`
-    /// fails with EBUSY at context drop). Storing it in the same struct as the
-    /// context, declared *before* the context field, gives the right Drop order
-    /// (Rust drops fields in declaration order).
+    /// Returns an RAII `RegisteredMr` that calls `ibv_dereg_mr` on drop and
+    /// keeps the PD alive until then. The caller must keep it alive while any
+    /// QP holds references to its lkey/rkey.
     ///
     /// For feature-table advertisement prefer [`Self::reg_feature_mr`], which
     /// applies ODP/pin policy and memlock preflight.
@@ -630,19 +699,22 @@ impl RdmaContext {
     /// referencing its lkey/rkey has completed. The MR holds no lifetime tie
     /// to the buffer; once the region is advertised, remote peers can DMA
     /// into/out of it, so violating this contract is remote reads/writes of
-    /// freed memory.
+    /// freed memory. Work requests posted against the lkey write into the
+    /// range from the NIC, so no Rust reference to the bytes a WR targets may
+    /// be live while that WR is in flight.
     pub unsafe fn reg_mr(
         &self,
         addr: *mut u8,
         len: usize,
         access: i32,
     ) -> io::Result<RegisteredMr> {
-        // SAFETY: `self.pd` is alive; `addr/len/access` are the caller's contract.
-        let mr = unsafe { ibv_reg_mr(self.pd, addr as *mut libc::c_void, len, access) };
+        // SAFETY: the PD is alive; `addr/len/access` are the caller's contract.
+        let mr = unsafe { ibv_reg_mr(self.dev.pd, addr as *mut libc::c_void, len, access) };
         if mr.is_null() {
             return Err(enrich_reg_mr_error(io::Error::last_os_error(), len));
         }
-        Ok(RegisteredMr { mr })
+        // SAFETY: `mr` is a fresh registration on this context's PD.
+        Ok(unsafe { RegisteredMr::from_raw(mr, self.dev.clone()) })
     }
 
     /// Register a dma-buf region for RDMA access.
@@ -651,7 +723,7 @@ impl RdmaContext {
     /// `fd`; `iova` is the address the MR's range starts at for work
     /// requests (pass the CUDA device VA so existing address arithmetic
     /// keeps working). The fd may be closed after this returns — the MR
-    /// holds its own reference. Same Drop-order contract as [`Self::reg_mr`].
+    /// holds its own reference to the dma-buf.
     pub fn reg_mr_dmabuf(
         &self,
         fd: i32,
@@ -660,18 +732,49 @@ impl RdmaContext {
         iova: u64,
         access: i32,
     ) -> io::Result<RegisteredMr> {
-        // SAFETY: `self.pd` is alive; `fd/offset/len` are the caller's contract.
-        let mr = unsafe { super::ffi::ibv_reg_dmabuf_mr(self.pd, offset, len, iova, fd, access) };
+        // SAFETY: the PD is alive; the kernel bounds `offset/len` by the
+        // dma-buf, whose pages the MR pins by reference.
+        let mr =
+            unsafe { super::ffi::ibv_reg_dmabuf_mr(self.dev.pd, offset, len, iova, fd, access) };
         if mr.is_null() {
             return Err(io::Error::last_os_error());
         }
-        Ok(RegisteredMr { mr })
+        // SAFETY: `mr` is a fresh registration on this context's PD.
+        Ok(unsafe { RegisteredMr::from_raw(mr, self.dev.clone()) })
     }
 
-    /// Raw ibverbs context pointer (for creating QPs on this device).
+    /// Raw ibverbs context pointer. Using it is `unsafe`; the context lives
+    /// as long as this `RdmaContext` or anything created on it.
     pub fn context_ptr(&self) -> *mut IbvContext {
-        self.context
+        self.dev.context
     }
+}
+
+/// Pick the RDMA device nearest a PCI function (e.g. a GPU's
+/// `0000:3b:00.0`) in the PCIe hierarchy: the one sharing the longest
+/// prefix of sysfs device path — the same switch before the same root
+/// port before the same socket. Ties go to the lower index. `None` when
+/// sysfs cannot place the PCI function or any device.
+pub fn closest_device_to_pci(pci_bus_id: &str) -> Option<usize> {
+    let target = std::fs::canonicalize(format!("/sys/bus/pci/devices/{pci_bus_id}")).ok()?;
+    let devices = enumerate_devices().ok()?;
+    devices
+        .iter()
+        .filter_map(|d| {
+            let path =
+                std::fs::canonicalize(format!("/sys/class/infiniband/{}/device", d.name)).ok()?;
+            Some((pci_path_affinity(&target, &path), d.index))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+        .map(|(_, index)| index)
+}
+
+/// Shared leading components of two sysfs device paths.
+fn pci_path_affinity(a: &std::path::Path, b: &std::path::Path) -> usize {
+    a.components()
+        .zip(b.components())
+        .take_while(|(x, y)| x == y)
+        .count()
 }
 
 /// One discovered RDMA device — name + NUMA node.
@@ -742,91 +845,113 @@ fn read_numa_node(dev_name: &str) -> Option<i32> {
     std::fs::read_to_string(&path).ok()?.trim().parse().ok()
 }
 
-impl Drop for RdmaContext {
-    fn drop(&mut self) {
-        // SAFETY: handles were created in `open_on_device` and are live until now.
-        unsafe { ibv_destroy_cq(self.cq) };
-        // SAFETY: see above.
-        unsafe { ibv_dealloc_pd(self.pd) };
-        // SAFETY: see above.
-        unsafe { ibv_close_device(self.context) };
-    }
-}
-
 /// Create an additional completion queue on this context. Use this when you
 /// want per-thread CQs (one CQ per shard / worker thread) so polling threads
-/// don't contend on a single CQ. Returns an RAII `RegisteredCq` that destroys
-/// the CQ on drop. Callers MUST drop the CQ before this context.
+/// don't contend on a single CQ. The CQ keeps the device alive and is
+/// destroyed when its last handle (including any QP created on it) drops.
 pub fn create_cq(ctx: &RdmaContext, cq_size: i32) -> io::Result<RegisteredCq> {
-    // SAFETY: `ctx.context` is alive for as long as `ctx` is borrowed.
-    let cq = unsafe { ibv_create_cq(ctx.context, cq_size, ptr::null_mut(), ptr::null_mut(), 0) };
-    if cq.is_null() {
-        return Err(io::Error::other("ibv_create_cq failed"));
-    }
-    Ok(RegisteredCq { cq })
+    RegisteredCq::create(&ctx.dev, cq_size, None)
 }
 
-/// A CQ whose completions raise events on `channel` (see
-/// [`super::event::CompletionChannel`]). Same Drop contract as
-/// [`create_cq`], plus: drop the CQ before the channel.
-pub fn create_cq_on_channel(
-    ctx: &RdmaContext,
-    cq_size: i32,
-    channel: *mut IbvCompChannel,
-) -> io::Result<RegisteredCq> {
-    // SAFETY: `ctx.context` and `channel` are alive for the call; the
-    // channel pointer type matches the void* parameter's real ABI type.
-    let cq = unsafe {
-        ibv_create_cq(
-            ctx.context,
-            cq_size,
-            ptr::null_mut(),
-            channel as *mut libc::c_void,
-            0,
-        )
-    };
-    if cq.is_null() {
-        return Err(io::Error::other("ibv_create_cq failed"));
-    }
-    Ok(RegisteredCq { cq })
+/// A completion channel a CQ raises events on: the raw channel plus the
+/// owner that keeps it alive at least as long as the CQ.
+pub(crate) struct ChannelBinding {
+    pub(crate) channel: *mut IbvCompChannel,
+    pub(crate) owner: Arc<dyn Any + Send + Sync>,
 }
 
-/// RAII wrapper around `*mut IbvCq`. Drop calls `ibv_destroy_cq`.
-///
-/// Tied by contract (not lifetime) to the `RdmaContext` that created it —
-/// must be dropped before the context, otherwise `ibv_destroy_cq` would run
-/// against a freed device handle.
-pub struct RegisteredCq {
+struct CqInner {
     cq: *mut IbvCq,
+    capacity: u32,
+    // Drop order: the CQ is destroyed in `Drop::drop`, before the channel it
+    // raises events on and the device it lives on.
+    _channel: Option<Arc<dyn Any + Send + Sync>>,
+    _dev: Arc<Device>,
 }
 
-// SAFETY: ibverbs CQ is thread-safe after creation.
-unsafe impl Send for RegisteredCq {}
+// SAFETY: ibverbs CQs are thread-safe after creation.
+unsafe impl Send for CqInner {}
 // SAFETY: see Send impl above.
-unsafe impl Sync for RegisteredCq {}
+unsafe impl Sync for CqInner {}
+
+impl Drop for CqInner {
+    fn drop(&mut self) {
+        // SAFETY: the CQ was created in `RegisteredCq::create`; every QP on
+        // it holds a `RegisteredCq` clone, so none is left.
+        let rc = unsafe { ibv_destroy_cq(self.cq) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_destroy_cq failed");
+        }
+    }
+}
+
+/// A completion queue. Cloning shares it; QPs created on it hold a clone,
+/// so it is destroyed only after them.
+#[derive(Clone)]
+pub struct RegisteredCq {
+    inner: Arc<CqInner>,
+}
 
 impl RegisteredCq {
-    /// Raw `*mut IbvCq` for passing to QP creation / `ibv_poll_cq`.
+    pub(crate) fn create(
+        dev: &Arc<Device>,
+        cq_size: i32,
+        channel: Option<ChannelBinding>,
+    ) -> io::Result<Self> {
+        let capacity = u32::try_from(cq_size)
+            .ok()
+            .filter(|&c| c > 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cq_size must be > 0"))?;
+        let raw_channel = channel
+            .as_ref()
+            .map_or(ptr::null_mut(), |c| c.channel as *mut libc::c_void);
+        // SAFETY: the context is open for as long as `dev` lives; the channel,
+        // when given, belongs to it and is kept alive by the binding's owner.
+        let cq = unsafe { ibv_create_cq(dev.context, cq_size, ptr::null_mut(), raw_channel, 0) };
+        if cq.is_null() {
+            return Err(io::Error::other("ibv_create_cq failed"));
+        }
+        Ok(Self {
+            inner: Arc::new(CqInner {
+                cq,
+                capacity,
+                _channel: channel.map(|c| c.owner),
+                _dev: dev.clone(),
+            }),
+        })
+    }
+
+    /// Raw `*mut IbvCq`. Using it is `unsafe`; it lives as long as any clone.
     #[inline]
     pub fn as_ptr(&self) -> *mut IbvCq {
-        self.cq
+        self.inner.cq
+    }
+
+    /// The depth requested at creation; the provider may round it up.
+    pub fn capacity(&self) -> u32 {
+        self.inner.capacity
+    }
+
+    /// Poll up to `wcs.len()` completions.
+    pub fn poll(&self, wcs: &mut [IbvWc]) -> io::Result<usize> {
+        let n = i32::try_from(wcs.len()).unwrap_or(i32::MAX);
+        // SAFETY: the CQ is alive for `self`'s lifetime; `wcs` has room for `n`.
+        let ret = unsafe { ibv_poll_cq(self.inner.cq, n, wcs.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(io::Error::other(format!("ibv_poll_cq failed: {ret}")));
+        }
+        Ok(ret as usize)
     }
 }
 
-impl Drop for RegisteredCq {
-    fn drop(&mut self) {
-        // SAFETY: `self.cq` was returned by `ibv_create_cq` and is live until now.
-        unsafe { ibv_destroy_cq(self.cq) };
-    }
-}
-
-/// RAII wrapper around `*mut IbvMr` — calls `ibv_dereg_mr` on drop.
-///
-/// Holds no lifetime to the owning `RdmaContext` (would be viral). Caller must
-/// drop this before the context. The accessor methods (`lkey`, `rkey`, `as_ptr`)
-/// are zero-cost — the underlying `IbvMr` struct is non-opaque from `aether-mem`.
+/// RAII wrapper around `*mut IbvMr` — calls `ibv_dereg_mr` on drop, then
+/// releases the PD owner it holds, so the PD always outlives the MR. The
+/// accessor methods (`lkey`, `rkey`, `as_ptr`) are zero-cost — the
+/// underlying `IbvMr` struct is non-opaque from `aether-mem`.
 pub struct RegisteredMr {
     mr: *mut IbvMr,
+    // Released after `Drop::drop` deregisters the MR.
+    _owner: Arc<dyn Any + Send + Sync>,
 }
 
 // SAFETY: ibverbs MR is thread-safe after creation.
@@ -835,24 +960,25 @@ unsafe impl Send for RegisteredMr {}
 unsafe impl Sync for RegisteredMr {}
 
 impl RegisteredMr {
-    /// Wrap an existing `ibv_reg_mr`-produced MR handle.
+    /// Take ownership of a fresh registration.
     ///
     /// # Safety
-    /// `mr` must be non-null, owned by the caller, and not yet deregistered.
-    /// This wrapper takes ownership and will call `ibv_dereg_mr` on drop.
-    /// Used by alternate transport paths (SRD) that call `ibv_reg_mr` directly.
+    /// `mr` must be non-null, owned by the caller, not yet deregistered, and
+    /// registered on the PD that `owner` keeps alive.
     #[inline]
-    pub unsafe fn __from_raw_mr(mr: *mut IbvMr) -> Self {
-        debug_assert!(!mr.is_null(), "__from_raw_mr called with null pointer");
-        Self { mr }
+    pub(crate) unsafe fn from_raw(mr: *mut IbvMr, owner: Arc<dyn Any + Send + Sync>) -> Self {
+        debug_assert!(
+            !mr.is_null(),
+            "RegisteredMr::from_raw called with null pointer"
+        );
+        Self { mr, _owner: owner }
     }
 
     /// Local key for use as `local_lkey` in send/RDMA work requests.
     #[inline]
     pub fn lkey(&self) -> u32 {
-        // SAFETY: mr is non-null for the lifetime of this wrapper (asserted in
-        // reg_mr / __from_raw_mr) and the IbvMr layout has been stable since
-        // libibverbs 1.0.
+        // SAFETY: mr is non-null for the lifetime of this wrapper and the
+        // IbvMr layout has been stable since libibverbs 1.0.
         unsafe { (*self.mr).lkey }
     }
 
@@ -873,9 +999,11 @@ impl RegisteredMr {
 
 impl Drop for RegisteredMr {
     fn drop(&mut self) {
-        // SAFETY: mr was returned by ibv_reg_mr in reg_mr / __from_raw_mr; we own it.
-        unsafe {
-            ibv_dereg_mr(self.mr);
+        // SAFETY: mr was returned by ibv_reg_mr and is owned here; its PD is
+        // still alive through `_owner`.
+        let rc = unsafe { ibv_dereg_mr(self.mr) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_dereg_mr failed");
         }
     }
 }
@@ -889,6 +1017,56 @@ mod tests {
         // Unlimited → Ok. Finite limit larger than a tiny request → Ok.
         // We only assert the helper does not spuriously fail for 1 byte.
         check_memlock_for(1).expect("1-byte registration must clear memlock check");
+    }
+
+    #[test]
+    fn pin_state_reads_cap_ipc_lock_and_vm_pin() {
+        let root = PinState::parse("Name:\tx\nVmPin:\t    2048 kB\nCapEff:\t000001ffffffffff\n");
+        assert!(root.cap_ipc_lock);
+        assert_eq!(root.pinned_bytes, 2048 * 1024);
+
+        // Bit 14 clear: an unprivileged process.
+        let user = PinState::parse("VmPin:\t0 kB\nCapEff:\t0000000000000000\n");
+        assert!(!user.cap_ipc_lock);
+        assert_eq!(user.pinned_bytes, 0);
+
+        // Only CAP_IPC_LOCK set.
+        assert!(PinState::parse("CapEff:\t0000000000004000\n").cap_ipc_lock);
+    }
+
+    #[test]
+    fn memlock_verdict_mirrors_the_kernel_charge() {
+        let unprivileged = |pinned| PinState {
+            cap_ipc_lock: false,
+            pinned_bytes: pinned,
+        };
+        // Unlimited never fails.
+        assert!(memlock_verdict(usize::MAX, None, unprivileged(0)).is_ok());
+        // Fits on its own.
+        assert!(memlock_verdict(100, Some(100), unprivileged(0)).is_ok());
+        // Fits alone but not on top of what is already pinned.
+        let err = memlock_verdict(100, Some(150), unprivileged(60)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        // CAP_IPC_LOCK is exempt from the limit entirely.
+        let privileged = PinState {
+            cap_ipc_lock: true,
+            pinned_bytes: 1 << 40,
+        };
+        assert!(memlock_verdict(1 << 40, Some(64 << 10), privileged).is_ok());
+    }
+
+    #[test]
+    fn pci_affinity_prefers_the_deepest_shared_bridge() {
+        use std::path::Path;
+        let gpu = Path::new("/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:00.0");
+        let same_switch =
+            Path::new("/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:03:00.0");
+        let same_root = Path::new("/sys/devices/pci0000:00/0000:00:02.0/0000:04:00.0");
+        let other_socket = Path::new("/sys/devices/pci0000:80/0000:80:01.0/0000:81:00.0");
+        let s = pci_path_affinity(gpu, same_switch);
+        let r = pci_path_affinity(gpu, same_root);
+        let o = pci_path_affinity(gpu, other_socket);
+        assert!(s > r && r > o, "switch {s} > root {r} > socket {o}");
     }
 
     #[test]

@@ -9,7 +9,7 @@ mod cache;
 mod cold_tier;
 #[cfg(target_os = "linux")]
 pub(crate) mod gather;
-#[cfg(feature = "gds")]
+#[cfg(all(target_os = "linux", feature = "gds"))]
 mod gds;
 pub(crate) mod header;
 #[cfg(all(target_os = "linux", feature = "shm"))]
@@ -22,7 +22,7 @@ pub use async_store::AsyncFeatureStore;
 pub use cache::{CacheStats, FeatureCache, FeatureCacheConfig, count_node_frequencies};
 #[cfg(feature = "zstd-tier")]
 pub use cold_tier::{ColdStore, ColdTier, ROWS_PER_BLOCK};
-#[cfg(feature = "gds")]
+#[cfg(all(target_os = "linux", feature = "gds"))]
 pub use gds::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
 pub use header::{FeatureDtype, FeatureHeader, parse_feature_header};
 #[cfg(all(target_os = "linux", feature = "shm"))]
@@ -32,6 +32,32 @@ pub use store::{
     FeatureData, FeatureLoadTelemetry, FeatureStore, create_features, save_feature_data,
     save_features, save_features_bf16, save_features_f16, save_features_ndarray,
 };
+
+/// Turn `O_DIRECT` on or off for an open descriptor, in place.
+///
+/// Reopening by path would race a replacement of the file; flipping the
+/// flag keeps I/O on the inode whose header was already validated. Turning
+/// it on fails with `EINVAL` where the filesystem cannot do direct I/O.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_direct_io(file: &std::fs::File, on: bool) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is live for the call; F_GETFL takes no argument.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = if on {
+        flags | libc::O_DIRECT
+    } else {
+        flags & !libc::O_DIRECT
+    };
+    // SAFETY: as above; F_SETFL takes the int flag word.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// Trait for reading node features from any backing store.
 ///

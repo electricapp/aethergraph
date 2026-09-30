@@ -22,14 +22,16 @@ const KERNEL_NAME: &str = "dequant_block_i8_rows";
 /// Ceiling on the dequant grid; the kernel grid-strides past it.
 const MAX_DEQUANT_BLOCKS: u32 = 4096;
 
-/// One encoded feature block resident in VRAM.
+/// One encoded feature block resident in VRAM. Built only by
+/// [`Self::upload`] from a [`BlockScaledI8`], so the code and scale buffers
+/// always cover `rows` rows of `feature_dim`.
 pub struct QuantizedRowsDevice {
     /// `rows * feature_dim` codes, row-major, as raw bytes.
-    pub codes: CudaSlice<u8>,
+    codes: CudaSlice<u8>,
     /// `rows * blocks_per_row` scales, row-major.
-    pub scales: CudaSlice<f32>,
-    pub rows: usize,
-    pub feature_dim: usize,
+    scales: CudaSlice<f32>,
+    rows: usize,
+    feature_dim: usize,
 }
 
 impl QuantizedRowsDevice {
@@ -38,6 +40,11 @@ impl QuantizedRowsDevice {
         stream: &Arc<CudaStream>,
         encoded: &BlockScaledI8,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let rows = encoded.rows();
+        let dim = encoded.dim();
+        if i32::try_from(rows).is_err() || i32::try_from(dim).is_err() {
+            return Err(format!("{rows}x{dim} block exceeds the kernel's i32 extents").into());
+        }
         // i8 and u8 have the same layout; the kernel re-signs each byte on
         // read, so the transfer is a plain byte copy.
         // SAFETY: `i8` and `u8` have identical size and alignment, the
@@ -57,9 +64,21 @@ impl QuantizedRowsDevice {
         Ok(Self {
             codes,
             scales,
-            rows: encoded.rows(),
-            feature_dim: encoded.dim(),
+            rows,
+            feature_dim: dim,
         })
+    }
+
+    /// Row count.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Features per row.
+    #[must_use]
+    pub fn feature_dim(&self) -> usize {
+        self.feature_dim
     }
 }
 
@@ -89,7 +108,10 @@ impl FeatureDequantizer {
 
     /// Enqueue a decode of every row in `src`.
     pub fn decode(&mut self, src: &QuantizedRowsDevice) -> Result<(), Box<dyn std::error::Error>> {
-        let elements = src.rows * src.feature_dim;
+        let elements = src
+            .rows
+            .checked_mul(src.feature_dim)
+            .ok_or("rows * feature_dim overflows")?;
         if elements > self.capacity {
             return Err(format!("{elements} elements exceeds capacity {}", self.capacity).into());
         }
@@ -99,11 +121,12 @@ impl FeatureDequantizer {
         let feature_dim = i32::try_from(src.feature_dim)?;
         let rows = i32::try_from(src.rows)?;
         let threads = 256u32;
-        let blocks = (src.rows as u32)
-            .div_ceil(threads / 32)
+        let blocks = u32::try_from(src.rows.div_ceil((threads / 32) as usize))
+            .unwrap_or(u32::MAX)
             .clamp(1, MAX_DEQUANT_BLOCKS);
-        // SAFETY: argument list matches dequant_block_i8_rows, and `output`
-        // holds `rows * feature_dim` f32 (checked above).
+        // SAFETY: argument list matches dequant_block_i8_rows; `src` came
+        // from a BlockScaledI8, so its codes and scales cover `rows` rows,
+        // and `output` holds `rows * feature_dim` f32 (checked above).
         unsafe {
             self.stream
                 .launch_builder(&self.func)

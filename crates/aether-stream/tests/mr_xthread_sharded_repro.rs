@@ -78,7 +78,6 @@ fn main_preregisters_mrs_ships_to_caller_threads() {
             &client_ctx,
             ShardedConfig {
                 num_shards: NUM_SHARDS,
-                cq_size: 256,
                 qp_cap: DEFAULT_QP_CAP,
                 worker_cores: vec![],
                 ..Default::default()

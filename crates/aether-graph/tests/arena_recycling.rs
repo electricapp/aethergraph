@@ -34,7 +34,7 @@ fn bounded_arena_sustains_rewrite_churn() {
     }
     let stats = w.recycle_stats();
     assert!(
-        stats.free_chunks + stats.pending > 0 || stats.leaked == 0,
+        stats.free_chunks + stats.free_interiors + stats.pending > 0,
         "churn of this volume must have exercised the recycler: {stats:?}"
     );
     drop(w);

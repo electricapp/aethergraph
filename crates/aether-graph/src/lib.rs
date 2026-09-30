@@ -32,4 +32,4 @@ pub use historical::{HistoricalBatch, HistoricalSampler};
 pub use snapshot::Snapshot;
 #[cfg(feature = "wal")]
 pub use wal::{EdgeRecord, ReplayOutcome, WalError, WalWriter, replay as replay_wal};
-pub use writer::{InsertError, Writer, WriterError};
+pub use writer::{InsertError, SortedDsts, Writer, WriterError};

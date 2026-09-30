@@ -73,6 +73,13 @@ impl GenSlots {
             (next_local, true)
         }
     }
+
+    /// Local index of `global` if it was recorded in the current pass.
+    #[inline(always)]
+    pub(crate) fn get(&self, global: NodeId) -> Option<u32> {
+        let slot = *self.slots.get(global as usize)?;
+        ((slot >> 32) as u32 == self.generation).then_some(slot as u32)
+    }
 }
 
 /// Two-mode node dedup: a dense [`GenSlots`] table when the ID space is
@@ -109,6 +116,15 @@ impl GenDedup {
                     (next_local, true)
                 }
             },
+        }
+    }
+
+    /// Local index of `global` if it was recorded in the current pass.
+    #[inline(always)]
+    pub(crate) fn get(&self, global: NodeId) -> Option<u32> {
+        match self {
+            Self::Dense(slots) => slots.get(global),
+            Self::Map(map) => map.get(&global).copied(),
         }
     }
 }
@@ -211,7 +227,10 @@ mod tests {
             assert_eq!(d.probe_or_insert(7, 0), (0, true));
             assert_eq!(d.probe_or_insert(2, 1), (1, true));
             assert_eq!(d.probe_or_insert(7, 2), (0, false));
+            assert_eq!(d.get(7), Some(0));
+            assert_eq!(d.get(3), None);
             d.begin();
+            assert_eq!(d.get(7), None);
             assert_eq!(d.probe_or_insert(2, 0), (0, true));
         }
     }

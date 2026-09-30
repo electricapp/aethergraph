@@ -50,16 +50,20 @@ instant startup.
 
 **Cache-locality reordering (Rabbit Order, Arai et al. IPDPS 2016):**
 
-- Phase 1 (parallel over V): each node picks its lowest-degree neighbor as a
-  merge candidate.
-- Phase 2 (parallel over E): lock-free concurrent union-find with `AtomicU32`
-  parent + rank, path-splitting `find`, CAS `union`. Logs `(winner, loser)`
-  pairs in merge order.
-- Phase 3 (sequential O(V)): replay the merge log into a dendrogram and emit the
-  permutation by in-order traversal.
-- Community partitions are a free byproduct of the merge log —
-  `rabbit_partitions()` runs a sequential UF replay without rebuilding the
-  dendrogram. `reorder_rabbit_with_partitions()` returns both in one pass.
+- Parallel setup: undirected degrees and the in-edge transpose, so directed
+  inputs cluster on both edge directions.
+- Incremental aggregation (sequential, ascending degree): each vertex sums the
+  edges of everything already merged into it, then merges into the neighbor
+  community with the largest modularity gain `2m·w(u,c) − d(u)·d(c)` (aggregated
+  community degrees, exact in i128) — only while that gain is positive.
+  Communities therefore stop growing at the modularity optimum the greedy order
+  reaches instead of collapsing into connected components.
+- The merges form a dendrogram; a pre-order walk (each community, then its
+  children) emits the permutation. Deterministic: the same graph always gives
+  the same permutation.
+- Community partitions come from the same dendrogram — `rabbit_partitions()`
+  labels each vertex by its top-level community, and
+  `reorder_rabbit_with_partitions()` returns both from one detection pass.
 - `partition_aligned_batches` uses the partition labels to construct seed
   batches whose neighborhoods overlap, amortizing destination-array reads across
   the batch.
@@ -282,8 +286,8 @@ HeteroNeighborSampler:
 | `HeteroGraph`           | core          | Multi-relational CSR (one per edge type)         |
 | `DynamicGraph`          | aether-graph  | Lock-free C-tree, concurrent R/W                 |
 | `NeighborSampler`       | core          | Floyd's O(k) sampling, zero-alloc                |
-| `reorder_rabbit`        | core          | Rabbit Order permutation (parallel UF merge)     |
-| `rabbit_partitions`     | core          | Community labels (free byproduct of merge log)   |
+| `reorder_rabbit`        | core          | Rabbit Order permutation (modularity merge)      |
+| `rabbit_partitions`     | core          | Community labels from the same dendrogram        |
 | `HeteroNeighborSampler` | core          | Typed multi-hop, pre-computed local indices      |
 | `NeighborLoader`        | core          | Prefetch thread, io_uring features               |
 | `FeatureTable`          | aether-stream | Seqlock feature table for RDMA                   |
@@ -346,7 +350,7 @@ Layout (v1):
   num_nodes           u64
   num_edges           u64
   has_weights         u32  (0 = absent, 1 = present)
-  integrity_checksum  u32  (0 = absent; FNV-1a 32-bit of offsets+edges otherwise;
+  integrity_checksum  u32  (0 = absent; CRC32 (IEEE) of offsets+edges otherwise;
                             verified only under Full validation — large files
                             default to OffsetsOnly, which skips the body hash)
 
@@ -354,6 +358,16 @@ Layout (v1):
 [Edges:   num_edges × 4 bytes,        u32 LE]
 [Weights: num_edges × 4 bytes,        f32 LE] (only if has_weights = 1)
 ```
+
+`num_nodes` is at most `u32::MAX` (node ids are `u32`, and `u32::MAX` itself is
+never an id). Every loaded `Graph` records how much it has proven — `HeaderOnly`
+(lengths and first/last offsets), `OffsetsOnly` (plus monotone offsets), `Full`
+(plus every destination in range) — and never reports less than was asked for.
+An mmap load proves exactly the requested level; owned and v2 loads read every
+byte and are always `Full`. `validate_with_mode` raises the level once, and
+whole-graph rebuilds (`permute`, Rabbit Order) prove `Full` before touching the
+arrays. Saves write a temporary sibling, fsync it, and rename it over the
+target, so a graph still mapped from that path keeps reading its old contents.
 
 Forward-compat policy:
 

@@ -241,7 +241,7 @@ def train(
 
             optimizer.zero_grad()
             out = model(batch.x, batch.edge_index)
-            seed_idx = batch.input_id
+            seed_idx = batch.seed_index
             loss = F.cross_entropy(out[seed_idx], batch_labels[seed_idx])
             loss.backward()  # type: ignore[no-untyped-call]
             optimizer.step()
@@ -267,7 +267,7 @@ def train(
                 batch = batch.to(device)
                 batch_labels = labels[batch.n_id].to(device)
                 logits = model(batch.x, batch.edge_index)
-                seed_idx = batch.input_id
+                seed_idx = batch.seed_index
                 pred = logits[seed_idx].argmax(dim=1)
                 correct += (pred == batch_labels[seed_idx]).sum().item()
                 total += int(seed_idx.numel())

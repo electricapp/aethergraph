@@ -18,11 +18,11 @@
 //! ```
 
 use crate::graph::DynamicGraph;
-use crate::writer::{InsertError, WriterError};
+use crate::writer::{InsertError, Writer, WriterError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Number of edges a single writer guard absorbs before every ingest
 /// loop drops and reacquires it. Each guard drop commits (WAL sync when
@@ -30,6 +30,71 @@ use std::time::Duration;
 /// crash can lose and how stale epoch-pinned readers can get during a
 /// long ingest session.
 pub const COMMIT_INTERVAL_EDGES: usize = 65_536;
+
+/// Longest an ingested edge waits for its commit while the source keeps
+/// delivering. Past it, the next edge (or batch boundary) commits; a
+/// source that goes idle commits at once. Bounds staleness and the crash
+/// window for slow sources that never reach [`COMMIT_INTERVAL_EDGES`].
+pub const COMMIT_MAX_LATENCY: Duration = Duration::from_millis(100);
+
+/// A writer guard plus the counters that decide when to commit it.
+struct Committer<'g> {
+    graph: &'g DynamicGraph,
+    /// `None` only between a commit and a failed reacquire.
+    writer: Option<Writer<'g>>,
+    edges: usize,
+    opened: Instant,
+}
+
+impl<'g> Committer<'g> {
+    fn open(graph: &'g DynamicGraph) -> Result<Self, WriterError> {
+        Ok(Self {
+            graph,
+            writer: Some(graph.writer()?),
+            edges: 0,
+            opened: Instant::now(),
+        })
+    }
+
+    /// Insert one edge; `false` on a fatal error (see [`drive_edge`]).
+    #[inline]
+    fn insert(&mut self, local: &mut LocalCounts, src: u32, dst: u32) -> bool {
+        let writer = self.writer.as_mut().expect("a live guard between commits");
+        let ok = drive_edge(writer, local, src, dst);
+        self.edges += usize::from(ok);
+        ok
+    }
+
+    /// Has the guard absorbed a full interval? A counter compare, cheap
+    /// enough for every edge.
+    #[inline]
+    fn full(&self) -> bool {
+        self.edges >= COMMIT_INTERVAL_EDGES
+    }
+
+    /// Full, or holding an edge longer than [`COMMIT_MAX_LATENCY`]?
+    #[inline]
+    fn due(&self) -> bool {
+        self.full() || (self.edges > 0 && self.opened.elapsed() >= COMMIT_MAX_LATENCY)
+    }
+
+    /// Commit if the guard holds any edge — for a source gone idle.
+    fn commit_pending(&mut self) -> Result<(), WriterError> {
+        if self.edges > 0 {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Drop the guard (committing it) and open the next one.
+    fn commit(&mut self) -> Result<(), WriterError> {
+        self.writer = None;
+        self.writer = Some(self.graph.writer()?);
+        self.edges = 0;
+        self.opened = Instant::now();
+        Ok(())
+    }
+}
 
 /// Ingestion statistics. Lock-free, read from any thread.
 #[derive(Debug)]
@@ -182,10 +247,11 @@ fn drive_edge(
 /// Calls `next_edge()` repeatedly until it returns `None`. Single-threaded
 /// on the write side. Readers may sample concurrently.
 ///
-/// Durability cadence: the writer guard is dropped and reacquired every
-/// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
-/// epoch advance) at that interval and again when the run ends. Stats are
-/// folded into the returned [`IngestStats`] at the same cadence.
+/// Durability cadence: the guard commits (WAL sync when attached, epoch
+/// advance) every [`COMMIT_INTERVAL_EDGES`] edges, once an edge has waited
+/// [`COMMIT_MAX_LATENCY`] — checked as edges arrive, so a closure that
+/// blocks holds its latest edges until it returns — and when the run ends.
+/// Stats are folded into the returned [`IngestStats`] at each commit.
 ///
 /// Returns `Err(IngestSpawnError::Writer(_))` if the writer slot is busy
 /// or poisoned (see [`WriterError`]), either at the start or when a
@@ -196,19 +262,14 @@ pub fn run(
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
     let mut local = LocalCounts::default();
-    let mut writer = graph.writer()?;
-    let mut guard_edges = 0usize;
+    let mut guard = Committer::open(graph)?;
     while let Some((src, dst)) = next_edge() {
-        let ok = drive_edge(&mut writer, &mut local, src, dst);
-        if !ok {
+        if !guard.insert(&mut local, src, dst) {
             break;
         }
-        guard_edges += 1;
-        if guard_edges >= COMMIT_INTERVAL_EDGES {
+        if guard.due() {
             local.flush(&stats);
-            drop(writer);
-            writer = graph.writer()?;
-            guard_edges = 0;
+            guard.commit()?;
         }
     }
     local.flush(&stats);
@@ -217,8 +278,9 @@ pub fn run(
 
 /// Ingest edges in batches from an iterator of `(src, dst)` slices.
 ///
-/// Durability cadence: the writer guard is dropped and reacquired every
-/// [`COMMIT_INTERVAL_EDGES`] edges — batch boundaries deliberately do NOT
+/// Durability cadence: the guard commits every [`COMMIT_INTERVAL_EDGES`]
+/// edges, and at a batch boundary once an edge has waited
+/// [`COMMIT_MAX_LATENCY`] — batch boundaries alone deliberately do NOT
 /// force a commit. A caller feeding 100-edge batches would otherwise pay
 /// an fsync every 100 edges (a 650x amplification over the interval),
 /// capping ingest at the storage's fsync rate. A final commit still runs
@@ -230,21 +292,20 @@ pub fn run_batches(
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
     let mut local = LocalCounts::default();
-    let mut writer = graph.writer()?;
-    let mut guard_edges = 0usize;
+    let mut guard = Committer::open(graph)?;
     'outer: for batch in batches {
         for &(src, dst) in &batch {
-            let ok = drive_edge(&mut writer, &mut local, src, dst);
-            if !ok {
+            if !guard.insert(&mut local, src, dst) {
                 break 'outer;
             }
-            guard_edges += 1;
-            if guard_edges >= COMMIT_INTERVAL_EDGES {
+            if guard.full() {
                 local.flush(&stats);
-                drop(writer);
-                writer = graph.writer()?;
-                guard_edges = 0;
+                guard.commit()?;
             }
+        }
+        if guard.due() {
+            local.flush(&stats);
+            guard.commit()?;
         }
     }
     local.flush(&stats);
@@ -259,10 +320,10 @@ pub fn run_batches(
 /// left behind. Returns `Err` if the writer slot is busy or poisoned, or
 /// if the OS refuses to spawn the thread.
 ///
-/// Durability cadence: the writer guard is dropped and reacquired every
-/// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
-/// epoch advance) at that interval. A failed reacquire bumps
-/// `stats.errors` and stops the thread.
+/// Durability cadence: the guard commits (WAL sync when attached, epoch
+/// advance) every [`COMMIT_INTERVAL_EDGES`] edges, once an edge has waited
+/// [`COMMIT_MAX_LATENCY`], and as soon as the source runs dry. A failed
+/// reacquire bumps `stats.errors` and stops the thread.
 pub fn spawn(
     graph: Arc<DynamicGraph>,
     stop: Arc<AtomicBool>,
@@ -277,10 +338,10 @@ pub fn spawn(
     let handle = std::thread::Builder::new()
         .name("edge-ingestor".into())
         .spawn(move || {
-            let mut writer = match graph.writer() {
-                Ok(w) => {
+            let mut guard = match Committer::open(&graph) {
+                Ok(g) => {
                     let _ = ready_tx.send(Ok(()));
-                    w
+                    g
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -288,47 +349,46 @@ pub fn spawn(
                 }
             };
             let mut local = LocalCounts::default();
-            let mut guard_edges = 0usize;
             let mut idle_spins = 0u32;
             while !stop.load(Ordering::Acquire) {
-                match next_edge() {
+                let committed = match next_edge() {
                     Some((src, dst)) => {
                         idle_spins = 0;
-                        let ok = drive_edge(&mut writer, &mut local, src, dst);
-                        if !ok {
+                        if !guard.insert(&mut local, src, dst) {
                             break;
                         }
-                        guard_edges += 1;
-                        if guard_edges >= COMMIT_INTERVAL_EDGES {
+                        if guard.due() {
                             local.flush(&stats_clone);
-                            drop(writer);
-                            writer = match graph.writer() {
-                                Ok(w) => w,
-                                Err(e) => {
-                                    stats_clone.errors.fetch_add(1, Ordering::Relaxed);
-                                    tracing::error!(
-                                        error = %e,
-                                        "ingestor could not reacquire the writer slot; stopping"
-                                    );
-                                    return;
-                                }
-                            };
-                            guard_edges = 0;
+                            guard.commit()
+                        } else {
+                            Ok(())
                         }
                     }
                     None => {
                         // Source momentarily dry. Make buffered stats
                         // visible, spin briefly for a bursty source, then
-                        // park — jumping straight to a 1 ms sleep adds up
-                        // to 1 ms latency per gap.
+                        // commit what the guard holds and park — jumping
+                        // straight to a 1 ms sleep adds up to 1 ms latency
+                        // per gap.
                         local.flush(&stats_clone);
                         idle_spins += 1;
                         if idle_spins < 64 {
                             std::hint::spin_loop();
+                            Ok(())
                         } else {
+                            let committed = guard.commit_pending();
                             std::thread::park_timeout(Duration::from_millis(1));
+                            committed
                         }
                     }
+                };
+                if let Err(e) = committed {
+                    stats_clone.errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        error = %e,
+                        "ingestor could not reacquire the writer slot; stopping"
+                    );
+                    return;
                 }
             }
             local.flush(&stats_clone);
@@ -350,52 +410,67 @@ pub fn spawn(
     }
 }
 
+/// Drain a channel into `guard` until the sender disconnects or `stop` is
+/// set: block once per burst, then pull everything already queued with
+/// non-blocking `try_recv` — a timeout-armed recv per edge (deadline
+/// construction + park/unpark) would cap throughput far below the writer
+/// itself. A quiet channel commits what the guard holds; a burst commits
+/// at the interval, or at its end once an edge has waited
+/// [`COMMIT_MAX_LATENCY`].
+fn drain_into(
+    guard: &mut Committer<'_>,
+    rx: &Receiver<(u32, u32)>,
+    stop: &AtomicBool,
+    stats: &IngestStats,
+) -> Result<(), WriterError> {
+    let mut local = LocalCounts::default();
+    'outer: while !stop.load(Ordering::Acquire) {
+        let first = match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(edge) => edge,
+            Err(RecvTimeoutError::Timeout) => {
+                local.flush(stats);
+                guard.commit_pending()?;
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let mut next = Some(first);
+        while let Some((src, dst)) = next {
+            if !guard.insert(&mut local, src, dst) {
+                break 'outer;
+            }
+            if guard.full() {
+                local.flush(stats);
+                guard.commit()?;
+            }
+            next = rx.try_recv().ok();
+        }
+        local.flush(stats);
+        if guard.due() {
+            guard.commit()?;
+        }
+    }
+    local.flush(stats);
+    Ok(())
+}
+
 /// Drain a [`Receiver<(u32, u32)>`] of edges into the graph.
 ///
 /// Replaces the busy-wait pattern: the thread blocks on the channel and wakes
 /// on each batch. Returns when the sender is dropped or `stop` is set.
 ///
-/// Durability cadence: the writer guard is dropped and reacquired every
-/// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
-/// epoch advance) at that interval. A failed reacquire returns
-/// `Err(IngestSpawnError::Writer(_))`.
+/// Durability cadence: the guard commits (WAL sync when attached, epoch
+/// advance) every [`COMMIT_INTERVAL_EDGES`] edges, once an edge has waited
+/// [`COMMIT_MAX_LATENCY`], and whenever the channel goes quiet. A failed
+/// reacquire returns `Err(IngestSpawnError::Writer(_))`.
 pub fn drain_channel(
     graph: &DynamicGraph,
     rx: Receiver<(u32, u32)>,
     stop: &AtomicBool,
 ) -> Result<IngestStats, IngestSpawnError> {
     let stats = IngestStats::new();
-    let mut local = LocalCounts::default();
-    let mut writer = graph.writer()?;
-    let mut guard_edges = 0usize;
-    'outer: while !stop.load(Ordering::Acquire) {
-        // One blocking receive arms the drain; everything already queued
-        // is then pulled with non-blocking try_recv — a timeout-armed recv
-        // per edge (deadline construction + park/unpark) would cap
-        // throughput far below the writer itself.
-        let first = match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(edge) => edge,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        let mut next = Some(first);
-        while let Some((src, dst)) = next {
-            let ok = drive_edge(&mut writer, &mut local, src, dst);
-            if !ok {
-                break 'outer;
-            }
-            guard_edges += 1;
-            if guard_edges >= COMMIT_INTERVAL_EDGES {
-                local.flush(&stats);
-                drop(writer);
-                writer = graph.writer()?;
-                guard_edges = 0;
-            }
-            next = rx.try_recv().ok();
-        }
-        local.flush(&stats);
-    }
-    local.flush(&stats);
+    let mut guard = Committer::open(graph)?;
+    drain_into(&mut guard, &rx, stop, &stats)?;
     Ok(stats)
 }
 
@@ -451,9 +526,7 @@ pub struct ChannelIngestor {
 /// The channel is bounded by `cfg.capacity`. Producers block on full —
 /// see [`SyncSender::try_send`] for non-blocking variants.
 ///
-/// Durability cadence: the writer guard is dropped and reacquired every
-/// [`COMMIT_INTERVAL_EDGES`] edges, committing (WAL sync when attached,
-/// epoch advance) at that interval. A failed reacquire bumps
+/// Durability cadence: as [`drain_channel`]. A failed reacquire bumps
 /// `stats.errors` and stops the drainer.
 pub fn spawn_channel(
     graph: Arc<DynamicGraph>,
@@ -469,54 +542,23 @@ pub fn spawn_channel(
     let handle = std::thread::Builder::new()
         .name("edge-ingestor-chan".into())
         .spawn(move || {
-            let mut writer = match graph.writer() {
-                Ok(w) => {
+            let mut guard = match Committer::open(&graph) {
+                Ok(g) => {
                     let _ = ready_tx.send(Ok(()));
-                    w
+                    g
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
                     return;
                 }
             };
-            let mut local = LocalCounts::default();
-            let mut guard_edges = 0usize;
-            'outer: while !stop.load(Ordering::Acquire) {
-                // Same drain pattern as `drain_channel`: block once, then
-                // pull everything queued with non-blocking try_recv.
-                let first = match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(edge) => edge,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                };
-                let mut next = Some(first);
-                while let Some((src, dst)) = next {
-                    let ok = drive_edge(&mut writer, &mut local, src, dst);
-                    if !ok {
-                        break 'outer;
-                    }
-                    guard_edges += 1;
-                    if guard_edges >= COMMIT_INTERVAL_EDGES {
-                        local.flush(&stats_clone);
-                        drop(writer);
-                        writer = match graph.writer() {
-                            Ok(w) => w,
-                            Err(e) => {
-                                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
-                                tracing::error!(
-                                    error = %e,
-                                    "drainer could not reacquire the writer slot; stopping"
-                                );
-                                return;
-                            }
-                        };
-                        guard_edges = 0;
-                    }
-                    next = rx.try_recv().ok();
-                }
-                local.flush(&stats_clone);
+            if let Err(e) = drain_into(&mut guard, &rx, &stop, &stats_clone) {
+                stats_clone.errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    error = %e,
+                    "drainer could not reacquire the writer slot; stopping"
+                );
             }
-            local.flush(&stats_clone);
         })
         .map_err(IngestSpawnError::Thread)?;
     match ready_rx.recv() {
@@ -645,6 +687,87 @@ mod tests {
         bundle.handle.join().unwrap();
 
         assert_eq!(bundle.stats.received(), 50);
+    }
+
+    /// Poll `f` until it holds or `limit` passes.
+    fn eventually(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        f()
+    }
+
+    #[test]
+    fn channel_trickle_commits_when_the_channel_goes_quiet() {
+        let graph = Arc::new(DynamicGraph::new(100, 1 << 20));
+        let stop = Arc::new(AtomicBool::new(false));
+        let bundle = spawn_channel(
+            Arc::clone(&graph),
+            Arc::clone(&stop),
+            ChannelIngestorConfig::default(),
+        )
+        .unwrap();
+        let before = graph.current_epoch();
+        bundle.sender.send((1, 2)).unwrap();
+        // Far below the edge interval: only the quiet-channel commit
+        // publishes it.
+        assert!(
+            eventually(Duration::from_secs(5), || graph.acquire().degree(&graph, 1)
+                == 1),
+            "a trickled edge never reached a committed snapshot"
+        );
+        assert!(graph.current_epoch() > before);
+        assert_eq!(graph.num_edges(), 1);
+        stop.store(true, Ordering::Release);
+        drop(bundle.sender);
+        bundle.handle.join().unwrap();
+    }
+
+    #[test]
+    fn spawn_commits_when_the_source_runs_dry() {
+        let graph = Arc::new(DynamicGraph::new(100, 1 << 20));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut sent = false;
+        let (handle, _stats) = spawn(Arc::clone(&graph), Arc::clone(&stop), move || {
+            (!std::mem::replace(&mut sent, true)).then_some((3, 4))
+        })
+        .unwrap();
+        assert!(
+            eventually(Duration::from_secs(5), || graph.acquire().degree(&graph, 3)
+                == 1),
+            "the dry source's edge was never committed"
+        );
+        stop.store(true, Ordering::Release);
+        handle.thread().unpark();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn slow_source_commits_within_the_latency_bound() {
+        let graph = DynamicGraph::new(100, 1 << 20);
+        let mut n = 0u32;
+        let mut epochs_seen = Vec::new();
+        // One edge per 30 ms: the guard must commit about every
+        // COMMIT_MAX_LATENCY, not wait for the edge interval.
+        let stats = run(&graph, || {
+            if n == 12 {
+                return None;
+            }
+            epochs_seen.push(graph.current_epoch());
+            std::thread::sleep(Duration::from_millis(30));
+            n += 1;
+            Some((0, n))
+        })
+        .unwrap();
+        assert_eq!(stats.inserted(), 12);
+        assert!(
+            epochs_seen.first() < epochs_seen.last(),
+            "no commit happened while the source trickled"
+        );
     }
 
     #[test]

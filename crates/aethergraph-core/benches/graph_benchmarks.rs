@@ -1,5 +1,5 @@
 use aethergraph_core::{
-    Graph, NeighborSampler, NodeId, ParallelBatchSampler, SamplingConfig, TemporalStrategy,
+    Graph, NeighborSampler, NodeId, ParallelBatchSampler, SamplingConfig, Seeds, TemporalStrategy,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::rngs::StdRng;
@@ -183,15 +183,18 @@ fn bench_parallel_sampling(c: &mut Criterion) {
 
     // Generate multiple batches
     let mut rng = StdRng::seed_from_u64(42);
-    let batches: Vec<Vec<NodeId>> = (0..100)
-        .map(|_| (0..32).map(|_| rng.random_range(0..10_000)).collect())
+    let batches: Vec<Seeds> = (0..100)
+        .map(|_| {
+            let ids: Vec<NodeId> = (0..32).map(|_| rng.random_range(0..10_000)).collect();
+            Seeds::new(ids, graph.num_nodes()).unwrap()
+        })
         .collect();
 
     group.throughput(Throughput::Elements((batches.len() * 32) as u64));
     group.bench_function("parallel_100_batches", |b| {
         let sampler = ParallelBatchSampler::new(&graph, config.clone());
 
-        b.iter(|| black_box(sampler.sample_batches(black_box(&batches))));
+        b.iter(|| black_box(sampler.sample_batches(black_box(&batches)).unwrap()));
     });
 
     group.finish();
@@ -390,11 +393,11 @@ fn bench_rabbit_reorder(c: &mut Criterion) {
             BenchmarkId::new("compute_perm", num_nodes),
             &num_nodes,
             |b, _| {
-                b.iter(|| black_box(graph.reorder_rabbit()));
+                b.iter(|| black_box(graph.reorder_rabbit().unwrap()));
             },
         );
 
-        let perm = graph.reorder_rabbit();
+        let perm = graph.reorder_rabbit().unwrap();
         group.bench_with_input(
             BenchmarkId::new("apply_perm", num_nodes),
             &num_nodes,
@@ -410,7 +413,7 @@ fn bench_rabbit_reorder(c: &mut Criterion) {
 fn bench_sampling_reordered(c: &mut Criterion) {
     let mut group = c.benchmark_group("reorder_sampling_speedup");
     let graph = generate_power_law_graph(100_000, 20);
-    let perm = graph.reorder_rabbit();
+    let perm = graph.reorder_rabbit().unwrap();
     let reordered = graph.permute(&perm).unwrap();
 
     let config = SamplingConfig {

@@ -6,12 +6,13 @@ Geometric's NeighborLoader that uses AetherGraph's Rust sampling backend.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import numpy.typing as npt
@@ -45,6 +46,9 @@ if TYPE_CHECKING:
     from aethergraph.graph import Graph
 
 __all__ = ["LoaderMetrics", "NeighborLoader"]
+
+# What a backend hands the epoch driver per batch, before PyG conversion.
+_Received = TypeVar("_Received")
 
 
 def normalize_input_nodes(
@@ -121,29 +125,44 @@ def _random_coprime_stride(modulus: int, rng: np.random.Generator) -> int:
             return stride
 
 
+@dataclass(frozen=True)
+class SeedBatch:
+    """One batch of seeds and where they sit in ``input_nodes``.
+
+    ``input_id`` is PyG's: each seed's position in the loader's
+    ``input_nodes`` (the node IDs themselves when iterating all nodes).
+    """
+
+    seeds: npt.NDArray[np.int64]
+    input_id: npt.NDArray[np.int64]
+
+
 def make_batch_getter(
     input_nodes: npt.NDArray[np.int64] | None,
     num_nodes: int,
     batch_size: int,
     shuffle: bool,
     rng: np.random.Generator,
-) -> Callable[[int], npt.NDArray[np.int64]]:
-    """Build the per-epoch ``batch_idx -> seed IDs`` function.
+) -> Callable[[int], SeedBatch]:
+    """Build the per-epoch ``batch_idx -> SeedBatch`` function.
 
-    With explicit ``input_nodes``, batches slice a (shuffled) copy. With all
-    nodes and ``shuffle``, an O(1)-memory coprime-stride permutation replaces
-    the full shuffle array — for billion-node graphs that saves ~8 GB per
-    epoch. Otherwise batches are plain ``arange`` ranges.
+    With explicit ``input_nodes``, batches slice a (shuffled) permutation of
+    their positions. With all nodes and ``shuffle``, an O(1)-memory
+    coprime-stride permutation replaces the full shuffle array — for
+    billion-node graphs that saves ~8 GB per epoch. Otherwise batches are
+    plain ``arange`` ranges.
     """
     if input_nodes is not None:
-        epoch_nodes = input_nodes.copy()
-        if shuffle:
-            rng.shuffle(epoch_nodes)
+        nodes = input_nodes
+        order = rng.permutation(num_nodes) if shuffle else None
 
-        def get_batch_sliced(batch_idx: int) -> npt.NDArray[np.int64]:
+        def get_batch_sliced(batch_idx: int) -> SeedBatch:
             start = batch_idx * batch_size
             end = min(start + batch_size, num_nodes)
-            return epoch_nodes[start:end]
+            if order is None:
+                return SeedBatch(nodes[start:end], np.arange(start, end, dtype=np.int64))
+            positions = order[start:end]
+            return SeedBatch(nodes[positions], positions)
 
         return get_batch_sliced
 
@@ -151,7 +170,7 @@ def make_batch_getter(
         offset = int(rng.integers(0, num_nodes))
         stride = _random_coprime_stride(num_nodes, rng)
 
-        def get_batch_strided(batch_idx: int) -> npt.NDArray[np.int64]:
+        def get_batch_strided(batch_idx: int) -> SeedBatch:
             start = batch_idx * batch_size
             end = min(start + batch_size, num_nodes)
             # In-place ops on the arange result: one allocation for the
@@ -160,16 +179,50 @@ def make_batch_getter(
             idx *= stride
             idx += offset
             idx %= num_nodes
-            return idx
+            return SeedBatch(idx, idx)
 
         return get_batch_strided
 
-    def get_batch_range(batch_idx: int) -> npt.NDArray[np.int64]:
+    def get_batch_range(batch_idx: int) -> SeedBatch:
         start = batch_idx * batch_size
         end = min(start + batch_size, num_nodes)
-        return np.arange(start, end, dtype=np.int64)
+        idx = np.arange(start, end, dtype=np.int64)
+        return SeedBatch(idx, idx)
 
     return get_batch_range
+
+
+def epoch_sampling_seed(seeds: np.random.SeedSequence | None) -> int | None:
+    """Draw the next epoch's neighbor-sampling seed from a loader's sequence.
+
+    Every epoch gets a fresh stream, so seeded training still resamples
+    neighborhoods each epoch, and a loader built with the same seed replays
+    the same sequence of epochs. ``None`` (an unseeded loader) stays None.
+    """
+    if seeds is None:
+        return None
+    (child,) = seeds.spawn(1)
+    return int(child.generate_state(1, dtype=np.uint64)[0])
+
+
+def pinned_block(specs: Sequence[tuple[tuple[int, ...], torch.dtype]]) -> list[torch.Tensor]:
+    """Carve one pinned host allocation into empty tensors of ``specs``.
+
+    A batch's tensors then cost one page-locked allocation instead of one
+    each, and every view still copies to the device asynchronously.
+    Regions are 8-byte aligned so each view keeps its dtype's alignment.
+    """
+    offsets: list[int] = []
+    total = 0
+    for shape, dtype in specs:
+        total = (total + 7) & ~7
+        offsets.append(total)
+        total += math.prod(shape) * dtype.itemsize
+    block = torch.empty(max(total, 1), dtype=torch.uint8, pin_memory=True)
+    return [
+        block[offset : offset + math.prod(shape) * dtype.itemsize].view(dtype).view(shape)
+        for offset, (shape, dtype) in zip(offsets, specs, strict=True)
+    ]
 
 
 @dataclass(frozen=True)
@@ -318,6 +371,12 @@ class NeighborLoader(IterableDataset[Data]):
     so epochs are reproducible (when ``seed`` is set) and concurrent
     iterations do not share mutable RNG state.
 
+    Batches follow PyG's conventions: the first ``batch_size`` entries of
+    ``n_id`` are the seeds and ``input_id`` holds each seed's position in
+    ``input_nodes``. ``seed_index`` additionally gives each seed's local
+    index into ``n_id``, one per input seed, so duplicate seeds map to the
+    same local node.
+
     Example:
         >>> from aethergraph import Graph
         >>> from aethergraph.pytorch import NeighborLoader
@@ -382,7 +441,7 @@ class NeighborLoader(IterableDataset[Data]):
         seed: int | None = None,
         generator: np.random.Generator | None = None,
         max_degree: int | None = None,
-        cumulative: bool = True,
+        cumulative: bool = False,
         subgraph_type: SubgraphType = "directional",
         track_edge_ids: bool = True,
         neighbor_sampler: Callable[..., Data] | None = None,
@@ -441,24 +500,27 @@ class NeighborLoader(IterableDataset[Data]):
                 edges). Requires ``graph.set_timestamps()``.
             disjoint: If True, each seed gets an isolated subgraph with no
                 node dedup across seeds. Output includes a ``batch`` tensor
-                mapping each node to its seed index.
+                mapping each node to its seed's position in the batch.
             seed: Random seed. Controls both seed-node shuffling (a fresh
                 child generator is derived per epoch, so epochs are
                 reproducible) and the Rust sampler's neighbor selection.
-                When set, each submitted batch reseeds from
-                ``mix(seed, batch_idx)`` so multi-worker pools produce the
-                same subgraph content for the same seeds, and the Rust
-                prefetch layer reorders yields by ``batch_idx`` so the
-                epoch stream is bit-identical to ``num_workers=1``. None
-                uses OS entropy (non-reproducible).
+                When set, each epoch draws a fresh sampling seed from it,
+                so neighborhoods are resampled every epoch while the whole
+                run stays reproducible; within an epoch each batch reseeds
+                from its submission order, and the Rust prefetch layer
+                yields in that order, so the stream is bit-identical to
+                ``num_workers=1``. None uses OS entropy (non-reproducible).
             generator: Explicit numpy ``Generator`` for seed-node shuffling.
                 Takes precedence over ``seed`` for shuffling. The Rust sampler
                 still uses ``seed`` for neighbor selection.
-            max_degree: Maximum degree to consider for hub nodes. None means
-                no cap.
-            cumulative: PyG-style cumulative sampling. When True, each hop
-                samples from all nodes seen so far (larger subgraphs); when
-                False, only from the new frontier.
+            max_degree: Degree above which a node counts as a hub. Uniform
+                draws never cap; weighted and uniform-temporal sampling draw
+                from ``max_degree`` random positions of a hub's row. None
+                never caps.
+            cumulative: When False (the default, PyG semantics), each hop
+                expands only the previous hop's new nodes. When True, each
+                hop re-expands every node seen so far, adding only edges no
+                earlier hop emitted.
             subgraph_type: One of ``"directional"``, ``"induced"``,
                 ``"bidirectional"``. Controls which edges are kept in the
                 output subgraph.
@@ -581,6 +643,9 @@ class NeighborLoader(IterableDataset[Data]):
         # reproducible and never shares mutable RNG state across concurrent
         # iterators.
         self._rng = generator if generator is not None else np.random.default_rng(seed)
+        # Neighbor sampling draws each epoch's seed from its own sequence,
+        # independent of the shuffle generator.
+        self._sampling_seeds = np.random.SeedSequence(seed) if seed is not None else None
         self._metrics = LoaderMetrics()
 
     @property
@@ -640,9 +705,10 @@ class NeighborLoader(IterableDataset[Data]):
                 - x: Node features [num_nodes, feature_dim] if available
                 - edge_index: Edge connectivity [2, num_edges]
                 - e_id: Global edge IDs [num_edges]
-                - n_id: Global node IDs [num_nodes]
+                - n_id: Global node IDs [num_nodes], seeds first
                 - batch_size: Number of seed nodes in this batch
-                - input_id: Local indices of seed nodes
+                - input_id: Each seed's position in ``input_nodes``
+                - seed_index: Each seed's local index into ``n_id``
                 - num_nodes: Total nodes in subgraph
                 - num_sampled_nodes: Nodes sampled per hop
                 - num_sampled_edges: Edges sampled per hop
@@ -663,14 +729,16 @@ class NeighborLoader(IterableDataset[Data]):
 
         if self._neighbor_sampler is not None:
             for batch_idx in range(num_batches):
-                seeds = get_batch(batch_idx)
-                data = self._neighbor_sampler(self.graph, seeds)
+                data = self._neighbor_sampler(self.graph, get_batch(batch_idx).seeds)
                 if self.transform is not None:
                     data = self.transform(data)
                 yield data
             return
 
-        rust_config = self._sampling._to_rust()
+        sampling = dataclasses.replace(
+            self._sampling, seed=epoch_sampling_seed(self._sampling_seeds)
+        )
+        rust_config = sampling._to_rust()
 
         if self._rdma is not None:
             # Upper bound on nodes per batch: batch_size * product of the
@@ -689,19 +757,24 @@ class NeighborLoader(IterableDataset[Data]):
                 sampler_threads=self._sampler_threads,
             )
 
-            def next_gpu_data(s: RustNeighborLoader) -> Data | None:
-                result = s.next_with_gpu_features()
+            def receive_gpu(
+                s: RustNeighborLoader,
+            ) -> tuple[int, tuple[RustSampledSubgraph, torch.Tensor]] | None:
+                result = s.next_batch_gpu()
                 if result is None:
                     return None
-                subgraph, dlpack_capsule = result
+                batch_idx, subgraph, dlpack_capsule = result
                 # torch re-exports from_dlpack without an explicit re-export.
-                return self._to_pyg_data_gpu(
-                    subgraph,
-                    torch.from_dlpack(dlpack_capsule),  # type: ignore[attr-defined]
-                )
+                x_gpu = torch.from_dlpack(dlpack_capsule)  # type: ignore[attr-defined]
+                return batch_idx, (subgraph, x_gpu)
 
             yield from self._drive_epoch(
-                sampler, num_batches, get_batch, next_gpu_data, "epoch_rdma"
+                sampler,
+                num_batches,
+                get_batch,
+                receive_gpu,
+                lambda got, input_id: self._to_pyg_data_gpu(got[0], got[1], input_id),
+                "epoch_rdma",
             )
             return
 
@@ -723,35 +796,56 @@ class NeighborLoader(IterableDataset[Data]):
                 self._sampler_threads,
             )
 
-        def next_cpu_data(s: RustNeighborLoader) -> Data | None:
-            result = s.next_with_features()
+        def receive_cpu(
+            s: RustNeighborLoader,
+        ) -> tuple[int, tuple[RustSampledSubgraph, npt.NDArray[np.float32] | None]] | None:
+            result = s.next_batch()
             if result is None:
                 return None
-            subgraph, features = result
-            return self._to_pyg_data(subgraph, features)
+            batch_idx, subgraph, features = result
+            return batch_idx, (subgraph, features)
 
-        yield from self._drive_epoch(sampler, num_batches, get_batch, next_cpu_data, "epoch")
+        yield from self._drive_epoch(
+            sampler,
+            num_batches,
+            get_batch,
+            receive_cpu,
+            lambda got, input_id: self._to_pyg_data(got[0], got[1], input_id),
+            "epoch",
+        )
 
     def _drive_epoch(
         self,
         sampler: RustNeighborLoader,
         num_batches: int,
-        get_batch: Callable[[int], npt.NDArray[np.int64]],
-        next_data: Callable[[RustNeighborLoader], Data | None],
+        get_batch: Callable[[int], SeedBatch],
+        receive: Callable[[RustNeighborLoader], tuple[int, _Received] | None],
+        to_data: Callable[[_Received, npt.NDArray[np.int64]], Data],
         span_name: str,
     ) -> Iterator[Data]:
         """Run one epoch through the Rust prefetch pipeline.
 
         Primes the sliding window, then interleaves receive and resubmit so
-        ``prefetch_factor`` batches are always in flight. ``next_data``
-        pulls one finished batch from the sampler and converts it to a PyG
-        ``Data`` object (``None`` means the backend stopped early). Metrics
+        ``prefetch_factor`` batches are always in flight. ``receive`` pulls
+        one finished batch and the ``batch_idx`` it was submitted under
+        (``None`` means the backend stopped early); ``to_data`` converts it,
+        given that batch's ``input_id``, to a PyG ``Data`` object. Metrics
         and the tracing span are finalized in all exit paths, including
         early ``break`` by the consumer.
         """
         submitted = 0
         received = 0
         epoch_start = time.perf_counter()
+        # Results arrive in completion order across an unseeded pool; each
+        # carries its batch_idx, which finds its input_id here.
+        input_ids: dict[int, npt.NDArray[np.int64]] = {}
+
+        def submit_next() -> None:
+            nonlocal submitted
+            batch = get_batch(submitted)
+            input_ids[submitted] = batch.input_id
+            sampler.submit(submitted, batch.seeds)
+            submitted += 1
 
         tracer = get_tracer()
         epoch_span = tracer.start_span(span_name) if tracer else None
@@ -763,22 +857,22 @@ class NeighborLoader(IterableDataset[Data]):
 
         try:
             while submitted < min(self.prefetch_factor, num_batches):
-                sampler.submit(submitted, get_batch(submitted))
-                submitted += 1
+                submit_next()
 
             while received < num_batches:
-                data = next_data(sampler)
-                if data is None:
+                got = receive(sampler)
+                if got is None:
                     raise RuntimeError(
                         f"NeighborLoader backend stopped early: received {received} "
                         f"of {num_batches} batches"
                     )
+                batch_idx, payload = got
                 received += 1
 
                 if submitted < num_batches:
-                    sampler.submit(submitted, get_batch(submitted))
-                    submitted += 1
+                    submit_next()
 
+                data = to_data(payload, input_ids.pop(batch_idx))
                 if self.transform is not None:
                     data = self.transform(data)
                 yield data
@@ -806,6 +900,7 @@ class NeighborLoader(IterableDataset[Data]):
         self,
         subgraph: RustSampledSubgraph,
         file_features: npt.NDArray[np.float32] | None,
+        input_id: npt.NDArray[np.int64],
     ) -> Data:
         """Convert a sampled subgraph to a PyG Data object.
 
@@ -815,157 +910,153 @@ class NeighborLoader(IterableDataset[Data]):
             3. No features (``x`` will be ``None``)
 
         Edge indices use pre-computed local IDs from Rust's
-        ``edge_index_local()``. Seeds are extracted from the subgraph itself,
-        eliminating any FIFO ordering dependency between batch submission and
-        result retrieval.
+        ``edge_index_local()``. In disjoint mode, a ``batch`` tensor is
+        attached mapping each node to its seed.
 
-        In disjoint mode, a ``batch`` tensor is attached mapping each node
-        to its seed index. All tensors are optionally pinned to page-locked
-        memory when ``pin_memory=True`` for faster async GPU transfer.
+        With pinning, every tensor of the batch is a view into one pinned
+        block (:func:`pinned_block`): one page-locked allocation per batch,
+        and each tensor still transfers to the device asynchronously.
+        Without it, the numpy arrays are wrapped zero-copy.
 
         Args:
             subgraph: Rust SampledSubgraph containing nodes, edges, and seeds.
             file_features: Features gathered by the Rust sampler, or None.
+            input_id: Each seed's position in ``input_nodes``.
 
         Returns:
-            PyG Data object with x, edge_index, e_id, n_id, input_id, and
-            optionally batch (disjoint mode).
+            PyG Data object with x, edge_index, e_id, n_id, input_id,
+            seed_index, and optionally batch (disjoint mode).
         """
-        n_id = torch.from_numpy(subgraph.nodes)
-        num_nodes = len(n_id)
-
-        edge_index = torch.from_numpy(subgraph.edge_index_local)
-
-        e_id: torch.Tensor | None
+        arrays: dict[str, npt.NDArray[np.int64]] = {
+            "n_id": subgraph.nodes,
+            "edge_index": subgraph.edge_index_local,
+            "seed_index": subgraph.seed_indices,
+            "input_id": input_id,
+        }
         if self._track_edge_ids:
-            e_id = torch.from_numpy(subgraph.edge_ids)
-        else:
-            e_id = None
+            arrays["e_id"] = subgraph.edge_ids
+        batch_arr = subgraph.batch
+        if batch_arr is not None:
+            arrays["batch"] = batch_arr
+        num_nodes = arrays["n_id"].shape[0]
 
-        seed_indices_arr: npt.NDArray[np.int64] = subgraph.seed_indices
-        input_id = torch.from_numpy(seed_indices_arr)
+        feature_dim: int | None = None
+        if file_features is not None:
+            feature_dim = file_features.shape[1]
+        elif self._feat_torch is not None:
+            feature_dim = self._feat_torch.shape[1]
 
         x: torch.Tensor | None = None
-        if file_features is not None:
-            x = torch.from_numpy(file_features)
-            if self._pin:
-                x = x.pin_memory()
-        elif self._feat_torch is not None:
-            # One gather pass total: index_select writes straight into the
-            # destination — pinned when requested — instead of a numpy
-            # fancy-index followed by copy and pin passes.
-            feature_dim = self._feat_torch.shape[1]
-            out = torch.empty((num_nodes, feature_dim), dtype=torch.float32, pin_memory=self._pin)
-            torch.index_select(self._feat_torch, 0, n_id, out=out)
-            x = out
-
+        tensors: dict[str, torch.Tensor]
         if self._pin:
-            edge_index = edge_index.pin_memory()
-            if e_id is not None:
-                e_id = e_id.pin_memory()
-            n_id = n_id.pin_memory()
-            input_id = input_id.pin_memory()
+            specs = [(a.shape, torch.int64) for a in arrays.values()]
+            if feature_dim is not None:
+                specs.append(((num_nodes, feature_dim), torch.float32))
+            views = pinned_block(specs)
+            tensors = {}
+            for (name, arr), view in zip(arrays.items(), views, strict=False):
+                view.copy_(torch.from_numpy(arr))
+                tensors[name] = view
+            if feature_dim is not None:
+                x = views[-1]
+        else:
+            tensors = {name: torch.from_numpy(arr) for name, arr in arrays.items()}
+            if feature_dim is not None:
+                x = torch.empty((num_nodes, feature_dim), dtype=torch.float32)
 
+        if x is not None:
+            if file_features is not None:
+                if self._pin:
+                    x.copy_(torch.from_numpy(file_features))
+                else:
+                    x = torch.from_numpy(file_features)
+            elif self._feat_torch is not None:
+                # One gather pass straight into the destination.
+                torch.index_select(self._feat_torch, 0, tensors["n_id"], out=x)
+
+        seed_index = tensors["seed_index"]
         data = Data(
             x=x,
-            edge_index=edge_index,
-            e_id=e_id,
-            n_id=n_id,
-            batch_size=len(seed_indices_arr),
-            input_id=input_id,
+            edge_index=tensors["edge_index"],
+            e_id=tensors.get("e_id"),
+            n_id=tensors["n_id"],
+            batch_size=seed_index.shape[0],
+            input_id=tensors["input_id"],
+            seed_index=seed_index,
             num_nodes=num_nodes,
             num_sampled_nodes=subgraph.num_sampled_nodes_per_hop,
             num_sampled_edges=subgraph.num_sampled_edges_per_hop,
         )
-
-        batch_arr = subgraph.batch
-        if batch_arr is not None:
-            batch_tensor = torch.from_numpy(batch_arr)
-            if self._pin:
-                batch_tensor = batch_tensor.pin_memory()
-            data.batch = batch_tensor
-
+        if "batch" in tensors:
+            data.batch = tensors["batch"]
         return data
 
     def _to_pyg_data_gpu(
         self,
         subgraph: RustSampledSubgraph,
         x_gpu: torch.Tensor,
+        input_id: npt.NDArray[np.int64],
     ) -> Data:
         """Build PyG Data with features already on GPU via RDMA.
 
         Unlike ``_to_pyg_data``, features arrive as a CUDA tensor from
-        GPUDirect RDMA (zero-copy DLPack capsule). The metadata arrays
-        (n_id, edge_index, e_id, input_id) are packed into one pinned
-        staging buffer and moved with a single asynchronous H2D copy;
-        the returned tensors are on-device views into that transfer.
+        GPUDirect RDMA (zero-copy DLPack capsule). The index arrays are
+        packed into one pinned staging buffer and moved with a single
+        asynchronous H2D copy; the returned tensors are on-device views
+        into that transfer.
 
         Args:
             subgraph: Rust SampledSubgraph containing nodes, edges, and seeds.
             x_gpu: CUDA tensor of node features from RDMA gather.
+            input_id: Each seed's position in ``input_nodes``.
 
         Returns:
             PyG Data object with all tensors on the same CUDA device.
         """
-        # `non_blocking=True` is only honoured from pinned host memory —
-        # pageable tensors silently fall back to synchronous copies. Pack all
-        # four int64 arrays into one pinned staging buffer and issue a single
-        # async H2D transfer, then slice views on-device.
-        nodes_arr: npt.NDArray[np.int64] = subgraph.nodes
-        local_edge_index: npt.NDArray[np.int64] = subgraph.edge_index_local
-        edge_ids_arr: npt.NDArray[np.int64] = subgraph.edge_ids
-        seed_indices_arr: npt.NDArray[np.int64] = subgraph.seed_indices
-
-        num_nodes = nodes_arr.shape[0]
-        num_edges = local_edge_index.shape[1]
-        n_eid = edge_ids_arr.shape[0]
-        n_seed = seed_indices_arr.shape[0]
+        arrays: dict[str, npt.NDArray[np.int64]] = {
+            "n_id": subgraph.nodes,
+            "edge_index": subgraph.edge_index_local,
+            "seed_index": subgraph.seed_indices,
+            "input_id": input_id,
+        }
+        if self._track_edge_ids:
+            arrays["e_id"] = subgraph.edge_ids
         batch_arr = subgraph.batch
-        n_batch = 0 if batch_arr is None else int(batch_arr.shape[0])
+        if batch_arr is not None:
+            arrays["batch"] = batch_arr
 
-        total = num_nodes + 2 * num_edges + n_eid + n_seed + n_batch
+        # `non_blocking=True` is only honoured from pinned host memory —
+        # pageable tensors silently fall back to synchronous copies.
+        total = sum(a.size for a in arrays.values())
         stage = torch.empty(total, dtype=torch.int64, pin_memory=True)
         stage_np = stage.numpy()
         pos = 0
-        stage_np[pos : pos + num_nodes] = nodes_arr
-        pos += num_nodes
-        stage_np[pos : pos + 2 * num_edges] = local_edge_index.reshape(-1)
-        pos += 2 * num_edges
-        stage_np[pos : pos + n_eid] = edge_ids_arr
-        pos += n_eid
-        stage_np[pos : pos + n_seed] = seed_indices_arr
-        pos += n_seed
-        if batch_arr is not None:
-            stage_np[pos : pos + n_batch] = np.ascontiguousarray(batch_arr, dtype=np.int64)
+        for arr in arrays.values():
+            stage_np[pos : pos + arr.size] = arr.reshape(-1)
+            pos += arr.size
+        packed = stage.to(x_gpu.device, non_blocking=True)
 
-        device = x_gpu.device
-        packed = stage.to(device, non_blocking=True)
-
+        on_device: dict[str, torch.Tensor] = {}
         pos = 0
-        n_id = packed[pos : pos + num_nodes]
-        pos += num_nodes
-        edge_index = packed[pos : pos + 2 * num_edges].view(2, num_edges)
-        pos += 2 * num_edges
-        e_id_view = packed[pos : pos + n_eid]
-        pos += n_eid
-        input_id = packed[pos : pos + n_seed]
-        pos += n_seed
+        for name, arr in arrays.items():
+            on_device[name] = packed[pos : pos + arr.size].view(arr.shape)
+            pos += arr.size
 
+        seed_index = on_device["seed_index"]
         data = Data(
             x=x_gpu,
-            edge_index=edge_index,
-            e_id=e_id_view if self._track_edge_ids else None,
-            n_id=n_id,
-            batch_size=n_seed,
-            input_id=input_id,
-            num_nodes=num_nodes,
+            edge_index=on_device["edge_index"],
+            e_id=on_device.get("e_id"),
+            n_id=on_device["n_id"],
+            batch_size=seed_index.shape[0],
+            input_id=on_device["input_id"],
+            seed_index=seed_index,
+            num_nodes=arrays["n_id"].shape[0],
             num_sampled_nodes=subgraph.num_sampled_nodes_per_hop,
             num_sampled_edges=subgraph.num_sampled_edges_per_hop,
         )
-
-        if batch_arr is not None:
-            data.batch = packed[pos : pos + n_batch]
-
+        if "batch" in on_device:
+            data.batch = on_device["batch"]
         return data
 
     def __len__(self) -> int:

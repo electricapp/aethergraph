@@ -1,10 +1,11 @@
 use aethergraph_core::{Graph, NodeId, load_graph, save_graph, save_graph_compressed};
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -23,6 +24,43 @@ struct Cli {
     command: Commands,
 }
 
+/// Column separator of an edge list.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Delimiter {
+    #[value(alias = "\t")]
+    Tab,
+    #[value(alias = ",")]
+    Comma,
+    /// Any run of whitespace, so aligned columns parse cleanly.
+    #[value(alias = " ")]
+    Space,
+}
+
+impl Delimiter {
+    /// Pick the separator from the first data line.
+    fn detect(line: &str) -> Self {
+        if line.contains('\t') {
+            Self::Tab
+        } else if line.contains(',') {
+            Self::Comma
+        } else {
+            Self::Space
+        }
+    }
+
+    /// The first two fields of `line`.
+    fn two_fields(self, line: &str) -> Option<(&str, &str)> {
+        fn first_two<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<(&'a str, &'a str)> {
+            Some((parts.next()?, parts.next()?))
+        }
+        match self {
+            Self::Tab => first_two(line.split('\t')),
+            Self::Comma => first_two(line.split(',')),
+            Self::Space => first_two(line.split_whitespace()),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Convert an edge list file to AetherGraph binary format
@@ -39,9 +77,9 @@ enum Commands {
         #[arg(short, long)]
         num_nodes: usize,
 
-        /// Delimiter for the input file (default: auto-detect)
-        #[arg(short, long)]
-        delimiter: Option<String>,
+        /// Column separator (default: detected from the first data line)
+        #[arg(short, long, value_enum)]
+        delimiter: Option<Delimiter>,
 
         /// Skip first N lines (for headers)
         #[arg(long, default_value = "0")]
@@ -68,15 +106,10 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    // Check for --quiet flag before parsing to show splash
-    let is_quiet = std::env::args().any(|arg| arg == "--quiet" || arg == "-q");
-
-    // Show splash screen unless in quiet mode
-    if !is_quiet {
+    let cli = Cli::parse();
+    if !cli.quiet {
         print_splash();
     }
-
-    let cli = Cli::parse();
 
     // Initialize logging based on verbosity
     init_logging(cli.verbose, cli.quiet);
@@ -147,10 +180,10 @@ fn init_logging(verbose: u8, quiet: bool) {
 }
 
 fn convert_edge_list(
-    input: &PathBuf,
-    output: &PathBuf,
+    input: &Path,
+    output: &Path,
     num_nodes: usize,
-    delimiter: Option<String>,
+    delimiter: Option<Delimiter>,
     skip_lines: usize,
     compressed: bool,
 ) -> Result<()> {
@@ -163,7 +196,9 @@ fn convert_edge_list(
     let file = File::open(input).context("failed to open input file")?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file); // 8MB buffer for HPC
 
-    let mut edges = Vec::new();
+    // Parallel arrays feed the structure-of-arrays builder directly.
+    let mut src: Vec<NodeId> = Vec::new();
+    let mut dst: Vec<NodeId> = Vec::new();
 
     // Set up progress bar only if not quiet
     let pb = if tracing::level_enabled!(tracing::Level::INFO) {
@@ -178,11 +213,9 @@ fn convert_edge_list(
         None
     };
 
-    let mut line_count = 0;
-    // Delimiter is resolved once from the first data line and reused for the
-    // whole file, so a stray tab/comma in a later row can't switch the parser
-    // mid-stream.
-    let mut delim: Option<String> = delimiter;
+    // Resolved once from the first data line and reused for the whole file,
+    // so a stray tab/comma in a later row can't switch the parser mid-stream.
+    let mut delim = delimiter;
 
     for (idx, line) in reader.lines().enumerate() {
         let line = line.context("failed to read line")?;
@@ -198,78 +231,39 @@ fn convert_edge_list(
             continue;
         }
 
-        // Auto-detect delimiter from the first data line if not provided
-        let delim = delim.get_or_insert_with(|| {
-            if line.contains('\t') {
-                "\t".to_string()
-            } else if line.contains(',') {
-                ",".to_string()
-            } else {
-                " ".to_string()
-            }
-        });
+        let delim = *delim.get_or_insert_with(|| Delimiter::detect(line));
+        let (s, d) = delim
+            .two_fields(line)
+            .with_context(|| format!("invalid edge format at line {}: {}", idx + 1, line))?;
+        src.push(
+            s.trim()
+                .parse()
+                .with_context(|| format!("invalid source node at line {}: {s}", idx + 1))?,
+        );
+        dst.push(
+            d.trim()
+                .parse()
+                .with_context(|| format!("invalid dest node at line {}: {d}", idx + 1))?,
+        );
 
-        // Parse edge. A space delimiter splits on any whitespace run so
-        // aligned columns (multiple spaces) parse cleanly.
-        let parts: Vec<&str> = if delim == " " {
-            line.split_whitespace().collect()
-        } else {
-            line.split(delim.as_str()).collect()
-        };
-        if parts.len() < 2 {
-            anyhow::bail!("invalid edge format at line {}: {}", idx + 1, line);
-        }
-
-        let src: NodeId = parts[0]
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid source node at line {}: {}", idx + 1, parts[0]))?;
-
-        let dst: NodeId = parts[1]
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid dest node at line {}: {}", idx + 1, parts[1]))?;
-
-        // Validate node IDs are within range
-        if src as usize >= num_nodes {
-            anyhow::bail!(
-                "source node {} exceeds num_nodes {} at line {}",
-                src,
-                num_nodes,
-                idx + 1
-            );
-        }
-        if dst as usize >= num_nodes {
-            anyhow::bail!(
-                "dest node {} exceeds num_nodes {} at line {}",
-                dst,
-                num_nodes,
-                idx + 1
-            );
-        }
-
-        edges.push((src, dst));
-
-        line_count += 1;
-        if line_count % 100_000 == 0 {
+        if src.len().is_multiple_of(100_000) {
             if let Some(pb) = &pb {
-                pb.set_message(format!("Read {line_count} edges"));
+                pb.set_message(format!("Read {} edges", src.len()));
             }
-            trace!("Read {} edges", line_count);
+            trace!("Read {} edges", src.len());
         }
     }
 
     if let Some(pb) = pb {
-        pb.finish_with_message(format!("Read {} edges total", edges.len()));
+        pb.finish_with_message(format!("Read {} edges total", src.len()));
     }
-    info!("Read {} edges from input file", edges.len());
+    info!("Read {} edges from input file", src.len());
 
-    // Build CSR graph
+    // The builder range-checks every endpoint; its error names the edge.
     debug!("Building CSR graph structure");
-    let graph = Graph::from_edges(num_nodes, &edges, None).context("failed to build CSR graph")?;
-
-    debug!("Validating graph structure");
-    graph.validate().context("graph validation failed")?;
+    let graph =
+        Graph::from_src_dst(num_nodes, &src, &dst, None).context("failed to build CSR graph")?;
+    drop((src, dst));
 
     // Save to binary format
     debug!("Writing binary file");
@@ -295,7 +289,7 @@ fn convert_edge_list(
     Ok(())
 }
 
-fn show_info(path: &PathBuf) -> Result<()> {
+fn show_info(path: &Path) -> Result<()> {
     debug!("Loading graph from {}", path.display());
 
     let graph = load_graph(path).context("failed to load graph")?;
@@ -317,7 +311,46 @@ fn show_info(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn show_stats(path: &PathBuf) -> Result<()> {
+/// Degree → node count, exact.
+///
+/// Small degrees count into a dense array; the rest go to a map. Distinct
+/// degrees number at most about sqrt(2E) (their sum is bounded by E), so
+/// the map stays small even for a hub of degree 10^9, where a dense
+/// `max_degree + 1` table would take gigabytes.
+struct DegreeHistogram {
+    dense: Vec<u64>,
+    sparse: BTreeMap<u64, u64>,
+}
+
+impl DegreeHistogram {
+    const DENSE_DEGREES: usize = 1 << 16;
+
+    fn new() -> Self {
+        Self {
+            dense: vec![0; Self::DENSE_DEGREES],
+            sparse: BTreeMap::new(),
+        }
+    }
+
+    fn add(&mut self, degree: u64) {
+        match self.dense.get_mut(degree as usize) {
+            Some(count) => *count += 1,
+            None => *self.sparse.entry(degree).or_default() += 1,
+        }
+    }
+
+    /// `(degree, count)` in ascending degree order.
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.dense
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(d, &c)| (d as u64, c))
+            .chain(self.sparse.iter().map(|(&d, &c)| (d, c)))
+    }
+}
+
+fn show_stats(path: &Path) -> Result<()> {
     debug!("Loading graph from {}", path.display());
 
     let graph = load_graph(path).context("failed to load graph")?;
@@ -362,14 +395,14 @@ fn show_stats(path: &PathBuf) -> Result<()> {
         None
     };
 
-    let mut degree_counts: Vec<usize> = vec![0; stats.max_degree + 1];
-    for node in 0..stats.num_nodes as NodeId {
-        let degree = graph.degree(node);
-        degree_counts[degree] += 1;
-        if node % 10000 == 0
+    // `load_graph` proves offsets monotone, so each window is a degree.
+    let mut histogram = DegreeHistogram::new();
+    for (node, w) in graph.offsets().windows(2).enumerate() {
+        histogram.add(w[1] - w[0]);
+        if node % (1 << 20) == 0
             && let Some(pb) = &pb
         {
-            pb.set_position(u64::from(node));
+            pb.set_position(node as u64);
         }
     }
     if let Some(pb) = pb {
@@ -377,36 +410,26 @@ fn show_stats(path: &PathBuf) -> Result<()> {
     }
 
     // Find some interesting degree percentiles
-    let mut cumulative = 0;
-    let p50_idx = stats.num_nodes / 2;
-    let p90_idx = (stats.num_nodes * 9) / 10;
-    let p99_idx = (stats.num_nodes * 99) / 100;
-
-    let mut p50 = None;
-    let mut p90 = None;
-    let mut p99 = None;
-
-    for (degree, &count) in degree_counts.iter().enumerate() {
+    let n = stats.num_nodes as u64;
+    let targets = [n / 2, (n * 9) / 10, (n * 99) / 100];
+    let mut percentiles = [None; 3];
+    let mut cumulative = 0u64;
+    for (degree, count) in histogram.iter() {
         cumulative += count;
-        if p50.is_none() && cumulative >= p50_idx {
-            p50 = Some(degree);
-        }
-        if p90.is_none() && cumulative >= p90_idx {
-            p90 = Some(degree);
-        }
-        if p99.is_none() && cumulative >= p99_idx {
-            p99 = Some(degree);
+        for (slot, &target) in percentiles.iter_mut().zip(&targets) {
+            if slot.is_none() && cumulative >= target {
+                *slot = Some(degree);
+            }
         }
     }
 
     info!("");
     info!("Degree Distribution:");
-    info!("  50th percentile: {}", p50.unwrap_or(0));
-    info!("  90th percentile: {}", p90.unwrap_or(0));
-    info!("  99th percentile: {}", p99.unwrap_or(0));
+    info!("  50th percentile: {}", percentiles[0].unwrap_or(0));
+    info!("  90th percentile: {}", percentiles[1].unwrap_or(0));
+    info!("  99th percentile: {}", percentiles[2].unwrap_or(0));
 
-    // Show top degree counts
-    let isolated_nodes = degree_counts[0];
+    let isolated_nodes = histogram.dense[0];
     if isolated_nodes > 0 {
         warn!(
             "  Isolated nodes (degree 0): {} ({:.2}%)",
@@ -416,4 +439,82 @@ fn show_stats(path: &PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splash_follows_parsed_quiet_flag() {
+        let cli = Cli::try_parse_from(["aethergraph", "-vq", "info", "g.bin"]).unwrap();
+        assert!(cli.quiet);
+        assert_eq!(cli.verbose, 1);
+    }
+
+    #[test]
+    fn delimiter_accepts_names_and_literals() {
+        for (arg, want) in [
+            ("tab", Delimiter::Tab),
+            ("\t", Delimiter::Tab),
+            ("comma", Delimiter::Comma),
+            (",", Delimiter::Comma),
+            ("space", Delimiter::Space),
+            (" ", Delimiter::Space),
+        ] {
+            let cli = Cli::try_parse_from([
+                "aethergraph",
+                "convert",
+                "-i",
+                "in",
+                "-o",
+                "out",
+                "-n",
+                "3",
+                "-d",
+                arg,
+            ])
+            .unwrap();
+            let Commands::Convert { delimiter, .. } = cli.command else {
+                panic!("expected convert");
+            };
+            assert!(delimiter == Some(want), "argument {arg:?}");
+        }
+    }
+
+    #[test]
+    fn delimiter_splits_fields() {
+        assert_eq!(Delimiter::Space.two_fields("1   2  3"), Some(("1", "2")));
+        assert_eq!(Delimiter::Comma.two_fields("1,2"), Some(("1", "2")));
+        assert_eq!(Delimiter::Tab.two_fields("7\t8\t9"), Some(("7", "8")));
+        assert_eq!(Delimiter::Comma.two_fields("7"), None);
+        assert!(Delimiter::detect("1\t2") == Delimiter::Tab);
+        assert!(Delimiter::detect("1,2") == Delimiter::Comma);
+        assert!(Delimiter::detect("1 2") == Delimiter::Space);
+    }
+
+    #[test]
+    fn histogram_is_exact_past_the_dense_range() {
+        let mut h = DegreeHistogram::new();
+        for d in [0, 3, 3, 1_000_000_000, 70_000] {
+            h.add(d);
+        }
+        let got: Vec<(u64, u64)> = h.iter().collect();
+        assert_eq!(got, vec![(0, 1), (3, 2), (70_000, 1), (1_000_000_000, 1)]);
+    }
+
+    #[test]
+    fn convert_reports_out_of_range_edges() {
+        let dir = std::env::temp_dir().join(format!("aethergraph-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("edges.tsv");
+        std::fs::write(&input, "0\t1\n0\t10\n").unwrap();
+        let err = convert_edge_list(&input, &dir.join("g.bin"), 3, None, 0, false).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("destination node 10 exceeds num_nodes 3"),
+            "got: {chain}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

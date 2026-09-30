@@ -11,6 +11,10 @@
 //! Seals make the sharing safe: `F_SEAL_SHRINK | F_SEAL_GROW` fix the
 //! size for the memfd's whole lifetime, so no holder can `ftruncate` it
 //! out from under a peer's mapping (which would fault them on access).
+//! A region whose contents are final is additionally sealed against
+//! writes ([`SharedRegion::seal_read_only`]); every peer receives an
+//! `O_RDWR` descriptor, and only `F_SEAL_WRITE` stops one from mapping it
+//! writable or `pwrite`-ing into every other process's view.
 
 #![cfg(all(target_os = "linux", feature = "shm"))]
 
@@ -79,7 +83,7 @@ impl SharedRegion {
             bail!("F_ADD_SEALS failed: {}", std::io::Error::last_os_error());
         }
 
-        let base = mmap_fd(raw, len, true)?;
+        let base = mmap_fd(raw, len, Mapping::Writable)?;
         Ok(Self {
             fd,
             base,
@@ -104,6 +108,21 @@ impl SharedRegion {
     /// Both are properties of the descriptor itself, which is why this
     /// needs no `unsafe` obligation from the caller.
     pub fn from_fd(fd: OwnedFd, len: usize) -> Result<Self> {
+        Self::attach(fd, len, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW)
+    }
+
+    /// Like [`from_fd`](Self::from_fd), but also require `F_SEAL_WRITE`:
+    /// the contents are final, so no holder of the descriptor — this
+    /// process included — can change the bytes the returned slice views.
+    pub fn from_sealed_fd(fd: OwnedFd, len: usize) -> Result<Self> {
+        Self::attach(
+            fd,
+            len,
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+        )
+    }
+
+    fn attach(fd: OwnedFd, len: usize, required: libc::c_int) -> Result<Self> {
         let raw = fd.as_raw_fd();
 
         // SAFETY: an all-zero `libc::stat` is a valid initial value; a
@@ -132,21 +151,64 @@ impl SharedRegion {
                 std::io::Error::last_os_error()
             );
         }
-        let required = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
-        if seals & required != required {
+        let size_seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
+        if seals & size_seals != size_seals {
             bail!(
                 "received memfd is not size-sealed (seals {seals:#x}); the owner \
                  could resize it under this mapping"
             );
         }
+        if seals & required != required {
+            bail!(
+                "received memfd is not write-sealed (seals {seals:#x}); any holder \
+                 of the descriptor could change the bytes under this mapping"
+            );
+        }
 
-        let base = mmap_fd(raw, len, false)?;
+        let mapping = if seals & libc::F_SEAL_WRITE != 0 {
+            Mapping::Frozen
+        } else {
+            Mapping::Live
+        };
+        let base = mmap_fd(raw, len, mapping)?;
         Ok(Self {
             fd,
             base,
             len,
             writable: false,
         })
+    }
+
+    /// Make the contents final: drop the creator's writable mapping, add
+    /// `F_SEAL_WRITE`, and map the sealed contents read-only.
+    ///
+    /// The kernel refuses the seal while any shared mapping that could be
+    /// made writable exists — a read-only `MAP_SHARED` view of an `O_RDWR`
+    /// memfd included — so this runs with no mapping at all, before peers
+    /// attach. That ordering is also what lets peers demand the seal
+    /// through [`from_sealed_fd`](Self::from_sealed_fd). The region is
+    /// consumed on failure.
+    pub fn seal_read_only(mut self) -> Result<Self> {
+        if !self.writable {
+            bail!("only the creating process can seal a region against writes");
+        }
+        let raw = self.fd.as_raw_fd();
+        // SAFETY: `base`/`len` is this region's own writable mapping, and
+        // `self` is consumed, so no slice into it can still be live.
+        unsafe { libc::munmap(self.base.cast::<libc::c_void>(), self.len) };
+        // Unmapped: `Drop` skips a null base if an early return follows.
+        self.base = std::ptr::null_mut();
+        self.writable = false;
+        // SAFETY: `raw` is this region's live memfd, created with
+        // MFD_ALLOW_SEALING; nothing maps it any more.
+        if unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, libc::F_SEAL_WRITE) } != 0 {
+            bail!(
+                "F_ADD_SEALS(F_SEAL_WRITE) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        self.base = mmap_fd(raw, self.len, Mapping::Frozen)?;
+        Ok(self)
     }
 
     /// The memfd for passing to peers over [`send_fd`].
@@ -186,6 +248,9 @@ impl SharedRegion {
 
 impl Drop for SharedRegion {
     fn drop(&mut self) {
+        if self.base.is_null() {
+            return;
+        }
         // SAFETY: `base`/`len` is our mapping; unmapping it doesn't affect
         // peers' independent mappings of the same memfd. The fd closes via
         // `OwnedFd`.
@@ -195,15 +260,29 @@ impl Drop for SharedRegion {
     }
 }
 
-fn mmap_fd(fd: RawFd, len: usize, writable: bool) -> Result<*mut u8> {
-    let prot = if writable {
-        libc::PROT_READ | libc::PROT_WRITE
-    } else {
-        libc::PROT_READ
+/// How a region maps its memfd.
+#[derive(Clone, Copy)]
+enum Mapping {
+    /// The creator's writable view.
+    Writable,
+    /// A read-only view that sees the creator's later writes.
+    Live,
+    /// A read-only view of write-sealed contents. `MAP_PRIVATE` maps the
+    /// same page-cache pages — nothing writes them, so none is ever copied —
+    /// and, unlike `MAP_SHARED` of an `O_RDWR` descriptor, a write-sealed
+    /// memfd accepts it on every kernel.
+    Frozen,
+}
+
+fn mmap_fd(fd: RawFd, len: usize, mapping: Mapping) -> Result<*mut u8> {
+    let (prot, flags) = match mapping {
+        Mapping::Writable => (libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED),
+        Mapping::Live => (libc::PROT_READ, libc::MAP_SHARED),
+        Mapping::Frozen => (libc::PROT_READ, libc::MAP_PRIVATE),
     };
-    // SAFETY: `fd` is a valid memfd of at least `len` bytes; MAP_SHARED so
-    // every mapping aliases the same pages.
-    let base = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_SHARED, fd, 0) };
+    // SAFETY: `fd` is a valid memfd of at least `len` bytes; every mode
+    // maps its page cache, so all mappings see the same pages.
+    let base = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, flags, fd, 0) };
     if base == libc::MAP_FAILED {
         bail!("mmap failed: {}", std::io::Error::last_os_error());
     }
@@ -226,16 +305,16 @@ pub fn send_fd(sock: RawFd, fd: RawFd) -> Result<()> {
         iov_base: iov_base.as_mut_ptr() as *mut libc::c_void,
         iov_len: 1,
     };
-    let mut cmsg_buf = [0u8; cmsg_space_one_fd()];
+    let mut cmsg_buf = CmsgBuf::new();
     // SAFETY: an all-zero msghdr is a valid empty message; fields are set below.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len();
+    msg.msg_control = cmsg_buf.as_mut_ptr();
+    msg.msg_controllen = CMSG_SPACE_ONE_FD;
 
-    // SAFETY: `msg.msg_control` points at `cmsg_buf`, large enough for one
-    // fd's CMSG header + payload.
+    // SAFETY: `msg.msg_control` points at `cmsg_buf`, aligned for and large
+    // enough to hold one fd's CMSG header + payload.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
@@ -268,71 +347,96 @@ pub fn recv_fd(sock: RawFd) -> Result<OwnedFd> {
         iov_base: iov_base.as_mut_ptr() as *mut libc::c_void,
         iov_len: 1,
     };
-    let mut cmsg_buf = [0u8; cmsg_space_one_fd()];
+    let mut cmsg_buf = CmsgBuf::new();
     // SAFETY: an all-zero msghdr is a valid empty message; fields are set below.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len();
+    msg.msg_control = cmsg_buf.as_mut_ptr();
+    msg.msg_controllen = CMSG_SPACE_ONE_FD;
 
+    // MSG_CMSG_CLOEXEC: a received descriptor is never inherited by a
+    // child spawned before this function takes ownership of it.
     // SAFETY: `msg` is initialized; the kernel fills the control buffer.
-    let n = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+    let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if n < 0 {
         bail!("recvmsg failed: {}", std::io::Error::last_os_error());
     }
 
+    // Own every descriptor the kernel installed before judging the
+    // message, so a rejected one closes them all instead of leaking them.
+    let mut fds = take_scm_rights(&msg);
+
     // A peer that sent more descriptors than this buffer holds gets the
     // excess dropped by the kernel, which flags the message MSG_CTRUNC.
-    // Reading the header out of a truncated buffer would hand back a
-    // half-copied descriptor number, and any fd the kernel did install
-    // beyond the first would leak with nothing owning it.
     if msg.msg_flags & libc::MSG_CTRUNC != 0 {
         bail!("control message truncated; peer sent more than one descriptor");
     }
-
-    // SAFETY: `msg` was populated by recvmsg; walk its control messages.
-    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if cmsg.is_null() {
-        bail!("recvmsg returned no control message (fd not received)");
-    }
-    // SAFETY: `cmsg` is non-null and points into `cmsg_buf`.
-    unsafe {
-        if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-            bail!("unexpected control message type");
-        }
-        // Exactly one descriptor's worth of payload: a longer message
-        // carries fds this function would never take ownership of.
-        let expected = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
-        if (*cmsg).cmsg_len != expected {
-            bail!(
-                "SCM_RIGHTS payload is {} bytes, expected exactly one descriptor ({expected})",
-                (*cmsg).cmsg_len
-            );
-        }
-        let mut fd: RawFd = -1;
-        std::ptr::copy_nonoverlapping(
-            libc::CMSG_DATA(cmsg),
-            &mut fd as *mut RawFd as *mut u8,
-            std::mem::size_of::<RawFd>(),
-        );
-        if fd < 0 {
-            bail!("received invalid fd");
-        }
-        Ok(OwnedFd::from_raw_fd(fd))
+    match fds.len() {
+        1 => Ok(fds.remove(0)),
+        0 => bail!("recvmsg returned no descriptor"),
+        k => bail!("peer sent {k} descriptors, expected exactly one"),
     }
 }
 
-/// Bytes needed to carry exactly one fd as ancillary data. `const` so the
-/// stack buffers above are correctly sized at compile time.
-const fn cmsg_space_one_fd() -> usize {
-    // CMSG_SPACE(sizeof(int)) — header aligned up plus the aligned payload.
-    // Computed conservatively as header + 8-aligned payload, which is
-    // always >= the exact CMSG_SPACE and never under-allocates.
-    let hdr = std::mem::size_of::<libc::cmsghdr>();
-    let payload = std::mem::size_of::<RawFd>();
-    // Align both up to 8 and sum.
-    hdr.div_ceil(8) * 8 + payload.div_ceil(8) * 8
+/// Take ownership of every descriptor in `msg`'s `SCM_RIGHTS` messages.
+fn take_scm_rights(msg: &libc::msghdr) -> Vec<OwnedFd> {
+    let mut fds = Vec::new();
+    // SAFETY: `msg` was populated by recvmsg; the CMSG walk stays inside
+    // its control buffer.
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg.is_null() {
+        // SAFETY: a non-null header from the walk lies wholly inside the
+        // (cmsghdr-aligned) control buffer.
+        let hdr = unsafe { &*cmsg };
+        if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_RIGHTS {
+            // SAFETY: `CMSG_LEN(0)` is pure arithmetic on the header size.
+            let header = unsafe { libc::CMSG_LEN(0) } as usize;
+            let count = (hdr.cmsg_len as usize).saturating_sub(header) / size_of::<RawFd>();
+            // SAFETY: CMSG_DATA points at this message's payload.
+            let data = unsafe { libc::CMSG_DATA(cmsg) }.cast::<RawFd>();
+            for i in 0..count {
+                // SAFETY: `i < count`, so the pointer stays inside the
+                // payload the kernel reported.
+                let slot = unsafe { data.add(i) };
+                // SAFETY: `slot` is in bounds; the payload need not be
+                // int-aligned, hence the unaligned read.
+                let fd = unsafe { slot.read_unaligned() };
+                if fd >= 0 {
+                    // SAFETY: the kernel just installed `fd` in this
+                    // process, and nothing else owns it.
+                    fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+            }
+        }
+        // SAFETY: `cmsg` is a valid header within `msg`'s control buffer.
+        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
+    }
+    fds
+}
+
+/// Bytes needed to carry exactly one fd as ancillary data.
+// SAFETY: CMSG_SPACE is pure arithmetic on its argument.
+const CMSG_SPACE_ONE_FD: usize = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as usize;
+
+/// Control-message buffer for one fd. The `cmsghdr` member makes it
+/// aligned for the header the CMSG macros read and write through.
+#[repr(C)]
+union CmsgBuf {
+    _align: libc::cmsghdr,
+    bytes: [u8; CMSG_SPACE_ONE_FD],
+}
+
+impl CmsgBuf {
+    fn new() -> Self {
+        Self {
+            bytes: [0u8; CMSG_SPACE_ONE_FD],
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::c_void {
+        std::ptr::from_mut(self).cast()
+    }
 }
 
 /// A cross-process fd for a Unix datagram/stream socket pair, split so the
@@ -444,6 +548,109 @@ mod tests {
             err.to_string().contains("size-sealed"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A sealed region's contents are final for every holder of the fd:
+    /// no write through it, no writable mapping of it, and peers can insist
+    /// on the seal.
+    #[test]
+    fn sealed_region_refuses_every_write_path() {
+        let mut owner = SharedRegion::create(4096).unwrap();
+        owner.as_mut_slice().unwrap().fill(0x42);
+        let owner = owner.seal_read_only().unwrap();
+        assert!(owner.as_slice().iter().all(|&b| b == 0x42));
+
+        // A peer's descriptor is O_RDWR; the seal is what stops it.
+        let byte = [0u8; 1];
+        // SAFETY: valid memfd and a 1-byte buffer; expected to fail.
+        let wrote = unsafe { libc::pwrite(owner.raw_fd(), byte.as_ptr().cast(), 1, 0) };
+        assert!(wrote < 0, "pwrite into a write-sealed memfd must fail");
+        // SAFETY: mapping request expected to fail; nothing is dereferenced.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                owner.raw_fd(),
+                0,
+            )
+        };
+        assert_eq!(map, libc::MAP_FAILED, "writable mapping must be refused");
+
+        // SAFETY: dup of a valid memfd returns a fresh fd or -1.
+        let raw_dup = unsafe { libc::dup(owner.raw_fd()) };
+        assert!(raw_dup >= 0);
+        // SAFETY: `raw_dup` is a fresh fd we exclusively own.
+        let peer =
+            SharedRegion::from_sealed_fd(unsafe { OwnedFd::from_raw_fd(raw_dup) }, 4096).unwrap();
+        assert_eq!(peer.as_slice(), owner.as_slice());
+        assert!(
+            owner.seal_read_only().is_err(),
+            "only a writable region seals"
+        );
+    }
+
+    #[test]
+    fn from_sealed_fd_rejects_a_writable_memfd() {
+        let owner = SharedRegion::create(4096).unwrap();
+        // SAFETY: dup of a valid memfd returns a fresh fd or -1.
+        let raw_dup = unsafe { libc::dup(owner.raw_fd()) };
+        assert!(raw_dup >= 0);
+        // SAFETY: `raw_dup` is a fresh fd we exclusively own.
+        let dup = unsafe { OwnedFd::from_raw_fd(raw_dup) };
+        let Err(err) = SharedRegion::from_sealed_fd(dup, 4096) else {
+            panic!("a memfd without F_SEAL_WRITE must be refused");
+        };
+        assert!(err.to_string().contains("write-sealed"), "{err}");
+    }
+
+    /// A peer that sends more than one descriptor is refused; the
+    /// descriptors the kernel did install are owned, and so closed, before
+    /// the message is judged.
+    // Building the two-fd message is the same indivisible CMSG ritual as
+    // `send_fd`, kept in one unsafe block.
+    #[allow(clippy::multiple_unsafe_ops_per_block)]
+    #[test]
+    fn recv_fd_refuses_extra_descriptors_without_leaking_them() {
+        let (a, b) = socket_pair().unwrap();
+        let region = SharedRegion::create(4096).unwrap();
+        let fds = [region.raw_fd(), region.raw_fd()];
+
+        let mut iov_base = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: iov_base.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        // SAFETY: CMSG_SPACE is pure arithmetic.
+        let space = unsafe { libc::CMSG_SPACE(size_of_val(&fds) as u32) } as usize;
+        // SAFETY: CMSG_LEN is pure arithmetic.
+        let len = unsafe { libc::CMSG_LEN(size_of_val(&fds) as u32) } as usize;
+        let mut buf = vec![0u64; space.div_ceil(8)];
+        // SAFETY: an all-zero msghdr is a valid empty message.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = buf.as_mut_ptr().cast();
+        msg.msg_controllen = space;
+        // SAFETY: the control buffer is 8-aligned and `space` bytes long.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = len;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr().cast::<u8>(),
+                libc::CMSG_DATA(cmsg),
+                size_of_val(&fds),
+            );
+            assert!(libc::sendmsg(a.as_raw_fd(), &msg, 0) > 0);
+        }
+
+        // CMSG_SPACE of one int is padded to 8 bytes of payload, so the
+        // kernel delivers both descriptors rather than truncating.
+        let err = recv_fd(b.as_raw_fd()).unwrap_err().to_string();
+        assert!(err.contains("2 descriptors"), "{err}");
     }
 
     #[test]

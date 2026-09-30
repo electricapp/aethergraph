@@ -149,9 +149,28 @@ impl EliasFano {
     /// read per element — O(n + words), unlike a loop over [`Self::get`]
     /// whose per-call select would make full decode quadratic.
     pub fn to_vec(&self) -> Vec<u64> {
-        let mut out = Vec::with_capacity(self.len);
+        let mut out = vec![0; self.len];
+        self.decode_into(&mut out);
+        out
+    }
+
+    /// Decode every element into `out`, which must hold exactly
+    /// [`Self::len`] elements.
+    ///
+    /// # Panics
+    /// Panics if `out.len() != self.len()`.
+    pub fn decode_into(&self, out: &mut [u64]) {
+        assert_eq!(out.len(), self.len, "decode target length");
+        self.for_each(|i, v| out[i] = v);
+    }
+
+    /// Visit `(index, value)` for every element in order.
+    fn for_each(&self, mut visit: impl FnMut(usize, u64)) {
         let mut i = 0usize;
-        'words: for (word_idx, &word) in self.high.iter().enumerate() {
+        if self.len == 0 {
+            return;
+        }
+        for (word_idx, &word) in self.high.iter().enumerate() {
             let mut w = word;
             while w != 0 {
                 let set_pos = word_idx * 64 + w.trailing_zeros() as usize;
@@ -162,15 +181,13 @@ impl EliasFano {
                 } else {
                     self.read_low(i)
                 };
-                out.push((high_part << self.low_bits) | low_part);
+                visit(i, (high_part << self.low_bits) | low_part);
                 i += 1;
                 if i == self.len {
-                    break 'words;
+                    return;
                 }
             }
         }
-        debug_assert_eq!(out.len(), self.len, "high bit count matches len");
-        out
     }
 
     /// Total heap bytes of the two backing arrays — for reporting the
@@ -197,9 +214,14 @@ impl EliasFano {
     }
 
     /// Parse one serialized sequence from the front of `bytes`, returning
-    /// it and the number of bytes consumed. Validates structural
-    /// consistency (word counts sized for `len`/`universe`, set-bit count
-    /// equal to `len`) so a decoded value can be trusted downstream.
+    /// it and the number of bytes consumed.
+    ///
+    /// The result upholds everything [`Self::encode`] guarantees: word
+    /// counts sized for `len` and `universe`, exactly `len` set bits, and a
+    /// decoded sequence that is non-decreasing and ends at `universe`. A
+    /// returned value is therefore a sorted sequence bounded by
+    /// [`Self::universe`], and [`Self::to_vec`] / [`Self::get`] run without
+    /// further checks. One O(len) pass verifies the ordering.
     pub fn read_from(bytes: &[u8]) -> anyhow::Result<(Self, usize)> {
         let mut r = ByteReader::new(bytes);
         let len = usize::try_from(r.u64()?).context("EF len")?;
@@ -209,35 +231,71 @@ impl EliasFano {
         let low = r.u64_vec().context("EF low words")?;
         let high = r.u64_vec().context("EF high words")?;
 
-        let expect_low_words = (len * low_bits as usize).div_ceil(64);
+        let expect_low_words = len
+            .checked_mul(low_bits as usize)
+            .context("EF low array size overflows")?
+            .div_ceil(64);
         anyhow::ensure!(
             low.len() >= expect_low_words,
             "EF low array truncated: {} words, need {expect_low_words}",
             low.len()
         );
-        if len > 0 {
-            let last_pos = (universe >> low_bits) as usize + len - 1;
-            anyhow::ensure!(
-                high.len() * 64 > last_pos,
-                "EF high array truncated for universe {universe}"
-            );
-        }
         let ones: usize = high.iter().map(|w| w.count_ones() as usize).sum();
         anyhow::ensure!(
             ones == len,
             "EF high array has {ones} set bits for {len} elements"
         );
+        if len == 0 {
+            anyhow::ensure!(universe == 0, "EF empty sequence with universe {universe}");
+        }
 
-        Ok((
-            Self {
-                len,
-                low_bits,
-                low,
-                high,
-                universe,
-            },
-            r.consumed(),
-        ))
+        let ef = Self {
+            len,
+            low_bits,
+            low,
+            high,
+            universe,
+        };
+        // Set-bit positions strictly increase, so high parts never decrease;
+        // order can only break between equal high parts, through the low
+        // bits. A high part above `universe >> low_bits` would overflow the
+        // shift below, so it is rejected before any value is formed.
+        let max_high = universe >> low_bits;
+        let mut prev: Option<(u64, u64)> = None;
+        let mut bad: Option<String> = None;
+        let mut i = 0usize;
+        'words: for (word_idx, &word) in ef.high.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let high_part = (word_idx * 64 + w.trailing_zeros() as usize - i) as u64;
+                w &= w - 1;
+                let low_part = if low_bits == 0 { 0 } else { ef.read_low(i) };
+                if high_part > max_high {
+                    bad = Some(format!("EF element {i} exceeds universe {universe}"));
+                    break 'words;
+                }
+                if let Some((ph, pl)) = prev
+                    && ph == high_part
+                    && low_part < pl
+                {
+                    bad = Some(format!("EF sequence decreases at element {i}"));
+                    break 'words;
+                }
+                prev = Some((high_part, low_part));
+                i += 1;
+            }
+        }
+        if let Some(msg) = bad {
+            anyhow::bail!(msg);
+        }
+        if let Some((h, l)) = prev {
+            let last = (h << low_bits) | l;
+            anyhow::ensure!(
+                last == universe,
+                "EF last element {last} disagrees with universe {universe}"
+            );
+        }
+        Ok((ef, r.consumed()))
     }
 
     /// Position of the `(rank+1)`-th set bit in `high`.
@@ -397,24 +455,33 @@ impl StreamVByte {
     /// walks the control stream two bits at a time, reads that many data
     /// bytes, and running-sums the deltas back to absolute values.
     pub fn decode(&self) -> Vec<u32> {
-        if self.len == 0 {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(self.len);
-        out.push(self.first);
+        let mut out = vec![0; self.len];
+        self.decode_into(&mut out);
+        out
+    }
+
+    /// Decode the full sequence into `out`, which must hold exactly
+    /// [`Self::len`] values.
+    ///
+    /// # Panics
+    /// Panics if `out.len() != self.len()`.
+    pub fn decode_into(&self, out: &mut [u32]) {
+        assert_eq!(out.len(), self.len, "decode target length");
+        let Some((first, rest)) = out.split_first_mut() else {
+            return;
+        };
+        *first = self.first;
         let mut acc = self.first;
         let mut pos = 0usize;
-        for i in 0..self.len - 1 {
+        for (i, slot) in rest.iter_mut().enumerate() {
             let tag = (self.control[i / 4] >> ((i % 4) * 2)) & 0b11;
             let nbytes = tag as usize + 1;
             let mut buf = [0u8; 4];
             buf[..nbytes].copy_from_slice(&self.data[pos..pos + nbytes]);
-            let delta = u32::from_le_bytes(buf);
-            acc = acc.wrapping_add(delta);
-            out.push(acc);
+            acc = acc.wrapping_add(u32::from_le_bytes(buf));
+            *slot = acc;
             pos += nbytes;
         }
-        out
     }
 }
 
@@ -682,6 +749,51 @@ mod tests {
         let mut buf = Vec::new();
         svb.write_into(&mut buf);
         assert!(StreamVByte::read_from(&buf[..buf.len() - 1]).is_err());
+    }
+
+    /// Serialize an EF record with the given raw parts, for crafting
+    /// streams `encode` would never produce.
+    fn raw_ef(len: u64, universe: u64, low_bits: u32, low: &[u64], high: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&universe.to_le_bytes());
+        out.extend_from_slice(&low_bits.to_le_bytes());
+        out.extend_from_slice(&(low.len() as u64).to_le_bytes());
+        for w in low {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.extend_from_slice(&(high.len() as u64).to_le_bytes());
+        for w in high {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn read_from_rejects_a_decreasing_sequence() {
+        // Two elements in high bucket 0 with low parts 3 then 1: [3, 1].
+        let low = [3u64 | (1 << 2)];
+        let high = [0b11u64];
+        let bytes = raw_ef(2, 3, 2, &low, &high);
+        let err = EliasFano::read_from(&bytes).unwrap_err().to_string();
+        assert!(err.contains("decreases"), "got: {err}");
+    }
+
+    #[test]
+    fn read_from_rejects_values_past_the_universe() {
+        // One element whose high part (bit 40 set) far exceeds universe 5.
+        let bytes = raw_ef(1, 5, 0, &[], &[1u64 << 40]);
+        let err = EliasFano::read_from(&bytes).unwrap_err().to_string();
+        assert!(err.contains("exceeds universe"), "got: {err}");
+        // A last element that stops short of the declared universe.
+        let bytes = raw_ef(1, 5, 0, &[], &[1u64 << 2]);
+        assert!(EliasFano::read_from(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_from_rejects_overflowing_sizes() {
+        let bytes = raw_ef(u64::MAX / 2, 0, 63, &[], &[]);
+        assert!(EliasFano::read_from(&bytes).is_err());
     }
 
     #[test]

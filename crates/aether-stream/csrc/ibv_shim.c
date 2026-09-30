@@ -10,6 +10,7 @@
  * Cargo feature; gating is done in build.rs via -DAETHER_EFA_SHIM.
  */
 
+#include <errno.h>
 #include <infiniband/verbs.h>
 
 int aether_ibv_post_send(struct ibv_qp *qp,
@@ -137,11 +138,12 @@ struct aether_srd_read {
  *
  * All reads share (ah, remote_qpn, remote_qkey, remote_rkey, local_lkey);
  * per-read `remote_addr` / `local_addr` / `length` come from `reads`.
- * wr_id for WR i is `base_wr_id + i`. Only the LAST WR is signaled so
- * the caller drains exactly one CQE (`wr_id = base_wr_id + n - 1`) after
- * this returns.
+ * wr_id for WR i is `base_wr_id + i`. Every WR is signaled, so each one
+ * posted produces exactly one CQE.
  *
- * Bails on the first failing `ibv_wr_complete`. */
+ * Bails on the first failing `ibv_wr_complete` and returns its errno.
+ * `*posted` always receives the count accepted before that point: those
+ * WRs are in flight and the caller must drain them. */
 int aether_ibv_post_rdma_reads_srd_batch(struct ibv_qp_ex *qpx,
                                          struct ibv_ah *ah,
                                          uint32_t remote_qpn,
@@ -150,7 +152,9 @@ int aether_ibv_post_rdma_reads_srd_batch(struct ibv_qp_ex *qpx,
                                          uint32_t local_lkey,
                                          uint64_t base_wr_id,
                                          const struct aether_srd_read *reads,
-                                         uint32_t n) {
+                                         uint32_t n,
+                                         uint32_t *posted) {
+    *posted = 0;
     for (uint32_t i = 0; i < n; i++) {
         ibv_wr_start(qpx);
         qpx->wr_id = base_wr_id + (uint64_t)i;
@@ -162,6 +166,7 @@ int aether_ibv_post_rdma_reads_srd_batch(struct ibv_qp_ex *qpx,
         ibv_wr_set_sge(qpx, local_lkey, reads[i].local_addr, reads[i].length);
         int rc = ibv_wr_complete(qpx);
         if (rc != 0) return rc;
+        *posted = i + 1;
     }
     return 0;
 }
@@ -196,18 +201,20 @@ int aether_ibv_poll_cq_ex_one(struct ibv_cq_ex *cqx,
     return 0;
 }
 
-/* Drain up to `max_out` CQEs in one FFI call. Returns the number drained.
- * Stops early if any CQE has non-SUCCESS status and writes it into
- * `*first_err` slot (index stored in `*first_err_idx`). ibv_next_poll is the
- * extended-CQ way to keep drawing consecutive CQEs without paying a full
- * start/end cycle per completion. */
+/* Drain up to `max_out` CQEs in one FFI call. Returns the number drained
+ * (0 when the CQ is empty), or a negative errno when polling itself fails.
+ * Error completions are returned like any other, status in the snapshot.
+ * ibv_next_poll is the extended-CQ way to keep drawing consecutive CQEs
+ * without paying a full start/end cycle per completion; an error from it
+ * after some CQEs were drawn returns those, and the next call reports it. */
 int aether_ibv_poll_cq_ex_many(struct ibv_cq_ex *cqx,
                                struct aether_cqe_snapshot *out,
                                uint32_t max_out) {
     if (max_out == 0) return 0;
     struct ibv_poll_cq_attr attr = {0};
     int rc = ibv_start_poll(cqx, &attr);
-    if (rc != 0) return 0; /* ENOENT — empty CQ */
+    if (rc == ENOENT) return 0;
+    if (rc != 0) return -rc;
     uint32_t i = 0;
     while (i < max_out) {
         out[i].status = cqx->status;
@@ -217,7 +224,7 @@ int aether_ibv_poll_cq_ex_many(struct ibv_cq_ex *cqx,
         out[i].vendor_err = ibv_wc_read_vendor_err(cqx);
         i++;
         if (i == max_out) break;
-        if (ibv_next_poll(cqx) != 0) break; /* CQ drained */
+        if (ibv_next_poll(cqx) != 0) break;
     }
     ibv_end_poll(cqx);
     return (int)i;

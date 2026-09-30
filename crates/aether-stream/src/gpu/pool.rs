@@ -192,6 +192,10 @@ impl FeaturePool {
                 "nothing committed yet; call ensure_rows first",
             ));
         }
+        if !self.vram.rdma_capable() {
+            tracing::debug!("device lacks GPUDirect RDMA on VMM memory; no BAR1 stamping");
+            return Ok(false);
+        }
         match super::gdrcopy::GdrMapping::new(self.vram.device_ptr(), HEADER_BYTES) {
             Ok(m) => {
                 self.stamp_window = Some(m);
@@ -205,17 +209,22 @@ impl FeaturePool {
     }
 
     /// Publish a batch: bump the generation and write it into the header
-    /// through the BAR1 window.
+    /// through the BAR1 window, once `after` — the stream the batch's rows
+    /// were written on — has drained.
     ///
-    /// A consumer polling the header sees the new generation the moment
-    /// the store retires — no kernel launch, no `cudaMemcpy`, no stream
-    /// synchronization. Returns the new generation, or `Ok(None)` when
-    /// stamping isn't enabled.
+    /// The stamp is the publish signal, so it must not retire before the
+    /// rows it announces: a consumer seeing generation N+1 reads batch N+1
+    /// in full. With the rows in place the store itself needs no kernel
+    /// launch or `cudaMemcpy`. Returns the new generation, or `Ok(None)`
+    /// when stamping isn't enabled.
     #[cfg(feature = "gdrcopy")]
-    pub fn stamp_generation(&mut self) -> io::Result<Option<u64>> {
+    pub fn stamp_generation(&mut self, after: &CudaStream) -> io::Result<Option<u64>> {
         let Some(window) = &self.stamp_window else {
             return Ok(None);
         };
+        after
+            .synchronize()
+            .map_err(|e| io::Error::other(format!("waiting on the batch before stamping: {e}")))?;
         self.generation += 1;
         window.copy_to(0, &self.generation.to_le_bytes())?;
         Ok(Some(self.generation))

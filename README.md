@@ -223,17 +223,18 @@ reordered.save("graph.reordered.bin")
 
 **Implementation:**
 
-- Phase 1 (parallel over V): each node picks its lowest-degree neighbor.
-- Phase 2 (parallel over E): lock-free concurrent union-find merges remaining
-  cross-community edges (`AtomicU32` parent + rank, path-splitting `find`, CAS
-  `union`).
-- Phase 3 (sequential, O(V)): replay the merge log into a dendrogram and emit
-  the permutation.
+- Degrees and the in-edge transpose are built in parallel; edges count in both
+  directions, so directed graphs cluster too.
+- Vertices are visited in ascending degree; each merges into the neighbor
+  community with the largest positive modularity gain, computed from aggregated
+  community degrees. Merging stops where modularity stops improving, so a
+  connected graph still splits into communities.
+- A pre-order walk of the resulting dendrogram emits the permutation — the same
+  graph always yields the same one.
 
-The community partitions fall out of the merge log for free —
-`graph.rabbit_partitions()` returns dense partition IDs without a second pass,
-and `partition_aligned_batches` uses them to build seed batches that respect
-locality.
+`graph.rabbit_partitions()` labels every node with its community from the same
+dendrogram, and `partition_aligned_batches` uses those labels to build seed
+batches that respect locality.
 
 See `crates/aethergraph-core/benches/graph_benchmarks.rs` (`rabbit_reorder`,
 `reorder_sampling_speedup`) for the measurement methodology.
@@ -415,7 +416,8 @@ for batch in loader:
     batch.edge_index         # [2, num_edges] COO edges
     batch.n_id               # [num_nodes] original node IDs
     batch.batch_size         # number of seed nodes
-    batch.input_id           # seed indices in batch
+    batch.input_id           # each seed's position in input_nodes (PyG)
+    batch.seed_index         # each seed's local index into n_id
     batch.num_sampled_nodes  # nodes per hop [num_hops]
     batch.num_sampled_edges  # edges per hop [num_hops]
 ```

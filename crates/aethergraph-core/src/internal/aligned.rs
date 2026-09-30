@@ -8,7 +8,7 @@
 #![cfg(target_os = "linux")]
 
 use anyhow::Result;
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ptr::NonNull;
 
 /// Default alignment for O_DIRECT buffers (4KB, typical page size).
@@ -20,6 +20,10 @@ pub const DIRECT_IO_ALIGNMENT: usize = 4096;
 /// O_DIRECT requires buffers to be aligned to the filesystem's block size
 /// (typically 512 or 4096 bytes). This struct ensures proper alignment
 /// and handles deallocation correctly.
+///
+/// The allocation is zeroed, so every byte is initialized from the start:
+/// the slice views are sound before any read lands, and a buffer written
+/// out whole (padding included) carries zeros rather than stale heap.
 pub struct AlignedBuffer {
     ptr: NonNull<u8>,
     len: usize,
@@ -48,7 +52,7 @@ impl AlignedBuffer {
             .map_err(|e| anyhow::anyhow!("invalid layout: {}", e))?;
 
         // SAFETY: layout is valid and non-zero
-        let ptr = unsafe { alloc(layout) };
+        let ptr = unsafe { alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr)
             .ok_or_else(|| anyhow::anyhow!("allocation failed: {} bytes", aligned_len))?;
 
@@ -76,13 +80,15 @@ impl AlignedBuffer {
 
     /// Get a mutable slice of the buffer.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: ptr is valid for len bytes, properly aligned
+        // SAFETY: ptr is valid for len initialized (zeroed at allocation)
+        // bytes, and `&mut self` makes this the only view.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     /// Get an immutable slice of the buffer.
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: ptr is valid for len bytes, properly aligned
+        // SAFETY: ptr is valid for len initialized (zeroed at allocation)
+        // bytes.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
@@ -264,9 +270,8 @@ mod tests {
         let sentinel: [f32; 4] = [-1.0, -1.0, -1.0, -1.0];
         let written: [f32; 4] = [1.5, -2.25, 0.0, 7.75];
 
-        // The pool allocates without zeroing, so slot 0 has to be given a
-        // known value before it can witness anything: "slot 1 did not bleed
-        // into slot 0" says nothing about bytes that were never defined.
+        // A nonzero sentinel in slot 0, so "slot 1 did not bleed into
+        // slot 0" is witnessed by more than the zeroed allocation.
         for (slot, values) in [(0usize, &sentinel), (1usize, &written)] {
             let src: &[u8] = bytemuck::cast_slice(values);
             let dst = pool.slot_ptr(slot);
@@ -277,6 +282,25 @@ mod tests {
 
         assert_eq!(pool.slot_slice_f32(1, 4), &written);
         assert_eq!(pool.slot_slice_f32(0, 4), &sentinel);
+    }
+
+    /// A buffer written out whole — record padding included — must carry
+    /// zeros, never whatever the allocator last held at that address.
+    #[test]
+    fn fresh_buffers_and_pools_read_as_zero() {
+        // Dirty the allocator's free lists with a same-size allocation
+        // first, so a non-zeroing allocator would likely hand it back.
+        {
+            let mut dirty = AlignedBuffer::try_new_default(8192).unwrap();
+            dirty.as_mut_slice().fill(0xA5);
+        }
+        let buf = AlignedBuffer::try_new_default(8192).unwrap();
+        assert!(buf.as_slice().iter().all(|&b| b == 0));
+
+        let pool = AlignedBufferPool::try_new(3, 100).unwrap();
+        for i in 0..3 {
+            assert!(pool.slot_slice(i, pool.slot_size()).iter().all(|&b| b == 0));
+        }
     }
 
     #[test]

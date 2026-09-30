@@ -3,8 +3,11 @@
 //! Ring allocations pre-fault before hooks run, so both hooks rely on
 //! `MPOL_MF_MOVE` migration inside [`crate::numa`]; the one-time move at
 //! allocation is what buys every later access its local-node latency.
+//!
+//! Both cover the whole mapping ([`HookSpan::Mapping`]): `mbind` splits the
+//! VMA at its range's ends, which a hugetlb VMA refuses inside a huge page.
 
-use crate::{HookError, MemoryHook, numa};
+use crate::{HookError, HookSpan, MemoryHook, numa};
 
 /// Binds the region to one NUMA node.
 ///
@@ -29,6 +32,10 @@ impl MemoryHook for NumaBindHook {
 
     fn on_dealloc(&self, _ptr: *mut u8, _size: usize) {
         // Policy dies with the mapping; nothing to undo.
+    }
+
+    fn span(&self) -> HookSpan {
+        HookSpan::Mapping
     }
 }
 
@@ -65,5 +72,9 @@ impl MemoryHook for NumaInterleaveHook {
 
     fn on_dealloc(&self, _ptr: *mut u8, _size: usize) {
         // Policy dies with the mapping; nothing to undo.
+    }
+
+    fn span(&self) -> HookSpan {
+        HookSpan::Mapping
     }
 }

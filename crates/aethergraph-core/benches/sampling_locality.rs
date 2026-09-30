@@ -200,7 +200,7 @@ fn bench_all(c: &mut Criterion) {
 
     bench_arm(c, "shuffled", &baseline, &seeds);
 
-    let perm = baseline.reorder_rabbit();
+    let perm = baseline.reorder_rabbit().expect("rabbit order");
     let reordered = baseline.permute(&perm).expect("rabbit permute");
     // The same logical nodes, named as the reordered graph names them.
     let mapped: Vec<NodeId> = {

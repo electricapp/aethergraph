@@ -53,7 +53,8 @@ User Training Loop
 │       edge_index=[2, num_edges],    # COO edges             │
 │       n_id=[num_nodes],             # Original node IDs     │
 │       batch_size=N,                 # Seed node count       │
-│       input_id=[batch_size],        # Seed indices          │
+│       input_id=[batch_size],        # Positions in input    │
+│       seed_index=[batch_size],      # Seed rows of n_id     │
 │       num_sampled_nodes=[hops],     # Nodes per hop         │
 │       num_sampled_edges=[hops],     # Edges per hop         │
 │   )                                                         │
@@ -93,7 +94,8 @@ loader = NeighborLoader(graph, num_neighbors=[15, 10], batch_size=128)
 | `edge_index`        | COO edges `[2, num_edges]`            |
 | `n_id`              | Original node IDs                     |
 | `batch_size`        | Number of seed nodes                  |
-| `input_id`          | Seed indices in batch                 |
+| `input_id`          | Each seed's position in `input_nodes` |
+| `seed_index`        | Each seed's local index into `n_id`   |
 | `num_sampled_nodes` | Nodes sampled per hop                 |
 | `num_sampled_edges` | Edges sampled per hop                 |
 

@@ -135,6 +135,69 @@ fn second_graph_on_same_wal_path_is_rejected_while_locked() {
 }
 
 #[test]
+fn rejected_opener_leaves_a_live_writers_log_untouched() {
+    use std::io::Write;
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let live = DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
+    {
+        let mut w = live.writer().unwrap();
+        w.insert_edge(0, 1).unwrap();
+    }
+    // The live writer is mid-append: bytes past the last clean record,
+    // exactly what a second opener's replay would read as a torn tail.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&[0xAA; 5])
+        .unwrap();
+    let len = std::fs::metadata(&path).unwrap().len();
+
+    match DynamicGraph::open_with_wal(&path, 16, 1 << 20) {
+        Err(WalError::Locked) => {}
+        Err(other) => panic!("expected Locked, got {other:?}"),
+        Ok(_) => panic!("expected Locked, got a second live graph"),
+    }
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        len,
+        "a rejected opener must not truncate the live writer's log"
+    );
+    drop(live);
+}
+
+#[test]
+fn raw_replay_ignores_bytes_appended_after_open() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    {
+        let g = DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
+        let mut w = g.writer().unwrap();
+        w.insert_edge(0, 1).unwrap();
+        w.insert_edge(0, 2).unwrap();
+    }
+    let live = DynamicGraph::open_with_wal(&path, 16, 1 << 20).unwrap();
+    let mut appended = false;
+    let outcome = replay_wal(&path, |_| {
+        // Grow the log mid-replay, as a live writer would.
+        if !appended {
+            appended = true;
+            let mut w = live.writer().unwrap();
+            w.insert_edge(1, 2).unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(outcome.applied, 2);
+    assert!(
+        outcome.truncate_to.is_none(),
+        "growth past the length measured at open is not a torn tail"
+    );
+}
+
+#[test]
 fn corrupt_tail_is_truncated_on_recovery() {
     use std::io::Write;
 

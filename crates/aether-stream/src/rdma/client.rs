@@ -4,91 +4,135 @@
 //! into a single `gather(node_ids)` call that returns a device pointer
 //! to a contiguous `[batch_size, feature_dim]` f32 tensor in VRAM.
 
-use crate::feature_table::FeatureSchema;
 use crate::gpu::buffer::GpuGatherBuffer;
 use crate::gpu::kernel::SeqlockValidator;
-use crate::rdma::context::RdmaContext;
+use crate::rdma::context::{RdmaContext, closest_device_to_pci};
 use crate::rdma::control;
-use crate::rdma::ffi::IbvWc;
-use crate::rdma::qp::{RdmaQp, RdmaRead};
+use crate::rdma::ffi::{IBV_WC_SUCCESS, IbvWc};
+use crate::rdma::layout::RemoteTable;
+use crate::rdma::qp::{DEFAULT_QP_CAP, RdmaQp, RdmaRead, next_wr_generation, required_cq_depth};
 use cudarc::driver::{CudaContext, sys};
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Maximum retries for torn reads before giving up.
 const MAX_RETRIES: usize = 8;
 
-/// Wall-clock deadline for a single `post_and_wait` completion drain. A
-/// healthy RDMA READ of a feature batch completes in microseconds; if no
-/// signaled completion lands within this window the QP has stalled (link
-/// down, remote gone) and we error out rather than spin a core forever.
+/// Wall-clock deadline for one window's signaled completion. A healthy
+/// RDMA READ of a feature batch completes in microseconds, and RC retries
+/// give up and flush the QP well inside this; only a hung device reaches it.
 const POLL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Bound on draining a stopped QP; see [`RdmaQp::quiesce`].
+const QUIESCE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// GPUDirect RDMA feature client.
 ///
 /// Connects to a feature server's control plane, exchanges QP endpoints,
 /// then gathers features for batches of node IDs directly into VRAM.
+///
+/// A READ that fails, a post that is refused, or a completion that never
+/// arrives stops the QP — every READ it was given has finished or been
+/// flushed before the error returns — and the client refuses further work.
+/// An RC QP in the error state needs a fresh connection.
 pub struct RdmaFeatureClient {
-    ctx: RdmaContext,
+    // The QP drops before the staging it targets.
     qp: RdmaQp,
     buffer: GpuGatherBuffer,
     validator: SeqlockValidator,
-    schema: FeatureSchema,
-    remote_rkey: u32,
-    remote_base: u64,
+    ctx: RdmaContext,
+    table: RemoteTable,
+    cuda_ctx: Arc<CudaContext>,
     /// Cumulative torn-slot detections across all gathers — every slot the
     /// seqlock validator rejected (first pass and retries). Nonzero means
     /// writer contention actually interleaved with RDMA reads.
     torn_slots_detected: u64,
+    /// Tags each window's `wr_id`s so a completion is matched to the window
+    /// that posted it.
+    generation: u32,
+    /// Set once the QP has been stopped after a failure.
+    failed: bool,
+}
+
+/// PCI address (`dddd:bb:dd.0`) of the GPU behind `ctx`, from the driver.
+fn gpu_pci_bus_id(ctx: &CudaContext) -> Option<String> {
+    use sys::CUdevice_attribute as A;
+    let domain = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID).ok()?;
+    let bus = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID).ok()?;
+    let device = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID).ok()?;
+    Some(format!("{domain:04x}:{bus:02x}:{device:02x}.0"))
 }
 
 impl RdmaFeatureClient {
-    /// Connect to a feature server's control plane and set up GPUDirect RDMA.
+    /// Connect to a feature server's control plane and set up GPUDirect
+    /// RDMA through the NIC nearest `gpu_id` in the PCIe topology.
     ///
-    /// 1. Opens the first RDMA device using the caller-specified `gid_index`
-    ///    (typically 1 for RoCEv2 IPv4-mapped GID; 0 is link-local IPv6 and
-    ///    not routable over Ethernet)
-    /// 2. Connects to the server's TCP control plane
-    /// 3. Exchanges QP endpoints
-    /// 4. Allocates VRAM staging buffer + registers with NIC
-    /// 5. Compiles the GPU validation kernel
+    /// `gid_index` is the local GID table index — typically 1 for the RoCEv2
+    /// IPv4-mapped GID; 0 is link-local IPv6 and not routable over Ethernet.
+    /// See [`Self::connect_on_device`] to name the NIC explicitly.
     pub fn connect(
         server_addr: &str,
         gpu_id: usize,
         max_batch_size: usize,
         gid_index: u8,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Open RDMA device
-        let rdma_ctx = RdmaContext::open(max_batch_size as i32 * 2, gid_index)?;
+        Self::connect_on_device(server_addr, gpu_id, max_batch_size, gid_index, None)
+    }
 
-        // Connect to server and exchange QP endpoints
-        let (advertisement, qp) = control::connect_with_qp(server_addr, &rdma_ctx)?;
-
-        let schema = advertisement.schema.clone();
-        let remote_rkey = advertisement.rkey;
-        let remote_base = advertisement.base_addr;
-
-        // Initialize CUDA context + stream
+    /// [`Self::connect`] on RDMA device `device_index` (see
+    /// [`crate::rdma::context::enumerate_devices`]); `None` picks the device
+    /// sharing the deepest PCIe bridge with the GPU, else device 0.
+    ///
+    /// 1. Opens the RDMA device, sized so a flushed QP cannot overrun its CQ
+    /// 2. Connects to the server's TCP control plane, parses its table, and
+    ///    exchanges QP endpoints
+    /// 3. Allocates the VRAM staging buffer and registers it with the NIC
+    /// 4. Compiles the GPU validation kernel on its own stream
+    pub fn connect_on_device(
+        server_addr: &str,
+        gpu_id: usize,
+        max_batch_size: usize,
+        gid_index: u8,
+        device_index: Option<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let cuda_ctx = CudaContext::new(gpu_id)
             .map_err(|e| io::Error::other(format!("CUDA init failed: {e}")))?;
-        let stream = cuda_ctx.default_stream();
+        let device_index = device_index
+            .or_else(|| gpu_pci_bus_id(&cuda_ctx).and_then(|bdf| closest_device_to_pci(&bdf)))
+            .unwrap_or(0);
 
-        // Allocate VRAM staging buffer
-        let buffer = GpuGatherBuffer::new(&rdma_ctx, &cuda_ctx, &stream, max_batch_size, &schema)?;
+        // The client QP is the only one on this context's CQ.
+        let rdma_ctx = RdmaContext::open_on_device(
+            required_cq_depth(&DEFAULT_QP_CAP),
+            device_index,
+            gid_index,
+        )?;
+        let (table, qp) = control::connect_with_qp(server_addr, &rdma_ctx)?;
 
-        // Compile GPU validation kernel
+        // A stream of our own: capturable for the validate graph, and not
+        // serialized behind whatever else runs on the legacy stream.
+        let stream = cuda_ctx.new_stream()?;
+        let buffer = GpuGatherBuffer::new(
+            &rdma_ctx,
+            &cuda_ctx,
+            &stream,
+            max_batch_size,
+            table.geometry(),
+        )?;
         let validator =
-            SeqlockValidator::new(&cuda_ctx, &stream, max_batch_size, schema.feature_dim)?;
+            SeqlockValidator::new(&cuda_ctx, &stream, max_batch_size, table.geometry())?;
 
         Ok(Self {
-            ctx: rdma_ctx,
             qp,
             buffer,
             validator,
-            schema,
-            remote_rkey,
-            remote_base,
+            ctx: rdma_ctx,
+            table,
+            cuda_ctx,
             torn_slots_detected: 0,
+            generation: 0,
+            failed: false,
         })
     }
 
@@ -103,20 +147,33 @@ impl RdmaFeatureClient {
     /// Gather features for a batch of node IDs into VRAM.
     ///
     /// After this call, the validated output tensor is available via
-    /// `self.validator().output()`. Use `validator().stream()` to get
-    /// a properly stream-ordered device pointer.
+    /// `self.validator().output()`, complete (the validator's stream has
+    /// been synchronized).
     ///
     /// Each row is READ twice, sequentially, into two staging regions; the
     /// GPU kernel accepts a row only when both snapshots agree on version
     /// and payload (see the RDMA reader contract in `feature_table.rs`).
-    /// Handles seqlock validation and automatic retry for torn reads.
+    /// Handles seqlock validation and automatic retry for torn reads. Every
+    /// node id is checked against the table before anything is posted.
     pub fn gather(&mut self, node_ids: &[u32]) -> Result<(), Box<dyn std::error::Error>> {
+        if self.failed {
+            return Err("RDMA QP failed on an earlier gather; reconnect".into());
+        }
+        let remote: Vec<u64> = node_ids
+            .iter()
+            .map(|&id| self.table.slot_addr(u64::from(id)))
+            .collect::<io::Result<_>>()?;
+
         if node_ids.len() > self.buffer.max_batch_size() {
             // One amortized re-reg + VRAM realloc — not per tensor, only when
             // the connect-time ceiling is actually exceeded.
             let stream = self.validator.stream().clone();
-            self.buffer
-                .ensure_capacity(&self.ctx, &stream, node_ids.len(), &self.schema)?;
+            self.buffer.ensure_capacity(
+                &self.ctx,
+                &stream,
+                node_ids.len(),
+                self.table.geometry(),
+            )?;
             self.validator.ensure_capacity(node_ids.len())?;
         }
 
@@ -124,13 +181,10 @@ impl RdmaFeatureClient {
 
         // READ both snapshots for every row, then cross-validate on the GPU.
         let all_indices: Vec<usize> = (0..batch_size).collect();
-        self.read_snapshots(node_ids, &all_indices)?;
-        let retry_count = self.validator.validate(
-            self.buffer.staging_ptr(),
-            self.buffer.staging2_ptr(),
-            self.buffer.slot_size(),
-            batch_size,
-        )?;
+        self.read_snapshots(&remote, &all_indices)?;
+        let retry_count = self
+            .validator
+            .validate(&self.buffer.staging_regions()?, batch_size)?;
 
         if retry_count == 0 {
             return Ok(());
@@ -145,13 +199,10 @@ impl RdmaFeatureClient {
                 break;
             }
 
-            self.read_snapshots(node_ids, &retry_indices)?;
-            let remaining = self.validator.validate(
-                self.buffer.staging_ptr(),
-                self.buffer.staging2_ptr(),
-                self.buffer.slot_size(),
-                batch_size,
-            )?;
+            self.read_snapshots(&remote, &retry_indices)?;
+            let remaining = self
+                .validator
+                .validate(&self.buffer.staging_regions()?, batch_size)?;
             self.torn_slots_detected += remaining as u64;
             if remaining == 0 {
                 return Ok(());
@@ -165,51 +216,9 @@ impl RdmaFeatureClient {
         Err(format!("seqlock validation did not converge after {MAX_RETRIES} retries").into())
     }
 
-    /// Translate a node id into the remote VRAM/host address to READ from,
-    /// validating it against the advertised table bounds.
-    ///
-    /// Two independent guards, both required:
-    ///   1. `node_id < schema.node_count` — the table holds exactly
-    ///      `node_count` logical slots.
-    ///   2. `(node_id + 1) * slot_size <= node_count * slot_size` via checked
-    ///      arithmetic — the offset of the slot's last byte must stay inside
-    ///      the region the server registered. The server registers the whole
-    ///      feature table (`node_count` rounded up to a power of two, each slot
-    ///      page-rounded), so `node_count * slot_size` is a conservative lower
-    ///      bound on the registered MR length; staying within it guarantees the
-    ///      one-sided READ never targets memory outside the MR even if a peer
-    ///      supplies an out-of-range id.
-    fn remote_addr_for(&self, node_id: u32) -> Result<u64, Box<dyn std::error::Error>> {
-        let node_count = self.schema.node_count as u64;
-        let slot_size = self.schema.slot_size as u64;
-        if (node_id as u64) >= node_count {
-            return Err(format!("node_id {node_id} out of range (node_count {node_count})").into());
-        }
-        // end_offset = (node_id + 1) * slot_size, checked.
-        let end_offset = (node_id as u64)
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(slot_size))
-            .ok_or("remote offset overflow")?;
-        let region_len = node_count
-            .checked_mul(slot_size)
-            .ok_or("region length overflow")?;
-        if end_offset > region_len {
-            return Err(format!(
-                "node_id {node_id} slot end {end_offset} exceeds region length {region_len}"
-            )
-            .into());
-        }
-        // start = base + node_id * slot_size, checked against u64 wrap.
-        let start_offset = (node_id as u64)
-            .checked_mul(slot_size)
-            .ok_or("remote offset overflow")?;
-        self.remote_base
-            .checked_add(start_offset)
-            .ok_or_else(|| "remote address overflow".into())
-    }
-
     /// READ the two sequential snapshots of each row in `indices` into the
-    /// buffer's two staging regions.
+    /// buffer's two staging regions. `remote[i]` is row `i`'s slot address,
+    /// already checked against the table.
     ///
     /// A row's snapshot-2 READ is posted only after its snapshot-1
     /// completion has been observed AND the GPUDirect write flush has run,
@@ -219,54 +228,47 @@ impl RdmaFeatureClient {
     /// split into windows and window k's snapshot-2 posts in the same
     /// chain as window k+1's snapshot-1, keeping the NIC busy through the
     /// protocol's serialization point instead of draining to idle between
-    /// two full-batch rounds. Each remote address is validated against the
-    /// advertised table bounds (see `remote_addr_for`) before it's turned
-    /// into a one-sided READ — a node_id past the table must never be
-    /// translated into a read outside the server's registered region.
+    /// two full-batch rounds.
     fn read_snapshots(
-        &self,
-        node_ids: &[u32],
+        &mut self,
+        remote: &[u64],
         indices: &[usize],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let lkey = self.buffer.lkey();
-        // Live bytes end at tail_version's last byte; the page-rounded
-        // remainder of the slot is dead padding not worth the PCIe traffic.
-        let read_len = (self.schema.tail_offset_in_slot + 8) as u32;
-
-        let build = |idx_window: &[usize],
-                     snapshot: usize|
-         -> Result<Vec<RdmaRead>, Box<dyn std::error::Error>> {
-            idx_window
-                .iter()
-                .map(|&i| {
-                    Ok(RdmaRead {
-                        local_addr: if snapshot == 0 {
-                            self.buffer.slot_addr(i)
-                        } else {
-                            self.buffer.slot_addr2(i)
-                        },
-                        local_lkey: lkey,
-                        remote_addr: self.remote_addr_for(node_ids[i])?,
-                        remote_rkey: self.remote_rkey,
-                        length: read_len,
-                    })
-                })
-                .collect()
-        };
-
         if indices.is_empty() {
             return Ok(());
         }
+        let lkey = self.buffer.lkey();
+        let rkey = self.table.rkey();
+        // Live bytes end at tail_version's last byte; the rest of the slot
+        // stride is padding not worth the PCIe traffic.
+        let read_len = self.table.geometry().live_len();
+
+        let build = |buffer: &GpuGatherBuffer, idx_window: &[usize], snapshot: usize| {
+            idx_window
+                .iter()
+                .map(|&i| RdmaRead {
+                    local_addr: if snapshot == 0 {
+                        buffer.slot_addr(i)
+                    } else {
+                        buffer.slot_addr2(i)
+                    },
+                    local_lkey: lkey,
+                    remote_addr: remote[i],
+                    remote_rkey: rkey,
+                    length: read_len,
+                })
+                .collect::<Vec<_>>()
+        };
 
         // Window size: combined S2(k) + S1(k+1) chains must fit the send
         // queue, and even small batches split in two so the pipeline has
         // an overlap step.
-        let cap = (self.qp.max_send_wr() as usize) / 2;
+        let cap = (self.qp.max_send_wr() as usize / 2).max(1);
         let window = indices.len().div_ceil(2).clamp(1, cap);
         let windows: Vec<&[usize]> = indices.chunks(window).collect();
 
         // Prologue: snapshot 1 of the first window.
-        let first_s1 = build(windows[0], 0)?;
+        let first_s1 = build(&self.buffer, windows[0], 0);
         self.post_and_wait(&first_s1)?;
         self.flush_gpudirect_writes()?;
 
@@ -274,9 +276,9 @@ impl RdmaFeatureClient {
             // Snapshot 2 of window k (its snapshot 1 completed and was
             // flushed in the previous iteration / prologue), chained with
             // snapshot 1 of window k+1.
-            let mut combined = build(windows[k], 1)?;
+            let mut combined = build(&self.buffer, windows[k], 1);
             if k + 1 < windows.len() {
-                combined.extend(build(windows[k + 1], 0)?);
+                combined.extend(build(&self.buffer, windows[k + 1], 0));
             }
             self.post_and_wait(&combined)?;
             self.flush_gpudirect_writes()?;
@@ -289,8 +291,11 @@ impl RdmaFeatureClient {
     /// data for the CPU, not for the GPU; this flush closes that gap. Cheap
     /// no-op on platforms with native GPUDirect write ordering.
     fn flush_gpudirect_writes(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // SAFETY: no pointers involved; both enum arguments are valid, and a
-        // live CUDA context exists for this process (created in `connect`).
+        // The flush acts on the calling thread's current context, and a
+        // gather may run on any thread: make it ours.
+        self.cuda_ctx.bind_to_thread()?;
+        // SAFETY: no pointers involved; both enum arguments are valid, and
+        // this client's context is current on the calling thread.
         let res = unsafe {
             sys::cuFlushGPUDirectRDMAWrites(
                 sys::CUflushGPUDirectRDMAWritesTarget::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
@@ -312,55 +317,56 @@ impl RdmaFeatureClient {
         &self.validator
     }
 
-    /// Post RDMA READs and busy-poll CQ until every completion arrives.
+    /// Post RDMA READs and busy-poll the CQ until every completion arrives.
     ///
     /// Batches larger than the QP send-queue depth stream through in
     /// windows: post one window (one WR per read, only the last signaled),
     /// drain its signaled completion, post the next. The window is the QP's
     /// own `max_send_wr`, so any batch size works without over-posting
     /// `ENOMEM`.
-    fn post_and_wait(&self, reads: &[RdmaRead]) -> Result<(), Box<dyn std::error::Error>> {
+    fn post_and_wait(&mut self, reads: &[RdmaRead]) -> Result<(), Box<dyn std::error::Error>> {
         let window_size = self.qp.max_send_wr() as usize;
         for window in reads.chunks(window_size) {
-            self.post_and_wait_window(window)?;
+            if let Err(e) = self.post_and_wait_window(window) {
+                // Nothing this QP was given may still be in flight when the
+                // error reaches a caller that could reuse the staging.
+                self.qp.quiesce(self.ctx.cq(), QUIESCE_DEADLINE);
+                self.failed = true;
+                return Err(e);
+            }
         }
         Ok(())
     }
 
-    /// Post one send-queue-sized window of READs and drain its completion.
-    ///
-    /// On error from an unsignaled WR, continues polling until the signaled
-    /// WR's CQE is also consumed. This prevents stale CQEs from corrupting
-    /// subsequent gather calls.
-    fn post_and_wait_window(&self, reads: &[RdmaRead]) -> Result<(), Box<dyn std::error::Error>> {
+    /// Post one send-queue-sized window of READs and wait for its signaled
+    /// completion. RC completes in order, so that completion covers every
+    /// unsignaled READ before it; any error completion ends the wait (the
+    /// caller quiesces the QP, reaping the flushed rest).
+    fn post_and_wait_window(
+        &mut self,
+        reads: &[RdmaRead],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if reads.is_empty() {
             return Ok(());
         }
+        self.generation = next_wr_generation(self.generation);
+        let base = u64::from(self.generation) << 32;
+        self.qp.post_reads_tagged(reads, reads.len(), base)?;
+        let signaled_wr_id = base + (reads.len() - 1) as u64;
 
-        self.qp.post_reads(reads)?;
-
-        let signaled_wr_id = (reads.len() - 1) as u64;
-        let mut first_error: Option<(u32, u32)> = None;
         let mut wc_buf = [IbvWc::default(); 16];
-
-        // Poll until we see the signaled WR's completion (success or error).
-        // Error CQEs from unsignaled WRs are consumed along the way. A deadline
-        // bounds the spin so a stalled QP can't pin a core indefinitely.
         let deadline = Instant::now() + POLL_DEADLINE;
         loop {
-            let n = self.qp.poll_cq(&self.ctx, &mut wc_buf)?;
-            for wc in wc_buf.iter().take(n) {
-                if wc.status != crate::rdma::ffi::IBV_WC_SUCCESS && first_error.is_none() {
-                    first_error = Some((wc.status, wc.vendor_err));
+            let n = self.ctx.cq().poll(&mut wc_buf)?;
+            for wc in &wc_buf[..n] {
+                if wc.status != IBV_WC_SUCCESS {
+                    return Err(format!(
+                        "RDMA READ failed: status={}, vendor_err={}, wr_id={:#x}",
+                        wc.status, wc.vendor_err, wc.wr_id
+                    )
+                    .into());
                 }
                 if wc.wr_id == signaled_wr_id {
-                    // Signaled WR completed — CQ is now fully drained for this batch.
-                    if let Some((status, vendor_err)) = first_error {
-                        return Err(format!(
-                            "RDMA READ failed: status={status}, vendor_err={vendor_err}"
-                        )
-                        .into());
-                    }
                     return Ok(());
                 }
             }
@@ -368,7 +374,7 @@ impl RdmaFeatureClient {
                 if Instant::now() >= deadline {
                     return Err(format!(
                         "RDMA READ completion timed out after {POLL_DEADLINE:?} \
-                         (signaled wr_id {signaled_wr_id} never landed)"
+                         (signaled wr_id {signaled_wr_id:#x} never landed)"
                     )
                     .into());
                 }
@@ -379,11 +385,16 @@ impl RdmaFeatureClient {
 
     /// Feature dimension.
     pub fn feature_dim(&self) -> usize {
-        self.schema.feature_dim
+        self.table.geometry().feature_dim()
     }
 
-    /// Schema of the remote feature table.
-    pub fn schema(&self) -> &FeatureSchema {
-        &self.schema
+    /// The remote feature table, as parsed from the server's advertisement.
+    pub fn table(&self) -> &RemoteTable {
+        &self.table
+    }
+
+    /// The CUDA context the gathers land in.
+    pub fn cuda_context(&self) -> &Arc<CudaContext> {
+        &self.cuda_ctx
     }
 }

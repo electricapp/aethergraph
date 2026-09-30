@@ -170,6 +170,53 @@ class TestFromEdges:
         with pytest.raises(ValueError, match="same length"):
             DynamicGraph.from_edges(2, src, dst)
 
+    def test_from_edges_rejects_out_of_range_vertex(self) -> None:
+        """An edge past num_vertices is an error, not silently dropped."""
+        src = np.array([0, 9], dtype=np.uint32)
+        dst = np.array([1, 2], dtype=np.uint32)
+        with pytest.raises(ValueError, match="out of range"):
+            DynamicGraph.from_edges(4, src, dst)
+
+    def test_from_edges_full_arena_raises(self) -> None:
+        """A full arena is a RuntimeError, not a panic."""
+        n = 200_000
+        src = np.arange(n, dtype=np.uint32) % 64
+        dst = np.arange(n, dtype=np.uint32)
+        with pytest.raises(RuntimeError, match="arena is full"):
+            DynamicGraph.from_edges(n, src, dst, arena_mb=1)
+
+
+class TestDimensions:
+    """Graph dimensions are checked where they enter."""
+
+    @pytest.mark.parametrize("arena_mb", [0, 40_000])
+    def test_arena_out_of_range(self, arena_mb: int) -> None:
+        with pytest.raises(ValueError, match="arena_mb"):
+            DynamicGraph(num_vertices=10, arena_mb=arena_mb)
+
+    def test_num_vertices_past_u32(self) -> None:
+        with pytest.raises(ValueError, match="u32"):
+            DynamicGraph(num_vertices=2**32 + 1)
+
+
+class TestBatchOutOfRange:
+    def test_insert_edges_out_of_range_inserts_nothing(self) -> None:
+        g = DynamicGraph(num_vertices=10)
+        src = np.array([0, 1, 2], dtype=np.uint32)
+        dst = np.array([1, 2, 99], dtype=np.uint32)
+        with pytest.raises(ValueError, match="out of range"):
+            g.insert_edges(src, dst)
+        assert g.num_edges == 0
+
+    def test_small_batch_into_hub(self) -> None:
+        g = DynamicGraph(num_vertices=50_000)
+        hub = np.arange(1, 40_001, dtype=np.uint32)
+        assert g.insert_edges(np.zeros_like(hub), hub) == hub.size
+        new = np.array([40_001, 40_002], dtype=np.uint32)
+        assert g.insert_edges(np.zeros_like(new), new) == 2
+        assert g.degree(0) == hub.size + 2
+        assert np.all(np.diff(g.neighbors(0)) > 0)
+
 
 class TestNeighborsSorted:
     """Test that neighbors are always returned in sorted order."""

@@ -11,6 +11,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use tracing::trace;
 
 /// Node ID type. u32 supports graphs up to 4 billion nodes.
@@ -18,6 +19,19 @@ pub type NodeId = u32;
 
 /// Edge offset type. u64 supports graphs with up to 18 quintillion edges.
 pub type EdgeOffset = u64;
+
+/// Largest node count a graph may declare.
+///
+/// Node ids are `u32`; `u32::MAX` itself is never a valid id, so code that
+/// walks ids can use it as a sentinel and `0..num_nodes as NodeId` never
+/// wraps.
+pub const MAX_NODES: usize = u32::MAX as usize;
+
+/// Edge count above which scans and fills fan out across rayon.
+const PARALLEL_EDGES: usize = 100_000;
+
+/// Node count above which offsets scans fan out across rayon.
+const PARALLEL_NODES: usize = 10_000;
 
 /// Edge timestamp length did not match `Graph::num_edges`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,14 +54,21 @@ impl std::error::Error for TimestampLengthMismatch {}
 
 /// Graph in CSR (Compressed Sparse Row) format.
 ///
-/// Memory layout is optimized for sequential scans and random access patterns
-/// common in GNN sampling.
-///
-/// Uses HPC-optimized custom binary format with bytemuck for zero-copy I/O.
+/// Every value satisfies the shape invariant — `offsets.len() == num_nodes +
+/// 1`, `offsets[0] == 0`, `offsets[num_nodes] == num_edges`, edge and weight
+/// arrays of length `num_edges`, `num_nodes <= MAX_NODES`. Stronger
+/// invariants are recorded as a [`GraphValidationMode`] proof level (see
+/// [`Graph::validated`]): monotone offsets from `OffsetsOnly` up, every
+/// destination below [`Graph::num_dst_nodes`] at `Full`.
 #[derive(Debug, Clone)]
 pub struct Graph {
-    /// Number of nodes in the graph
+    /// Number of nodes (CSR rows).
     num_nodes: usize,
+
+    /// Size of the destination id space. Equals `num_nodes` for a
+    /// homogeneous graph; a per-edge-type CSR of a heterogeneous graph
+    /// carries its destination type's count.
+    num_dst_nodes: usize,
 
     /// Number of edges in the graph
     num_edges: usize,
@@ -57,15 +78,20 @@ pub struct Graph {
 
     /// Optional edge timestamps (parallel to edges array, set separately).
     /// Used for temporal sampling: only edges with timestamp < seed time are eligible.
-    timestamps: Option<Arc<[f64]>>,
+    timestamps: Option<Arc<Vec<f64>>>,
+
+    /// Strongest validation level this value has passed.
+    proof: Proof,
 }
 
+/// Owned arrays are `Arc<Vec<_>>`: wrapping a filled `Vec` is free, where
+/// `Arc<[_]>::from(vec)` would allocate and copy the whole array.
 #[derive(Debug, Clone)]
 enum GraphStorage {
     Owned {
-        offsets: Arc<[EdgeOffset]>,
-        edges: Arc<[NodeId]>,
-        weights: Option<Arc<[f32]>>,
+        offsets: Arc<Vec<EdgeOffset>>,
+        edges: Arc<Vec<NodeId>>,
+        weights: Option<Arc<Vec<f32>>>,
     },
     Mapped {
         mmap: Arc<Mmap>,
@@ -75,40 +101,58 @@ enum GraphStorage {
     },
 }
 
-/// Validation modes for graph loading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How much of a graph's structure has been proven. Ordered: each level
+/// implies every level below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GraphValidationMode {
-    /// Validate only metadata/length checks.
+    /// Array lengths and the first/last offsets. Neighbor lookups stay
+    /// memory-safe on a corrupt body (a bad offset pair reads as an empty
+    /// list), but degrees and neighbor lists are then unspecified.
     HeaderOnly,
-    /// Validate metadata + offsets invariants.
+    /// Also monotone offsets: every node's neighbor range lies inside the
+    /// edge array and the ranges tile it exactly.
     OffsetsOnly,
-    /// Full validation including destination node range checks.
+    /// Also every destination below [`Graph::num_dst_nodes`].
     Full,
+}
+
+impl GraphValidationMode {
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::HeaderOnly,
+            1 => Self::OffsetsOnly,
+            _ => Self::Full,
+        }
+    }
+}
+
+/// Monotone proof level. Graph data is immutable, so a raised level stays
+/// true; clones carry the level they were taken at.
+#[derive(Debug)]
+struct Proof(AtomicU8);
+
+impl Proof {
+    fn new(mode: GraphValidationMode) -> Self {
+        Self(AtomicU8::new(mode as u8))
+    }
+
+    fn get(&self) -> GraphValidationMode {
+        GraphValidationMode::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    fn raise(&self, mode: GraphValidationMode) {
+        self.0.fetch_max(mode as u8, Ordering::Relaxed);
+    }
+}
+
+impl Clone for Proof {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
 }
 
 /// Smallest array worth a huge-page hint: one 2 MiB page.
 const HUGEPAGE_HINT_MIN_BYTES: usize = 2 << 20;
-
-/// Build owned CSR storage, asking the kernel to back the large arrays with
-/// huge pages.
-///
-/// Sampling probes `offsets` at an unpredictable index per frontier node, so at
-/// graph scale the cost is page-table walks rather than cache misses. The mmap
-/// loader advises the same two arrays; every `GraphStorage::Owned` is built
-/// here so no construction path can miss the hint.
-fn owned_storage(
-    offsets: Arc<[EdgeOffset]>,
-    edges: Arc<[NodeId]>,
-    weights: Option<Arc<[f32]>>,
-) -> GraphStorage {
-    hint_hugepage(&offsets);
-    hint_hugepage(&edges);
-    GraphStorage::Owned {
-        offsets,
-        edges,
-        weights,
-    }
-}
 
 fn hint_hugepage<T>(slice: &[T]) {
     let bytes = std::mem::size_of_val(slice);
@@ -117,12 +161,159 @@ fn hint_hugepage<T>(slice: &[T]) {
     }
 }
 
+/// A zero-filled array for `len` elements with the huge-page hint issued
+/// before any page is touched.
+///
+/// `vec![0; n]` is a zeroed allocation, so a large array arrives as
+/// untouched lazily-zeroed pages; advising then lets the first-touch faults
+/// of the fill that follows take huge pages directly. Hinting a filled
+/// array only queues it for khugepaged.
+pub(crate) fn alloc_hinted<T: bytemuck::Zeroable + Clone>(len: usize) -> Vec<T> {
+    let v = vec![T::zeroed(); len];
+    hint_hugepage(&v);
+    v
+}
+
+/// Shape checks every `Graph` satisfies, whatever its proof level. O(1).
+fn check_shape(
+    num_nodes: usize,
+    num_dst_nodes: usize,
+    offsets: &[EdgeOffset],
+    num_edges: usize,
+    weights_len: Option<usize>,
+) -> Result<()> {
+    anyhow::ensure!(
+        num_nodes <= MAX_NODES,
+        "num_nodes {num_nodes} exceeds the u32 node-id limit {MAX_NODES}"
+    );
+    anyhow::ensure!(
+        num_dst_nodes <= MAX_NODES,
+        "destination id space {num_dst_nodes} exceeds the u32 node-id limit {MAX_NODES}"
+    );
+    anyhow::ensure!(
+        offsets.len() == num_nodes + 1,
+        "offsets length {} should be num_nodes + 1 = {}",
+        offsets.len(),
+        num_nodes + 1
+    );
+    anyhow::ensure!(
+        offsets[0] == 0,
+        "first offset should be 0, got {}",
+        offsets[0]
+    );
+    anyhow::ensure!(
+        offsets[num_nodes] == num_edges as EdgeOffset,
+        "last offset {} should equal num_edges {num_edges}",
+        offsets[num_nodes]
+    );
+    if let Some(w) = weights_len {
+        anyhow::ensure!(
+            w == num_edges,
+            "weights length {w} doesn't match num_edges {num_edges}"
+        );
+    }
+    Ok(())
+}
+
+fn check_monotone(offsets: &[EdgeOffset]) -> Result<()> {
+    let ok = if offsets.len() > PARALLEL_NODES {
+        offsets.par_windows(2).all(|w| w[0] <= w[1])
+    } else {
+        offsets.windows(2).all(|w| w[0] <= w[1])
+    };
+    if !ok {
+        let i = offsets
+            .windows(2)
+            .position(|w| w[0] > w[1])
+            .expect("a window failed the monotone scan");
+        anyhow::bail!(
+            "offsets not monotonic at index {}: {} < {}",
+            i + 1,
+            offsets[i + 1],
+            offsets[i]
+        );
+    }
+    Ok(())
+}
+
+fn check_destinations(edges: &[NodeId], bound: usize) -> Result<()> {
+    let ok = if edges.len() > PARALLEL_EDGES {
+        edges.par_iter().all(|&d| (d as usize) < bound)
+    } else {
+        edges.iter().all(|&d| (d as usize) < bound)
+    };
+    if !ok {
+        let i = edges
+            .iter()
+            .position(|&d| (d as usize) >= bound)
+            .expect("an edge failed the destination scan");
+        anyhow::bail!(
+            "edge destination {} at edge {i} out of range [0, {bound})",
+            edges[i]
+        );
+    }
+    Ok(())
+}
+
+/// View a `u64` array as atomics for a parallel counting pass.
+pub(crate) fn as_atomic(slice: &mut [u64]) -> &[AtomicU64] {
+    const {
+        assert!(std::mem::align_of::<AtomicU64>() == std::mem::align_of::<u64>());
+        assert!(std::mem::size_of::<AtomicU64>() == std::mem::size_of::<u64>());
+    };
+    // SAFETY: AtomicU64 has u64's size and bit validity, and the const
+    // assertion above pins its alignment to u64's on this target. The
+    // exclusive borrow means no non-atomic access overlaps the view.
+    unsafe { &*(std::ptr::from_mut::<[u64]>(slice) as *const [AtomicU64]) }
+}
+
+/// Fill `out` row by row in parallel. `row_offsets` (monotone, first 0,
+/// last `out.len()`) partitions `out` into one slice per row, and
+/// `fill(row, slice)` writes row `row`'s slice.
+///
+/// Rows are grouped into contiguous chunks, and `out` is split into one
+/// disjoint `&mut` subslice per chunk before the parallel pass, so each task
+/// owns its output outright.
+pub(crate) fn par_fill_rows<T: Send>(
+    out: &mut [T],
+    row_offsets: &[EdgeOffset],
+    fill: impl Fn(usize, &mut [T]) + Sync,
+) {
+    const ROWS_PER_CHUNK: usize = 4096;
+    let rows = row_offsets.len().saturating_sub(1);
+    assert_eq!(
+        row_offsets.last().copied().unwrap_or(0),
+        out.len() as EdgeOffset,
+        "row offsets must span the output"
+    );
+    let mut chunks = Vec::with_capacity(rows.div_ceil(ROWS_PER_CHUNK));
+    let mut rest = out;
+    let mut start = 0;
+    while start < rows {
+        let end = (start + ROWS_PER_CHUNK).min(rows);
+        let len = (row_offsets[end] - row_offsets[start]) as usize;
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
+        chunks.push((start, end, head));
+        rest = tail;
+        start = end;
+    }
+    chunks.into_par_iter().for_each(|(start, end, chunk)| {
+        let base = row_offsets[start];
+        for row in start..end {
+            let lo = (row_offsets[row] - base) as usize;
+            let hi = (row_offsets[row + 1] - base) as usize;
+            fill(row, &mut chunk[lo..hi]);
+        }
+    });
+}
+
 /// The canonical guarded neighbor-range lookup over hoisted CSR arrays.
 ///
-/// Every neighbor accessor — [`Graph::neighbors`] and the sampler hop loops
-/// via [`CsrView`] — routes through this one function, so an out-of-range
-/// node or a corrupt offset pair yields an empty range everywhere, with
-/// identical semantics.
+/// Every neighbor accessor — [`Graph::neighbors`], [`Graph::degree`], and
+/// the sampler hop loops via [`CsrView`] — routes through this one
+/// function, so an out-of-range node or a corrupt offset pair on an
+/// unproven graph yields an empty range everywhere, with identical
+/// semantics.
 #[inline(always)]
 fn neighbor_range_guarded(
     offsets: &[EdgeOffset],
@@ -199,120 +390,153 @@ impl Graph {
     /// Used for NVMe-backed samplers where the graph is file-backed
     /// and we don't need to keep it in memory.
     pub fn empty() -> Self {
-        Self {
-            num_nodes: 0,
-            num_edges: 0,
-            storage: owned_storage(
-                Arc::from(vec![0u64].into_boxed_slice()),
-                Arc::from(Vec::<NodeId>::new().into_boxed_slice()),
-                None,
-            ),
-            timestamps: None,
-        }
+        Self::from_trusted_parts(0, 0, vec![0], Vec::new(), None)
     }
 
-    /// Creates a graph directly from CSR arrays.
-    ///
-    /// This is the most efficient way to construct a graph when you already
-    /// have the CSR representation (e.g., loading from a binary file).
+    /// Creates a graph from CSR arrays, proving every invariant — shape,
+    /// monotone offsets, destinations below `num_nodes` — before the graph
+    /// exists. The result is `Full`-validated.
     ///
     /// # Arguments
     /// * `num_nodes` - Number of nodes
     /// * `offsets` - CSR offset array (length = num_nodes + 1)
     /// * `edges` - CSR edges array (destination nodes)
     /// * `weights` - Optional edge weights
-    ///
-    /// # Safety
-    /// Caller must ensure arrays are valid CSR format. These invariants are
-    /// checked with `debug_assert!` (active in debug builds, compiled out in
-    /// release):
-    /// - offsets.len() == num_nodes + 1
-    /// - `offsets[0] == 0`
-    /// - offsets is monotonically increasing
-    /// - `offsets[num_nodes] == edges.len()`
-    ///
-    /// Edge-destination range (all destinations < num_nodes) is not asserted
-    /// here; use [`Graph::validate`] for that.
     pub fn from_csr_arrays(
         num_nodes: usize,
         offsets: Vec<EdgeOffset>,
         edges: Vec<NodeId>,
         weights: Option<Vec<f32>>,
-    ) -> Self {
-        let num_edges = edges.len();
-        debug_assert_eq!(
-            offsets.len(),
-            num_nodes + 1,
-            "offsets length must be num_nodes + 1"
-        );
-        debug_assert!(
-            offsets.first().is_none_or(|&first| first == 0),
-            "offsets[0] must be 0"
-        );
-        debug_assert!(
-            offsets.windows(2).all(|w| w[0] <= w[1]),
-            "offsets must be monotonically increasing"
-        );
-        debug_assert!(
-            offsets
-                .last()
-                .is_none_or(|&last| last == num_edges as EdgeOffset),
-            "offsets[num_nodes] must equal edges.len()"
-        );
-        Self {
+    ) -> Result<Self> {
+        let graph = Self::from_csr_vecs(
             num_nodes,
-            num_edges,
-            storage: owned_storage(
-                Arc::from(offsets.into_boxed_slice()),
-                Arc::from(edges.into_boxed_slice()),
-                weights.map(|w| Arc::from(w.into_boxed_slice())),
-            ),
-            timestamps: None,
-        }
+            num_nodes,
+            offsets,
+            edges,
+            weights,
+            GraphValidationMode::Full,
+        )?;
+        // The caller filled these arrays, so the hint can only queue them
+        // for khugepaged.
+        hint_hugepage(graph.offsets_slice());
+        hint_hugepage(graph.edges_slice());
+        Ok(graph)
     }
 
-    /// Creates a graph from pre-built owned CSR arrays.
-    ///
-    /// Used by reordering and other transformations that construct new CSR data.
-    /// Caller must ensure arrays are consistent (offsets length = num_nodes + 1,
-    /// edges/weights length = num_edges).
-    pub(crate) fn from_owned_parts(
+    /// Validate owned CSR arrays up to `mode`, then build the graph.
+    pub(crate) fn from_csr_vecs(
         num_nodes: usize,
-        num_edges: usize,
-        offsets: Arc<[EdgeOffset]>,
-        edges: Arc<[NodeId]>,
-        weights: Option<Arc<[f32]>>,
+        num_dst_nodes: usize,
+        offsets: Vec<EdgeOffset>,
+        edges: Vec<NodeId>,
+        weights: Option<Vec<f32>>,
+        mode: GraphValidationMode,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !offsets.is_empty(),
+            "offsets array is empty; it needs num_nodes + 1 entries"
+        );
+        check_shape(
+            num_nodes,
+            num_dst_nodes,
+            &offsets,
+            edges.len(),
+            weights.as_ref().map(Vec::len),
+        )?;
+        if mode >= GraphValidationMode::OffsetsOnly {
+            check_monotone(&offsets)?;
+        }
+        if mode == GraphValidationMode::Full {
+            check_destinations(&edges, num_dst_nodes)?;
+        }
+        Ok(Self {
+            num_nodes,
+            num_dst_nodes,
+            num_edges: edges.len(),
+            storage: GraphStorage::Owned {
+                offsets: Arc::new(offsets),
+                edges: Arc::new(edges),
+                weights: weights.map(Arc::new),
+            },
+            timestamps: None,
+            proof: Proof::new(mode),
+        })
+    }
+
+    /// Build a graph from arrays whose construction already proves every
+    /// invariant (a builder or a permutation of a `Full` graph).
+    pub(crate) fn from_trusted_parts(
+        num_nodes: usize,
+        num_dst_nodes: usize,
+        offsets: Vec<EdgeOffset>,
+        edges: Vec<NodeId>,
+        weights: Option<Vec<f32>>,
     ) -> Self {
+        debug_assert!(
+            check_shape(
+                num_nodes,
+                num_dst_nodes,
+                &offsets,
+                edges.len(),
+                weights.as_ref().map(Vec::len)
+            )
+            .is_ok()
+        );
         Self {
             num_nodes,
-            num_edges,
-            storage: owned_storage(offsets, edges, weights),
+            num_dst_nodes,
+            num_edges: edges.len(),
+            storage: GraphStorage::Owned {
+                offsets: Arc::new(offsets),
+                edges: Arc::new(edges),
+                weights: weights.map(Arc::new),
+            },
             timestamps: None,
+            proof: Proof::new(GraphValidationMode::Full),
         }
     }
 
-    /// Creates a graph view directly from mmap-backed CSR bytes.
+    /// Creates a graph view over mmap-backed CSR bytes, validated up to
+    /// `mode` before it exists.
     ///
-    /// Caller must ensure ranges are valid and correctly typed. Alignment
-    /// and length divisibility are asserted here, once, so the per-call
-    /// slice accessors can reconstruct typed slices without re-validating
-    /// on every `neighbors()` in the sampling hot loop.
+    /// Range alignment and length divisibility are checked here, once, so
+    /// the per-call slice accessors can reconstruct typed slices without
+    /// re-validating on every `neighbors()` in the sampling hot loop.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_mapped_parts(
         num_nodes: usize,
+        num_dst_nodes: usize,
         num_edges: usize,
         mmap: Arc<Mmap>,
         offsets_range: Range<usize>,
         edges_range: Range<usize>,
         weights_range: Option<Range<usize>>,
-    ) -> Self {
+        mode: GraphValidationMode,
+    ) -> Result<Self> {
         let base = mmap.as_ptr() as usize;
-        assert_range_aligned::<EdgeOffset>(base, &offsets_range, "offsets");
-        assert_range_aligned::<NodeId>(base, &edges_range, "edges");
+        check_range::<EdgeOffset>(base, mmap.len(), &offsets_range, "offsets")?;
+        check_range::<NodeId>(base, mmap.len(), &edges_range, "edges")?;
         if let Some(ref w) = weights_range {
-            assert_range_aligned::<f32>(base, w, "weights");
+            check_range::<f32>(base, mmap.len(), w, "weights")?;
+            anyhow::ensure!(
+                w.len() == edges_range.len(),
+                "weights section length {} doesn't match edges section {}",
+                w.len(),
+                edges_range.len()
+            );
         }
-        Self {
+        anyhow::ensure!(
+            edges_range.len() == num_edges * std::mem::size_of::<NodeId>(),
+            "edges section holds {} bytes for {num_edges} edges",
+            edges_range.len()
+        );
+        anyhow::ensure!(
+            !offsets_range.is_empty(),
+            "offsets section is empty; it needs num_nodes + 1 entries"
+        );
+        let graph = Self {
             num_nodes,
+            num_dst_nodes,
             num_edges,
             storage: GraphStorage::Mapped {
                 mmap,
@@ -321,7 +545,17 @@ impl Graph {
                 weights_range,
             },
             timestamps: None,
-        }
+            proof: Proof::new(GraphValidationMode::HeaderOnly),
+        };
+        check_shape(
+            num_nodes,
+            num_dst_nodes,
+            graph.offsets_slice(),
+            num_edges,
+            graph.weights_slice().map(<[f32]>::len),
+        )?;
+        graph.validate_with_mode(mode)?;
+        Ok(graph)
     }
 
     /// Creates a new CSR graph from an edge list.
@@ -332,14 +566,16 @@ impl Graph {
     /// * `weights` - Optional edge weights (must match edges length if provided)
     ///
     /// # Performance
-    /// This uses counting sort which is O(V + E) time and O(V) extra space.
-    /// For large graphs (>100K edges), uses parallel processing with Rayon.
+    /// Counting sort, O(V + E) time. Neighbors keep their input order within
+    /// each source. Validation and degree counting share one parallel pass;
+    /// input already grouped by source fills with a parallel copy.
     pub fn from_edges(
         num_nodes: usize,
         edges: &[(NodeId, NodeId)],
         weights: Option<&[f32]>,
     ) -> Result<Self> {
         Self::build_csr(
+            num_nodes,
             num_nodes,
             edges.len(),
             |i| edges[i].0,
@@ -360,35 +596,58 @@ impl Graph {
         dst: &[NodeId],
         weights: Option<&[f32]>,
     ) -> Result<Self> {
+        Self::from_bipartite_src_dst(num_nodes, num_nodes, src, dst, weights)
+    }
+
+    /// Creates a bipartite CSR: rows are sources in `0..num_src`,
+    /// destinations lie in `0..num_dst`. The shape of one edge type in a
+    /// heterogeneous graph, where the two endpoint types have their own id
+    /// spaces — sizing the rows by `num_src` alone keeps a 1M-source,
+    /// 1B-destination relation at 8 MB of offsets instead of 8 GB.
+    pub fn from_bipartite_src_dst(
+        num_src: usize,
+        num_dst: usize,
+        src: &[NodeId],
+        dst: &[NodeId],
+        weights: Option<&[f32]>,
+    ) -> Result<Self> {
         anyhow::ensure!(
             src.len() == dst.len(),
             "src length {} doesn't match dst length {}",
             src.len(),
             dst.len()
         );
-        Self::build_csr(num_nodes, src.len(), |i| src[i], |i| dst[i], weights)
+        Self::build_csr(num_src, num_dst, src.len(), |i| src[i], |i| dst[i], weights)
     }
 
     /// Shared counting-sort CSR builder over an indexed edge accessor.
     ///
-    /// Degree counting uses one shared array of relaxed atomic counters:
-    /// O(V) memory total, where per-chunk local counts would be
-    /// O(V x threads) (1.28 GB of temporaries for a 10M-node graph on 16
-    /// threads) plus an O(V x threads) reduce.
+    /// Pass 1 validates both endpoints, counts degrees straight into the
+    /// offsets array (as relaxed atomics, O(V) memory rather than per-thread
+    /// counts), and notes whether the input is already grouped by source.
+    /// Pass 2 fills: a parallel copy for grouped input, otherwise a serial
+    /// stable scatter that walks the edges backwards and decrements the
+    /// row ends in place, so it needs no cursor array beside the offsets.
     fn build_csr(
         num_nodes: usize,
+        num_dst_nodes: usize,
         num_edges: usize,
         src_at: impl Fn(usize) -> NodeId + Sync,
         dst_at: impl Fn(usize) -> NodeId + Sync,
         weights: Option<&[f32]>,
     ) -> Result<Self> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
         trace!(
             "Building CSR graph: {} nodes, {} edges",
             num_nodes, num_edges
         );
-
+        anyhow::ensure!(
+            num_nodes <= MAX_NODES,
+            "num_nodes {num_nodes} exceeds the u32 node-id limit {MAX_NODES}"
+        );
+        anyhow::ensure!(
+            num_dst_nodes <= MAX_NODES,
+            "destination id space {num_dst_nodes} exceeds the u32 node-id limit {MAX_NODES}"
+        );
         if let Some(w) = weights {
             anyhow::ensure!(
                 w.len() == num_edges,
@@ -398,88 +657,96 @@ impl Graph {
             );
         }
 
-        // Validate all source nodes up front so the counting pass is
-        // branch-free on the bounds.
-        let parallel = num_edges > 100_000;
-        let all_src_valid = if parallel {
-            (0..num_edges)
-                .into_par_iter()
-                .all(|i| (src_at(i) as usize) < num_nodes)
-        } else {
-            (0..num_edges).all(|i| (src_at(i) as usize) < num_nodes)
+        // offsets[s + 1] accumulates the degree of s; the prefix sum below
+        // turns it into the row end in place.
+        let mut offsets: Vec<EdgeOffset> = alloc_hinted(num_nodes + 1);
+        let (first_bad, grouped) = {
+            let counts = &as_atomic(&mut offsets)[1..];
+            let scan = |range: Range<usize>| -> (usize, bool) {
+                let mut grouped =
+                    range.start == 0 || src_at(range.start - 1) <= src_at(range.start);
+                let mut prev = 0;
+                for i in range {
+                    let s = src_at(i);
+                    let d = dst_at(i);
+                    if (s as usize) >= num_nodes || (d as usize) >= num_dst_nodes {
+                        return (i, false);
+                    }
+                    grouped &= prev <= s;
+                    prev = s;
+                    counts[s as usize].fetch_add(1, Ordering::Relaxed);
+                }
+                (usize::MAX, grouped)
+            };
+            if num_edges > PARALLEL_EDGES {
+                let chunk = num_edges.div_ceil(rayon::current_num_threads() * 4).max(1);
+                (0..num_edges.div_ceil(chunk))
+                    .into_par_iter()
+                    .map(|c| scan(c * chunk..((c + 1) * chunk).min(num_edges)))
+                    .reduce(|| (usize::MAX, true), |a, b| (a.0.min(b.0), a.1 && b.1))
+            } else {
+                scan(0..num_edges)
+            }
         };
-        if !all_src_valid {
-            let bad = (0..num_edges)
-                .find(|&i| (src_at(i) as usize) >= num_nodes)
-                .expect("a source failed validation");
+        if first_bad != usize::MAX {
+            let (s, d) = (src_at(first_bad), dst_at(first_bad));
+            if (s as usize) >= num_nodes {
+                anyhow::bail!("source node {s} exceeds num_nodes {num_nodes} (edge {first_bad})");
+            }
             anyhow::bail!(
-                "source node {} exceeds num_nodes {}",
-                src_at(bad),
-                num_nodes
+                "destination node {d} exceeds num_nodes {num_dst_nodes} (edge {first_bad})"
             );
         }
+        for i in 1..=num_nodes {
+            offsets[i] += offsets[i - 1];
+        }
+        debug_assert_eq!(offsets[num_nodes], num_edges as EdgeOffset);
 
-        // Count outgoing edges per node.
-        let degree: Vec<u64> = if parallel {
-            let counters: Vec<AtomicU64> = (0..num_nodes).map(|_| AtomicU64::new(0)).collect();
-            (0..num_edges).into_par_iter().for_each(|i| {
-                counters[src_at(i) as usize].fetch_add(1, Ordering::Relaxed);
-            });
-            counters.into_iter().map(AtomicU64::into_inner).collect()
+        let mut csr_edges: Vec<NodeId> = alloc_hinted(num_edges);
+        let mut csr_weights: Option<Vec<f32>> = weights.map(|_| alloc_hinted(num_edges));
+
+        if grouped {
+            // Grouped by source: CSR order is input order.
+            let fill = |i: usize, out: &mut NodeId| *out = dst_at(i);
+            if num_edges > PARALLEL_EDGES {
+                csr_edges
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(i, out)| fill(i, out));
+            } else {
+                csr_edges
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, out)| fill(i, out));
+            }
+            if let (Some(out), Some(w)) = (&mut csr_weights, weights) {
+                out.copy_from_slice(w);
+            }
         } else {
-            let mut degree = vec![0u64; num_nodes];
-            for i in 0..num_edges {
-                degree[src_at(i) as usize] += 1;
+            // Backward stable scatter: offsets[s + 1] starts as row s's end
+            // and is decremented per edge, so each row fills back to front
+            // and keeps input order. It ends at row s's start, one slot to
+            // the right of where the offsets array keeps it.
+            for i in (0..num_edges).rev() {
+                let s = src_at(i) as usize;
+                offsets[s + 1] -= 1;
+                let pos = offsets[s + 1] as usize;
+                csr_edges[pos] = dst_at(i);
+                if let (Some(out), Some(w)) = (&mut csr_weights, weights) {
+                    out[pos] = w[i];
+                }
             }
-            degree
-        };
-
-        // Build offsets using prefix sum
-        let mut offsets: Vec<EdgeOffset> = Vec::with_capacity(num_nodes + 1);
-        offsets.push(0);
-        for &deg in &degree {
-            let last = *offsets.last().unwrap();
-            let next = last.checked_add(deg).ok_or_else(|| {
-                anyhow::anyhow!("CSR offset overflow: {last} + {deg} exceeds u64::MAX")
-            })?;
-            offsets.push(next);
+            offsets.copy_within(1.., 0);
+            offsets[num_nodes] = num_edges as EdgeOffset;
         }
 
-        // Allocate edges array
-        let mut csr_edges = vec![0; num_edges];
-        let mut csr_weights = weights.map(|_| vec![0.0; num_edges]);
-
-        // Fill edges using offsets as insertion cursors. Serial: per-source
-        // arrival order of neighbors is part of the observable layout.
-        let mut cursors = offsets[..num_nodes].to_vec();
-        for edge_idx in 0..num_edges {
-            let src = src_at(edge_idx);
-            let dst = dst_at(edge_idx);
-            anyhow::ensure!(
-                (dst as usize) < num_nodes,
-                "destination node {dst} exceeds num_nodes {num_nodes}"
-            );
-
-            let pos = cursors[src as usize] as usize;
-            csr_edges[pos] = dst;
-
-            if let (Some(csr_w), Some(w)) = (&mut csr_weights, weights) {
-                csr_w[pos] = w[edge_idx];
-            }
-
-            cursors[src as usize] += 1;
-        }
-
-        Ok(Self {
+        Ok(Self::from_trusted_parts(
             num_nodes,
-            num_edges,
-            storage: owned_storage(
-                Arc::from(offsets.into_boxed_slice()),
-                Arc::from(csr_edges.into_boxed_slice()),
-                csr_weights.map(|w| Arc::from(w.into_boxed_slice())),
-            ),
-            timestamps: None,
-        })
+            num_dst_nodes,
+            offsets,
+            csr_edges,
+            csr_weights,
+        ))
     }
 
     /// Returns the number of nodes in the graph.
@@ -488,10 +755,35 @@ impl Graph {
         self.num_nodes
     }
 
+    /// Size of the destination id space: once `Full`-validated, every edge
+    /// destination is below it. Equal to [`Self::num_nodes`] for a
+    /// homogeneous graph.
+    #[inline(always)]
+    pub const fn num_dst_nodes(&self) -> usize {
+        self.num_dst_nodes
+    }
+
+    /// Whether sources and destinations share one id space — required by
+    /// operations that relabel both ends with one permutation.
+    #[inline(always)]
+    pub const fn is_homogeneous(&self) -> bool {
+        self.num_dst_nodes == self.num_nodes
+    }
+
     /// Returns the number of edges in the graph.
     #[inline(always)]
     pub const fn num_edges(&self) -> usize {
         self.num_edges
+    }
+
+    /// Strongest validation level this graph has passed.
+    ///
+    /// At `Full`, every destination is below [`Self::num_dst_nodes`], so
+    /// consumers need no per-edge range check. [`Self::validate_with_mode`]
+    /// raises the level (once per graph value) when a caller needs more.
+    #[inline(always)]
+    pub fn validated(&self) -> GraphValidationMode {
+        self.proof.get()
     }
 
     /// Raw offsets array (for serialization).
@@ -506,35 +798,37 @@ impl Graph {
         self.edges_slice()
     }
 
-    /// Returns the degree (number of outgoing edges) of a node.
+    /// Returns the degree (number of outgoing edges) of a node — always
+    /// `self.neighbors(node).len()`.
     ///
     /// # Performance
     /// O(1) - single array lookup.
     #[inline(always)]
     pub fn degree(&self, node: NodeId) -> usize {
-        let idx = node as usize;
-        if idx >= self.num_nodes {
-            return 0;
-        }
-        let offsets = self.offsets_slice();
-        // saturating_sub guards against non-monotonic offsets that slipped past
-        // HeaderOnly validation — without it the fuzz target trips a panic.
-        (offsets[idx + 1].saturating_sub(offsets[idx])) as usize
+        self.neighbor_range(node).len()
     }
 
     /// Returns the degree of every node in one pass over the offsets array.
     ///
     /// Equivalent to calling [`Graph::degree`] for each node in
     /// `0..num_nodes`, but amortizes the per-call overhead — useful for FFI
-    /// callers that would otherwise cross the boundary once per node.
+    /// callers that would otherwise cross the boundary once per node. A
+    /// degree past `u32::MAX` saturates.
     ///
     /// # Performance
     /// O(num_nodes) - a single sequential scan over the (possibly mmap'd)
     /// offsets array.
     pub fn degrees(&self) -> Vec<u32> {
+        let num_edges = self.num_edges as EdgeOffset;
         self.offsets_slice()
             .windows(2)
-            .map(|w| w[1].saturating_sub(w[0]) as u32)
+            .map(|w| {
+                if w[0] <= w[1] && w[1] <= num_edges {
+                    u32::try_from(w[1] - w[0]).unwrap_or(u32::MAX)
+                } else {
+                    0
+                }
+            })
             .collect()
     }
 
@@ -549,6 +843,14 @@ impl Graph {
     ///
     /// Out-of-range nodes report degree 0, matching [`Self::degree`].
     pub fn degrees_of(&self, nodes: &[NodeId]) -> Vec<u32> {
+        if self.validated() < GraphValidationMode::OffsetsOnly {
+            // The gather reads raw offset pairs; without monotone offsets
+            // it could disagree with the guarded `degree`.
+            return nodes
+                .iter()
+                .map(|&n| u32::try_from(self.degree(n)).unwrap_or(u32::MAX))
+                .collect();
+        }
         let mut out = vec![0u32; nodes.len()];
         crate::internal::simd::gather_degrees(self.offsets_slice(), nodes, &mut out);
         out
@@ -618,7 +920,7 @@ impl Graph {
                 expected: self.num_edges,
             });
         }
-        self.timestamps = Some(Arc::from(timestamps.into_boxed_slice()));
+        self.timestamps = Some(Arc::new(timestamps));
         Ok(())
     }
 
@@ -634,7 +936,7 @@ impl Graph {
     /// Returns the full timestamps array, if set.
     #[inline(always)]
     pub fn timestamps(&self) -> Option<&[f64]> {
-        self.timestamps.as_deref()
+        self.timestamps.as_deref().map(Vec::as_slice)
     }
 
     /// Returns whether timestamps are available.
@@ -676,133 +978,62 @@ impl Graph {
         self.weights_slice()
     }
 
-    /// Validates graph structure invariants.
+    /// Validates every graph invariant (`Full`).
     ///
     /// # Performance
-    /// Uses parallel validation for large graphs (>100K edges) with rayon.
+    /// O(1) once the graph is `Full`-validated; otherwise one parallel pass
+    /// over whatever is not yet proven.
     pub fn validate(&self) -> Result<()> {
         self.validate_with_mode(GraphValidationMode::Full)
     }
 
-    /// Validates graph structure invariants with configurable strictness.
+    /// Proves the graph up to `mode`, recording the result so a later call
+    /// at or below the proven level returns immediately. Only the levels
+    /// above the current proof are checked.
     pub fn validate_with_mode(&self, mode: GraphValidationMode) -> Result<()> {
-        trace!("Validating graph structure");
-        let offsets = self.offsets_slice();
-        let edges = self.edges_slice();
-        let weights = self.weights_slice();
-
-        anyhow::ensure!(
-            offsets.len() == self.num_nodes + 1,
-            "offsets length {} should be num_nodes + 1 = {}",
-            offsets.len(),
-            self.num_nodes + 1
-        );
-
-        anyhow::ensure!(
-            offsets[0] == 0,
-            "first offset should be 0, got {}",
-            offsets[0]
-        );
-
-        anyhow::ensure!(
-            *offsets.last().unwrap() as usize == self.num_edges,
-            "last offset should equal num_edges"
-        );
-
-        if mode != GraphValidationMode::HeaderOnly {
-            // Check offsets are monotonically increasing (parallel for large graphs)
-            if self.num_nodes > 10_000 {
-                // Parallel validation for large graphs
-                let is_monotonic = offsets.par_windows(2).all(|w| w[1] >= w[0]);
-                anyhow::ensure!(is_monotonic, "offsets not monotonically increasing");
-            } else {
-                // Sequential for small graphs (less overhead)
-                for i in 1..offsets.len() {
-                    anyhow::ensure!(
-                        offsets[i] >= offsets[i - 1],
-                        "offsets not monotonic at index {}: {} < {}",
-                        i,
-                        offsets[i],
-                        offsets[i - 1]
-                    );
-                }
-            }
-        }
-
-        anyhow::ensure!(
-            edges.len() == self.num_edges,
-            "edges array length {} doesn't match num_edges {}",
-            edges.len(),
-            self.num_edges
-        );
-
-        if let Some(w) = weights {
-            anyhow::ensure!(
-                w.len() == self.num_edges,
-                "weights length {} doesn't match num_edges {}",
-                w.len(),
-                self.num_edges
-            );
-        }
-
-        if mode != GraphValidationMode::Full {
-            trace!(?mode, "Graph validation passed");
+        let proven = self.proof.get();
+        if proven >= mode {
             return Ok(());
         }
-
-        // Validate all destination nodes are in range (parallel for large graphs)
-        if self.num_edges > 100_000 {
-            let all_valid = edges.par_iter().all(|&dst| (dst as usize) < self.num_nodes);
-
-            anyhow::ensure!(
-                all_valid,
-                "some edge destinations are out of range [0, {})",
-                self.num_nodes
-            );
-        } else {
-            for &dst in edges {
-                anyhow::ensure!(
-                    (dst as usize) < self.num_nodes,
-                    "edge destination {} out of range [0, {})",
-                    dst,
-                    self.num_nodes
-                );
-            }
+        trace!(?proven, ?mode, "Validating graph structure");
+        if proven < GraphValidationMode::OffsetsOnly {
+            check_monotone(self.offsets_slice())?;
+            self.proof.raise(GraphValidationMode::OffsetsOnly);
         }
-
-        trace!("Graph validation passed");
+        if mode == GraphValidationMode::Full {
+            check_destinations(self.edges_slice(), self.num_dst_nodes)?;
+            self.proof.raise(GraphValidationMode::Full);
+        }
         Ok(())
     }
 
     /// Returns statistics about the graph structure.
     ///
     /// # Performance
-    /// Uses parallel computation for large graphs (>10K nodes).
+    /// One scan over the offsets array, parallel for large graphs.
     pub fn stats(&self) -> GraphStats {
-        let (max_degree, degree_sum) = if self.num_nodes > 10_000 {
-            // Parallel stats computation for large graphs
-            (0..self.num_nodes as NodeId)
-                .into_par_iter()
-                .map(|node| {
-                    let deg = self.degree(node);
-                    (deg, deg as u64)
-                })
-                .reduce(
-                    || (0, 0u64),
-                    |(max1, sum1), (max2, sum2)| (max1.max(max2), sum1 + sum2),
-                )
-        } else {
-            // Sequential for small graphs
-            let mut max_degree = 0;
-            let mut degree_sum = 0u64;
-
-            for node in 0..self.num_nodes as NodeId {
-                let deg = self.degree(node);
-                max_degree = max_degree.max(deg);
-                degree_sum += deg as u64;
+        let num_edges = self.num_edges as EdgeOffset;
+        let degree = |w: &[EdgeOffset]| -> u64 {
+            if w[0] <= w[1] && w[1] <= num_edges {
+                w[1] - w[0]
+            } else {
+                0
             }
-
-            (max_degree, degree_sum)
+        };
+        let offsets = self.offsets_slice();
+        let (max_degree, degree_sum) = if self.num_nodes > PARALLEL_NODES {
+            offsets
+                .par_windows(2)
+                .map(|w| {
+                    let d = degree(w);
+                    (d, d)
+                })
+                .reduce(|| (0, 0), |(m1, s1), (m2, s2)| (m1.max(m2), s1 + s2))
+        } else {
+            offsets
+                .windows(2)
+                .map(degree)
+                .fold((0, 0), |(m, s), d| (m.max(d), s + d))
         };
 
         let avg_degree = if self.num_nodes > 0 {
@@ -814,7 +1045,7 @@ impl Graph {
         GraphStats {
             num_nodes: self.num_nodes,
             num_edges: self.num_edges,
-            max_degree,
+            max_degree: max_degree as usize,
             avg_degree,
             has_weights: self.weights().is_some(),
         }
@@ -829,9 +1060,10 @@ impl Graph {
                 offsets_range,
                 ..
             } => {
-                // SAFETY: `from_mapped_parts` asserted this range aligned
-                // and sized for `EdgeOffset` (see `typed_slice`'s contract);
-                // the mmap is immutable and outlives `self` via the Arc.
+                // SAFETY: `from_mapped_parts` checked this range aligned,
+                // in bounds, and sized for `EdgeOffset` (see `typed_slice`'s
+                // contract); the mmap is immutable and outlives `self` via
+                // the Arc.
                 unsafe { typed_slice::<EdgeOffset>(&mmap[offsets_range.start..offsets_range.end]) }
             }
         }
@@ -844,9 +1076,10 @@ impl Graph {
             GraphStorage::Mapped {
                 mmap, edges_range, ..
             } => {
-                // SAFETY: `from_mapped_parts` asserted this range aligned
-                // and sized for `NodeId` (see `typed_slice`'s contract);
-                // the mmap is immutable and outlives `self` via the Arc.
+                // SAFETY: `from_mapped_parts` checked this range aligned,
+                // in bounds, and sized for `NodeId` (see `typed_slice`'s
+                // contract); the mmap is immutable and outlives `self` via
+                // the Arc.
                 unsafe { typed_slice::<NodeId>(&mmap[edges_range.start..edges_range.end]) }
             }
         }
@@ -855,41 +1088,47 @@ impl Graph {
     #[inline(always)]
     fn weights_slice(&self) -> Option<&[f32]> {
         match &self.storage {
-            GraphStorage::Owned { weights, .. } => weights.as_deref(),
+            GraphStorage::Owned { weights, .. } => weights.as_deref().map(Vec::as_slice),
             GraphStorage::Mapped {
                 mmap,
                 weights_range,
                 ..
             } => weights_range.as_ref().map(|range| {
-                // SAFETY: `from_mapped_parts` asserted this range aligned
-                // and sized for `f32` (see `typed_slice`'s contract); the
-                // mmap is immutable and outlives `self` via the Arc.
+                // SAFETY: `from_mapped_parts` checked this range aligned,
+                // in bounds, and sized for `f32` (see `typed_slice`'s
+                // contract); the mmap is immutable and outlives `self` via
+                // the Arc.
                 unsafe { typed_slice::<f32>(&mmap[range.start..range.end]) }
             }),
         }
     }
 }
 
-/// Assert that an mmap byte range starts aligned for `T` and spans a whole
-/// number of `T`s. Runs once per range at [`Graph::from_mapped_parts`] so
-/// [`typed_slice`] can skip per-call re-validation — re-checking on every
-/// access would put an alignment test and division in the sampler's
-/// per-node path.
-fn assert_range_aligned<T>(base: usize, range: &Range<usize>, what: &str) {
-    assert!(
+/// Check that an mmap byte range lies inside the mapping, starts aligned for
+/// `T`, and spans a whole number of `T`s. Runs once per range at
+/// [`Graph::from_mapped_parts`] so [`typed_slice`] can skip per-call
+/// re-validation — re-checking on every access would put an alignment test
+/// and division in the sampler's per-node path.
+fn check_range<T>(base: usize, map_len: usize, range: &Range<usize>, what: &str) -> Result<()> {
+    anyhow::ensure!(
+        range.start <= range.end && range.end <= map_len,
+        "mmap {what} range {range:?} lies outside the {map_len}-byte mapping"
+    );
+    anyhow::ensure!(
         (base + range.start).is_multiple_of(std::mem::align_of::<T>())
             && range.len().is_multiple_of(std::mem::size_of::<T>()),
         "mmap {what} range misaligned for {}",
         std::any::type_name::<T>()
     );
+    Ok(())
 }
 
 /// Reinterpret an mmap byte range as a typed slice.
 ///
 /// # Safety
 /// - `bytes` must start aligned for `T` and its length must be a multiple of
-///   `size_of::<T>()` — [`assert_range_aligned`] establishes both, once per
-///   range, in [`Graph::from_mapped_parts`].
+///   `size_of::<T>()` — [`check_range`] establishes both, once per range, in
+///   [`Graph::from_mapped_parts`].
 /// - The backing memory must be immutable and outlive the returned slice
 ///   (the `Graph` holds the mmap via `Arc`, and the slice borrows `bytes`).
 ///
@@ -1064,6 +1303,15 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_destination_names_the_edge() {
+        let err = Graph::from_edges(3, &[(0, 1), (1, 7)], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("destination node 7"), "got: {err}");
+        assert!(err.contains("edge 1"), "got: {err}");
+    }
+
+    #[test]
     fn test_out_of_bounds_with_weights() {
         let edges = vec![(0, 1)];
         let weights = vec![1.0];
@@ -1133,5 +1381,153 @@ mod tests {
         assert!(!graph.has_timestamps());
         assert!(graph.neighbor_timestamps(0).is_none());
         assert!(graph.neighbor_timestamps(1).is_none());
+    }
+
+    /// Unsorted input takes the backward-scatter path, sorted input the
+    /// parallel copy; both keep each source's neighbors in input order.
+    #[test]
+    fn test_build_keeps_input_order_on_both_fill_paths() {
+        let unsorted = vec![(2, 5), (0, 3), (2, 1), (0, 4), (1, 0), (0, 1)];
+        let w: Vec<f32> = (0..unsorted.len()).map(|i| i as f32).collect();
+        let g = Graph::from_edges(6, &unsorted, Some(&w)).unwrap();
+        assert_eq!(g.offsets(), &[0, 3, 4, 6, 6, 6, 6]);
+        assert_eq!(g.neighbors(0), &[3, 4, 1]);
+        assert_eq!(g.neighbor_weights(0), Some(&[1.0, 3.0, 5.0][..]));
+        assert_eq!(g.neighbors(2), &[5, 1]);
+        assert_eq!(g.neighbor_weights(2), Some(&[0.0, 2.0][..]));
+
+        let mut sorted = unsorted.clone();
+        sorted.sort_by_key(|&(s, _)| s);
+        let g2 = Graph::from_edges(6, &sorted, None).unwrap();
+        assert_eq!(g2.offsets(), g.offsets());
+        assert_eq!(g2.edges(), g.edges());
+    }
+
+    /// A large unsorted edge list runs the parallel counting pass and must
+    /// agree with a naive per-source bucketing.
+    #[test]
+    fn test_build_parallel_pass_matches_reference() {
+        let n = 5_000u32;
+        let edges: Vec<(u32, u32)> = (0..300_000u64)
+            .map(|i| {
+                let s = (i.wrapping_mul(2_654_435_761) % u64::from(n)) as u32;
+                let d = (i.wrapping_mul(40_503) % u64::from(n)) as u32;
+                (s, d)
+            })
+            .collect();
+        let g = Graph::from_edges(n as usize, &edges, None).unwrap();
+        let mut buckets = vec![Vec::new(); n as usize];
+        for &(s, d) in &edges {
+            buckets[s as usize].push(d);
+        }
+        for s in 0..n {
+            assert_eq!(g.neighbors(s), &buckets[s as usize][..]);
+        }
+    }
+
+    #[test]
+    fn test_bipartite_rows_and_destination_space() {
+        let g = Graph::from_bipartite_src_dst(2, 1_000, &[0, 1, 1], &[999, 5, 0], None).unwrap();
+        assert_eq!(g.num_nodes(), 2);
+        assert_eq!(g.num_dst_nodes(), 1_000);
+        assert!(!g.is_homogeneous());
+        assert_eq!(g.offsets().len(), 3);
+        assert_eq!(g.neighbors(0), &[999]);
+        assert_eq!(g.validated(), GraphValidationMode::Full);
+        assert!(Graph::from_bipartite_src_dst(2, 1_000, &[2], &[0], None).is_err());
+        assert!(Graph::from_bipartite_src_dst(2, 1_000, &[0], &[1_000], None).is_err());
+    }
+
+    #[test]
+    fn test_from_csr_arrays_checks_every_invariant() {
+        // Valid.
+        let g = Graph::from_csr_arrays(3, vec![0, 2, 2, 3], vec![1, 2, 0], None).unwrap();
+        assert_eq!(g.validated(), GraphValidationMode::Full);
+        // Non-monotone offsets.
+        assert!(Graph::from_csr_arrays(3, vec![0, 3, 1, 3], vec![1, 2, 0], None).is_err());
+        // Destination out of range.
+        assert!(Graph::from_csr_arrays(3, vec![0, 2, 2, 2], vec![1, 99], None).is_err());
+        // Last offset disagrees with the edge count.
+        assert!(Graph::from_csr_arrays(3, vec![0, 1, 1, 1], vec![1, 2], None).is_err());
+        // Offsets length disagrees with num_nodes.
+        assert!(Graph::from_csr_arrays(3, vec![0, 2], vec![1, 2], None).is_err());
+        // Nonzero first offset.
+        assert!(Graph::from_csr_arrays(1, vec![1, 1], vec![], None).is_err());
+        // Empty offsets.
+        assert!(Graph::from_csr_arrays(0, vec![], vec![], None).is_err());
+        // Weights of the wrong length.
+        assert!(Graph::from_csr_arrays(2, vec![0, 1, 1], vec![1], Some(vec![])).is_err());
+    }
+
+    #[test]
+    fn test_node_count_limit() {
+        assert!(Graph::from_src_dst(MAX_NODES + 1, &[], &[], None).is_err());
+    }
+
+    #[test]
+    fn test_validation_records_and_raises_proof() {
+        let g = Graph::from_csr_vecs(
+            3,
+            3,
+            vec![0, 2, 2, 3],
+            vec![1, 2, 0],
+            None,
+            GraphValidationMode::HeaderOnly,
+        )
+        .unwrap();
+        assert_eq!(g.validated(), GraphValidationMode::HeaderOnly);
+        g.validate_with_mode(GraphValidationMode::OffsetsOnly)
+            .unwrap();
+        assert_eq!(g.validated(), GraphValidationMode::OffsetsOnly);
+        let cloned = g.clone();
+        g.validate().unwrap();
+        assert_eq!(g.validated(), GraphValidationMode::Full);
+        assert_eq!(cloned.validated(), GraphValidationMode::OffsetsOnly);
+    }
+
+    /// Guarded accessors agree with each other on an unproven, corrupt
+    /// body: degree is the neighbor list's length and the bulk variants
+    /// match it.
+    #[test]
+    fn test_degree_agrees_with_neighbors_on_corrupt_offsets() {
+        let g = Graph::from_csr_vecs(
+            3,
+            3,
+            vec![0, 4, 0, 12],
+            vec![0; 12],
+            None,
+            GraphValidationMode::HeaderOnly,
+        )
+        .unwrap();
+        for n in 0..3 {
+            assert_eq!(g.degree(n), g.neighbors(n).len());
+        }
+        let per_node: Vec<u32> = (0..3).map(|n| g.degree(n) as u32).collect();
+        assert_eq!(g.degrees(), per_node);
+        assert_eq!(g.degrees_of(&[0, 1, 2]), per_node);
+        assert!(
+            g.validate_with_mode(GraphValidationMode::OffsetsOnly)
+                .is_err()
+        );
+        assert_eq!(g.validated(), GraphValidationMode::HeaderOnly);
+    }
+
+    #[test]
+    fn test_par_fill_rows_covers_every_row() {
+        let mut prefix = vec![0u64; 10_001];
+        for i in 1..prefix.len() {
+            prefix[i] = prefix[i - 1] + (i as u64 % 5);
+        }
+        let total = *prefix.last().unwrap() as usize;
+        let mut out = vec![u32::MAX; total];
+        par_fill_rows(&mut out, &prefix, |row, slice| {
+            assert_eq!(slice.len() as u64, prefix[row + 1] - prefix[row]);
+            slice.fill(row as u32);
+        });
+        for row in 0..prefix.len() - 1 {
+            let (lo, hi) = (prefix[row] as usize, prefix[row + 1] as usize);
+            assert!(out[lo..hi].iter().all(|&v| v == row as u32));
+        }
+        assert!(out.iter().all(|&v| v != u32::MAX));
     }
 }

@@ -33,10 +33,6 @@ use tracing::{debug, trace, warn};
 /// never exceeds a smaller burst.
 pub const DEFAULT_RING_ENTRIES: u32 = 4096;
 
-/// Minimum alignment for O_DIRECT file offsets (512 bytes for most NVMe/SSD).
-/// File offsets must be aligned to this value for O_DIRECT reads to succeed.
-pub const DIRECT_IO_OFFSET_ALIGNMENT: usize = 512;
-
 /// Userspace-owned backing for an `IORING_REGISTER_PBUF_RING` registration.
 ///
 /// The kernel reads the descriptor ring and writes into the landing slab until
@@ -177,65 +173,165 @@ impl Drop for ProvidedBufferRing {
     }
 }
 
-/// The file's real O_DIRECT offset alignment, from `statx(STATX_DIOALIGN)`.
+/// A file's O_DIRECT requirements: the offset/length alignment every read
+/// must meet, and the alignment its landing memory must meet.
 ///
-/// [`DIRECT_IO_OFFSET_ALIGNMENT`] is the historical 512-byte assumption. It
-/// is not universal: a 4Kn drive, or a filesystem layered over one, requires
-/// 4096, and a layout that satisfies 512 but not 4096 passes the static
-/// check and then fails every read with `EINVAL`. `STATX_DIOALIGN` (Linux
-/// 6.1) reports what the backing device actually needs, so the compatibility
-/// decision can be made against the truth rather than a guess.
-///
-/// Returns `None` when the kernel or filesystem does not report it — the
-/// caller then keeps the conservative default.
-pub fn direct_io_offset_alignment(file: &File) -> Option<usize> {
-    // STATX_DIOALIGN, from <linux/stat.h>.
-    const STATX_DIOALIGN: libc::c_uint = 0x0000_2000;
-    // SAFETY: an all-zero statx is a valid out-parameter the kernel fills.
-    let mut st: libc::statx = unsafe { std::mem::zeroed() };
-    // SAFETY: `file` provides a live fd; with AT_EMPTY_PATH and an empty
-    // path the fd itself is the target, and `st` is a valid out-pointer.
-    let rc = unsafe {
-        libc::statx(
-            file.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            STATX_DIOALIGN,
-            &mut st,
-        )
+/// Probed once per file by [`Self::probe`] and never guessed low. A layout
+/// that clears 512 bytes but not the device's real requirement (4096 on a
+/// 4Kn drive) passes a static check and then fails every read with
+/// `EINVAL`, so every source here is either what the kernel reports or an
+/// upper bound on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectIoAlignment {
+    offset: usize,
+    memory: usize,
+}
+
+impl DirectIoAlignment {
+    /// Alignment assumed when neither the kernel nor the block device
+    /// reports one. No common device needs more.
+    const CONSERVATIVE: usize = 4096;
+
+    /// The requirements for `file`, from the most exact source available:
+    ///
+    /// 1. `statx(STATX_DIOALIGN)` (Linux 6.1+): what the kernel will check.
+    /// 2. ext4 and XFS on a block device check the device's logical block
+    ///    size, which sysfs publishes.
+    /// 3. Otherwise the larger of 4096 and the file's `st_blksize`.
+    pub fn probe(file: &File) -> Self {
+        if let Some(reported) = Self::from_statx(file) {
+            return reported;
+        }
+        if let Some(lbs) = block_fs_logical_block_size(file) {
+            return Self {
+                offset: lbs,
+                memory: lbs.min(Self::CONSERVATIVE),
+            };
+        }
+        use std::os::unix::fs::MetadataExt;
+        let blksize = file
+            .metadata()
+            .ok()
+            .and_then(|m| usize::try_from(m.blksize()).ok())
+            .filter(|b| b.is_power_of_two() && *b <= 1 << 20)
+            .unwrap_or(Self::CONSERVATIVE);
+        let offset = blksize.max(Self::CONSERVATIVE);
+        Self {
+            offset,
+            memory: Self::CONSERVATIVE,
+        }
+    }
+
+    fn from_statx(file: &File) -> Option<Self> {
+        // STATX_DIOALIGN, from <linux/stat.h>.
+        const STATX_DIOALIGN: libc::c_uint = 0x0000_2000;
+        // SAFETY: an all-zero statx is a valid out-parameter the kernel fills.
+        let mut st: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` provides a live fd; with AT_EMPTY_PATH and an empty
+        // path the fd itself is the target, and `st` is a valid out-pointer.
+        let rc = unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                STATX_DIOALIGN,
+                &mut st,
+            )
+        };
+        // The mask reports what the kernel actually filled in; a kernel that
+        // does not know the flag succeeds and simply leaves it clear. Zero
+        // alignments mean the file cannot do O_DIRECT, which the open itself
+        // then reports.
+        if rc != 0 || st.stx_mask & STATX_DIOALIGN == 0 {
+            return None;
+        }
+        let offset = st.stx_dio_offset_align as usize;
+        let memory = st.stx_dio_mem_align as usize;
+        (offset.is_power_of_two() && memory.is_power_of_two()).then_some(Self { offset, memory })
+    }
+
+    /// The file-offset and length alignment in bytes.
+    pub fn bytes(self) -> usize {
+        self.offset
+    }
+}
+
+impl std::fmt::Display for DirectIoAlignment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-byte", self.offset)
+    }
+}
+
+/// The logical block size ext4 or XFS checks O_DIRECT reads against: the
+/// block device's, from sysfs. `None` for any other filesystem or a device
+/// sysfs does not describe.
+fn block_fs_logical_block_size(file: &File) -> Option<usize> {
+    use std::os::unix::fs::MetadataExt;
+    const EXT_SUPER_MAGIC: libc::c_long = 0xEF53;
+    const XFS_SUPER_MAGIC: libc::c_long = 0x5846_5342;
+
+    // SAFETY: an all-zero statfs is a valid out-parameter the kernel fills.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` is a live fd and `fs` a valid out-pointer.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)] // f_type's width differs by target.
+    let fs_type = fs.f_type as libc::c_long;
+    if fs_type != EXT_SUPER_MAGIC && fs_type != XFS_SUPER_MAGIC {
+        return None;
+    }
+    let dev = file.metadata().ok()?.dev();
+    let dir = std::fs::canonicalize(format!(
+        "/sys/dev/block/{}:{}",
+        libc::major(dev),
+        libc::minor(dev)
+    ))
+    .ok()?;
+    // A partition has no queue of its own; its disk's applies.
+    let disk = if dir.join("partition").exists() {
+        dir.parent()?.to_path_buf()
+    } else {
+        dir
     };
-    if rc != 0 {
-        return None;
-    }
-    // The mask reports what the kernel actually filled in; a kernel that
-    // does not know the flag succeeds and simply leaves it clear.
-    if st.stx_mask & STATX_DIOALIGN == 0 {
-        return None;
-    }
-    let align = st.stx_dio_offset_align as usize;
-    // Zero means the file does not support O_DIRECT at all.
-    (align > 0).then_some(align)
+    let lbs: usize = std::fs::read_to_string(disk.join("queue/logical_block_size"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (lbs >= 512 && lbs.is_power_of_two()).then_some(lbs)
 }
 
 /// Check if a feature file layout is compatible with O_DIRECT.
 ///
 /// O_DIRECT requires both buffer and file offset alignment. For feature
 /// files this means `features_start_offset` and `feature_size` must both be
-/// multiples of the device's offset alignment; if either is not, reads fail
-/// with `EINVAL`.
-///
-/// `alignment` comes from [`direct_io_offset_alignment`] where the kernel
-/// reports it, and [`DIRECT_IO_OFFSET_ALIGNMENT`] otherwise.
+/// multiples of the device's offset alignment, and the landing buffers'
+/// alignment ([`DIRECT_IO_ALIGNMENT`](crate::internal::aligned::DIRECT_IO_ALIGNMENT))
+/// must satisfy its memory alignment; otherwise reads fail with `EINVAL`.
 pub fn is_layout_direct_io_compatible_with(
     features_start_offset: u64,
     feature_size: usize,
-    alignment: usize,
+    alignment: DirectIoAlignment,
 ) -> bool {
-    if alignment == 0 {
-        return false;
+    alignment.memory <= crate::internal::aligned::DIRECT_IO_ALIGNMENT
+        && features_start_offset.is_multiple_of(alignment.offset as u64)
+        && feature_size.is_multiple_of(alignment.offset)
+}
+
+/// Proof that a file is open with O_DIRECT — the only kind of file an
+/// IOPOLL ring can serve. Read from the fd's own status flags, so it
+/// cannot disagree with how the file was actually opened.
+#[derive(Clone, Copy)]
+pub struct DirectFile<'a>(std::marker::PhantomData<&'a File>);
+
+impl<'a> DirectFile<'a> {
+    /// `Some` when `file` was opened with O_DIRECT.
+    pub fn of(file: &'a File) -> Option<Self> {
+        // SAFETY: F_GETFL on a live fd takes no argument.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        (flags >= 0 && flags & libc::O_DIRECT != 0).then_some(Self(std::marker::PhantomData))
     }
-    (features_start_offset as usize).is_multiple_of(alignment)
-        && feature_size.is_multiple_of(alignment)
 }
 
 /// Open a file with O_DIRECT for use with io_uring IOPOLL.
@@ -292,52 +388,6 @@ pub fn open_direct_or_fallback(path: impl AsRef<Path>) -> Result<(File, bool)> {
     }
 }
 
-/// Open with O_DIRECT for read+write. Spill tiers must use this — a
-/// read-only O_DIRECT fd returns `EBADF` on `pwrite`.
-pub fn open_direct_rw(path: impl AsRef<Path>) -> Result<File> {
-    let path = path.as_ref();
-
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-        .with_context(|| format!("failed to open {} with O_DIRECT (rw)", path.display()))
-}
-
-/// Like [`open_direct_or_fallback`], but always opens read+write.
-pub fn open_direct_rw_or_fallback(path: impl AsRef<Path>) -> Result<(File, bool)> {
-    let path = path.as_ref();
-
-    match open_direct_rw(path) {
-        Ok(file) => {
-            debug!("Opened {} with O_DIRECT (rw)", path.display());
-            Ok((file, true))
-        }
-        Err(e) => {
-            let is_unsupported = e
-                .downcast_ref::<std::io::Error>()
-                .map(|io_err| io_err.raw_os_error() == Some(libc::EINVAL))
-                .unwrap_or(false);
-
-            if is_unsupported {
-                warn!(
-                    "O_DIRECT not supported for {}, falling back to buffered I/O (rw)",
-                    path.display()
-                );
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(path)
-                    .with_context(|| format!("failed to open {} buffered (rw)", path.display()))?;
-                Ok((file, false))
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
 /// One ring plus its reusable landing buffers.
 ///
 /// The landing buffers live with the ring under one lock, so per-batch
@@ -351,6 +401,17 @@ pub struct UringLane {
     /// region is `f32`-aligned by construction and a decoded batch can be
     /// read back as `[f32]` without a runtime alignment check.
     scratch: Vec<f32>,
+    /// This lane's NVMe passthrough reader, opened on first use.
+    #[cfg(feature = "nvme-passthru")]
+    nvme: NvmeSlot,
+}
+
+/// A lane's passthrough reader: not yet tried, open, or refused.
+#[cfg(feature = "nvme-passthru")]
+enum NvmeSlot {
+    Untried,
+    Open(Box<crate::internal::nvme::NvmeReader>),
+    Unavailable,
 }
 
 impl UringLane {
@@ -359,6 +420,30 @@ impl UringLane {
             handle,
             pool: None,
             scratch: Vec::new(),
+            #[cfg(feature = "nvme-passthru")]
+            nvme: NvmeSlot::Untried,
+        }
+    }
+
+    /// This lane's passthrough reader for `target`, opened on the first
+    /// call. `None` once opening has failed on this lane.
+    #[cfg(feature = "nvme-passthru")]
+    pub(crate) fn nvme_reader(
+        &mut self,
+        target: &crate::internal::nvme::NamespaceTarget,
+    ) -> Option<&mut crate::internal::nvme::NvmeReader> {
+        if matches!(self.nvme, NvmeSlot::Untried) {
+            self.nvme = match crate::internal::nvme::NvmeReader::open(target) {
+                Ok(reader) => NvmeSlot::Open(Box::new(reader)),
+                Err(e) => {
+                    debug!("NVMe passthrough reader unavailable on this lane: {e:#}");
+                    NvmeSlot::Unavailable
+                }
+            };
+        }
+        match &mut self.nvme {
+            NvmeSlot::Open(reader) => Some(reader),
+            _ => None,
         }
     }
 
@@ -566,7 +651,11 @@ impl<T: Send + 'static> RingPool<T> {
     where
         F: Fn(usize) -> Option<T> + Send + Clone + 'static,
     {
-        let (ready_tx, ready_rx) = crossbeam_channel::bounded(lanes.max(1));
+        // Each lane reports its own index with its outcome: reports arrive
+        // in whatever order the lanes finish building, so pairing them
+        // with senders by arrival order would keep a dead lane's queue and
+        // drop a live one's.
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<(usize, bool)>(lanes.max(1));
         let mut txs = Vec::with_capacity(lanes);
         let mut workers = Vec::with_capacity(lanes);
 
@@ -578,10 +667,10 @@ impl<T: Send + 'static> RingPool<T> {
                 .name(format!("{name}-{idx}"))
                 .spawn(move || {
                     let Some(mut resource) = make(idx) else {
-                        let _ = ready_tx.send(false);
+                        let _ = ready_tx.send((idx, false));
                         return;
                     };
-                    let _ = ready_tx.send(true);
+                    let _ = ready_tx.send((idx, true));
                     drop(ready_tx);
                     // Ends when every sender is dropped, i.e. on pool drop.
                     while let Ok(job) = rx.recv() {
@@ -590,7 +679,7 @@ impl<T: Send + 'static> RingPool<T> {
                 });
             match spawned {
                 Ok(handle) => {
-                    txs.push(tx);
+                    txs.push((idx, tx));
                     workers.push(handle);
                 }
                 Err(e) => warn!("failed to spawn ring lane {idx}: {e}"),
@@ -598,18 +687,24 @@ impl<T: Send + 'static> RingPool<T> {
         }
         drop(ready_tx);
 
-        // Wait for each lane to report, so a pool that returns Some really
+        // Wait for every lane to report, so a pool that returns Some really
         // has rings behind it rather than threads that failed to build one.
-        let mut live = Vec::with_capacity(txs.len());
-        for (idx, tx) in txs.into_iter().enumerate() {
-            match ready_rx.recv() {
-                Ok(true) => live.push(tx),
-                // The thread exited; its queue would never be serviced.
-                Ok(false) | Err(_) => {
+        // A lane whose `make` panicked never reports; the channel closes
+        // once every lane thread has either reported or exited.
+        let mut ready = vec![false; lanes];
+        while let Ok((idx, ok)) = ready_rx.recv() {
+            ready[idx] = ok;
+        }
+        let live: Vec<_> = txs
+            .into_iter()
+            .filter_map(|(idx, tx)| {
+                if !ready[idx] {
+                    // The thread exited; its queue would never be serviced.
                     trace!("ring lane {idx} did not initialize");
                 }
-            }
-        }
+                ready[idx].then_some(tx)
+            })
+            .collect();
         if live.is_empty() {
             return None;
         }
@@ -692,15 +787,18 @@ pub struct UringHandle {
 }
 
 impl UringHandle {
-    /// Create a new io_uring handle with SQPOLL + IOPOLL.
+    /// Create an io_uring handle with SQPOLL + IOPOLL for `file`.
     ///
-    /// IOPOLL requires O_DIRECT files with aligned offsets. Use `new_sqpoll_only`
-    /// if your file offsets aren't aligned.
+    /// The kernel rejects every polled read on a file not opened with
+    /// O_DIRECT (`EOPNOTSUPP`), so this constructor takes the proof rather
+    /// than trusting its caller; a buffered file gets
+    /// [`Self::new_sqpoll_only`]. Falls back down the same ladder when the
+    /// kernel refuses SQPOLL or IOPOLL.
     ///
     /// # Arguments
     /// * `entries` - Number of SQ/CQ entries (power of 2, typically 256)
     /// * `sqpoll_idle_ms` - Kernel thread idle timeout in ms (typically 1000)
-    pub fn new(entries: u32, sqpoll_idle_ms: u32) -> Result<Self> {
+    pub fn new_polled(entries: u32, sqpoll_idle_ms: u32, _file: DirectFile<'_>) -> Result<Self> {
         // Try full SQPOLL + IOPOLL first
         let mut builder = io_uring::IoUring::builder();
         builder.setup_sqpoll(sqpoll_idle_ms).setup_iopoll();
@@ -807,6 +905,18 @@ impl UringHandle {
     /// SQ/CQ depth this ring was built with.
     pub fn entries(&self) -> u32 {
         self.entries
+    }
+
+    /// Completion-queue capacity: the most reads that can be in flight
+    /// before completions spill to the kernel's overflow list.
+    pub fn cq_entries(&self) -> u32 {
+        self.ring.params().cq_entries()
+    }
+
+    /// Whether completions post only on an `io_uring_enter` that carries
+    /// `GETEVENTS` (`DEFER_TASKRUN`).
+    fn defers_taskrun(&self) -> bool {
+        self.tier == "deferred"
     }
 
     /// Which setup this ring actually got: `"deferred"`, `"single-issuer"`,
@@ -1115,41 +1225,30 @@ impl Drop for UringHandle {
     }
 }
 
-/// Build one `UringHandle` for the feature-read hot path. Picks the best tier
-/// the kernel + layout permit:
+/// Build one `UringHandle` for reading `file` on the feature hot path. Picks
+/// the best tier the kernel and the file permit:
 ///
-/// 1. `direct_io` + SQPOLL + IOPOLL — zero-syscall NVMe polling
-/// 2. SQPOLL only — reduced syscalls, falls here when O_DIRECT is unavailable
-///    or IOPOLL construction fails
+/// 1. O_DIRECT file + SQPOLL + IOPOLL — zero-syscall NVMe polling
+/// 2. SQPOLL only — reduced syscalls; any buffered file lands here, as does
+///    a direct one whose IOPOLL construction fails
 /// 3. `None` — even SQPOLL refused (kernel too old / missing perms)
 ///
 /// Emits one `debug!` line describing which tier was taken. Caller is
 /// responsible for `register_fd` if FD-register is wanted.
-pub fn create_feature_uring(direct_io: bool) -> Option<UringHandle> {
-    let handle = if direct_io {
-        match UringHandle::new(DEFAULT_RING_ENTRIES, 1000) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("Failed to create io_uring with IOPOLL: {}", e);
-                match UringHandle::new_sqpoll_only(DEFAULT_RING_ENTRIES, 1000) {
-                    Ok(h) => h,
-                    Err(e2) => {
-                        warn!("SQPOLL fallback also failed: {}", e2);
-                        return None;
-                    }
-                }
-            }
-        }
-    } else {
-        match UringHandle::new_sqpoll_only(DEFAULT_RING_ENTRIES, 1000) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("Failed to create io_uring: {}", e);
-                return None;
-            }
+pub fn create_feature_uring(file: &File) -> Option<UringHandle> {
+    let direct = DirectFile::of(file);
+    let built = match direct {
+        Some(direct) => UringHandle::new_polled(DEFAULT_RING_ENTRIES, 1000, direct),
+        None => UringHandle::new_sqpoll_only(DEFAULT_RING_ENTRIES, 1000),
+    };
+    let handle = match built {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Failed to create io_uring: {}", e);
+            return None;
         }
     };
-    if handle.is_sqpoll() && handle.is_iopoll() && direct_io {
+    if handle.is_sqpoll() && handle.is_iopoll() && direct.is_some() {
         debug!("io_uring: SQPOLL + IOPOLL + O_DIRECT (near-zero-syscall)");
     } else if handle.is_sqpoll() {
         debug!("io_uring: SQPOLL (reduced syscalls, no IOPOLL)");
@@ -1165,12 +1264,12 @@ pub fn create_feature_uring(direct_io: bool) -> Option<UringHandle> {
 /// falls back to the shared-safe constructors, so a kernel too old for
 /// those still gets a working lane rather than none.
 ///
-/// `direct_io` still buys IOPOLL only in the SQPOLL path, which deferred
-/// task-work excludes; on a kernel that supports both, the deferred ring is
-/// the better trade for a batch gather — no core spent polling, and
-/// completion work batched into the `io_uring_enter` the gather already
-/// makes.
-pub fn create_owned_feature_uring(direct_io: bool) -> Option<UringHandle> {
+/// An O_DIRECT `file` still buys IOPOLL only in the SQPOLL path, which
+/// deferred task-work excludes; on a kernel that supports both, the
+/// deferred ring is the better trade for a batch gather — no core spent
+/// polling, and completion work batched into the `io_uring_enter` the
+/// gather already makes.
+pub fn create_owned_feature_uring(file: &File) -> Option<UringHandle> {
     match UringHandle::new_thread_owned(DEFAULT_RING_ENTRIES) {
         Ok(handle) => {
             // Name the rung reached, not the one asked for: the ladder
@@ -1181,22 +1280,36 @@ pub fn create_owned_feature_uring(direct_io: bool) -> Option<UringHandle> {
         }
         Err(e) => {
             debug!("thread-owned io_uring unavailable ({e}); using the shared setup");
-            create_feature_uring(direct_io)
+            create_feature_uring(file)
         }
     }
 }
 
-/// Whether a [`batch_read`] error means the ring cannot serve this file at
-/// all, rather than that one read failed.
+/// Whether a [`batch_read`] error means this ring and fd cannot serve the
+/// file at all, rather than that one read failed.
 ///
-/// A ring built with IOPOLL is accepted by a kernel that has the feature,
-/// even when the filesystem underneath cannot do polled I/O — that only
-/// surfaces as `EOPNOTSUPP` on the first real read. The setup ladder cannot
-/// see it, so the caller degrades to its portable path instead.
+/// Two errnos say so, and neither is visible when the ring is built:
+///
+/// - `EOPNOTSUPP`: a kernel with IOPOLL accepts the ring even when the
+///   filesystem underneath cannot do polled I/O, and says so on the first
+///   real read.
+/// - `EINVAL`: the device's O_DIRECT alignment is stricter than
+///   [`DirectIoAlignment::probe`] could learn from this kernel.
+///
+/// The caller degrades to its portable path, which must read through a
+/// buffered fd — the O_DIRECT fd rejects unaligned `pread`s the same way.
 pub fn is_ring_unsupported(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(|io| io.raw_os_error() == Some(libc::EOPNOTSUPP))
+        .any(|io| matches!(io.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)))
+}
+
+/// An `io_uring_enter` failure that clears on retry.
+fn is_transient_enter_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)
+    )
 }
 
 /// Perform a batch of reads using io_uring with proper SQPOLL handling.
@@ -1215,10 +1328,13 @@ pub fn is_ring_unsupported(err: &anyhow::Error) -> bool {
 /// keeps the ring clean for the next batch — a leftover CQE would be
 /// misattributed to the next batch's `user_data` index space.
 ///
+/// At most one CQ's worth of reads is ever in flight, so a batch larger
+/// than the ring never spills completions to the kernel's overflow list.
+///
 /// # Safety
 /// Each `dest_buffer_ptr` must point to writable memory of at least `length` bytes
 /// and remain valid for the duration of this call.
-pub fn batch_read(
+pub unsafe fn batch_read(
     handle: &mut UringHandle,
     fd: i32,
     reads: &[(u64, *mut u8, usize)], // (offset, dest_ptr, length)
@@ -1280,12 +1396,20 @@ pub fn batch_read(
         })
     };
     let is_sqpoll = handle.is_sqpoll();
+    // Under DEFER_TASKRUN a completion is posted only by an enter that
+    // carries GETEVENTS; a plain submit would leave every finished read
+    // invisible until the final drain.
+    let getevents = if handle.defers_taskrun() {
+        io_uring::EnterFlags::GETEVENTS.bits()
+    } else {
+        0
+    };
     // During the push phase, hand accumulated SQEs to the kernel and reap
     // available completions at this cadence — the device starts working
-    // while later SQEs are still being built, the queue depth stays high
-    // instead of sawtoothing submit-everything → drain-everything, and a
-    // batch larger than the CQ can never overflow it.
+    // while later SQEs are still being built, and the queue depth stays
+    // high instead of sawtoothing submit-everything → drain-everything.
     let pipeline_stride = (handle.entries() as usize / 4).max(1);
+    let cq_capacity = (handle.cq_entries() as usize).max(1);
 
     // Records one CQE against the batch. Every submitted SQE produces
     // exactly one CQE, all of which must be reaped before returning.
@@ -1333,7 +1457,45 @@ pub fn batch_read(
     {
         let (submitter, mut sq, mut cq) = handle.split();
 
+        // Hand pending SQEs to the kernel without waiting, running
+        // deferred completion work where the ring needs it.
+        let kick = |sq: &mut io_uring::squeue::SubmissionQueue<'_>| -> std::io::Result<()> {
+            sq.sync();
+            if is_sqpoll {
+                if sq.need_wakeup() {
+                    submitter.submit()?;
+                }
+                return Ok(());
+            }
+            // SAFETY: no extended argument; the flags are GETEVENTS or none.
+            unsafe { submitter.enter::<libc::sigset_t>(sq.len() as u32, 0, getevents, None) }
+                .map(|_| ())
+        };
+
         'push: for (i, &(offset, buf_ptr, len)) in reads.iter().enumerate() {
+            // Never put more reads in flight than the CQ holds: past that
+            // the kernel spills completions to an overflow list — a slow
+            // path, and one that can lose CQEs under memory pressure.
+            let mut wait_failures = 0u32;
+            while submitted - completed >= cq_capacity {
+                sq.sync();
+                match submitter.submit_and_wait(1) {
+                    Ok(_) => {}
+                    Err(e) if is_transient_enter_error(&e) && wait_failures < 1000 => {
+                        wait_failures += 1;
+                    }
+                    Err(e) => {
+                        first_err = Some(anyhow::Error::from(e).context("io_uring wait failed"));
+                        break 'push;
+                    }
+                }
+                cq.sync();
+                for cqe in &mut cq {
+                    completed += 1;
+                    process_cqe(cqe, &mut first_err);
+                }
+            }
+
             let entry = match (registered_idx, in_registered_buf(buf_ptr, len)) {
                 (Some(idx), true) => {
                     opcode::ReadFixed::new(types::Fixed(idx), buf_ptr, len as u32, 0)
@@ -1355,22 +1517,16 @@ pub fn batch_read(
             // Push to SQ, submitting if full. A submit failure stops the
             // push phase — entries already pushed are (or will be) in
             // flight and still need draining.
+            let mut kick_failures = 0u32;
             // SAFETY: the buffers referenced by the SQEs live until the
             // drain loop below has reaped every submitted entry.
-            unsafe {
-                while sq.push(&entry).is_err() {
-                    sq.sync();
-                    let res = if is_sqpoll {
-                        // Check NEED_WAKEUP from SQ shared memory
-                        if sq.need_wakeup() {
-                            submitter.submit().map(|_| ())
-                        } else {
-                            Ok(())
-                        }
-                    } else {
-                        submitter.submit().map(|_| ())
-                    };
-                    if let Err(e) = res {
+            while unsafe { sq.push(&entry) }.is_err() {
+                match kick(&mut sq) {
+                    Ok(()) => {}
+                    Err(e) if is_transient_enter_error(&e) && kick_failures < 1000 => {
+                        kick_failures += 1;
+                    }
+                    Err(e) => {
                         first_err = Some(anyhow::Error::from(e).context("io_uring submit failed"));
                         break 'push;
                     }
@@ -1381,19 +1537,14 @@ pub fn batch_read(
             // Pipeline: kick submission and reap whatever has already
             // finished, without blocking.
             if submitted.is_multiple_of(pipeline_stride) {
-                sq.sync();
-                let res = if is_sqpoll {
-                    if sq.need_wakeup() {
-                        submitter.submit().map(|_| ())
-                    } else {
-                        Ok(())
+                match kick(&mut sq) {
+                    // A transient failure just defers this kick to the next
+                    // stride or the drain.
+                    Err(e) if !is_transient_enter_error(&e) => {
+                        first_err = Some(anyhow::Error::from(e).context("io_uring submit failed"));
+                        break 'push;
                     }
-                } else {
-                    submitter.submit().map(|_| ())
-                };
-                if let Err(e) = res {
-                    first_err = Some(anyhow::Error::from(e).context("io_uring submit failed"));
-                    break 'push;
+                    _ => {}
                 }
                 cq.sync();
                 for cqe in &mut cq {
@@ -1473,7 +1624,7 @@ mod tests {
     fn scratch_is_f32_aligned_and_aliases_the_lane_view() {
         // Sandboxed CI runners can refuse io_uring entirely; the scratch
         // invariant is unrelated to the ring, so skip rather than fail.
-        let Ok(handle) = UringHandle::new(8, 0) else {
+        let Ok(handle) = UringHandle::new_sqpoll_only(8, 0) else {
             eprintln!("io_uring unavailable; skipping scratch alignment check");
             return;
         };
@@ -1587,40 +1738,106 @@ mod tests {
         assert_eq!(rx.blocking_recv().ok(), Some(7));
     }
 
-    /// A layout that clears 512 but not 4096 is the case the static
-    /// assumption got wrong: it would be accepted on a 4Kn device and then
-    /// fail every read with EINVAL. The decision must follow the alignment
-    /// it is given.
+    /// Lanes report in the order they finish building, not by index. A
+    /// slow lane that fails must not take a live lane's queue with it:
+    /// every job has to reach a lane that answers.
+    #[test]
+    fn a_failed_lane_never_displaces_a_live_one() {
+        let pool = RingPool::new(4, "test-pairing", |idx| {
+            if idx == 0 {
+                // Report last, after every live lane has already said yes.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            } else {
+                Some(idx)
+            }
+        })
+        .expect("three lanes construct");
+        assert_eq!(pool.lanes(), 3);
+
+        let answered: std::collections::BTreeSet<usize> = (0..12)
+            .map(|_| pool.submit(|idx: &mut usize| *idx))
+            .map(|rx| rx.blocking_recv().expect("every job reaches a live lane"))
+            .collect();
+        assert_eq!(answered, [1, 2, 3].into_iter().collect());
+    }
+
+    fn alignment(offset: usize, memory: usize) -> DirectIoAlignment {
+        DirectIoAlignment { offset, memory }
+    }
+
+    /// A layout that clears 512 but not 4096 would be accepted on a 4Kn
+    /// device and then fail every read with EINVAL. The decision must
+    /// follow the alignment it is given.
     #[test]
     fn layout_compatibility_follows_the_reported_alignment() {
         // 512-aligned but not 4096-aligned.
         let offset = 512u64;
         let size = 1536usize;
-        assert!(is_layout_direct_io_compatible_with(offset, size, 512));
+        assert!(is_layout_direct_io_compatible_with(
+            offset,
+            size,
+            alignment(512, 4)
+        ));
         assert!(
-            !is_layout_direct_io_compatible_with(offset, size, 4096),
+            !is_layout_direct_io_compatible_with(offset, size, alignment(4096, 4)),
             "a 4Kn device must reject a merely 512-aligned layout"
         );
 
         // Aligned for both.
-        assert!(is_layout_direct_io_compatible_with(8192, 4096, 512));
-        assert!(is_layout_direct_io_compatible_with(8192, 4096, 4096));
+        assert!(is_layout_direct_io_compatible_with(
+            8192,
+            4096,
+            alignment(512, 512)
+        ));
+        assert!(is_layout_direct_io_compatible_with(
+            8192,
+            4096,
+            alignment(4096, 4096)
+        ));
 
-        // A zero alignment means the file cannot do O_DIRECT at all, and
-        // must never divide.
-        assert!(!is_layout_direct_io_compatible_with(0, 0, 0));
+        // Landing buffers are page-aligned; a device wanting more cannot
+        // take them.
+        assert!(!is_layout_direct_io_compatible_with(
+            8192,
+            8192,
+            alignment(8192, 8192)
+        ));
     }
 
-    /// The query either reports a real power-of-two alignment or declines.
-    /// A bogus value would silently disable O_DIRECT or, worse, wave
-    /// through a layout the device rejects.
+    /// The probe never answers below a sector, never with a non-power of
+    /// two, and never below 4096 unless something authoritative said so.
     #[test]
-    fn reported_alignment_is_sane_or_absent() {
+    fn probed_alignment_is_sane() {
         let temp = NamedTempFile::new().unwrap();
         let file = File::open(temp.path()).unwrap();
-        if let Some(align) = direct_io_offset_alignment(&file) {
-            assert!(align.is_power_of_two(), "alignment {align} is not 2^n");
-            assert!(align >= 512, "alignment {align} is below a sector");
+        let probed = DirectIoAlignment::probe(&file);
+        let a = probed.bytes();
+        assert!(a.is_power_of_two() && a >= 512, "alignment {a}");
+        assert!(probed.memory.is_power_of_two(), "memory {}", probed.memory);
+        let authoritative = DirectIoAlignment::from_statx(&file).is_some()
+            || block_fs_logical_block_size(&file).is_some();
+        if !authoritative {
+            assert!(
+                a >= 4096,
+                "an unreported alignment must not guess below 4096"
+            );
+        }
+    }
+
+    /// The IOPOLL constructor takes a proof of O_DIRECT, read from the fd
+    /// itself: a buffered file never produces one.
+    #[test]
+    fn direct_file_proof_follows_the_fd_flags() {
+        let mut temp = NamedTempFile::new().unwrap();
+        temp.write_all(&[0u8; 4096]).unwrap();
+        let buffered = File::open(temp.path()).unwrap();
+        assert!(DirectFile::of(&buffered).is_none());
+
+        let (file, direct) = open_direct_or_fallback(temp.path()).unwrap();
+        assert_eq!(DirectFile::of(&file).is_some(), direct);
+        if let Some(handle) = create_feature_uring(&buffered) {
+            assert!(!handle.is_iopoll(), "a buffered file must never get IOPOLL");
         }
     }
 
@@ -1760,16 +1977,20 @@ mod tests {
 
     #[test]
     fn test_uring_handle_creation() {
-        // Test that UringHandle::new() succeeds with some configuration
-        // Even if SQPOLL/IOPOLL aren't supported, it should fall back gracefully
-        let result = UringHandle::new(32, 1000);
-
-        match result {
+        // The polled constructor needs an O_DIRECT file; tmpfs may not
+        // offer one. Even if SQPOLL/IOPOLL aren't supported, it should fall
+        // back gracefully.
+        let mut temp = NamedTempFile::new().unwrap();
+        temp.write_all(&[0u8; 4096]).unwrap();
+        let (file, _) = open_direct_or_fallback(temp.path()).unwrap();
+        let Some(direct) = DirectFile::of(&file) else {
+            println!("O_DIRECT unavailable here; skipping");
+            return;
+        };
+        match UringHandle::new_polled(32, 1000, direct) {
             Ok(handle) => {
-                // Verify the handle reports its capabilities
                 println!("SQPOLL enabled: {}", handle.is_sqpoll());
                 println!("IOPOLL enabled: {}", handle.is_iopoll());
-                // Handle should work regardless of which mode it's in
             }
             Err(e) => {
                 // io_uring may not be available at all (e.g., old kernel, container)
@@ -1808,11 +2029,11 @@ mod tests {
         temp.write_all(&data).unwrap();
         temp.flush().unwrap();
 
-        let Some(mut handle) = create_feature_uring(false) else {
+        let file = File::open(temp.path()).unwrap();
+        let Some(mut handle) = create_feature_uring(&file) else {
             println!("io_uring not available; skipping");
             return;
         };
-        let file = File::open(temp.path()).unwrap();
         let fd = file.as_raw_fd();
 
         let mut bufs: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 4096]).collect();
@@ -1823,7 +2044,8 @@ mod tests {
             (1 << 20, ptrs[2], 4096), // past EOF → short read
             (4096, ptrs[3], 4096),
         ];
-        let err = batch_read(&mut handle, fd, &reads);
+        // SAFETY: every destination is a live 4096-byte Vec owned here.
+        let err = unsafe { batch_read(&mut handle, fd, &reads) };
         assert!(err.is_err(), "short read past EOF must surface as Err");
 
         // Fresh batch on the same handle: must succeed with correct data.
@@ -1833,9 +2055,58 @@ mod tests {
             (0, buf_a.as_mut_ptr(), 4096),
             (4096, buf_b.as_mut_ptr(), 4096),
         ];
-        batch_read(&mut handle, fd, &reads2).unwrap();
+        // SAFETY: as above.
+        unsafe { batch_read(&mut handle, fd, &reads2) }.unwrap();
         assert_eq!(&buf_a[..], &data[..4096]);
         assert_eq!(&buf_b[..], &data[4096..8192]);
+    }
+
+    /// A batch many times the CQ's size, on the rings `RingPool` lanes
+    /// actually get: completions must be reaped while the batch is still
+    /// being pushed (deferred task-work posts them only on a GETEVENTS
+    /// enter), and every read must land.
+    #[test]
+    fn batches_larger_than_the_cq_complete_on_thread_owned_rings() {
+        let rows = 300usize;
+        let mut temp = NamedTempFile::new().unwrap();
+        let data: Vec<u8> = (0..rows * 512).map(|i| (i % 253) as u8).collect();
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+        let file = File::open(temp.path()).unwrap();
+
+        // Eight SQ entries, sixteen CQ entries.
+        let Ok(mut handle) = UringHandle::new_thread_owned(8) else {
+            println!("io_uring not available; skipping");
+            return;
+        };
+        println!("ring tier: {}", handle.tier());
+        assert!(handle.cq_entries() < rows as u32);
+
+        let mut out = vec![0u8; rows * 512];
+        // Reversed order, so each read's destination differs from its
+        // source position and a misrouted completion would show.
+        let reads: Vec<(u64, *mut u8, usize)> = (0..rows)
+            .map(|i| {
+                let src = rows - 1 - i;
+                // SAFETY: `i * 512 + 512 <= out.len()`.
+                let dst = unsafe { out.as_mut_ptr().add(i * 512) };
+                ((src * 512) as u64, dst, 512)
+            })
+            .collect();
+        for _ in 0..3 {
+            out.fill(0);
+            // SAFETY: every destination is inside `out`, which outlives
+            // the call.
+            unsafe { batch_read(&mut handle, file.as_raw_fd(), &reads) }.unwrap();
+            for i in 0..rows {
+                let src = rows - 1 - i;
+                assert_eq!(
+                    &out[i * 512..(i + 1) * 512],
+                    &data[src * 512..(src + 1) * 512],
+                    "row {i}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1849,12 +2120,12 @@ mod tests {
         temp.write_all(&data).unwrap();
         temp.flush().unwrap();
 
-        let Some(handle) = create_feature_uring(false) else {
+        let file = File::open(temp.path()).unwrap();
+        let Some(handle) = create_feature_uring(&file) else {
             println!("io_uring not available; skipping");
             return;
         };
         let mut lane = UringLane::new(handle);
-        let file = File::open(temp.path()).unwrap();
         let fd = file.as_raw_fd();
 
         // Two geometries: the second forces a pool rebuild + re-register.
@@ -1868,7 +2139,8 @@ mod tests {
             let mut outside = vec![0u8; 4096];
             reads.push(((4 * 4096) as u64, outside.as_mut_ptr(), 4096));
 
-            batch_read(&mut lane.handle, fd, &reads).unwrap();
+            // SAFETY: the pool slots and `outside` all outlive the call.
+            unsafe { batch_read(&mut lane.handle, fd, &reads) }.unwrap();
 
             let pool = lane.direct_pool(num_slots, slot_size).unwrap();
             for i in 0..4 {
@@ -1887,8 +2159,13 @@ mod tests {
         // Verify the fallback chain works: SQPOLL+IOPOLL -> SQPOLL -> basic io_uring
         // We can't force failures, but we can verify the code paths exist
 
-        // Try full mode
-        if let Ok(handle) = UringHandle::new(32, 1000) {
+        // Try full mode, which needs an O_DIRECT file.
+        let mut temp = NamedTempFile::new().unwrap();
+        temp.write_all(&[0u8; 4096]).unwrap();
+        let (file, _) = open_direct_or_fallback(temp.path()).unwrap();
+        if let Some(direct) = DirectFile::of(&file)
+            && let Ok(handle) = UringHandle::new_polled(32, 1000, direct)
+        {
             if handle.is_sqpoll() && handle.is_iopoll() {
                 println!("Full SQPOLL+IOPOLL mode available");
             } else if handle.is_sqpoll() {

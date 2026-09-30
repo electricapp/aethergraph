@@ -90,6 +90,39 @@ fn empty_commit_keeps_previous_snapshot() {
 }
 
 #[test]
+fn snapshots_stay_exact_across_many_sparse_commits() {
+    // Spans several root-table subtrees; each commit touches a scattered
+    // handful of leaves, so most of every snapshot is shared structure.
+    const N: u32 = 300_000;
+    let g = DynamicGraph::new(N as usize, 16 << 20);
+    let mut snaps = Vec::new();
+    let mut expected: Vec<Vec<(u32, usize)>> = Vec::new();
+    let probes: Vec<u32> = (0..N).step_by(9_973).collect();
+    for round in 0..12u32 {
+        {
+            let mut w = g.writer().unwrap();
+            for (i, &v) in probes.iter().enumerate() {
+                if (i as u32 + round).is_multiple_of(3) {
+                    w.insert_edge(v, (v + round + 1) % N).unwrap();
+                }
+            }
+        }
+        let s = g.acquire();
+        expected.push(probes.iter().map(|&v| (v, s.degree(&g, v))).collect());
+        snaps.push(s);
+    }
+    for (s, want) in snaps.iter().zip(&expected) {
+        for &(v, deg) in want {
+            assert_eq!(s.degree(&g, v), deg, "vertex {v} moved under its snapshot");
+        }
+    }
+    let last = snaps.last().unwrap();
+    for &v in &probes {
+        assert_eq!(last.degree(&g, v), g.degree(v));
+    }
+}
+
+#[test]
 fn snapshot_csr_is_a_commit_cut() {
     let g = DynamicGraph::new(4, 1 << 20);
     insert_all(&g, &[(0, 1), (0, 2), (2, 3), (3, 0)]);

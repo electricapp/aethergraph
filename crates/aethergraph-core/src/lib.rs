@@ -26,13 +26,14 @@ pub use aether_epoch::{Epoch, EpochClock};
 // Primary public exports
 pub use graph::{
     AsyncCsrGraph, CsrView, EdgeOffset, EdgeTypeId, EdgeTypeMeta, Graph, GraphStats,
-    GraphValidationMode, HeteroGraph, NodeId, NodeTypeId, NodeTypeMeta, partition_aligned_batches,
+    GraphValidationMode, HeteroBuildError, HeteroGraph, MAX_NODES, NodeId, NodeTypeId,
+    NodeTypeMeta, partition_aligned_batches,
 };
 pub use loader::{
     HeteroNeighborLoader, HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig,
     LocalEdgeIndex, NeighborLoader, NeighborSampler, ParallelBatchSampler, PrefetchError,
-    PrefetchStats, SampledSubgraph, SamplingConfig, SubgraphType, SyncFeatureStore,
-    TemporalSamplingError, TemporalStrategy,
+    PrefetchStats, SampleError, SampledSubgraph, SamplerConfigError, SamplingConfig,
+    SeedOutOfRange, Seeds, SubgraphType, SyncFeatureStore, TemporalSamplingError, TemporalStrategy,
 };
 
 // Feature store exports (needed for file-backed features)
@@ -41,7 +42,7 @@ pub use features::{
     NodeFeatureSource,
 };
 pub use features::{FeatureHeader, parse_feature_header};
-#[cfg(feature = "gds")]
+#[cfg(all(target_os = "linux", feature = "gds"))]
 pub use features::{GdsFeatureStore, GdsReadResult, gds_driver_close, gds_driver_open};
 #[cfg(all(target_os = "linux", feature = "shm"))]
 pub use features::{ShareHandle, SharedFeatureStore};

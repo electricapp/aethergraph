@@ -4,8 +4,11 @@
 //! Each edge type's CSR uses per-type local node IDs: source IDs are local to the
 //! source node type, destination IDs are local to the destination node type.
 
-use crate::graph::Graph;
+use crate::graph::csr::MAX_NODES;
+use crate::graph::{Graph, GraphValidationMode, NodeId};
+use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Integer identifier for a node type.
 pub type NodeTypeId = u8;
@@ -33,6 +36,11 @@ pub struct EdgeTypeMeta {
 /// Each edge type has its own CSR graph using per-type local node IDs.
 /// For example, in a ("user", "votes", "post") edge type, source IDs
 /// are local to the "user" type and destination IDs are local to "post".
+///
+/// Construction proves, for every edge type: monotone CSR offsets, no
+/// edges from rows at or past the source type's count, and every
+/// destination below the destination type's count. Consumers index
+/// per-type arrays by destination with no range check.
 #[derive(Debug, Clone)]
 pub struct HeteroGraph {
     node_types: Vec<NodeTypeMeta>,
@@ -41,6 +49,68 @@ pub struct HeteroGraph {
     edge_type_index: HashMap<(String, String, String), EdgeTypeId>,
     /// Per-edge-type CSR graph. csr_graphs[edge_type_id] is the CSR for that edge type.
     csr_graphs: Vec<Graph>,
+    /// Per-edge-type incoming adjacency, built on first use.
+    in_adjacency: OnceLock<Vec<InAdjacency>>,
+}
+
+/// Incoming adjacency of one edge type: for each destination node, the
+/// source nodes with an edge into it, in stored edge order.
+///
+/// Built by [`HeteroGraph::in_adjacency`]. Rows past the source type's count
+/// and destinations past the destination type's count are dropped while
+/// building, so every stored source is in range for its node type.
+#[derive(Debug, Clone, Default)]
+pub struct InAdjacency {
+    offsets: Vec<u64>,
+    sources: Vec<NodeId>,
+}
+
+impl InAdjacency {
+    /// Transpose `csr` (rows are sources) into per-destination source lists.
+    fn transpose(csr: &Graph, num_src: usize, num_dst: usize) -> Self {
+        let view = csr.csr_view();
+        let rows = view.num_nodes().min(num_src) as NodeId;
+
+        let mut offsets = vec![0u64; num_dst + 1];
+        for s in 0..rows {
+            for &d in view.neighbors(s) {
+                if (d as usize) < num_dst {
+                    offsets[d as usize + 1] += 1;
+                }
+            }
+        }
+        for i in 1..offsets.len() {
+            offsets[i] += offsets[i - 1];
+        }
+
+        let mut cursor = offsets[..num_dst].to_vec();
+        let mut sources = vec![0 as NodeId; offsets[num_dst] as usize];
+        for s in 0..rows {
+            for &d in view.neighbors(s) {
+                if let Some(slot) = cursor.get_mut(d as usize) {
+                    sources[*slot as usize] = s;
+                    *slot += 1;
+                }
+            }
+        }
+        Self { offsets, sources }
+    }
+
+    /// Sources with an edge into `dst`; empty when `dst` is out of range.
+    #[inline]
+    pub fn sources(&self, dst: NodeId) -> &[NodeId] {
+        let d = dst as usize;
+        match (self.offsets.get(d), self.offsets.get(d + 1)) {
+            (Some(&start), Some(&end)) => &self.sources[start as usize..end as usize],
+            _ => &[],
+        }
+    }
+
+    /// Offset array (`num_dst + 1` entries), for prefetching.
+    #[inline]
+    pub fn offsets(&self) -> &[u64] {
+        &self.offsets
+    }
 }
 
 /// Errors returned when constructing a [`HeteroGraph`] via [`HeteroGraph::try_from_parts`].
@@ -53,6 +123,15 @@ pub enum HeteroBuildError {
     DuplicateNodeType(String),
     /// An edge type (src, relation, dst) triple appeared more than once.
     DuplicateEdgeType(String, String, String),
+    /// A node type's count exceeds the `u32` node-id space.
+    NodeTypeTooLarge(String, usize),
+    /// An edge type's CSR does not fit its endpoint types.
+    InvalidEdgeType {
+        src: String,
+        rel: String,
+        dst: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for HeteroBuildError {
@@ -65,8 +144,57 @@ impl std::fmt::Display for HeteroBuildError {
             Self::DuplicateEdgeType(src, rel, dst) => {
                 write!(f, "duplicate edge type: ({src}, {rel}, {dst})")
             }
+            Self::NodeTypeTooLarge(name, count) => write!(
+                f,
+                "node type {name} has {count} nodes, over the u32 node-id limit {MAX_NODES}"
+            ),
+            Self::InvalidEdgeType {
+                src,
+                rel,
+                dst,
+                reason,
+            } => write!(f, "edge type ({src}, {rel}, {dst}): {reason}"),
         }
     }
+}
+
+/// Prove `csr` fits an edge type from `src_count` sources to `dst_count`
+/// destinations.
+///
+/// Rows past `src_count` are allowed only when empty, so CSRs built over a
+/// shared, larger row count stay valid. With monotone offsets that is one
+/// comparison. Destinations are scanned unless the CSR's own `Full` proof
+/// already bounds them.
+fn check_edge_type(csr: &Graph, src_count: usize, dst_count: usize) -> Result<(), String> {
+    csr.validate_with_mode(GraphValidationMode::OffsetsOnly)
+        .map_err(|e| e.to_string())?;
+    if csr.num_nodes() > src_count {
+        let tail = csr.edge_offset(src_count as NodeId);
+        if tail != csr.num_edges() as u64 {
+            return Err(format!(
+                "{} edges leave source ids at or past the source type's count {src_count}",
+                csr.num_edges() as u64 - tail
+            ));
+        }
+    }
+    let bounded = csr.validated() == GraphValidationMode::Full && csr.num_dst_nodes() <= dst_count;
+    if !bounded {
+        let edges = csr.edges();
+        let bad = if edges.len() > 100_000 {
+            edges
+                .par_iter()
+                .position_any(|&d| (d as usize) >= dst_count)
+        } else {
+            edges.iter().position(|&d| (d as usize) >= dst_count)
+        };
+        if let Some(i) = bad {
+            return Err(format!(
+                "destination {} at edge {i} is not below the destination type's count {dst_count}",
+                edges[i]
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl std::error::Error for HeteroBuildError {}
@@ -78,8 +206,10 @@ impl HeteroGraph {
     /// * `node_types` - Vec of (name, count) pairs for each node type
     /// * `edge_types` - Vec of (src_type_name, relation, dst_type_name, csr_graph) tuples
     ///
-    /// Returns `Err` if there are too many types or an edge type references an
-    /// unknown node type name. For tests / one-shot scripts, see [`Self::from_parts`].
+    /// Returns `Err` if there are too many types, a name repeats, an edge
+    /// type references an unknown node type, or an edge type's CSR does not
+    /// fit its endpoint types (see [`HeteroGraph`]'s invariants). For tests
+    /// / one-shot scripts, see [`Self::from_parts`].
     pub fn try_from_parts(
         node_types: Vec<(String, usize)>,
         edge_types: Vec<(String, String, String, Graph)>,
@@ -95,6 +225,9 @@ impl HeteroGraph {
         let mut node_metas = Vec::with_capacity(node_types.len());
 
         for (i, (name, count)) in node_types.into_iter().enumerate() {
+            if count > MAX_NODES {
+                return Err(HeteroBuildError::NodeTypeTooLarge(name, count));
+            }
             if node_type_index
                 .insert(name.clone(), i as NodeTypeId)
                 .is_some()
@@ -122,6 +255,18 @@ impl HeteroGraph {
             {
                 return Err(HeteroBuildError::DuplicateEdgeType(src, rel, dst));
             }
+            let (src_count, dst_count) = (
+                node_metas[src_id as usize].count,
+                node_metas[dst_id as usize].count,
+            );
+            if let Err(reason) = check_edge_type(&graph, src_count, dst_count) {
+                return Err(HeteroBuildError::InvalidEdgeType {
+                    src,
+                    rel,
+                    dst,
+                    reason,
+                });
+            }
             edge_metas.push(EdgeTypeMeta {
                 src_type: src_id,
                 relation: rel,
@@ -136,6 +281,7 @@ impl HeteroGraph {
             edge_types: edge_metas,
             edge_type_index,
             csr_graphs,
+            in_adjacency: OnceLock::new(),
         })
     }
 
@@ -244,6 +390,36 @@ impl HeteroGraph {
             .filter(|(_, et)| et.src_type == src_type)
             .map(|(i, _)| i as EdgeTypeId)
             .collect()
+    }
+
+    /// Returns all edge type IDs where the given node type is the destination.
+    pub fn edge_types_for_dst(&self, dst_type: NodeTypeId) -> Vec<EdgeTypeId> {
+        self.edge_types
+            .iter()
+            .enumerate()
+            .filter(|(_, et)| et.dst_type == dst_type)
+            .map(|(i, _)| i as EdgeTypeId)
+            .collect()
+    }
+
+    /// Incoming adjacency of every edge type, indexed by edge type ID.
+    ///
+    /// Built on the first call — one O(edges) transpose per edge type, in
+    /// parallel — and shared by every later caller of this graph.
+    pub fn in_adjacency(&self) -> &[InAdjacency] {
+        self.in_adjacency.get_or_init(|| {
+            self.edge_types
+                .par_iter()
+                .zip(self.csr_graphs.par_iter())
+                .map(|(meta, csr)| {
+                    InAdjacency::transpose(
+                        csr,
+                        self.num_nodes(meta.src_type),
+                        self.num_nodes(meta.dst_type),
+                    )
+                })
+                .collect()
+        })
     }
 }
 
@@ -412,6 +588,63 @@ mod tests {
         assert_eq!(writes_meta.src_type, 0); // user
         assert_eq!(writes_meta.relation, "writes");
         assert_eq!(writes_meta.dst_type, 2); // comment
+    }
+
+    #[test]
+    fn test_rejects_destination_past_its_type() {
+        // Built over a shared 100-node id space, but "tag" has only 5 nodes.
+        let csr = Graph::from_edges(100, &[(0, 3), (1, 7)], None).unwrap();
+        let err = HeteroGraph::try_from_parts(
+            vec![("item".into(), 100), ("tag".into(), 5)],
+            vec![("item".into(), "tagged".into(), "tag".into(), csr)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, HeteroBuildError::InvalidEdgeType { .. }),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("destination 7"), "got {err}");
+    }
+
+    #[test]
+    fn test_rejects_edges_from_rows_past_the_source_type() {
+        // Rows past the source count are fine while empty...
+        let empty_tail = Graph::from_edges(10, &[(0, 1)], None).unwrap();
+        assert!(
+            HeteroGraph::try_from_parts(
+                vec![("a".into(), 2), ("b".into(), 10)],
+                vec![("a".into(), "r".into(), "b".into(), empty_tail)],
+            )
+            .is_ok()
+        );
+        // ...and rejected once a row past it holds an edge.
+        let live_tail = Graph::from_edges(10, &[(0, 1), (5, 2)], None).unwrap();
+        let err = HeteroGraph::try_from_parts(
+            vec![("a".into(), 2), ("b".into(), 10)],
+            vec![("a".into(), "r".into(), "b".into(), live_tail)],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("source ids"), "got {err}");
+    }
+
+    #[test]
+    fn test_accepts_bipartite_csr() {
+        let csr =
+            Graph::from_bipartite_src_dst(2, 1_000_000, &[0, 1], &[999_999, 3], None).unwrap();
+        let g = HeteroGraph::try_from_parts(
+            vec![("user".into(), 2), ("item".into(), 1_000_000)],
+            vec![("user".into(), "buys".into(), "item".into(), csr)],
+        )
+        .unwrap();
+        assert_eq!(g.csr(0).neighbors(0), &[999_999]);
+        assert_eq!(g.csr(0).offsets().len(), 3);
+    }
+
+    #[test]
+    fn test_rejects_node_type_past_id_space() {
+        let err =
+            HeteroGraph::try_from_parts(vec![("huge".into(), MAX_NODES + 1)], vec![]).unwrap_err();
+        assert!(matches!(err, HeteroBuildError::NodeTypeTooLarge(..)));
     }
 
     #[test]

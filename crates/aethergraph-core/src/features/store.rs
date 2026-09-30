@@ -358,6 +358,19 @@ impl StoreBacking {
             Self::Paged(r) => r.as_slice(),
         }
     }
+
+    /// Whether `bytes()` reads the store's contents. A paged region can
+    /// fail (its pager then serves zero pages) or be a forked copy; see
+    /// [`PagedRegion::check`](crate::internal::uffd::PagedRegion::check).
+    /// Copying readers check before touching the bytes and again after.
+    #[inline(always)]
+    fn check(&self) -> Result<()> {
+        match self {
+            Self::Mapped(_) => Ok(()),
+            #[cfg(all(target_os = "linux", feature = "uffd"))]
+            Self::Paged(r) => r.check(),
+        }
+    }
 }
 
 impl FeatureStore {
@@ -385,102 +398,18 @@ impl FeatureStore {
                 .context("failed to mmap feature file")?
         });
 
-        // Validate header
-        anyhow::ensure!(
-            mmap.len() >= HEADER_SIZE,
-            "feature file too small: {} bytes",
-            mmap.len()
-        );
-
-        // Check magic
-        anyhow::ensure!(
-            &mmap[0..8] == MAGIC,
-            "invalid feature file format (bad magic)"
-        );
-
-        // Read metadata
-        let num_nodes_u64 = u64::from_le_bytes(mmap[8..16].try_into()?);
-        let feature_dim_u64 = u64::from_le_bytes(mmap[16..24].try_into()?);
-        let data_offset_u64 = u64::from_le_bytes(mmap[24..32].try_into()?);
-
-        // Sanity check: prevent OOM from malicious headers
-        const MAX_NODES: u64 = 10_000_000_000; // 10B nodes max
-        const MAX_DIM: u64 = 100_000; // 100K feature dim max
-        anyhow::ensure!(
-            num_nodes_u64 <= MAX_NODES,
-            "num_nodes {} exceeds maximum {}",
-            num_nodes_u64,
-            MAX_NODES
-        );
-        anyhow::ensure!(
-            feature_dim_u64 <= MAX_DIM,
-            "feature_dim {} exceeds maximum {}",
-            feature_dim_u64,
-            MAX_DIM
-        );
-        // The dtype tag lives at byte 32, so the payload must start past it.
-        anyhow::ensure!(
-            data_offset_u64 > HEADER_SIZE as u64,
-            "invalid data_offset {} (must be > {})",
-            data_offset_u64,
-            HEADER_SIZE
-        );
-        let data_offset =
-            usize::try_from(data_offset_u64).context("data_offset does not fit in usize")?;
-        anyhow::ensure!(
-            data_offset <= mmap.len(),
-            "invalid data_offset {} for file size {}",
-            data_offset,
-            mmap.len()
-        );
-        anyhow::ensure!(
-            data_offset % std::mem::align_of::<f32>() == 0,
-            "invalid data_offset {} (must be {}-byte aligned)",
-            data_offset,
-            std::mem::align_of::<f32>()
-        );
-
-        // Read the dtype tag at byte 32 (first byte of the padding region).
-        // In bounds: data_offset > HEADER_SIZE and data_offset <= mmap.len().
-        let dtype = FeatureDtype::from_u8(mmap[HEADER_SIZE])?;
-
-        // Validate data size entirely in u64 first, so a 32-bit usize can't
-        // truncate the product before it's range-checked. Cast to usize only
-        // after the mapped file is known large enough to hold the payload.
-        let expected_data_size_u64 = num_nodes_u64
-            .checked_mul(feature_dim_u64)
-            .and_then(|n| n.checked_mul(dtype.element_size() as u64))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "feature data size overflow: {} nodes * {} dims * {} bytes",
-                    num_nodes_u64,
-                    feature_dim_u64,
-                    dtype.element_size()
-                )
-            })?;
-        let actual_data_size = (mmap.len() - data_offset) as u64;
-        anyhow::ensure!(
-            actual_data_size >= expected_data_size_u64,
-            "feature file truncated: expected {} bytes of data, got {}",
-            expected_data_size_u64,
-            actual_data_size
-        );
-        let feature_data_end = (data_offset as u64)
-            .checked_add(expected_data_size_u64)
-            .ok_or_else(|| anyhow::anyhow!("feature_data_end overflow"))?;
-        anyhow::ensure!(
-            feature_data_end <= mmap.len() as u64,
-            "feature payload end {} exceeds file size {}",
-            feature_data_end,
-            mmap.len()
-        );
-
-        let num_nodes =
-            usize::try_from(num_nodes_u64).context("num_nodes does not fit in usize")?;
-        let feature_dim =
-            usize::try_from(feature_dim_u64).context("feature_dim does not fit in usize")?;
-        let expected_data_size = usize::try_from(expected_data_size_u64)
-            .context("feature data size does not fit in usize")?;
+        // The mapping is the file, so its bytes and length are what the
+        // shared parser validates.
+        let header = super::header::parse_feature_header_bytes(
+            &mmap[..mmap.len().min(super::header::HEADER_PREFIX_LEN)],
+            mmap.len() as u64,
+        )?;
+        let num_nodes = header.num_nodes;
+        let feature_dim = header.feature_dim;
+        let dtype = header.dtype;
+        let expected_data_size = header.payload_bytes;
+        // Fits: the parser bounded it by the mapped length.
+        let data_offset = header.features_start_offset as usize;
 
         debug!(
             "Feature store loaded: {} nodes, {} dims, dtype={:?}, offset={}, {:.2} GB",
@@ -552,15 +481,9 @@ impl FeatureStore {
             weights,
         )?;
 
-        let payload_bytes = header
-            .num_nodes
-            .checked_mul(header.feature_size)
-            .context("feature payload size overflows usize")?;
-        let start = usize::try_from(header.features_start_offset).context("payload offset")?;
-        anyhow::ensure!(
-            start + payload_bytes <= file_len,
-            "feature payload ({payload_bytes} bytes at {start}) exceeds file length {file_len}"
-        );
+        let payload_bytes = header.payload_bytes;
+        // Fits: the parser bounded offset + payload by the file length.
+        let start = header.features_start_offset as usize;
 
         Ok(Self {
             backing: StoreBacking::Paged(Arc::new(region)),
@@ -684,6 +607,7 @@ impl FeatureStore {
             self.num_nodes
         );
 
+        self.backing.check()?;
         let data = self.feature_data();
         let start_idx = node_idx.checked_mul(self.feature_dim).ok_or_else(|| {
             anyhow::anyhow!(
@@ -745,6 +669,7 @@ impl FeatureStore {
             self.feature_dim
         );
 
+        self.backing.check()?;
         let raw = self.feature_data_raw();
         let row_bytes = self.feature_dim * self.dtype.element_size();
         // `node_idx < num_nodes` was checked above and the payload length is
@@ -754,7 +679,7 @@ impl FeatureStore {
         let row = &raw[start..start + row_bytes];
 
         self.dtype.decode_row(row, &mut out[..self.feature_dim]);
-        Ok(())
+        self.backing.check()
     }
 
     /// Get features for multiple nodes in batch (optimized).
@@ -775,6 +700,7 @@ impl FeatureStore {
         // loop below then runs branch-light with rows prefetched ahead of
         // the copy, overlapping the random-access miss latency instead of
         // serializing one miss per row.
+        self.backing.check()?;
         let raw = self.feature_data_raw();
         let GatherPlan {
             row_bytes,
@@ -817,6 +743,7 @@ impl FeatureStore {
                 decoder.decode_row(row, out);
             }
         }
+        self.backing.check()?;
 
         // Track telemetry (only if enabled)
         if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {
@@ -864,6 +791,7 @@ impl FeatureStore {
         // Same prefetched gather as `get_batch`, writing into the caller's
         // buffer. Bounds are validated up front so the copy loop stays
         // branch-light.
+        self.backing.check()?;
         let raw = self.feature_data_raw();
         let GatherPlan {
             row_bytes,
@@ -887,6 +815,7 @@ impl FeatureStore {
             let dst = &mut out[i * self.feature_dim..(i + 1) * self.feature_dim];
             decoder.decode_row(row, dst);
         }
+        self.backing.check()?;
 
         if let (Some(stats), Some(start)) = (self.telemetry.as_deref(), start) {
             stats.batch_gets.fetch_add(1, Ordering::Relaxed);
@@ -919,6 +848,7 @@ impl FeatureStore {
             "features() is not supported for F16 stores -- the raw payload is not f32. \
              Use get_batch() to upcast."
         );
+        self.backing.check()?;
         let data = self.feature_data();
         let len = self
             .num_nodes
@@ -952,23 +882,51 @@ impl super::NodeFeatureSource for FeatureStore {
 /// - `num_nodes`: Number of nodes
 /// - `feature_dim`: Feature dimension
 ///
+/// The bytes go to a fsynced sibling that is renamed over `path`, so the
+/// target is always the old file or the whole new one, and a store still
+/// mapping the old file keeps reading the old bytes.
+///
 /// # Performance
 /// - Single write, no fragmentation
 /// - ~1-2 GB/s write throughput
 pub fn save_features(
     path: impl AsRef<Path>,
-    features: Vec<f32>,
+    features: impl AsRef<[f32]>,
     num_nodes: usize,
     feature_dim: usize,
 ) -> Result<()> {
     let path = path.as_ref();
+    let features = features.as_ref();
     debug!(
         "Saving features to {}: {} nodes, {} dims",
         path.display(),
         num_nodes,
         feature_dim
     );
+    let size = write_feature_file(path, features, num_nodes, feature_dim, FeatureDtype::F32)?;
+    debug!("Features saved ({:.2} GB)", size as f64 / 1e9);
+    Ok(())
+}
 
+/// Elements encoded per write while converting to a half-width dtype, so
+/// the conversion buffer stays small however large the store is.
+const ENCODE_CHUNK: usize = 1 << 16;
+
+/// Write a complete feature file for `features` in `dtype`, returning its
+/// size in bytes.
+///
+/// The bytes land in a uniquely named sibling of `path`, are fsynced, and
+/// then renamed over `path` (with the directory fsynced after), so the
+/// target is always either the old file or the complete new one. A reader
+/// that mapped the old file keeps its pages: the rename detaches the old
+/// inode instead of truncating it under the mapping.
+fn write_feature_file(
+    path: &Path,
+    features: &[f32],
+    num_nodes: usize,
+    feature_dim: usize,
+    dtype: FeatureDtype,
+) -> Result<u64> {
     let expected = num_nodes
         .checked_mul(feature_dim)
         .ok_or_else(|| anyhow::anyhow!("num_nodes * feature_dim overflows usize"))?;
@@ -979,41 +937,106 @@ pub fn save_features(
         features.len()
     );
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .context("failed to create feature file")?;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("feature path {} has no file name", path.display()))?;
+    let (tmp_path, file) = create_sibling_temp(dir, name)?;
+    // Removes the temporary on every early return; disarmed by the rename.
+    let mut guard = TempGuard(Some(tmp_path.clone()));
 
-    // Write header.
-    // New files store an explicit, aligned payload offset to unlock O_DIRECT/IOPOLL paths.
-    let data_offset = ALIGNED_DATA_OFFSET;
-    anyhow::ensure!(
-        data_offset >= HEADER_SIZE as u64,
-        "invalid data_offset {data_offset}"
-    );
-    file.write_all(MAGIC)?;
-    file.write_all(&(num_nodes as u64).to_le_bytes())?;
-    file.write_all(&(feature_dim as u64).to_le_bytes())?;
-    file.write_all(&data_offset.to_le_bytes())?;
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+    // New files store an explicit, aligned payload offset to unlock
+    // O_DIRECT/IOPOLL paths. Byte 0 of the padding is the dtype tag.
+    let mut header = [0u8; ALIGNED_DATA_OFFSET as usize];
+    header[0..8].copy_from_slice(MAGIC);
+    header[8..16].copy_from_slice(&(num_nodes as u64).to_le_bytes());
+    header[16..24].copy_from_slice(&(feature_dim as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&ALIGNED_DATA_OFFSET.to_le_bytes());
+    header[HEADER_SIZE] = dtype as u8;
+    out.write_all(&header)?;
 
-    // Pad header to payload offset. Byte 0 of padding = dtype tag (0 = F32).
-    let padding = data_offset as usize - HEADER_SIZE;
-    if padding > 0 {
-        let mut pad = vec![0u8; padding];
-        pad[0] = FeatureDtype::F32 as u8;
-        file.write_all(&pad)?;
+    match dtype {
+        FeatureDtype::F32 => out.write_all(bytemuck::cast_slice(features))?,
+        FeatureDtype::F16 => {
+            write_encoded(&mut out, features, |v| f16::from_f32(v).to_le_bytes())?;
+        }
+        FeatureDtype::BF16 => write_encoded(&mut out, features, f32_to_bf16_le)?,
     }
 
-    // Write raw f32 data
-    let feature_bytes: &[u8] = bytemuck::cast_slice(&features);
-    file.write_all(feature_bytes)?;
+    let file = out
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("failed to flush feature file: {}", e.error()))?;
     file.sync_all().context("failed to sync feature file")?;
+    let size = file.metadata()?.len();
+    drop(file);
 
-    let file_size = data_offset as usize + feature_bytes.len();
-    debug!("Features saved ({:.2} GB)", file_size as f64 / 1e9);
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    guard.0 = None;
+    // Persist the rename itself; best-effort where directories can't be
+    // opened for sync.
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(size)
+}
+
+/// Stream `features` through a half-width `encode`, one bounded chunk at a
+/// time.
+fn write_encoded(
+    out: &mut impl Write,
+    features: &[f32],
+    encode: impl Fn(f32) -> [u8; 2],
+) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(ENCODE_CHUNK.min(features.len()) * 2);
+    for chunk in features.chunks(ENCODE_CHUNK) {
+        buf.clear();
+        buf.extend(chunk.iter().flat_map(|&v| encode(v)));
+        out.write_all(&buf)?;
+    }
     Ok(())
+}
+
+/// Create a fresh file next to the target, failing rather than reusing a
+/// name another writer holds.
+fn create_sibling_temp(dir: &Path, name: &std::ffi::OsStr) -> Result<(std::path::PathBuf, File)> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    loop {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".tmp.{pid}.{n}"));
+        let tmp_path = dir.join(tmp_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(f) => return Ok((tmp_path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to create feature file in {}", dir.display())
+                });
+            }
+        }
+    }
+}
+
+/// Deletes an unfinished temporary file when dropped.
+struct TempGuard(Option<std::path::PathBuf>);
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// Save features as f16 (half precision).
@@ -1033,46 +1056,8 @@ pub fn save_features_f16(
         num_nodes,
         feature_dim
     );
-
-    let expected = num_nodes
-        .checked_mul(feature_dim)
-        .ok_or_else(|| anyhow::anyhow!("num_nodes * feature_dim overflows usize"))?;
-    anyhow::ensure!(
-        features.len() == expected,
-        "feature array size mismatch: expected {}, got {}",
-        expected,
-        features.len()
-    );
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .context("failed to create feature file")?;
-
-    let data_offset = ALIGNED_DATA_OFFSET;
-    file.write_all(MAGIC)?;
-    file.write_all(&(num_nodes as u64).to_le_bytes())?;
-    file.write_all(&(feature_dim as u64).to_le_bytes())?;
-    file.write_all(&data_offset.to_le_bytes())?;
-
-    // Pad header to payload offset. Byte 0 of padding = dtype tag (1 = F16).
-    let padding = data_offset as usize - HEADER_SIZE;
-    let mut pad = vec![0u8; padding];
-    pad[0] = FeatureDtype::F16 as u8;
-    file.write_all(&pad)?;
-
-    // Convert f32 -> f16 and write
-    let mut buf = Vec::with_capacity(features.len() * 2);
-    for &v in features {
-        buf.extend_from_slice(&f16::from_f32(v).to_le_bytes());
-    }
-    file.write_all(&buf)?;
-    file.sync_all().context("failed to sync feature file")?;
-
-    let file_size = data_offset as usize + buf.len();
-    debug!("F16 features saved ({:.2} GB)", file_size as f64 / 1e9);
+    let size = write_feature_file(path, features, num_nodes, feature_dim, FeatureDtype::F16)?;
+    debug!("F16 features saved ({:.2} GB)", size as f64 / 1e9);
     Ok(())
 }
 
@@ -1095,44 +1080,8 @@ pub fn save_features_bf16(
         num_nodes,
         feature_dim
     );
-
-    let expected = num_nodes
-        .checked_mul(feature_dim)
-        .ok_or_else(|| anyhow::anyhow!("num_nodes * feature_dim overflows usize"))?;
-    anyhow::ensure!(
-        features.len() == expected,
-        "feature array size mismatch: expected {}, got {}",
-        expected,
-        features.len()
-    );
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .context("failed to create feature file")?;
-
-    let data_offset = ALIGNED_DATA_OFFSET;
-    file.write_all(MAGIC)?;
-    file.write_all(&(num_nodes as u64).to_le_bytes())?;
-    file.write_all(&(feature_dim as u64).to_le_bytes())?;
-    file.write_all(&data_offset.to_le_bytes())?;
-
-    let padding = data_offset as usize - HEADER_SIZE;
-    let mut pad = vec![0u8; padding];
-    pad[0] = FeatureDtype::BF16 as u8;
-    file.write_all(&pad)?;
-
-    let mut buf = Vec::with_capacity(features.len() * 2);
-    for &v in features {
-        buf.extend_from_slice(&f32_to_bf16_le(v));
-    }
-    file.write_all(&buf)?;
-    file.sync_all().context("failed to sync feature file")?;
-
-    let file_size = data_offset as usize + buf.len();
-    debug!("BF16 features saved ({:.2} GB)", file_size as f64 / 1e9);
+    let size = write_feature_file(path, features, num_nodes, feature_dim, FeatureDtype::BF16)?;
+    debug!("BF16 features saved ({:.2} GB)", size as f64 / 1e9);
     Ok(())
 }
 
@@ -1166,7 +1115,7 @@ pub fn create_features(num_nodes: usize, feature_dim: usize) -> FeatureData {
 pub fn save_feature_data(path: impl AsRef<Path>, data: &FeatureData) -> Result<()> {
     save_features(
         path,
-        data.features.clone(),
+        &data.features,
         data.num_nodes as usize,
         data.feature_dim as usize,
     )
@@ -1192,14 +1141,17 @@ where
 {
     let (num_nodes, feature_dim) = features.dim();
 
-    // Convert ndarray to contiguous row-major Vec<f32>
-    let features_vec: Vec<f32> = if features.is_standard_layout() {
-        features.as_slice().unwrap().to_vec()
-    } else {
-        features.iter().copied().collect()
-    };
-
-    save_features(path, features_vec, num_nodes, feature_dim)
+    // A standard-layout array is already row-major; anything else is
+    // gathered into one.
+    match features.as_slice() {
+        Some(flat) => save_features(path, flat, num_nodes, feature_dim),
+        None => save_features(
+            path,
+            features.iter().copied().collect::<Vec<f32>>(),
+            num_nodes,
+            feature_dim,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1638,6 +1590,54 @@ mod tests {
             "f16 should flush 1e-30 and overflow 1e30, got {:?}",
             &f16_row[..2]
         );
+    }
+
+    /// Saving over a path a live store maps must not truncate the mapped
+    /// file: the old store keeps reading its own bytes, a fresh load sees
+    /// the new ones, and no temporary file is left behind.
+    #[test]
+    fn save_over_a_mapped_store_replaces_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("features.bin");
+        save_features(&path, vec![1.0f32; 64 * 8], 64, 8).unwrap();
+        let old = FeatureStore::load(&path).unwrap();
+
+        save_features_f16(&path, &vec![2.0f32; 16 * 4], 16, 4).unwrap();
+        assert_eq!(old.num_nodes(), 64);
+        assert!(
+            old.get_batch(&[0u32, 63])
+                .unwrap()
+                .iter()
+                .all(|&x| x == 1.0)
+        );
+
+        let new = FeatureStore::load(&path).unwrap();
+        assert_eq!((new.num_nodes(), new.feature_dim()), (16, 4));
+        assert_eq!(new.dtype(), FeatureDtype::F16);
+        assert!(
+            new.get_batch(&[0u32, 15])
+                .unwrap()
+                .iter()
+                .all(|&x| x == 2.0)
+        );
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("features.bin")]);
+    }
+
+    /// A rejected save leaves the existing file untouched.
+    #[test]
+    fn failed_save_keeps_the_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("features.bin");
+        save_features(&path, vec![3.0f32; 10 * 2], 10, 2).unwrap();
+        assert!(save_features(&path, vec![0.0f32; 5], 10, 2).is_err());
+        let store = FeatureStore::load(&path).unwrap();
+        assert_eq!(store.num_nodes(), 10);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

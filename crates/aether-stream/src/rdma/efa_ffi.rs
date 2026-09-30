@@ -250,12 +250,14 @@ unsafe extern "C" {
         length: u32,
     ) -> i32;
 
-    /// Post N chained RDMA READs inside ONE builder-API transaction. All
-    /// reads share the same AH + (remote_qpn, remote_qkey, remote_rkey,
-    /// local_lkey); per-read offset + length come from `reads`. Only the
-    /// final WR is signaled, so the caller drains exactly one CQE after
-    /// this call. Zero Rust ↔ C boundary crossings per WR — the whole
-    /// batch posts in one FFI call. Returns 0 on success.
+    /// Post N RDMA READs in one FFI call, each in its own builder-API
+    /// transaction (SRD rejects more than one per `wr_start`). All reads
+    /// share the same AH + (remote_qpn, remote_qkey, remote_rkey,
+    /// local_lkey); per-read offset + length come from `reads`; WR `i`
+    /// carries `wr_id = base_wr_id + i`. Every WR is signaled, so each one
+    /// posted yields one CQE. Returns 0, or the errno of the first WR the
+    /// provider refused; `*posted` receives how many were accepted before
+    /// it either way, and those must be drained.
     pub fn aether_ibv_post_rdma_reads_srd_batch(
         qpx: *mut IbvQpEx,
         ah: *mut IbvAh,
@@ -266,6 +268,7 @@ unsafe extern "C" {
         base_wr_id: u64,
         reads: *const AetherSrdRead,
         n: u32,
+        posted: *mut u32,
     ) -> i32;
 
     /// Drain at most one CQE into the snapshot. Returns:
@@ -275,9 +278,10 @@ unsafe extern "C" {
     pub fn aether_ibv_poll_cq_ex_one(cqx: *mut IbvCqEx, out: *mut AetherCqeSnapshot) -> i32;
 
     /// Drain up to `max_out` CQEs into the array in a single FFI call.
-    /// Returns the number drained (0 if CQ was empty). Uses `ibv_next_poll`
-    /// inside one `start_poll`/`end_poll` bracket, so N drains cost 1 FFI
-    /// crossing instead of N.
+    /// Returns the number drained (0 if CQ was empty), or a negative errno
+    /// when polling fails. Uses `ibv_next_poll` inside one
+    /// `start_poll`/`end_poll` bracket, so N drains cost 1 FFI crossing
+    /// instead of N.
     pub fn aether_ibv_poll_cq_ex_many(
         cqx: *mut IbvCqEx,
         out: *mut AetherCqeSnapshot,

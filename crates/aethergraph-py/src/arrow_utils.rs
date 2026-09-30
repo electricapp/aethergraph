@@ -1,5 +1,5 @@
 use aethergraph_core::SampledSubgraph;
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use pyo3::prelude::*;
 use std::sync::Arc;
@@ -39,31 +39,18 @@ pub struct SubgraphRecordBatches {
 pub fn subgraph_into_record_batches(
     subgraph: SampledSubgraph,
 ) -> Result<SubgraphRecordBatches, ArrowError> {
+    // Edge ids are CSR positions, which pass u32 on graphs over 4B edges.
     let edges_schema = Schema::new(vec![
         Field::new("edge_src", DataType::UInt32, false),
         Field::new("edge_dst", DataType::UInt32, false),
-        Field::new("edge_id", DataType::UInt32, false),
+        Field::new("edge_id", DataType::UInt64, false),
     ]);
     let edges = RecordBatch::try_new(
         Arc::new(edges_schema),
         vec![
             Arc::new(UInt32Array::from(subgraph.edge_src)) as ArrayRef,
             Arc::new(UInt32Array::from(subgraph.edge_dst)) as ArrayRef,
-            // `edge_ids` is `Vec<u64>` in the core (edge offsets can exceed
-            // u32 for >4B edge graphs); narrow with bounds-check.
-            Arc::new(UInt32Array::from(
-                subgraph
-                    .edge_ids
-                    .into_iter()
-                    .map(|e| {
-                        u32::try_from(e).map_err(|_| {
-                            ArrowError::CastError(format!(
-                                "edge_id {e} exceeds u32::MAX — sampled subgraph has too many edges to fit in an Arrow UInt32 column"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )) as ArrayRef,
+            Arc::new(UInt64Array::from(subgraph.edge_ids)) as ArrayRef,
         ],
     )?;
 
@@ -142,18 +129,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_edge_id_overflow() {
+    fn keeps_edge_ids_past_u32() {
+        let big = u64::from(u32::MAX) + 1;
         let subgraph = SampledSubgraph::from_parts(
             vec![0, 1],
             vec![0],
             vec![1],
-            // edge_id beyond u32::MAX
-            vec![u64::from(u32::MAX) + 1],
+            vec![big],
             vec![0],
             vec![2],
             vec![1],
         );
-        let err = subgraph_into_record_batches(subgraph).unwrap_err();
-        assert!(format!("{err}").contains("exceeds u32::MAX"));
+        let batches = subgraph_into_record_batches(subgraph).unwrap();
+        let ids = batches
+            .edges
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("edge_id is UInt64");
+        assert_eq!(ids.values().as_ref(), &[big]);
     }
 }

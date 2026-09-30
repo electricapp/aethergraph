@@ -12,8 +12,10 @@
 
 use aether_stream::feature_table::FeatureTable;
 use aether_stream::gpu::kernel::SeqlockValidator;
+use aether_stream::gpu::kernels::validate::StagingRegions;
 use aether_stream::rdma::context::RdmaContext;
 use aether_stream::rdma::ffi::*;
+use aether_stream::rdma::layout::SlotGeometry;
 use aether_stream::rdma::qp::{DEFAULT_QP_CAP, RdmaQp, RdmaRead};
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtrMut};
 use std::time::{Duration, Instant};
@@ -158,11 +160,16 @@ fn rdma_into_host_then_memcpy_into_vram_and_validate() {
     };
     let staging2_ptr = staging1_ptr + snap_len as u64;
 
-    let mut validator = SeqlockValidator::new(&cuda_ctx, &stream, NODES_READ, FEATURE_DIM)
+    let geometry = SlotGeometry::from_schema(&schema).expect("table geometry");
+    // SAFETY: `staging` holds both snapshot regions of NODES_READ slots and
+    // outlives the validate below.
+    let regions = unsafe { StagingRegions::new(staging1_ptr, staging2_ptr, NODES_READ, geometry) }
+        .expect("staging regions");
+    let mut validator = SeqlockValidator::new(&cuda_ctx, &stream, NODES_READ, &geometry)
         .expect("SeqlockValidator nvrtc compile");
 
     let retries = validator
-        .validate(staging1_ptr, staging2_ptr, schema.slot_size, NODES_READ)
+        .validate(&regions, NODES_READ)
         .expect("kernel launch");
     assert_eq!(
         retries, 0,

@@ -1,9 +1,11 @@
 //! K2.1: mlx5 RDMA READ WQE segments from `mlx5_ifc`.
 //!
-//! This 48-byte builder is ordered as control (bytes 0..16), data (16..32),
-//! and remote-address (32..48), the segment order consumed by the IBGDA path.
-//! `qpn_ds` stores the QP number in bits 31:8 and the 16-byte segment count in
-//! bits 5:0. The runtime doorbell record and BlueFlame write remain hardware
+//! This 48-byte builder is ordered as control (bytes 0..16), remote-address
+//! (16..32), and data (32..48) — the order the mlx5 HCA parses an RDMA
+//! READ/WRITE WQE in (rdma-core's `_mlx5_post_send` writes `set_raddr_seg`
+//! straight after the control segment, then the data pointer). `qpn_ds`
+//! stores the QP number in bits 31:8 and the 16-byte segment count in bits
+//! 5:0. The runtime doorbell record and BlueFlame write remain hardware
 //! integration concerns.
 
 /// mlx5 transport opcode for RDMA READ.
@@ -12,7 +14,7 @@ pub const MLX5_OPCODE_RDMA_READ: u8 = 0x10;
 pub const MLX5_WQE_CTRL_CQ_UPDATE: u8 = 2 << 2;
 const WQE_SEGMENTS: u32 = 3;
 
-/// A packed mlx5 RDMA READ WQE: ctrl, data, then remote-address segment.
+/// A packed mlx5 RDMA READ WQE: ctrl, remote-address, then data segment.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mlx5RdmaReadWqe {
@@ -25,17 +27,21 @@ pub struct Mlx5RdmaReadWqe {
     /// Fence / CQ-update / solicited bits (`fm_ce_se`).
     pub ctrl_fm_ce_se: u8,
     pub ctrl_imm: [u8; 4],
-    /// Data segment: byte count, local key, local address.
-    pub byte_count: [u8; 4],
-    pub lkey: [u8; 4],
-    pub local_address: [u8; 8],
-    /// Remote-address segment: remote address, remote key, reserved.
+    /// Remote-address segment (`mlx5_wqe_raddr_seg`): remote address,
+    /// remote key, reserved.
     pub remote_address: [u8; 8],
     pub rkey: [u8; 4],
     pub remote_reserved: [u8; 4],
+    /// Data segment (`mlx5_wqe_data_seg`): byte count, local key, local
+    /// address.
+    pub byte_count: [u8; 4],
+    pub lkey: [u8; 4],
+    pub local_address: [u8; 8],
 }
 
 const _: () = assert!(core::mem::size_of::<Mlx5RdmaReadWqe>() == 48);
+const _: () = assert!(core::mem::offset_of!(Mlx5RdmaReadWqe, remote_address) == 16);
+const _: () = assert!(core::mem::offset_of!(Mlx5RdmaReadWqe, byte_count) == 32);
 
 impl Mlx5RdmaReadWqe {
     /// Build one RDMA READ WQE with CQ update requested.
@@ -61,18 +67,23 @@ impl Mlx5RdmaReadWqe {
             ctrl_rsvd: [0; 2],
             ctrl_fm_ce_se: MLX5_WQE_CTRL_CQ_UPDATE,
             ctrl_imm: [0; 4],
-            byte_count: byte_count.to_be_bytes(),
-            lkey: lkey.to_be_bytes(),
-            local_address: local_address.to_be_bytes(),
             remote_address: remote_address.to_be_bytes(),
             rkey: rkey.to_be_bytes(),
             remote_reserved: [0; 4],
+            byte_count: byte_count.to_be_bytes(),
+            lkey: lkey.to_be_bytes(),
+            local_address: local_address.to_be_bytes(),
         }
     }
 
     /// The encoded 24-bit QP number.
     pub fn qpn(self) -> u32 {
         u32::from_be_bytes(self.ctrl_qpn_ds) >> 8
+    }
+
+    /// The producer index encoded in the control segment.
+    pub fn wqe_index(self) -> u16 {
+        (u32::from_be_bytes(self.ctrl_opmod_idx_opcode) >> 8) as u16
     }
 
     /// Number of 16-byte segments consumed by this WQE.
@@ -96,16 +107,21 @@ mod tests {
     use super::*;
     use core::mem::{offset_of, size_of};
 
+    /// The segment offsets the HCA parses: control, then remote address,
+    /// then the local data pointer.
     #[test]
     fn rdma_read_wqe_has_mlx5_segment_offsets() {
         assert_eq!(size_of::<Mlx5RdmaReadWqe>(), 48);
         assert_eq!(offset_of!(Mlx5RdmaReadWqe, ctrl_opmod_idx_opcode), 0);
-        assert_eq!(offset_of!(Mlx5RdmaReadWqe, byte_count), 16);
-        assert_eq!(offset_of!(Mlx5RdmaReadWqe, remote_address), 32);
+        assert_eq!(offset_of!(Mlx5RdmaReadWqe, remote_address), 16);
+        assert_eq!(offset_of!(Mlx5RdmaReadWqe, rkey), 24);
+        assert_eq!(offset_of!(Mlx5RdmaReadWqe, byte_count), 32);
+        assert_eq!(offset_of!(Mlx5RdmaReadWqe, lkey), 36);
+        assert_eq!(offset_of!(Mlx5RdmaReadWqe, local_address), 40);
     }
 
     #[test]
-    fn builder_packs_control_data_and_remote_segments() {
+    fn builder_packs_control_remote_and_data_segments() {
         let wqe = Mlx5RdmaReadWqe::new(
             0x12_3456,
             0x42,
@@ -116,10 +132,14 @@ mod tests {
             0x3333_4444,
         );
         assert_eq!(wqe.qpn(), 0x12_3456);
+        assert_eq!(wqe.wqe_index(), 0x42);
         assert_eq!(wqe.segment_count(), 3);
         assert!(wqe.requests_cq_update());
         assert_eq!(u32::from_be_bytes(wqe.ctrl_opmod_idx_opcode), 0x0000_4210);
         assert_eq!(u32::from_be_bytes(wqe.byte_count), 4096);
         assert_eq!(u64::from_be_bytes(wqe.remote_address), 0x9000_a000);
+        assert_eq!(u32::from_be_bytes(wqe.rkey), 0x3333_4444);
+        assert_eq!(u64::from_be_bytes(wqe.local_address), 0x1000_2000);
+        assert_eq!(u32::from_be_bytes(wqe.lkey), 0x1111_2222);
     }
 }

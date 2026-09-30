@@ -37,12 +37,17 @@
 //! The loader validates everything it reads against the file length with
 //! checked arithmetic before constructing any view: a corrupt or
 //! truncated file must surface as `Err`, never as a panic or a SIGBUS on
-//! first access.
+//! first access. Each edge type is then proven in full — monotone offsets
+//! and every destination below its destination type's count — so a
+//! loaded [`HeteroGraph`] upholds the same invariants as one built in
+//! memory. That proof reads every edge once.
 
+use super::mmap::{MAX_EDGES, write_atomically};
 use crate::graph::hetero::HeteroGraph;
-use crate::graph::{EdgeOffset, Graph, NodeId};
+use crate::graph::{EdgeOffset, Graph, GraphValidationMode, MAX_NODES, NodeId};
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::MmapOptions;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -56,10 +61,6 @@ const EDGE_TYPE_ENTRY_SIZE: usize = 216; // 64*3 names + 8+8+4+4
 
 /// Type IDs are u8 throughout `HeteroGraph`.
 const MAX_TYPES: usize = 256;
-/// Sanity caps mirroring the homogeneous loader — a corrupt header must
-/// not drive multi-GB allocations or offset arithmetic.
-const MAX_NODES: u64 = 10_000_000_000;
-const MAX_EDGES: u64 = 100_000_000_000;
 
 /// Bytes of zero padding needed to align `len` up to 8.
 fn pad8(len: usize) -> usize {
@@ -83,17 +84,21 @@ fn read_padded_name(data: &[u8]) -> Result<String> {
     String::from_utf8(data[..end].to_vec()).context("invalid UTF-8 in type name")
 }
 
-/// Save a heterogeneous graph to a binary file.
+/// Save a heterogeneous graph to a binary file, atomically replacing any
+/// existing file at `path` (fsynced before it takes the name).
 pub fn save_hetero_graph(graph: &HeteroGraph, path: impl AsRef<Path>) -> Result<()> {
-    let path = path.as_ref();
-    let mut file = File::create(path).context("create file")?;
-
     let num_nt = graph.node_type_count();
     let num_et = graph.edge_type_count();
     ensure!(
         num_nt <= MAX_TYPES && num_et <= MAX_TYPES,
         "type counts ({num_nt} node, {num_et} edge) exceed the format limit of {MAX_TYPES}"
     );
+    write_atomically(path.as_ref(), |file| write_hetero(graph, file))
+}
+
+fn write_hetero(graph: &HeteroGraph, file: &mut impl Write) -> Result<()> {
+    let num_nt = graph.node_type_count();
+    let num_et = graph.edge_type_count();
 
     // Header
     let mut header = vec![0u8; HEADER_SIZE];
@@ -149,8 +154,6 @@ pub fn save_hetero_graph(graph: &HeteroGraph, path: impl AsRef<Path>) -> Result<
             file.write_all(&ZERO_PAD[..pad8(weight_bytes.len())])?;
         }
     }
-
-    file.flush()?;
     Ok(())
 }
 
@@ -163,19 +166,9 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
     let mmap = Arc::new(unsafe { MmapOptions::new().map(&file)? });
     let file_len = mmap.len();
 
-    // The load below reads only the header, the type tables, and the first/
-    // last 8 bytes of each offsets array — deliberately O(1) page faults.
-    // WILLNEED therefore covers just a small prefix (header + tables live at
-    // the front); the CSR body is hinted MADV_RANDOM instead, since sampling
-    // faults one page per useful neighbor list and default readahead would
-    // drag in 128 KiB per fault.
-    let prefix = file_len.min(1 << 20);
-    crate::internal::hint::prefetch_mmap_range(mmap.as_ptr(), prefix);
-    if file_len > prefix {
-        // SAFETY: `prefix <= file_len`, so the offset stays in the mapping.
-        let body = unsafe { mmap.as_ptr().add(prefix) };
-        crate::internal::hint::advise_mmap_random(body, file_len - prefix);
-    }
+    // Validation below streams every offsets and edges section once, so the
+    // whole file is read ahead.
+    crate::internal::hint::prefetch_mmap_range(mmap.as_ptr(), file_len);
 
     if file_len < HEADER_SIZE {
         bail!("file too small for header: {file_len} bytes");
@@ -219,7 +212,7 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
         let name = read_padded_name(&entry[..64])?;
         let count = u64::from_le_bytes(entry[64..72].try_into()?);
         ensure!(
-            count <= MAX_NODES,
+            count <= MAX_NODES as u64,
             "node type '{name}' count {count} exceeds maximum {MAX_NODES} — file is corrupt"
         );
         node_types.push((name, count as usize));
@@ -244,7 +237,7 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
         let num_src_nodes = u64::from_le_bytes(entry[192..200].try_into()?);
         let num_edges = u64::from_le_bytes(entry[200..208].try_into()?);
         ensure!(
-            num_src_nodes <= MAX_NODES,
+            num_src_nodes <= MAX_NODES as u64,
             "edge type '{rel_name}' num_src_nodes {num_src_nodes} exceeds maximum {MAX_NODES} \
              — file is corrupt"
         );
@@ -283,9 +276,19 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
             Ok(start..end)
         };
 
+    let type_counts: HashMap<&str, usize> = node_types
+        .iter()
+        .map(|(name, count)| (name.as_str(), *count))
+        .collect();
     let mut edge_types: Vec<(String, String, String, Graph)> = Vec::with_capacity(num_et);
     for hdr in et_headers {
         let rel = hdr.rel_name.as_str();
+        let dst_count = *type_counts.get(hdr.dst_name.as_str()).with_context(|| {
+            format!(
+                "edge type '{rel}' names unknown destination type '{}' — file is corrupt",
+                hdr.dst_name
+            )
+        })?;
         let offsets_bytes = hdr
             .num_src_nodes
             .checked_add(1)
@@ -297,24 +300,6 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
             .ok_or_else(|| anyhow::anyhow!("edges size overflows for edge type '{rel}'"))?;
 
         let offsets_range = take(&mut offset, offsets_bytes, "offsets", rel)?;
-        ensure!(
-            offsets_range
-                .start
-                .is_multiple_of(std::mem::align_of::<EdgeOffset>()),
-            "offsets section of edge type '{rel}' is misaligned — file is corrupt"
-        );
-        // O(1) structural check: a CSR offsets array starts at 0 and ends
-        // at num_edges. Catches sections that landed on the wrong bytes
-        // without faulting in the whole file.
-        let first =
-            u64::from_le_bytes(mmap[offsets_range.start..offsets_range.start + 8].try_into()?);
-        let last = u64::from_le_bytes(mmap[offsets_range.end - 8..offsets_range.end].try_into()?);
-        ensure!(
-            first == 0 && last == hdr.num_edges as u64,
-            "offsets of edge type '{rel}' are inconsistent (first={first}, last={last}, \
-             num_edges={}) — file is corrupt",
-            hdr.num_edges
-        );
         let edges_range = take(&mut offset, edges_bytes, "edges", rel)?;
         offset = offset
             .checked_add(pad8(edges_bytes))
@@ -335,12 +320,15 @@ pub fn load_hetero_graph(path: impl AsRef<Path>) -> Result<HeteroGraph> {
 
         let graph = Graph::from_mapped_parts(
             hdr.num_src_nodes,
+            dst_count,
             hdr.num_edges,
             Arc::clone(&mmap),
             offsets_range,
             edges_range,
             weights_range,
-        );
+            GraphValidationMode::Full,
+        )
+        .with_context(|| format!("edge type '{rel}' is inconsistent — file is corrupt"))?;
 
         // `et_headers` is consumed by value, so move the names instead of
         // cloning them into the edge-type list.
@@ -775,6 +763,29 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         assert!(load_hetero_graph(&path).is_err());
+    }
+
+    /// A destination id past its destination type's count fails the load,
+    /// so samplers can index per-type arrays by destination unchecked.
+    #[test]
+    fn test_out_of_range_destination_rejected() {
+        let csr = Graph::from_bipartite_src_dst(2, 4, &[0, 1], &[1, 3], None).unwrap();
+        let graph = HeteroGraph::from_parts(
+            vec![("a".into(), 2), ("b".into(), 4)],
+            vec![("a".into(), "r".into(), "b".into(), csr)],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dst.bin");
+        save_hetero_graph(&graph, &path).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Edges follow the 3-entry offsets array of the only edge type.
+        let edges_at = HEADER_SIZE + 2 * NODE_TYPE_ENTRY_SIZE + EDGE_TYPE_ENTRY_SIZE + 3 * 8;
+        bytes[edges_at + 4..edges_at + 8].copy_from_slice(&4u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let msg = format!("{:#}", load_hetero_graph(&path).unwrap_err());
+        assert!(msg.contains("out of range"), "got: {msg}");
     }
 
     #[test]

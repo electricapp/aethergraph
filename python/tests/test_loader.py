@@ -201,7 +201,10 @@ class TestNeighborLoaderSampling:
 
         seen: list[int] = []
         for batch in loader:
-            seen.extend(batch.n_id[batch.input_id].tolist())
+            seeds = batch.n_id[batch.seed_index]
+            # Iterating all nodes, a seed's position in input_nodes is its ID.
+            assert batch.input_id.tolist() == seeds.tolist()
+            seen.extend(seeds.tolist())
 
         assert len(seen) == small_graph.num_nodes
         assert len(set(seen)) == small_graph.num_nodes
@@ -292,8 +295,8 @@ class TestNeighborLoaderEdgeCases:
         for batch in loader:
             assert batch.num_nodes > 0
 
-    def test_input_id_tracks_seed_order(self) -> None:
-        """Seed ordering should be recovered via input_id, not by slicing [:batch_size]."""
+    def test_seed_index_tracks_seed_order(self) -> None:
+        """Seeds lead n_id in input order, and seed_index recovers them."""
         from aethergraph import Graph
         from aethergraph.pytorch import NeighborLoader
 
@@ -310,11 +313,12 @@ class TestNeighborLoaderEdgeCases:
         )
 
         batch = next(iter(loader))
-        seed_nodes = batch.n_id[batch.input_id].tolist()
-        assert seed_nodes == [3, 2]
+        assert batch.n_id[batch.seed_index].tolist() == [3, 2]
+        assert batch.n_id[: batch.batch_size].tolist() == [3, 2]
+        assert batch.input_id.tolist() == [0, 1]
 
-    def test_duplicate_seeds_preserved_in_input_id(self) -> None:
-        """Duplicate seeds should produce duplicate entries in input_id."""
+    def test_duplicate_seeds_preserved_in_seed_index(self) -> None:
+        """Duplicate seeds produce one seed_index entry each, same local node."""
         from aethergraph import Graph
         from aethergraph.pytorch import NeighborLoader
 
@@ -332,8 +336,29 @@ class TestNeighborLoaderEdgeCases:
 
         batch = next(iter(loader))
         assert batch.batch_size == 2
-        assert len(batch.input_id) == 2
-        assert batch.n_id[batch.input_id].tolist() == [1, 1]
+        assert batch.input_id.tolist() == [0, 1]
+        assert batch.n_id[batch.seed_index].tolist() == [1, 1]
+
+    def test_input_id_is_position_in_input_nodes(self, medium_graph: Graph) -> None:
+        """input_id follows PyG: positions in input_nodes, across a shuffle."""
+        from aethergraph.pytorch import NeighborLoader
+
+        input_nodes = np.arange(medium_graph.num_nodes - 1, 9, -3, dtype=np.int64)
+        loader = NeighborLoader(
+            medium_graph,
+            num_neighbors=[3],
+            input_nodes=input_nodes,
+            batch_size=7,
+            shuffle=True,
+            seed=3,
+            num_workers=3,
+        )
+        positions: list[int] = []
+        for batch in loader:
+            seeds = batch.n_id[batch.seed_index].numpy()
+            np.testing.assert_array_equal(input_nodes[batch.input_id.numpy()], seeds)
+            positions.extend(batch.input_id.tolist())
+        assert sorted(positions) == list(range(len(input_nodes)))
 
     def test_negative_input_nodes_rejected(self, small_graph: Graph) -> None:
         """Negative node IDs should be rejected before sampling."""
@@ -382,7 +407,7 @@ class TestNeighborLoaderFailureHandling:
             def submit(self, _batch_idx: int, _seeds: npt.NDArray[np.int64]) -> None:
                 return None
 
-            def next_with_features(self) -> None:
+            def next_batch(self) -> None:
                 return None
 
             def stats(self) -> _FakeStats:
@@ -419,6 +444,24 @@ class TestNeighborLoaderRepr:
 
         r = repr(loader)
         assert "NeighborLoader" in r
+
+
+class TestEdgeOrientation:
+    """Batches follow PyG's source-to-target flow toward the seeds."""
+
+    def test_hop_one_edges_end_at_seeds(self, small_graph: Graph) -> None:
+        from aethergraph.pytorch import NeighborLoader
+
+        loader = NeighborLoader(small_graph, num_neighbors=[5], batch_size=8, shuffle=False)
+        batch = next(iter(loader))
+        assert batch.edge_index.shape[1] > 0
+        seeds = set(batch.input_id.tolist())
+        assert set(batch.edge_index[1].tolist()) <= seeds
+        # Each edge names the stored edge from row 1 to row 0.
+        n_id = batch.n_id
+        for src_local, dst_local in batch.edge_index.T.tolist():
+            neighbor, expanded = int(n_id[src_local]), int(n_id[dst_local])
+            assert neighbor in small_graph.neighbors(expanded).tolist()
 
 
 class TestSamplingConfigValidation:
@@ -584,3 +627,120 @@ class TestTrackEdgeIds:
         batch = next(iter(ld))
         assert batch.get("e_id") is None
         assert batch.edge_index.shape[1] >= 0
+
+
+class TestLoaderModes:
+    def test_disjoint_loader_attaches_batch(self, small_graph: Graph) -> None:
+        """disjoint=True gives each seed its own subgraph and a batch vector."""
+        from aethergraph.pytorch import NeighborLoader
+
+        ld = NeighborLoader(
+            small_graph,
+            num_neighbors=[4, 2],
+            input_nodes=np.array([5, 5, 7], dtype=np.int64),
+            batch_size=3,
+            disjoint=True,
+            num_workers=2,
+            shuffle=False,
+        )
+        batch = next(iter(ld))
+        assert batch.batch.shape[0] == batch.num_nodes
+        assert sorted(set(batch.batch.tolist())) == [0, 1, 2]
+        # No dedup across seeds: the repeated seed appears once per copy.
+        assert batch.n_id.tolist().count(5) >= 2
+
+    def test_seeded_epochs_resample_neighborhoods(self, medium_graph: Graph) -> None:
+        """A seeded loader draws fresh neighborhoods every epoch, reproducibly."""
+        from aethergraph.pytorch import NeighborLoader
+
+        def make() -> NeighborLoader:
+            return NeighborLoader(
+                medium_graph,
+                num_neighbors=[5, 5],
+                input_nodes=np.arange(64, dtype=np.int64),
+                batch_size=64,
+                seed=11,
+                shuffle=False,
+            )
+
+        def n_ids(ld: NeighborLoader) -> list[int]:
+            return next(iter(ld)).n_id.tolist()
+
+        loader = make()
+        first, second = n_ids(loader), n_ids(loader)
+        assert first != second
+        replay = make()
+        assert n_ids(replay) == first
+        assert n_ids(replay) == second
+
+
+class TestRawLoader:
+    """The `_core.NeighborLoader` pipeline contract."""
+
+    def test_seeded_loader_serves_repeated_epochs_and_any_batch_idx(
+        self, small_graph: Graph
+    ) -> None:
+        from aethergraph._core import NeighborLoader, SamplingConfig
+
+        cfg = SamplingConfig([3], seed=2)
+        with NeighborLoader(small_graph, cfg, 2, 3) as loader:
+            for idx_base in (0, 100):
+                indices = [idx_base + 7, idx_base + 7, idx_base + 1]
+                for i in indices:
+                    loader.submit(batch_idx=i, seeds=[i % small_graph.num_nodes])
+                got = [loader.next_batch() for _ in indices]
+                assert [g[0] for g in got if g is not None] == indices
+        assert loader.next() is None
+
+    def test_out_of_range_seed_fails_at_submit(self, small_graph: Graph) -> None:
+        """A bad seed raises at submit and leaves the loader usable."""
+        from aethergraph._core import NeighborLoader, SamplingConfig, SamplingError
+
+        with NeighborLoader(small_graph, SamplingConfig([3]), 2, 2) as loader:
+            assert loader.num_nodes == small_graph.num_nodes
+            with pytest.raises(SamplingError, match="out of range"):
+                loader.submit(0, [small_graph.num_nodes])
+            loader.submit(1, [0])
+            got = loader.next_batch()
+            assert got is not None and got[0] == 1
+
+    def test_shutdown_unblocks_a_blocked_submit(self, small_graph: Graph) -> None:
+        """shutdown() from one thread wakes a submit() blocked in another."""
+        import threading
+
+        from aethergraph._core import NeighborLoader, SamplingConfig, SamplingError
+
+        loader = NeighborLoader(small_graph, SamplingConfig([3], seed=0), 1, 1)
+        outcome: list[BaseException] = []
+
+        def produce() -> None:
+            try:
+                for i in range(10_000):
+                    loader.submit(i, [i % small_graph.num_nodes])
+            except SamplingError as e:
+                outcome.append(e)
+
+        producer = threading.Thread(target=produce)
+        producer.start()
+        producer.join(timeout=0.5)
+        assert producer.is_alive(), "submit should block once the pipeline is full"
+        loader.shutdown()
+        producer.join(timeout=10)
+        assert not producer.is_alive()
+        assert outcome and "shut down" in str(outcome[0])
+
+    def test_shutdown_unblocks_a_blocked_next(self, small_graph: Graph) -> None:
+        import threading
+
+        from aethergraph._core import NeighborLoader, SamplingConfig
+
+        loader = NeighborLoader(small_graph, SamplingConfig([3]), 2, 1)
+        results: list[object] = []
+        consumer = threading.Thread(target=lambda: results.append(loader.next()))
+        consumer.start()
+        consumer.join(timeout=0.3)
+        assert consumer.is_alive()
+        loader.shutdown()
+        consumer.join(timeout=10)
+        assert not consumer.is_alive()
+        assert results == [None]

@@ -42,6 +42,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "compressed_loader_bytes"
+path = "fuzz_targets/compressed_loader_bytes.rs"
+test = false
+doc = false
+bench = false
+
 # Reproducible corpus seeder: source-controlled, audit-friendly. Run with
 #   cargo run -p aethergraph-fuzz --bin seed_corpus
 # to (re)populate ./corpus/<target>/ with the canonical inputs declared in

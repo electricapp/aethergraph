@@ -8,12 +8,13 @@
 //! addresses far more than 2^31 bytes: capacity is bounded by the
 //! interior-slot index range at 32 GiB.
 //!
-//! Retired slots are recycled: each staged batch is stamped with a reader-
-//! gate snapshot and its guard's commit epoch, and is freed once the gate
-//! drains past the stamp and no pinned [`Snapshot`](crate::Snapshot) older
-//! than it remains. Free lists are intrusive (link in the freed slot) and
-//! allocation pops them before bumping, so steady-state ingest reuses
-//! garbage instead of growing until [`compact`](crate::DynamicGraph::compact).
+//! Retired slots are recycled: each staged batch is stamped with the
+//! reader-gate phase it must outwait and its guard's commit epoch, and is
+//! freed once the gate reaches that phase and no pinned
+//! [`Snapshot`](crate::Snapshot) older than it remains. Free lists are
+//! intrusive (link in the freed slot) and allocation pops them before
+//! bumping, so steady-state ingest reuses garbage instead of growing until
+//! [`compact`](crate::DynamicGraph::compact).
 //!
 //! Mutation goes through [`ArenaWriter`], obtained once from
 //! [`Arena::writer`] — the one `unsafe` point proving the single-writer
@@ -26,6 +27,7 @@ use crate::pad::CachePadded;
 use std::alloc::Layout;
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Mutex};
@@ -38,67 +40,101 @@ pub const INTERIOR_SLOT: usize = 16;
 /// Free-list terminator / "no slot" sentinel inside the recycler.
 const NO_SLOT: u32 = u32::MAX;
 
-/// Reader-gate stripes. Sixteen padded counters keep concurrent readers
-/// from serializing on one cache line while staying cheap to snapshot.
+/// Reader-gate stripes. Sixteen padded stripes keep concurrent readers
+/// from serializing on one cache line while staying cheap to scan.
 const GATE_STRIPES: usize = 16;
 
 /// Retire-log capacity per class before the writer should flush. Also the
-/// batch buffers' pre-allocated capacity, so a watermark flush never
-/// grows a vector.
+/// pooled batches' capacity, so a watermark flush in the unpinned steady
+/// state never grows a vector.
 pub(crate) const RETIRE_LOG_CAP: usize = 4096;
 
 /// Cleared batches pooled for reuse — keeps unpinned-steady-state
 /// retirement allocation-free.
 const SPARE_BATCHES: usize = 4;
 
-/// Backstop cap on batches awaiting grace/pin release; past it, staged
-/// slots are dropped (garbage until compact) — recycling never blocks
-/// the writer.
-const MAX_PENDING_BATCHES: usize = 4096;
+/// A retirement folds into its queue's newest batch while the merged
+/// batch stays at or below this many slots. The merged batch takes the
+/// newer grace requirement, so the cap bounds how long merging can hold
+/// back an early slot; and since any two consecutive batches then sum past
+/// it, the batch count stays near `2 * pending / COALESCE_SLOTS`.
+const COALESCE_SLOTS: usize = 4096;
 
-/// One stripe of the reader gate: monotonic entry/exit counters.
+/// One stripe of the reader gate: live-reader counts for the two phase
+/// buckets. Counts are exact — entry increments and exit decrements the
+/// same bucket — so any number of threads, and nested guards, may share a
+/// stripe.
 struct GateStripe {
-    ingress: AtomicU64,
-    egress: AtomicU64,
+    active: [AtomicU64; 2],
 }
 
-/// Striped ingress/egress reader gate.
+/// Two-phase striped reader gate.
 ///
-/// A reader bumps `ingress` (SeqCst) on entry and `egress` (Release) on
-/// exit. The writer, after unpublishing nodes, issues a SeqCst fence and
-/// snapshots every stripe's `ingress`; once each stripe's `egress` reaches
-/// its snapshot, every reader that could have observed the old nodes has
-/// finished. The SeqCst entry RMW paired with the writer's fence closes
-/// the store-buffer race: a reader whose entry the writer's snapshot
-/// missed is ordered after the fence and therefore loads the new root.
+/// A reader enters the bucket named by the phase's low bit (SeqCst RMW)
+/// and leaves the same bucket (Release). The writer advances the phase
+/// only after proving the bucket the next phase reuses is empty, so a
+/// slot unpublished while the phase was `p` is unobservable once the
+/// phase reaches `p + 2`: those two advances drained both buckets after
+/// the unpublishing store.
+///
+/// Each emptiness proof follows a SeqCst fence, and readers load roots
+/// with SeqCst after their SeqCst entry RMW. A reader whose entry the
+/// proof missed is therefore ordered after the fence and loads the new
+/// root; a reader it counted holds the bucket non-empty until it leaves,
+/// and its Release exit synchronizes with the proof's Acquire load.
 struct ReadGate {
+    /// Low bit picks the bucket new readers enter. Written only by the
+    /// writer; readers use it only to steer, never for correctness.
+    phase: CachePadded<AtomicU64>,
     stripes: [CachePadded<GateStripe>; GATE_STRIPES],
 }
 
 impl ReadGate {
     fn new() -> Self {
         Self {
+            phase: CachePadded(AtomicU64::new(0)),
             stripes: std::array::from_fn(|_| {
                 CachePadded(GateStripe {
-                    ingress: AtomicU64::new(0),
-                    egress: AtomicU64::new(0),
+                    active: [AtomicU64::new(0), AtomicU64::new(0)],
                 })
             }),
         }
     }
 
-    fn snapshot(&self, out: &mut [u64; GATE_STRIPES]) {
-        fence(Ordering::SeqCst);
-        for (i, s) in self.stripes.iter().enumerate() {
-            out[i] = s.0.ingress.load(Ordering::Relaxed);
-        }
+    #[inline]
+    fn enter(&self) -> &AtomicU64 {
+        let bucket = (self.phase.0.load(Ordering::Relaxed) & 1) as usize;
+        let slot = &self.stripes[gate_stripe()].0.active[bucket];
+        slot.fetch_add(1, Ordering::SeqCst);
+        slot
     }
 
-    fn grace_passed(&self, snap: &[u64; GATE_STRIPES]) -> bool {
+    /// The writer's current phase. Only the writer stores it, and writer
+    /// handoff synchronizes through the graph's writer lock.
+    #[inline]
+    fn phase(&self) -> u64 {
+        self.phase.0.load(Ordering::Relaxed)
+    }
+
+    fn bucket_empty(&self, bucket: usize) -> bool {
         self.stripes
             .iter()
-            .zip(snap)
-            .all(|(s, &want)| s.0.egress.load(Ordering::Acquire) >= want)
+            .all(|s| s.0.active[bucket].load(Ordering::Acquire) == 0)
+    }
+
+    /// Advance the phase as far as drained buckets allow and return it.
+    /// Writer-only. Two steps is the most any pending batch needs.
+    fn advance(&self) -> u64 {
+        let mut phase = self.phase();
+        fence(Ordering::SeqCst);
+        for _ in 0..2 {
+            if !self.bucket_empty(((phase + 1) & 1) as usize) {
+                break;
+            }
+            phase += 1;
+            self.phase.0.store(phase, Ordering::Relaxed);
+        }
+        phase
     }
 }
 
@@ -120,15 +156,16 @@ fn gate_stripe() -> usize {
 }
 
 /// RAII gate entry for one traversal. Hold it across every dereference of
-/// arena nodes; drop it as soon as the data has been copied out.
+/// arena nodes; drop it as soon as the data has been copied out. Guards
+/// nest freely: each one leaves exactly the bucket it entered.
 pub struct ReadGuard<'a> {
-    stripe: &'a GateStripe,
+    bucket: &'a AtomicU64,
 }
 
 impl Drop for ReadGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.stripe.egress.fetch_add(1, Ordering::Release);
+        self.bucket.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -137,19 +174,35 @@ struct PendingBatch {
     /// Epoch the retiring guard commits. A batch is held while any pinned
     /// snapshot's epoch is below it.
     stamp_epoch: u64,
-    snap: [u64; GATE_STRIPES],
+    /// Gate phase at which no gated reader can still observe the slots.
+    grace_phase: u64,
     chunks: Vec<u32>,
     interiors: Vec<u32>,
 }
 
 impl PendingBatch {
-    fn new() -> Self {
+    /// A pooled batch, pre-sized so the steady state never grows it.
+    fn pooled() -> Self {
         Self {
             stamp_epoch: 0,
-            snap: [0; GATE_STRIPES],
+            grace_phase: 0,
             chunks: Vec::with_capacity(RETIRE_LOG_CAP),
             interiors: Vec::with_capacity(RETIRE_LOG_CAP),
         }
+    }
+
+    /// An overflow batch past the pool, sized by what it receives.
+    fn unpooled() -> Self {
+        Self {
+            stamp_epoch: 0,
+            grace_phase: 0,
+            chunks: Vec::new(),
+            interiors: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.chunks.len() + self.interiors.len()
     }
 }
 
@@ -262,8 +315,6 @@ struct Recycler {
     free_interior_head: u32,
     free_chunks: usize,
     free_interiors: usize,
-    /// Slots dropped because `pending` hit its cap (garbage until compact).
-    leaked: u64,
 }
 
 impl Recycler {
@@ -273,14 +324,56 @@ impl Recycler {
             // growth under a long pin allocates on the retire path.
             pending_young: VecDeque::with_capacity(SPARE_BATCHES),
             pending_old: VecDeque::with_capacity(SPARE_BATCHES),
-            spare: (0..SPARE_BATCHES).map(|_| PendingBatch::new()).collect(),
+            spare: (0..SPARE_BATCHES).map(|_| PendingBatch::pooled()).collect(),
             free_chunk_head: NO_SLOT,
             free_interior_head: NO_SLOT,
             free_chunks: 0,
             free_interiors: 0,
-            leaked: 0,
         }
     }
+
+    fn take_spare(&mut self) -> PendingBatch {
+        self.spare.pop().unwrap_or_else(PendingBatch::unpooled)
+    }
+}
+
+/// Return a drained batch to the pool, or drop it once the pool is full.
+fn return_spare(spare: &mut Vec<PendingBatch>, mut batch: PendingBatch) {
+    if spare.len() < SPARE_BATCHES {
+        batch.chunks.clear();
+        batch.interiors.clear();
+        spare.push(batch);
+    }
+}
+
+/// Queue `batch` stamped with `stamp_epoch` / `grace_phase`, folding it
+/// into the queue's newest batch while the merge stays within
+/// [`COALESCE_SLOTS`]. Stamps and phases are nondecreasing across calls,
+/// so the merged batch's requirement is the incoming one.
+fn enqueue(
+    queue: &mut VecDeque<PendingBatch>,
+    spare: &mut Vec<PendingBatch>,
+    mut batch: PendingBatch,
+    stamp_epoch: u64,
+    grace_phase: u64,
+) {
+    if batch.len() == 0 {
+        return_spare(spare, batch);
+        return;
+    }
+    if let Some(back) = queue.back_mut()
+        && back.len() + batch.len() <= COALESCE_SLOTS
+    {
+        back.chunks.append(&mut batch.chunks);
+        back.interiors.append(&mut batch.interiors);
+        back.stamp_epoch = back.stamp_epoch.max(stamp_epoch);
+        back.grace_phase = back.grace_phase.max(grace_phase);
+        return_spare(spare, batch);
+        return;
+    }
+    batch.stamp_epoch = stamp_epoch;
+    batch.grace_phase = grace_phase;
+    queue.push_back(batch);
 }
 
 /// Superseded slots reported by tree operations, owned by the writer.
@@ -288,10 +381,11 @@ impl Recycler {
 /// Tree operations only *record* what they superseded; nothing here is
 /// reusable until the writer has published the root stores that made the
 /// slots unreachable and then handed the log to
-/// [`ArenaWriter::retire`], which stamps it with a reader-gate snapshot.
+/// [`ArenaWriter::retire`], which stamps it with the reader-gate phase.
 /// Separating "record" from "stamp" is what keeps the grace reasoning
 /// sound: a stamp taken before the unpublishing store could clear a
 /// reader that goes on to walk the still-published old tree.
+#[derive(Default)]
 pub(crate) struct RetireLog {
     pub(crate) chunks: Vec<u32>,
     pub(crate) interiors: Vec<u32>,
@@ -324,8 +418,6 @@ pub struct RecycleStats {
     pub free_interiors: usize,
     /// Retired slots staged or awaiting grace (not yet reusable).
     pub pending: usize,
-    /// Slots dropped because the pending queue hit its cap.
-    pub leaked: u64,
 }
 
 /// Fixed-capacity two-region slab arena. Pre-allocates all memory upfront.
@@ -376,17 +468,22 @@ impl Arena {
     /// tighter bound is the 16-byte interior region: 2^31 slots x 16 B.
     pub const MAX_CAPACITY: usize = (1 << 31) * INTERIOR_SLOT;
 
-    /// Create an arena with `capacity` bytes, 64-byte aligned.
+    /// Create an arena of `capacity` bytes rounded down to a whole
+    /// interior slot, 64-byte aligned.
+    ///
+    /// Interior slots count down from the top, so the rounding is what
+    /// keeps every interior slot 16-byte aligned.
     ///
     /// # Panics
-    /// Panics if `capacity == 0` or `capacity > Self::MAX_CAPACITY`.
+    /// Panics if the rounded capacity is 0 or `capacity > Self::MAX_CAPACITY`.
     pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "Arena capacity must be > 0");
         assert!(
             capacity <= Self::MAX_CAPACITY,
             "Arena capacity {capacity} exceeds MAX_CAPACITY {} (slot indices are u32 with a tag bit)",
             Self::MAX_CAPACITY
         );
+        let capacity = capacity - capacity % INTERIOR_SLOT;
+        assert!(capacity > 0, "Arena capacity must be > 0");
         let layout = Layout::from_size_align(capacity, 64)
             .expect("Layout: capacity > 0, alignment is power of two");
         // SAFETY: layout has non-zero size (capacity > 0); alloc_zeroed
@@ -415,11 +512,13 @@ impl Arena {
     /// Enter the reader gate for one traversal. Every dereference of arena
     /// nodes by a non-writer thread must happen while a guard is live —
     /// the grace period that makes slot recycling sound is defined by it.
+    /// Load the root to traverse with `SeqCst` after entering: the gate's
+    /// store-buffer argument pairs that load with the writer's fence.
     #[inline]
     pub fn read_guard(&self) -> ReadGuard<'_> {
-        let stripe = &self.gate.stripes[gate_stripe()].0;
-        stripe.ingress.fetch_add(1, Ordering::SeqCst);
-        ReadGuard { stripe }
+        ReadGuard {
+            bucket: self.gate.enter(),
+        }
     }
 
     /// Obtain the arena's write handle. All allocation, retirement, and
@@ -445,6 +544,7 @@ impl Arena {
             arena: self,
             young_chunk_start: (low / CHUNK_SLOT) as u32,
             young_interior_start: ((self.capacity - high) / INTERIOR_SLOT) as u32,
+            _not_sync: PhantomData,
         }
     }
 
@@ -529,46 +629,120 @@ impl Arena {
         unsafe { std::ptr::write(p, next) };
     }
 
-    /// Free every ready pending batch: young ones on gate grace, old ones
-    /// on grace plus release of all pins below their stamp. Conditions
-    /// are prefix-closed over each stamp-ordered queue, so each drains
-    /// from the front to its first blocked batch.
+    /// Free every ready pending batch: young ones once the gate reaches
+    /// their grace phase, old ones additionally once no pin below their
+    /// stamp remains. Both requirements are nondecreasing along each
+    /// queue, so each drains from the front to its first blocked batch.
+    ///
+    /// Writer-only: `rec` is the exclusive recycler borrow.
     fn reclaim_ready(&self, rec: &mut Recycler) {
         let min_pinned = self.pins.min_pinned();
-        loop {
-            let ready_young = rec
-                .pending_young
-                .front()
-                .is_some_and(|b| self.gate.grace_passed(&b.snap));
-            let queue = if ready_young {
-                &mut rec.pending_young
-            } else {
-                let ready_old = rec.pending_old.front().is_some_and(|b| {
-                    b.stamp_epoch <= min_pinned && self.gate.grace_passed(&b.snap)
-                });
-                if !ready_old {
-                    return;
-                }
-                &mut rec.pending_old
-            };
-            let mut batch = queue.pop_front().expect("front checked");
-            for idx in batch.chunks.drain(..) {
-                // SAFETY: the batch's conditions passed — the slot is
-                // unobservable; `rec` is exclusive via `ArenaWriter`.
-                unsafe { self.write_link(idx as usize * CHUNK_SLOT, rec.free_chunk_head) };
-                rec.free_chunk_head = idx;
-                rec.free_chunks += 1;
-            }
-            for idx in batch.interiors.drain(..) {
-                // SAFETY: as above, for the interior region.
-                unsafe { self.write_link(self.interior_byte(idx), rec.free_interior_head) };
-                rec.free_interior_head = idx;
-                rec.free_interiors += 1;
-            }
-            if rec.spare.len() < SPARE_BATCHES {
-                rec.spare.push(batch);
-            }
+        // Advance the gate only for a front batch nothing else holds.
+        let young_need = rec.pending_young.front().map(|b| b.grace_phase);
+        let old_need = rec
+            .pending_old
+            .front()
+            .filter(|b| b.stamp_epoch <= min_pinned)
+            .map(|b| b.grace_phase);
+        let Some(needed) = young_need.max(old_need) else {
+            return;
+        };
+        let mut phase = self.gate.phase();
+        if phase < needed {
+            phase = self.gate.advance();
         }
+        while rec
+            .pending_young
+            .front()
+            .is_some_and(|b| b.grace_phase <= phase)
+        {
+            let batch = rec.pending_young.pop_front().expect("front checked");
+            self.free_batch(rec, batch);
+        }
+        while rec
+            .pending_old
+            .front()
+            .is_some_and(|b| b.grace_phase <= phase && b.stamp_epoch <= min_pinned)
+        {
+            let batch = rec.pending_old.pop_front().expect("front checked");
+            self.free_batch(rec, batch);
+        }
+    }
+
+    /// Thread a cleared batch's slots onto the free lists.
+    fn free_batch(&self, rec: &mut Recycler, mut batch: PendingBatch) {
+        for idx in batch.chunks.drain(..) {
+            // SAFETY: the batch's conditions passed — the slot is
+            // unobservable; `rec` is exclusive via `ArenaWriter`.
+            unsafe { self.write_link(idx as usize * CHUNK_SLOT, rec.free_chunk_head) };
+            rec.free_chunk_head = idx;
+            rec.free_chunks += 1;
+        }
+        for idx in batch.interiors.drain(..) {
+            // SAFETY: as above, for the interior region.
+            unsafe { self.write_link(self.interior_byte(idx), rec.free_interior_head) };
+            rec.free_interior_head = idx;
+            rec.free_interiors += 1;
+        }
+        return_spare(&mut rec.spare, batch);
+    }
+
+    #[inline]
+    fn pop_free_chunk(&self, rec: &mut Recycler) -> Option<u32> {
+        if rec.free_chunk_head == NO_SLOT {
+            return None;
+        }
+        let idx = rec.free_chunk_head;
+        // SAFETY: a free chunk slot stores the next free index in its
+        // first 4 bytes; the slot is in bounds by construction.
+        rec.free_chunk_head = unsafe { self.read_link(idx as usize * CHUNK_SLOT) };
+        rec.free_chunks -= 1;
+        Some(idx)
+    }
+
+    #[inline]
+    fn pop_free_interior(&self, rec: &mut Recycler) -> Option<u32> {
+        if rec.free_interior_head == NO_SLOT {
+            return None;
+        }
+        let idx = rec.free_interior_head;
+        // SAFETY: a free interior slot stores the next free index in its
+        // first 4 bytes; the slot is in bounds by construction.
+        rec.free_interior_head = unsafe { self.read_link(self.interior_byte(idx)) };
+        rec.free_interiors -= 1;
+        Some(idx)
+    }
+
+    /// Writer-only: bump the chunk cursor.
+    #[inline]
+    fn bump_chunk(&self) -> Option<u32> {
+        let low = self.cursors.0.0.load(Ordering::Relaxed);
+        let high = self.cursors.0.1.load(Ordering::Relaxed);
+        let new_low = low + CHUNK_SLOT;
+        if new_low > high {
+            return None;
+        }
+        self.cursors.0.0.store(new_low, Ordering::Relaxed);
+        Some((low / CHUNK_SLOT) as u32)
+    }
+
+    /// Writer-only: bump the interior cursor.
+    #[inline]
+    fn bump_interior(&self) -> Option<u32> {
+        let low = self.cursors.0.0.load(Ordering::Relaxed);
+        let high = self.cursors.0.1.load(Ordering::Relaxed);
+        if high < low + INTERIOR_SLOT {
+            return None;
+        }
+        let new_high = high - INTERIOR_SLOT;
+        let idx = ((self.capacity - new_high) / INTERIOR_SLOT - 1) as u32;
+        // Reserve index 0x7FFF_FFFF: tagged it would collide with the
+        // NULL sentinel (u32::MAX).
+        if idx >= (1 << 31) - 1 {
+            return None;
+        }
+        self.cursors.0.1.store(new_high, Ordering::Relaxed);
+        Some(idx)
     }
 
     // -- Stats --------------------------------------------------------------
@@ -656,6 +830,9 @@ pub struct ArenaWriter<'a> {
     /// First bump slot index of each class allocated by this guard.
     young_chunk_start: u32,
     young_interior_start: u32,
+    /// `!Sync`: the handle hands out the recycler, so two threads sharing
+    /// `&ArenaWriter` would alias it.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl std::ops::Deref for ArenaWriter<'_> {
@@ -678,12 +855,12 @@ impl<'a> ArenaWriter<'a> {
 }
 
 impl ArenaWriter<'_> {
-    /// The recycler, exclusive by the construction contract.
+    /// The recycler, exclusive for as long as `self` is mutably borrowed:
+    /// `Arena::writer`'s contract makes this handle the only path to it,
+    /// and every mutable view is derived from `&mut self`.
     #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    fn recycler(&self) -> &mut Recycler {
-        // SAFETY: `Arena::writer`'s contract makes this handle the only
-        // path to the recycler, and the handle is not Sync.
+    fn recycler_mut(&mut self) -> &mut Recycler {
+        // SAFETY: see above — no other reference to the recycler is live.
         unsafe { &mut *self.arena.recycler.get() }
     }
 
@@ -692,87 +869,33 @@ impl ArenaWriter<'_> {
     /// pending batch has cleared its grace period).
     #[inline]
     pub fn alloc_chunk(&mut self) -> Option<u32> {
-        let rec = self.recycler();
-        if let Some(idx) = self.pop_free_chunk(rec) {
+        let arena = self.arena;
+        let rec = self.recycler_mut();
+        if let Some(idx) = arena.pop_free_chunk(rec) {
             return Some(idx);
         }
-        if let Some(idx) = self.bump_chunk() {
+        if let Some(idx) = arena.bump_chunk() {
             return Some(idx);
         }
         // Cursors met: reclaim any grace-cleared pending batches and retry
         // the free list before reporting full.
-        self.arena.reclaim_ready(rec);
-        self.pop_free_chunk(rec)
+        arena.reclaim_ready(rec);
+        arena.pop_free_chunk(rec)
     }
 
     /// Allocate one 16-byte interior slot. See [`alloc_chunk`](Self::alloc_chunk).
     #[inline]
     pub fn alloc_interior(&mut self) -> Option<u32> {
-        let rec = self.recycler();
-        if let Some(idx) = self.pop_free_interior(rec) {
+        let arena = self.arena;
+        let rec = self.recycler_mut();
+        if let Some(idx) = arena.pop_free_interior(rec) {
             return Some(idx);
         }
-        if let Some(idx) = self.bump_interior() {
+        if let Some(idx) = arena.bump_interior() {
             return Some(idx);
         }
-        self.arena.reclaim_ready(rec);
-        self.pop_free_interior(rec)
-    }
-
-    #[inline]
-    fn pop_free_chunk(&self, rec: &mut Recycler) -> Option<u32> {
-        if rec.free_chunk_head == NO_SLOT {
-            return None;
-        }
-        let idx = rec.free_chunk_head;
-        // SAFETY: a free chunk slot stores the next free index in its
-        // first 4 bytes; the slot is in bounds by construction.
-        rec.free_chunk_head = unsafe { self.arena.read_link(idx as usize * CHUNK_SLOT) };
-        rec.free_chunks -= 1;
-        Some(idx)
-    }
-
-    #[inline]
-    fn pop_free_interior(&self, rec: &mut Recycler) -> Option<u32> {
-        if rec.free_interior_head == NO_SLOT {
-            return None;
-        }
-        let idx = rec.free_interior_head;
-        // SAFETY: a free interior slot stores the next free index in its
-        // first 4 bytes; the slot is in bounds by construction.
-        rec.free_interior_head = unsafe { self.arena.read_link(self.arena.interior_byte(idx)) };
-        rec.free_interiors -= 1;
-        Some(idx)
-    }
-
-    #[inline]
-    fn bump_chunk(&self) -> Option<u32> {
-        let low = self.arena.cursors.0.0.load(Ordering::Relaxed);
-        let high = self.arena.cursors.0.1.load(Ordering::Relaxed);
-        let new_low = low + CHUNK_SLOT;
-        if new_low > high {
-            return None;
-        }
-        self.arena.cursors.0.0.store(new_low, Ordering::Relaxed);
-        Some((low / CHUNK_SLOT) as u32)
-    }
-
-    #[inline]
-    fn bump_interior(&self) -> Option<u32> {
-        let low = self.arena.cursors.0.0.load(Ordering::Relaxed);
-        let high = self.arena.cursors.0.1.load(Ordering::Relaxed);
-        if high < low + INTERIOR_SLOT {
-            return None;
-        }
-        let new_high = high - INTERIOR_SLOT;
-        let idx = ((self.arena.capacity - new_high) / INTERIOR_SLOT - 1) as u32;
-        // Reserve index 0x7FFF_FFFF: tagged it would collide with the
-        // NULL sentinel (u32::MAX).
-        if idx >= (1 << 31) - 1 {
-            return None;
-        }
-        self.arena.cursors.0.1.store(new_high, Ordering::Relaxed);
-        Some(idx)
+        arena.reclaim_ready(rec);
+        arena.pop_free_interior(rec)
     }
 
     /// Allocate a chunk slot and write `val` into it.
@@ -800,12 +923,13 @@ impl ArenaWriter<'_> {
         Some(idx)
     }
 
-    /// Stamp the retire log with a gate snapshot and `stamp_epoch` (the
-    /// epoch the current guard commits), partition it into young/old
-    /// batches, queue them, and fold any ready batches onto the free
-    /// lists. Buffers come from a pool, so steady-state flushes never
-    /// allocate; at the pending cap the slots are dropped instead
-    /// (recycling never blocks the writer).
+    /// Stamp the retire log with the gate phase it must outwait and
+    /// `stamp_epoch` (the epoch the current guard commits), partition it
+    /// into young/old batches, queue them, and fold every ready batch —
+    /// this one included, when no reader is in the gate — onto the free
+    /// lists. Pooled buffers keep steady-state flushes allocation-free;
+    /// under a long pin, small retirements coalesce so the queues grow by
+    /// slots, not by batches.
     ///
     /// # Safety
     /// Every logged slot must already be unreachable from every published
@@ -814,27 +938,27 @@ impl ArenaWriter<'_> {
         if log.chunks.is_empty() && log.interiors.is_empty() {
             return;
         }
-        let rec = self.recycler();
-        self.arena.reclaim_ready(rec);
-        if rec.pending_young.len() + rec.pending_old.len() >= MAX_PENDING_BATCHES {
-            rec.leaked += (log.chunks.len() + log.interiors.len()) as u64;
-            log.chunks.clear();
-            log.interiors.clear();
-            return;
-        }
+        let (young_chunk_start, young_interior_start) =
+            (self.young_chunk_start, self.young_interior_start);
+        let arena = self.arena;
+        let rec = self.recycler_mut();
+        // Read before any gate check that follows the unpublishing root
+        // stores: two advances from here drain every reader that could
+        // still hold these slots.
+        let grace_phase = arena.gate.phase() + 2;
         // Split by guard-start cursor: young slots (allocated this guard)
         // free on gate grace alone; old ones also wait out older pins.
-        let mut young = rec.spare.pop().unwrap_or_else(PendingBatch::new);
-        let mut old = rec.spare.pop().unwrap_or_else(PendingBatch::new);
+        let mut young = rec.take_spare();
+        let mut old = rec.take_spare();
         for &idx in &log.chunks {
-            if idx >= self.young_chunk_start {
+            if idx >= young_chunk_start {
                 young.chunks.push(idx);
             } else {
                 old.chunks.push(idx);
             }
         }
         for &idx in &log.interiors {
-            if idx >= self.young_interior_start {
+            if idx >= young_interior_start {
                 young.interiors.push(idx);
             } else {
                 old.interiors.push(idx);
@@ -842,42 +966,47 @@ impl ArenaWriter<'_> {
         }
         log.chunks.clear();
         log.interiors.clear();
-        let mut snap = [0u64; GATE_STRIPES];
-        self.arena.gate.snapshot(&mut snap);
-        for (mut batch, queue) in [(young, &mut rec.pending_young), (old, &mut rec.pending_old)] {
-            if batch.chunks.is_empty() && batch.interiors.is_empty() {
-                rec.spare.push(batch);
-            } else {
-                batch.stamp_epoch = stamp_epoch;
-                batch.snap = snap;
-                queue.push_back(batch);
-            }
-        }
+        enqueue(
+            &mut rec.pending_young,
+            &mut rec.spare,
+            young,
+            stamp_epoch,
+            grace_phase,
+        );
+        enqueue(
+            &mut rec.pending_old,
+            &mut rec.spare,
+            old,
+            stamp_epoch,
+            grace_phase,
+        );
+        arena.reclaim_ready(rec);
     }
 
     /// Fold grace-cleared pending batches onto the free lists without
     /// stamping anything new. Useful at commit points when the log is
     /// empty but earlier batches may have cleared.
     pub(crate) fn reclaim(&mut self) {
-        let rec = self.recycler();
-        self.arena.reclaim_ready(rec);
+        let arena = self.arena;
+        arena.reclaim_ready(self.recycler_mut());
     }
 
     /// Recycling counters. Slots recorded in a not-yet-stamped
     /// [`RetireLog`] count as neither free nor pending.
     pub(crate) fn recycle_stats(&self) -> RecycleStats {
-        let rec = self.recycler();
+        // SAFETY: mutable recycler views exist only under `&mut self`, and
+        // the handle is `!Sync`, so none is live while `&self` is.
+        let rec = unsafe { &*self.arena.recycler.get() };
         let pending = rec
             .pending_young
             .iter()
             .chain(rec.pending_old.iter())
-            .map(|b| b.chunks.len() + b.interiors.len())
+            .map(PendingBatch::len)
             .sum::<usize>();
         RecycleStats {
             free_chunks: rec.free_chunks,
             free_interiors: rec.free_interiors,
             pending,
-            leaked: rec.leaked,
         }
     }
 }
@@ -1028,6 +1157,91 @@ mod tests {
         drop(guard);
         aw.reclaim();
         assert_eq!(aw.recycle_stats().free_chunks, 1);
+    }
+
+    #[test]
+    fn nested_guard_exit_does_not_release_outer_guard() {
+        // Nested guards share their thread's stripe: an inner guard's exit
+        // must not count toward the outer guard's grace.
+        let arena = Arena::new(4096);
+        let mut log = RetireLog::new();
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let a = aw.alloc_chunk().unwrap();
+        let outer = arena.read_guard();
+        log.chunks.push(a);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log, 1) };
+        let inner = arena.read_guard();
+        drop(inner);
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, 0, "outer guard still live");
+        drop(outer);
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, 1);
+    }
+
+    #[test]
+    fn many_guards_on_one_stripe_all_block_reclaim() {
+        let arena = Arena::new(4096);
+        let mut log = RetireLog::new();
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let a = aw.alloc_chunk().unwrap();
+        let guards: Vec<_> = (0..40).map(|_| arena.read_guard()).collect();
+        log.chunks.push(a);
+        // SAFETY: the logged slot is test-local and never published.
+        unsafe { aw.retire(&mut log, 1) };
+        // Churn fresh guards through the same stripe; none may stand in
+        // for the ones entered before the retirement.
+        for _ in 0..100 {
+            drop(arena.read_guard());
+            aw.reclaim();
+        }
+        assert_eq!(aw.recycle_stats().free_chunks, 0);
+        drop(guards);
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, 1);
+    }
+
+    #[test]
+    fn capacity_rounds_down_to_an_aligned_interior_slot() {
+        let arena = Arena::new(1001);
+        assert_eq!(arena.capacity(), 992);
+        // SAFETY: sole handle in a single-threaded test.
+        let mut aw = unsafe { arena.writer() };
+        let i0 = aw.alloc_interior().unwrap();
+        // SAFETY: slot `i0` was just allocated.
+        let p = unsafe { arena.interior_ptr(i0) };
+        assert_eq!(p.addr() % std::mem::align_of::<Interior>(), 0);
+        assert_eq!(p.addr() % INTERIOR_SLOT, 0);
+    }
+
+    #[test]
+    fn small_retirements_coalesce_under_a_pin() {
+        let arena = Arena::new(1 << 20);
+        let slots: Vec<u32> = {
+            // SAFETY: dropped before the second handle exists.
+            let mut aw = unsafe { arena.writer() };
+            (0..3000).map(|_| aw.alloc_chunk().unwrap()).collect()
+        };
+        // SAFETY: the first handle is gone.
+        let mut aw = unsafe { arena.writer() };
+        let ticket = PinTicket::new(Arc::clone(arena.pins()), 0);
+        let mut log = RetireLog::new();
+        for (i, &s) in slots.iter().enumerate() {
+            log.chunks.push(s);
+            // SAFETY: the logged slots are test-local and never published.
+            unsafe { aw.retire(&mut log, 1 + i as u64) };
+        }
+        let arena_ref = aw.arena();
+        // SAFETY: shared view while no mutable recycler borrow is live.
+        let rec = unsafe { &*arena_ref.recycler.get() };
+        assert_eq!(rec.pending_old.len(), 1, "one-slot retirements must merge");
+        assert_eq!(aw.recycle_stats().pending, slots.len());
+        drop(ticket);
+        aw.reclaim();
+        assert_eq!(aw.recycle_stats().free_chunks, slots.len());
     }
 
     #[test]

@@ -6,9 +6,10 @@
 //! (`ibv_reg_dmabuf_mr`). When an RDMA READ completes, data lands
 //! directly in VRAM — the host CPU's memory bus is never touched.
 
-use crate::feature_table::FeatureSchema;
+use crate::gpu::kernels::validate::StagingRegions;
 use crate::rdma::context::{RdmaContext, RegisteredMr};
 use crate::rdma::ffi;
+use crate::rdma::layout::SlotGeometry;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, sys};
 use std::io;
 use std::sync::Arc;
@@ -116,6 +117,8 @@ pub struct GpuGatherBuffer {
     max_batch_size: usize,
     /// feature_dim * sizeof(f32).
     feature_bytes: usize,
+    /// Layout of every slot in both regions.
+    geometry: SlotGeometry,
     /// Keep the CudaSlice alive so the allocation isn't freed.
     _allocation: CudaSlice<u8>,
 }
@@ -136,10 +139,10 @@ impl GpuGatherBuffer {
         cuda_ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         max_batch_size: usize,
-        schema: &FeatureSchema,
+        geometry: &SlotGeometry,
     ) -> io::Result<Self> {
-        let slot_size = schema.slot_size;
-        let feature_bytes = schema.feature_dim * std::mem::size_of::<f32>();
+        let slot_size = geometry.stride();
+        let feature_bytes = geometry.feature_dim() * std::mem::size_of::<f32>();
         // Two snapshot regions of `max_batch_size` slots each.
         let total_bytes = slot_size
             .checked_mul(max_batch_size)
@@ -180,6 +183,7 @@ impl GpuGatherBuffer {
             slot_size,
             max_batch_size,
             feature_bytes,
+            geometry: *geometry,
             _allocation: allocation,
         })
     }
@@ -228,6 +232,20 @@ impl GpuGatherBuffer {
         self.max_batch_size
     }
 
+    /// Both snapshot regions, borrowed for the validator.
+    pub fn staging_regions(&self) -> Result<StagingRegions<'_>, Box<dyn std::error::Error>> {
+        // SAFETY: each region is `max_batch_size` slots at `geometry.stride()`
+        // inside `_allocation`, which the borrow keeps alive and unreplaced.
+        unsafe {
+            StagingRegions::new(
+                self.staging_ptr(),
+                self.staging2_ptr(),
+                self.max_batch_size,
+                self.geometry,
+            )
+        }
+    }
+
     /// Grow staging VRAM + re-register once so `needed` slots fit.
     ///
     /// Registration stays off the per-gather hot path except when capacity
@@ -238,14 +256,14 @@ impl GpuGatherBuffer {
         rdma_ctx: &RdmaContext,
         stream: &Arc<CudaStream>,
         needed: usize,
-        schema: &FeatureSchema,
+        geometry: &SlotGeometry,
     ) -> io::Result<()> {
         if needed <= self.max_batch_size {
             return Ok(());
         }
         let new_max = needed.next_power_of_two().max(needed);
-        let slot_size = schema.slot_size;
-        let feature_bytes = schema.feature_dim * std::mem::size_of::<f32>();
+        let slot_size = geometry.stride();
+        let feature_bytes = geometry.feature_dim() * std::mem::size_of::<f32>();
         let total_bytes = slot_size
             .checked_mul(new_max)
             .and_then(|b| b.checked_mul(2))
@@ -274,6 +292,7 @@ impl GpuGatherBuffer {
         self.slot_size = slot_size;
         self.max_batch_size = new_max;
         self.feature_bytes = feature_bytes;
+        self.geometry = *geometry;
         self._allocation = allocation;
         Ok(())
     }

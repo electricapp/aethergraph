@@ -11,7 +11,13 @@
 //! downstream" contract as the rest of the store. Rows are fixed-size, so
 //! a node ID maps to (block, offset) arithmetically with no per-row index.
 
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
+use parking_lot::Mutex;
+use zstd::dict::DecoderDictionary;
 
 use super::header::{FeatureDtype, parse_feature_header};
 
@@ -20,16 +26,60 @@ use super::header::{FeatureDtype, parse_feature_header};
 /// row. 512 rows balances the two for typical feature dimensions.
 pub const ROWS_PER_BLOCK: usize = 512;
 
+/// Most bytes fed to dictionary training. zstd wants on the order of 100x
+/// the dictionary size in samples; past that, more only costs build time
+/// and memory, and ZDICT rejects inputs beyond ~4 GiB outright.
+const MAX_SAMPLE_BYTES: usize = 64 << 20;
+
+/// Most samples drawn for dictionary training, spread evenly over the tier.
+const MAX_SAMPLES: usize = 1024;
+
+/// Decompressed blocks kept for reuse, so repeated single-row misses on a
+/// hot block decompress it once.
+const RECENT_BLOCKS: usize = 8;
+
 /// A built cold tier: dictionary, per-block compressed payloads, and the
 /// fixed geometry needed to locate any row.
-#[derive(Debug, Clone)]
 pub struct ColdTier {
     row_bytes: usize,
     num_rows: usize,
     dictionary: Vec<u8>,
+    /// The dictionary digested once for decoding; every gather borrows it
+    /// instead of re-loading the raw bytes.
+    prepared: Option<DecoderDictionary<'static>>,
     /// One compressed payload per block, block `b` covering rows
     /// `b*ROWS_PER_BLOCK .. min(num_rows, (b+1)*ROWS_PER_BLOCK)`.
     blocks: Vec<Vec<u8>>,
+    /// Most recently decompressed blocks, newest last.
+    recent: Mutex<VecDeque<(usize, Arc<Vec<u8>>)>>,
+}
+
+impl std::fmt::Debug for ColdTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColdTier")
+            .field("row_bytes", &self.row_bytes)
+            .field("num_rows", &self.num_rows)
+            .field("dictionary_bytes", &self.dictionary.len())
+            .field("blocks", &self.blocks.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for ColdTier {
+    fn clone(&self) -> Self {
+        Self {
+            row_bytes: self.row_bytes,
+            num_rows: self.num_rows,
+            dictionary: self.dictionary.clone(),
+            prepared: prepare(&self.dictionary),
+            blocks: self.blocks.clone(),
+            recent: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+fn prepare(dictionary: &[u8]) -> Option<DecoderDictionary<'static>> {
+    (!dictionary.is_empty()).then(|| DecoderDictionary::copy(dictionary))
 }
 
 impl ColdTier {
@@ -39,26 +89,70 @@ impl ColdTier {
     /// `level` is the zstd compression level (1–22; ~19 is a good archive
     /// setting for a cold tier written once and read many times).
     pub fn build(data: &[u8], row_bytes: usize, level: i32) -> Result<Self> {
-        if row_bytes == 0 {
+        let Some(row) = NonZeroUsize::new(row_bytes) else {
             bail!("row_bytes must be > 0");
-        }
+        };
         if !data.len().is_multiple_of(row_bytes) {
             bail!(
                 "data length {} is not a multiple of row_bytes {row_bytes}",
                 data.len()
             );
         }
-        let num_rows = data.len() / row_bytes;
         let block_size = ROWS_PER_BLOCK * row_bytes;
+        Self::build_from_blocks(data.len() / row_bytes, row, level, |b, buf| {
+            let start = b * block_size;
+            buf.clear();
+            buf.extend_from_slice(&data[start..(start + block_size).min(data.len())]);
+            Ok(())
+        })
+    }
 
-        let raw_blocks: Vec<&[u8]> = data.chunks(block_size).collect();
+    /// Build from a block source: `read_block(b, buf)` replaces `buf`'s
+    /// contents with block `b`'s raw rows. Blocks are pulled one at a time
+    /// — a bounded sample first, for dictionary training, then each block
+    /// once to compress — so building never holds the raw tier in memory.
+    fn build_from_blocks(
+        num_rows: usize,
+        row_bytes: NonZeroUsize,
+        level: i32,
+        mut read_block: impl FnMut(usize, &mut Vec<u8>) -> Result<()>,
+    ) -> Result<Self> {
+        let row_bytes = row_bytes.get();
+        let block_size = ROWS_PER_BLOCK
+            .checked_mul(row_bytes)
+            .context("block size overflows usize")?;
+        let total_bytes = num_rows
+            .checked_mul(row_bytes)
+            .context("tier size overflows usize")?;
+        let num_blocks = num_rows.div_ceil(ROWS_PER_BLOCK);
+        let mut buf = Vec::with_capacity(block_size);
 
-        // Train a dictionary on the raw blocks so every block decodes
-        // against shared statistics. Dictionary training needs several
-        // samples; with too few, skip it and compress without one.
-        let dictionary = if raw_blocks.len() >= 8 {
-            let max_dict = (data.len() / 100).clamp(4 * 1024, 112 * 1024);
-            zstd::dict::from_samples(&raw_blocks, max_dict).unwrap_or_default()
+        // Train a dictionary so every block decodes against shared
+        // statistics. Training needs several samples; with too few blocks,
+        // compress without one.
+        let dictionary = if num_blocks >= 8 {
+            let samples = num_blocks.min(MAX_SAMPLES);
+            // Whole rows from the head of each sampled block, capped so the
+            // sample set stays bounded however large the tier is.
+            let per_sample = (MAX_SAMPLE_BYTES / samples / row_bytes).max(1) * row_bytes;
+            let mut sample_data = Vec::with_capacity(per_sample.min(block_size) * samples);
+            let mut sizes = Vec::with_capacity(samples);
+            for i in 0..samples {
+                read_block(i * num_blocks / samples, &mut buf)?;
+                let take = buf.len().min(per_sample);
+                sample_data.extend_from_slice(&buf[..take]);
+                sizes.push(take);
+            }
+            let max_dict = (total_bytes / 100).clamp(4 * 1024, 112 * 1024);
+            match zstd::dict::from_continuous(&sample_data, &sizes, max_dict) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        "zstd dictionary training failed ({e}); compressing without one"
+                    );
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -74,11 +168,12 @@ impl ColdTier {
                     .context("zstd compressor")?,
             )
         };
-        let mut blocks = Vec::with_capacity(raw_blocks.len());
-        for raw in &raw_blocks {
+        let mut blocks = Vec::with_capacity(num_blocks);
+        for b in 0..num_blocks {
+            read_block(b, &mut buf)?;
             let compressed = match encoder.as_mut() {
-                Some(c) => c.compress(raw).context("zstd compress (dict)")?,
-                None => zstd::bulk::compress(raw, level).context("zstd compress")?,
+                Some(c) => c.compress(&buf).context("zstd compress (dict)")?,
+                None => zstd::bulk::compress(&buf, level).context("zstd compress")?,
             };
             blocks.push(compressed);
         }
@@ -86,8 +181,10 @@ impl ColdTier {
         Ok(Self {
             row_bytes,
             num_rows,
+            prepared: prepare(&dictionary),
             dictionary,
             blocks,
+            recent: Mutex::new(VecDeque::with_capacity(RECENT_BLOCKS)),
         })
     }
 
@@ -132,22 +229,28 @@ impl ColdTier {
         needed.sort_unstable();
         needed.dedup();
 
-        // Loading a dictionary digests it into the decoder's tables, which
-        // costs more than decoding a block does. Build the decoder once for
-        // the whole gather rather than once per block.
-        let mut decoder = if self.dictionary.is_empty() {
-            None
-        } else {
-            Some(
-                zstd::bulk::Decompressor::with_dictionary(&self.dictionary)
-                    .context("zstd decompressor")?,
-            )
-        };
-
-        let mut cache: std::collections::HashMap<usize, Vec<u8>> =
+        // The dictionary was digested once at build; binding it to a
+        // decoder is a pointer handoff, not a reload.
+        let mut decoder: Option<zstd::bulk::Decompressor<'_>> = None;
+        let mut cache: std::collections::HashMap<usize, Arc<Vec<u8>>> =
             std::collections::HashMap::with_capacity(needed.len());
         for &block in &needed {
-            let raw = self.decompress_block(block, decoder.as_mut())?;
+            let raw = match self.recent_block(block) {
+                Some(raw) => raw,
+                None => {
+                    if decoder.is_none() && self.prepared.is_some() {
+                        decoder = self
+                            .prepared
+                            .as_ref()
+                            .map(zstd::bulk::Decompressor::with_prepared_dictionary)
+                            .transpose()
+                            .context("zstd decompressor")?;
+                    }
+                    let raw = Arc::new(self.decompress_block(block, decoder.as_mut())?);
+                    self.remember_block(block, Arc::clone(&raw));
+                    raw
+                }
+            };
             cache.insert(block, raw);
         }
 
@@ -162,8 +265,31 @@ impl ColdTier {
         Ok(out)
     }
 
+    /// A recently decompressed copy of `block`, refreshed as newest.
+    fn recent_block(&self, block: usize) -> Option<Arc<Vec<u8>>> {
+        let mut recent = self.recent.lock();
+        let pos = recent.iter().position(|(b, _)| *b == block)?;
+        let entry = recent.remove(pos)?;
+        let raw = Arc::clone(&entry.1);
+        recent.push_back(entry);
+        Some(raw)
+    }
+
+    /// Keep `raw` as the newest recent block, dropping the oldest past
+    /// [`RECENT_BLOCKS`].
+    fn remember_block(&self, block: usize, raw: Arc<Vec<u8>>) {
+        let mut recent = self.recent.lock();
+        if recent.iter().any(|(b, _)| *b == block) {
+            return;
+        }
+        if recent.len() == RECENT_BLOCKS {
+            recent.pop_front();
+        }
+        recent.push_back((block, raw));
+    }
+
     /// Decompress one block back to its raw rows. `decoder` carries the
-    /// dictionary-loaded decompressor when the tier was built with one.
+    /// dictionary-bound decompressor when the tier was built with one.
     fn decompress_block(
         &self,
         block: usize,
@@ -212,18 +338,27 @@ pub struct ColdStore {
 impl ColdStore {
     /// Read the feature file at `path` and compress its payload into a
     /// resident cold store. `level` is the zstd compression level.
+    ///
+    /// The payload streams through one block-sized buffer, so building
+    /// needs memory for the compressed tier, not for the raw store.
     pub fn build_from_store(path: &std::path::Path, level: i32) -> Result<Self> {
         use std::os::unix::fs::FileExt;
 
         let file = std::fs::File::open(path)
             .with_context(|| format!("failed to open feature store {}", path.display()))?;
         let header = parse_feature_header(&file)?;
-        let row_bytes = header.feature_dim * header.dtype.element_size();
-        let mut payload = vec![0u8; header.num_nodes * row_bytes];
-        file.read_exact_at(&mut payload, header.features_start_offset)
-            .context("failed to read feature payload")?;
-
-        let tier = ColdTier::build(&payload, row_bytes, level)?;
+        let Some(row_bytes) = NonZeroUsize::new(header.feature_size) else {
+            bail!("feature store {} has zero-width rows", path.display());
+        };
+        let block_size = ROWS_PER_BLOCK * row_bytes.get();
+        let tier = ColdTier::build_from_blocks(header.num_nodes, row_bytes, level, |b, buf| {
+            // In bounds: the header proved the payload fits the file.
+            let start = b * block_size;
+            let len = block_size.min(header.payload_bytes - start);
+            buf.resize(len, 0);
+            file.read_exact_at(buf, header.features_start_offset + start as u64)
+                .context("failed to read feature payload")
+        })?;
         Ok(Self {
             tier,
             dtype: header.dtype,
@@ -359,6 +494,62 @@ mod tests {
                 "node {n} at position {i}"
             );
         }
+    }
+
+    /// Repeated single-row gathers on one block reuse its decompressed
+    /// copy, and the reuse window stays bounded.
+    #[test]
+    fn single_row_gathers_reuse_recent_blocks() {
+        let (num_rows, row_bytes) = (ROWS_PER_BLOCK * 20, 32usize);
+        let data = synthetic(num_rows, row_bytes);
+        let tier = ColdTier::build(&data, row_bytes, 3).unwrap();
+        assert!(!tier.dictionary.is_empty(), "20 blocks train a dictionary");
+
+        for row in [5u32, 6, 7] {
+            let got = tier.gather_rows(&[row]).unwrap();
+            assert_eq!(
+                got,
+                data[row as usize * row_bytes..(row as usize + 1) * row_bytes]
+            );
+        }
+        assert_eq!(
+            tier.recent.lock().len(),
+            1,
+            "three rows of block 0 decompress it once"
+        );
+
+        for block in 0..RECENT_BLOCKS * 2 {
+            let row = (block * ROWS_PER_BLOCK) as u32;
+            let got = tier.gather_rows(&[row]).unwrap();
+            assert_eq!(
+                got,
+                data[row as usize * row_bytes..(row as usize + 1) * row_bytes]
+            );
+        }
+        assert_eq!(tier.recent.lock().len(), RECENT_BLOCKS);
+        // A clone decodes identically with its own, empty reuse window.
+        let copy = tier.clone();
+        assert_eq!(
+            copy.gather_rows(&[1, 9000]).unwrap(),
+            tier.gather_rows(&[1, 9000]).unwrap()
+        );
+    }
+
+    /// Streaming the build from a file matches building from memory,
+    /// including a short final block.
+    #[test]
+    fn streamed_store_build_matches_the_in_memory_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feat.bin");
+        let (num_nodes, dim) = (ROWS_PER_BLOCK * 9 + 37, 16usize);
+        let features: Vec<f32> = (0..num_nodes * dim).map(|i| (i % 97) as f32).collect();
+        crate::features::save_features(&path, &features, num_nodes, dim).unwrap();
+
+        let store = ColdStore::build_from_store(&path, 5).unwrap();
+        let direct = ColdTier::build(bytemuck::cast_slice(&features), dim * 4, 5).unwrap();
+        assert_eq!(store.tier.blocks.len(), direct.blocks.len());
+        let all: Vec<u32> = (0..num_nodes as u32).collect();
+        assert_eq!(store.gather(&all).unwrap(), features);
     }
 
     #[test]

@@ -18,9 +18,9 @@ use crate::ctree::CTree;
 use crate::dirty::DirtyBitmap;
 use crate::pad::CachePadded;
 use crate::snapshot::Snapshot;
-use crate::writer::InsertError;
 #[cfg(feature = "wal")]
 use crate::writer::Writer;
+use crate::writer::{InsertError, WriterScratch};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -76,6 +76,8 @@ pub struct DynamicGraph {
     /// [`acquire`](Self::acquire) hands out is protected from publication
     /// onward.
     pub(crate) latest: Mutex<Snapshot>,
+    /// Writer buffers parked between guards; the live guard holds them.
+    pub(crate) writer_scratch: Mutex<WriterScratch>,
     /// Optional write-ahead log. When present, every successful
     /// `Writer::insert_edge` appends a record; `Writer::drop` fsyncs.
     /// The `Mutex` is uncontended in practice (the surrounding `Writer`
@@ -135,6 +137,7 @@ impl DynamicGraph {
             poisoned: AtomicBool::new(false),
             epoch,
             latest,
+            writer_scratch: Mutex::new(WriterScratch::new()),
             #[cfg(feature = "wal")]
             wal: None,
         }
@@ -173,7 +176,7 @@ impl DynamicGraph {
         let path = path.as_ref();
 
         // Build a fresh in-memory graph, then replay records into it
-        // before opening the WalWriter that will accept new appends. We
+        // before attaching the WalWriter that will accept new appends. We
         // deliberately leave `graph.wal = None` during replay — we do
         // NOT want to re-log records we're reading from the log.
         //
@@ -188,11 +191,15 @@ impl DynamicGraph {
         // surfaces here, record by record. Both must abort recovery: a
         // silently partial replay would present itself as a smaller but
         // valid graph.
-        let outcome = {
+        //
+        // The log is locked before a byte is read, and a torn tail is
+        // truncated through the locked handle: a second opener fails with
+        // `Locked` instead of cutting records a live writer is appending.
+        let (wal, _outcome) = {
             // Lazy guard: an empty WAL applies no records and must not
             // advance the epoch (the guard's drop commits once).
             let mut writer: Option<Writer<'_>> = None;
-            crate::wal::replay(path, |rec| {
+            WalWriter::open_replaying(path, |rec| {
                 let w = writer.get_or_insert_with(|| graph.writer_or_panic());
                 match w.insert_edge(rec.src, rec.dst) {
                     Ok(_) => Ok(()),
@@ -210,23 +217,7 @@ impl DynamicGraph {
             })?
         };
 
-        // If the WAL ended in a torn record, truncate so future appends
-        // sit on top of clean data. The truncation is fsynced before any
-        // new appends: an unsynced set_len could be undone by a later
-        // crash, resurrecting the discarded torn bytes mid-log.
-        if let Some(off) = outcome.truncate_to {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .and_then(|f| {
-                    f.set_len(off)?;
-                    f.sync_data()
-                })
-                .map_err(WalError::Io)?;
-        }
-
-        let writer = WalWriter::create_or_open(path)?;
-        graph.wal = Some(Mutex::new(writer));
+        graph.wal = Some(Mutex::new(wal));
         Ok(graph)
     }
 
@@ -268,10 +259,15 @@ impl DynamicGraph {
     /// empty rather than panicking — the sampler's inner loops shouldn't
     /// carry a panic edge for a bounds condition the caller can't hit
     /// with valid IDs.
+    ///
+    /// Call with a [`ReadGuard`](crate::ReadGuard) live. SeqCst (a plain
+    /// load on x86, `ldar` on ARMv8) completes the reader gate's pairing
+    /// with the writer's fence; Acquire alone would not order it after the
+    /// gate entry.
     #[inline(always)]
     fn tree_for(&self, vertex: u32) -> CTree {
         let root = match self.roots.get(vertex as usize) {
-            Some(r) => r.load(Ordering::Acquire),
+            Some(r) => r.load(Ordering::SeqCst),
             None => crate::ctree::NULL,
         };
         CTree { root }
@@ -384,6 +380,20 @@ impl DynamicGraph {
         self.dirty.clear_all();
     }
 
+    /// Build from edges in any order, duplicates allowed, through the
+    /// batch insert path. An out-of-range edge is an error rather than
+    /// dropped, and a full arena an error rather than a panic. `edges` is
+    /// sorted in place.
+    pub fn try_from_edges(
+        num_vertices: usize,
+        edges: &mut [(u32, u32)],
+        arena_bytes: usize,
+    ) -> Result<Self, InsertError> {
+        let graph = Self::new(num_vertices, arena_bytes);
+        graph.writer_or_panic().insert_edges(edges)?;
+        Ok(graph)
+    }
+
     /// Build from a batch of edges.
     ///
     /// Convenience for trusted input: duplicate edges are skipped and
@@ -414,7 +424,7 @@ impl DynamicGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompactError, WriterError};
+    use crate::{CompactError, SortedDsts, WriterError};
 
     #[test]
     fn empty_graph() {
@@ -507,6 +517,136 @@ mod tests {
         assert_eq!(g.degree(1), 2);
         assert_eq!(g.degree(2), 3);
         assert_eq!(g.degree(3), 0);
+    }
+
+    #[test]
+    fn small_batch_into_a_hub_costs_a_path_not_a_rebuild() {
+        let g = DynamicGraph::new(40_000, 64 << 20);
+        let hub: Vec<u32> = (5_000..35_000).collect();
+        {
+            let mut w = g.writer_or_panic();
+            let n = w
+                .insert_edges_sorted(0, SortedDsts::new(&hub).unwrap())
+                .unwrap();
+            assert_eq!(n, hub.len() as u64);
+        }
+        // Hold every superseded slot back so each new slot bumps a cursor.
+        let reader = g.arena.read_guard();
+        let before = g.arena_used();
+        {
+            let mut w = g.writer_or_panic();
+            let n = w
+                .insert_edges_sorted(0, SortedDsts::new(&[1, 2, 3]).unwrap())
+                .unwrap();
+            assert_eq!(n, 3);
+        }
+        let grew = g.arena_used() - before;
+        assert!(
+            grew < 4096,
+            "3 edges into a 30k-edge hub wrote {grew} bytes"
+        );
+        drop(reader);
+        let mut buf = Vec::new();
+        g.neighbors_into(0, &mut buf);
+        assert_eq!(buf.len(), hub.len() + 3);
+        assert_eq!(&buf[..4], &[1, 2, 3, 5_000]);
+        assert!(buf.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn batch_inserts_match_a_set_model_under_both_strategies() {
+        use std::collections::BTreeSet;
+        const NV: u32 = 2_000;
+        let g = DynamicGraph::new(NV as usize, 64 << 20);
+        let mut model = vec![BTreeSet::new(); 8];
+        let mut state = 0x9E37_79B9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..300u32 {
+            let src = next() % 8;
+            // Alternate tiny batches (path copy once the tree is large) with
+            // wide ones (rebuild).
+            let k = if round % 5 == 0 { 400 } else { 1 + next() % 6 };
+            let mut dsts: Vec<u32> = (0..k).map(|_| next() % NV).collect();
+            let sorted = SortedDsts::sort_dedup(&mut dsts);
+            let want = sorted
+                .as_slice()
+                .iter()
+                .filter(|&&d| model[src as usize].insert(d))
+                .count() as u64;
+            let mut w = g.writer_or_panic();
+            assert_eq!(w.insert_edges_sorted(src, sorted).unwrap(), want);
+        }
+        let mut buf = Vec::new();
+        for (v, set) in model.iter().enumerate() {
+            g.neighbors_into(v as u32, &mut buf);
+            assert!(buf.iter().eq(set.iter()), "vertex {v} diverged");
+        }
+        assert_eq!(
+            g.num_edges(),
+            model.iter().map(BTreeSet::len).sum::<usize>() as u64
+        );
+    }
+
+    #[test]
+    fn edge_batch_out_of_range_inserts_nothing() {
+        let g = DynamicGraph::new(10, 1 << 20);
+        let mut w = g.writer_or_panic();
+        let mut edges = vec![(1, 2), (3, 4), (5, 99)];
+        assert_eq!(
+            w.insert_edges(&mut edges),
+            Err(InsertError::VertexOutOfRange { src: 5, dst: 99 })
+        );
+        drop(w);
+        assert_eq!(g.num_edges(), 0);
+        assert_eq!(g.degree(1), 0);
+    }
+
+    #[test]
+    fn edge_batch_sorts_and_dedups() {
+        let mut edges = vec![(2, 1), (0, 3), (2, 1), (0, 1), (2, 0)];
+        let g = DynamicGraph::try_from_edges(4, &mut edges, 1 << 20).unwrap();
+        assert_eq!(g.num_edges(), 4);
+        let mut buf = Vec::new();
+        g.neighbors_into(2, &mut buf);
+        assert_eq!(buf, vec![0, 1]);
+        let mut bad = vec![(0, 1), (7, 0)];
+        assert!(matches!(
+            DynamicGraph::try_from_edges(4, &mut bad, 1 << 20),
+            Err(InsertError::VertexOutOfRange { src: 7, dst: 0 })
+        ));
+    }
+
+    #[test]
+    fn sorted_dsts_rejects_unsorted_and_duplicate_input() {
+        assert!(SortedDsts::new(&[1, 2, 3]).is_some());
+        assert!(SortedDsts::new(&[]).is_some());
+        assert!(SortedDsts::new(&[2, 1]).is_none());
+        assert!(SortedDsts::new(&[5, 5]).is_none());
+    }
+
+    #[test]
+    fn batch_out_of_range_names_a_real_edge() {
+        let g = DynamicGraph::new(10, 1 << 20);
+        let mut w = g.writer_or_panic();
+        let dsts = SortedDsts::new(&[3, 12, 40]).unwrap();
+        assert_eq!(
+            w.insert_edges_sorted(0, dsts),
+            Err(InsertError::VertexOutOfRange { src: 0, dst: 12 })
+        );
+        let dsts = SortedDsts::new(&[3]).unwrap();
+        assert_eq!(
+            w.insert_edges_sorted(10, dsts),
+            Err(InsertError::VertexOutOfRange { src: 10, dst: 3 })
+        );
+        assert_eq!(
+            w.insert_edges_sorted(10, SortedDsts::new(&[]).unwrap()),
+            Ok(0)
+        );
     }
 
     #[test]
@@ -662,6 +802,9 @@ mod tests {
     fn compact_reclaims_garbage_and_preserves_graph() {
         let mut g = DynamicGraph::new(5000, 16 << 20);
         {
+            // A long-lived reader keeps every superseded slot unrecyclable,
+            // so the inserts leave the garbage compaction exists for.
+            let _reader = g.arena.read_guard();
             let mut w = g.writer_or_panic();
             for v in 0..64u32 {
                 for d in 0..200u32 {

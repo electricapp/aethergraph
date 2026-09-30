@@ -151,7 +151,7 @@ fn mr_on_main_post_on_worker() {
         eprintln!(
             "[A] worker posting: local_addr=0x{local_addr:x} lkey={lkey} remote=0x{remote_addr:x} rkey={remote_rkey} len={slot_size} table_base=0x{table_base:x}"
         );
-        post_and_wait(&client_qp, &[read], client_ctx.cq).map_err(|e| format!("[A] {e}"))?;
+        post_and_wait(&client_qp, &[read], client_ctx.cq().as_ptr()).map_err(|e| format!("[A] {e}"))?;
         Ok(buf.clone())
     })
     .join()
@@ -206,7 +206,7 @@ fn mr_on_worker_post_on_worker() {
             length: slot_size as u32,
         };
         eprintln!("[B] worker-registered: buf_ptr={buf_ptr:p} lkey={lkey} len={slot_size}");
-        post_and_wait(&client_qp, &[read], client_ctx.cq)?;
+        post_and_wait(&client_qp, &[read], client_ctx.cq().as_ptr())?;
         let _ = mr;
         Ok(buf)
     })
@@ -259,7 +259,7 @@ fn mr_on_main_post_on_main() {
         "[C] all-main: buf_ptr={buf_ptr:p} lkey={lkey} len={}",
         lb.slot_size
     );
-    post_and_wait(&lb.client_qp, &[read], lb.client_ctx.cq).expect("[C] post_and_wait");
+    post_and_wait(&lb.client_qp, &[read], lb.client_ctx.cq().as_ptr()).expect("[C] post_and_wait");
     let head = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     assert_ne!(head, 0);
 }
@@ -309,7 +309,7 @@ fn mr_on_main_touched_by_worker_then_post_on_main() {
         length: lb.slot_size as u32,
     };
     eprintln!("[D] touch-by-worker-then-post-on-main");
-    post_and_wait(&lb.client_qp, &[read], lb.client_ctx.cq).expect("[D] post_and_wait");
+    post_and_wait(&lb.client_qp, &[read], lb.client_ctx.cq().as_ptr()).expect("[D] post_and_wait");
     let head = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     assert_ne!(head, 0);
 }

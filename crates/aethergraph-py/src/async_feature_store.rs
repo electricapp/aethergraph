@@ -58,7 +58,11 @@ impl PyAsyncFeatureStore {
     /// ```
     #[staticmethod]
     #[pyo3(signature = (path, telemetry=false))]
-    fn load<'py>(py: Python<'py>, path: String, telemetry: bool) -> PyResult<Bound<'py, PyAny>> {
+    fn load<'py>(
+        py: Python<'py>,
+        path: std::path::PathBuf,
+        telemetry: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
         future_into_py(py, async move {
             let mut inner = CoreAsyncFeatureStore::load(&path).await.map_err(|e| {
                 pyo3::exceptions::PyIOError::new_err(format!("Failed to load async features: {e}"))

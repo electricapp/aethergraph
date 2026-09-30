@@ -42,15 +42,15 @@ impl DynamicGraph {
             // owns this handle for its lifetime; `compact*` takes
             // `&mut self` and so cannot overlap a live guard.
             arena: unsafe { self.arena.writer() },
-            commit_epoch: self.epoch.current().as_u64() + 1,
-            rebalance_scratch: Vec::new(),
-            merge_scratch: Vec::new(),
-            new_dsts: Vec::new(),
+            retire_stamp: self.epoch.current().as_u64() + 1,
+            scratch: std::mem::take(
+                &mut *self
+                    .writer_scratch
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
             pending_edges: 0,
-            dirty_buf: Vec::with_capacity(DIRTY_BUF_FLUSH_THRESHOLD),
-            touched_pages: Vec::new(),
-            touched_dedup_limit: TOUCHED_PAGES_DEDUP_START,
-            retire_log: RetireLog::new(),
+            touched_dedup_limit: TOUCHED_LEAVES_DEDUP_START,
             #[cfg(feature = "wal")]
             wal_guard: self
                 .wal
@@ -80,9 +80,74 @@ impl DynamicGraph {
 /// by `tests/zero_alloc.rs`).
 const DIRTY_BUF_FLUSH_THRESHOLD: usize = 8192;
 
-/// First in-place sort+dedup of `touched_pages`; doubles after each pass
+/// First in-place sort+dedup of `touched_leaves`; doubles after each pass
 /// so scattered writers pay amortized O(log) sorts, not one per push.
-const TOUCHED_PAGES_DEDUP_START: usize = 1024;
+const TOUCHED_LEAVES_DEDUP_START: usize = 1024;
+
+/// Scratch vectors above this many elements are shrunk back when parked,
+/// so one huge batch doesn't pin its buffers for the graph's lifetime.
+const SCRATCH_KEEP: usize = 1 << 16;
+
+/// Buffers a writer guard reuses across its inserts, parked on the graph
+/// between guards so a short guard (one edge from Python) allocates
+/// nothing.
+#[derive(Default)]
+pub(crate) struct WriterScratch {
+    /// A scapegoat subtree's elements during a rebalance, or the existing
+    /// neighbors during a bulk merge.
+    rebalance: Vec<u32>,
+    /// The bulk insert path's merged neighbor list.
+    merge: Vec<u32>,
+    /// The bulk insert path's genuinely-new destinations — the WAL
+    /// records and dirty marks a batch produces.
+    new_dsts: Vec<u32>,
+    /// One source's destinations while [`Writer::insert_edges`] groups a
+    /// batch.
+    batch_dsts: Vec<u32>,
+    /// Vertices touched by this guard's inserts. Sorted, deduplicated, and
+    /// flushed to the dirty bitmap in one sequential pass at commit —
+    /// marking per edge would cost two random-line atomic RMWs per insert
+    /// (each a likely DRAM + TLB miss on a multi-hundred-MB bitmap), and
+    /// consumers only drain dirtiness at epoch boundaries anyway.
+    dirty: Vec<u32>,
+    /// Root-table leaves whose roots this guard stored — the leaves the
+    /// commit snapshot must copy. Clustered-deduped on push (skip if same
+    /// as last), fully deduped at `touched_dedup_limit` and at commit.
+    touched_leaves: Vec<u32>,
+    /// Slots superseded by this guard's inserts. Stamped and queued at
+    /// the fixed watermark and at commit — always after the root stores
+    /// that made the slots unreachable.
+    retire_log: RetireLog,
+}
+
+impl WriterScratch {
+    /// Pre-sized so steady-state inserts never grow a buffer.
+    pub(crate) fn new() -> Self {
+        Self {
+            dirty: Vec::with_capacity(DIRTY_BUF_FLUSH_THRESHOLD),
+            retire_log: RetireLog::new(),
+            ..Self::default()
+        }
+    }
+
+    /// Reset for the next guard. The retire log must be empty: a slot
+    /// left in it would be retired by a guard that never unpublished it.
+    fn park(&mut self) {
+        self.retire_log.chunks.clear();
+        self.retire_log.interiors.clear();
+        self.dirty.clear();
+        self.touched_leaves.clear();
+        for v in [
+            &mut self.rebalance,
+            &mut self.merge,
+            &mut self.new_dsts,
+            &mut self.batch_dsts,
+        ] {
+            v.clear();
+            v.shrink_to(SCRATCH_KEEP);
+        }
+    }
+}
 
 /// Single-writer guard for [`DynamicGraph`].
 ///
@@ -95,37 +160,17 @@ pub struct Writer<'a> {
     /// [`DynamicGraph::writer`] is the one point where the single-writer
     /// invariant is proven; allocation through it is safe code.
     arena: ArenaWriter<'a>,
-    /// Epoch this guard commits (`current + 1`); stamps retire batches
-    /// and becomes the published snapshot's epoch.
-    commit_epoch: u64,
-    /// Scratch buffer reused across inserts to hold a scapegoat subtree's
-    /// elements during a rebalance. Owned by the guard so the write path
-    /// allocates at most once per writer instead of once per rebalance.
-    rebalance_scratch: Vec<u32>,
-    /// Scratch for the bulk insert path's merged neighbor list.
-    merge_scratch: Vec<u32>,
-    /// Scratch for the bulk insert path's genuinely-new destinations —
-    /// the WAL records and dirty marks a batch produces.
-    new_dsts: Vec<u32>,
+    /// Stamp for retirements before commit: above every pre-guard
+    /// snapshot's epoch, and at most the epoch the commit's `advance`
+    /// returns (other subsystems sharing the clock only move it forward).
+    retire_stamp: u64,
+    /// Buffers borrowed from the graph for the guard's lifetime.
+    scratch: WriterScratch,
     /// Edges inserted by this guard, folded into the shared counter once
     /// at drop — a per-edge atomic RMW on a shared line would buy nothing
     /// from a provably single writer.
     pending_edges: u64,
-    /// Vertices touched by this guard's inserts. Sorted, deduplicated, and
-    /// flushed to the dirty bitmap in one sequential pass at commit —
-    /// marking per edge would cost two random-line atomic RMWs per insert
-    /// (each a likely DRAM + TLB miss on a multi-hundred-MB bitmap), and
-    /// consumers only drain dirtiness at epoch boundaries anyway.
-    dirty_buf: Vec<u32>,
-    /// Root-table pages whose roots this guard stored — the pages the
-    /// commit snapshot must copy. Clustered-deduped on push (skip if same
-    /// as last), fully deduped at `touched_dedup_limit` and at commit.
-    touched_pages: Vec<u32>,
     touched_dedup_limit: usize,
-    /// Slots superseded by this guard's inserts. Stamped and queued at
-    /// the fixed watermark and at commit — always after the root stores
-    /// that made the slots unreachable.
-    retire_log: RetireLog,
     /// The WAL, locked once for the guard's lifetime — the guard already
     /// enforces single-writer, so per-edge lock traffic would be pure tax.
     #[cfg(feature = "wal")]
@@ -151,6 +196,7 @@ impl<'a> Writer<'a> {
         if (src as usize) >= self.graph.num_vertices || (dst as usize) >= self.graph.num_vertices {
             return Err(InsertError::VertexOutOfRange { src, dst });
         }
+        self.check_wal()?;
         match self.insert_edge_inner(src, dst) {
             Err(InsertError::ArenaFull) => {
                 // Both cursors are spent, but slots superseded by earlier
@@ -159,7 +205,10 @@ impl<'a> Writer<'a> {
                 // grace-cleared batch, then retry once.
                 // SAFETY: everything in the log was unpublished by a
                 // prior root store.
-                unsafe { self.arena.retire(&mut self.retire_log, self.commit_epoch) };
+                unsafe {
+                    self.arena
+                        .retire(&mut self.scratch.retire_log, self.retire_stamp)
+                };
                 self.insert_edge_inner(src, dst)
             }
             other => other,
@@ -176,14 +225,14 @@ impl<'a> Writer<'a> {
         // Marks for rolling back retire entries if the WAL append fails
         // below: a failed append leaves the old tree live, so its nodes
         // must not stay logged for reuse.
-        let chunks_mark = self.retire_log.chunks.len();
-        let interiors_mark = self.retire_log.interiors.len();
+        let chunks_mark = self.scratch.retire_log.chunks.len();
+        let interiors_mark = self.scratch.retire_log.interiors.len();
 
         match tree.insert_with_scratch(
             &mut self.arena,
             dst,
-            &mut self.rebalance_scratch,
-            &mut self.retire_log,
+            &mut self.scratch.rebalance,
+            &mut self.scratch.retire_log,
         ) {
             InsertResult::Inserted(new_tree) => {
                 // WAL append first (buffered; fsync happens in
@@ -198,8 +247,8 @@ impl<'a> Writer<'a> {
                     if let Err(e) = w.append_edge(rec) {
                         // Record the failure so `Writer::drop` can poison,
                         // and un-log the still-live old nodes.
-                        self.retire_log.chunks.truncate(chunks_mark);
-                        self.retire_log.interiors.truncate(interiors_mark);
+                        self.scratch.retire_log.chunks.truncate(chunks_mark);
+                        self.scratch.retire_log.interiors.truncate(interiors_mark);
                         self.wal_failed = true;
                         tracing::error!(error = %e, "WAL append failed");
                         return Err(InsertError::WalAppend);
@@ -227,62 +276,195 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// Refuse further inserts once this guard's WAL has failed: the log's
+    /// state is uncertain, and the guard poisons the graph on drop.
+    #[inline]
+    fn check_wal(&self) -> Result<(), InsertError> {
+        #[cfg(feature = "wal")]
+        if self.wal_failed {
+            return Err(InsertError::WalAppend);
+        }
+        Ok(())
+    }
+
     /// Stamp the retire log at its fixed watermark. Called only after a
     /// root store, so every logged slot is already unreachable.
     #[inline]
     fn maybe_stamp_retired(&mut self) {
-        if self.retire_log.wants_flush() {
+        if self.scratch.retire_log.wants_flush() {
             // SAFETY: called only after the root stores that unpublished
             // every logged slot.
-            unsafe { self.arena.retire(&mut self.retire_log, self.commit_epoch) };
+            unsafe {
+                self.arena
+                    .retire(&mut self.scratch.retire_log, self.retire_stamp)
+            };
         }
     }
 
-    /// Insert every edge `(src, dst)` for `dst` in an ascending,
-    /// deduplicated `dsts` slice, rebuilding `src`'s tree once.
+    /// Insert a batch of edges given in any order, duplicates allowed.
     ///
-    /// Ingest streams are heavily source-clustered; inserting D edges one
-    /// at a time path-copies the root-to-leaf path D times (O(D log D)
-    /// allocations and garbage). This merges the existing neighbors with
-    /// `dsts` and builds the new tree in one pass — O(degree + D) arena
-    /// bytes, one root publish.
+    /// Every edge is range-checked before anything is inserted, so an
+    /// out-of-range batch changes nothing. The batch is then sorted and
+    /// grouped by source, and each source goes through
+    /// [`insert_edges_sorted`](Self::insert_edges_sorted) once. An error
+    /// after the check (a full arena, a WAL failure) leaves the sources
+    /// before it inserted and published.
+    ///
+    /// Returns the number of edges actually new.
+    pub fn insert_edges(&mut self, edges: &mut [(u32, u32)]) -> Result<u64, InsertError> {
+        let nv = self.graph.num_vertices;
+        if let Some(&(src, dst)) = edges
+            .iter()
+            .find(|&&(s, d)| s as usize >= nv || d as usize >= nv)
+        {
+            return Err(InsertError::VertexOutOfRange { src, dst });
+        }
+        edges.sort_unstable();
+        let mut dsts = std::mem::take(&mut self.scratch.batch_dsts);
+        let mut inserted = 0;
+        let mut result = Ok(());
+        for run in edges.chunk_by(|a, b| a.0 == b.0) {
+            dsts.clear();
+            dsts.extend(run.iter().map(|&(_, d)| d));
+            dsts.dedup();
+            match self.insert_edges_sorted(run[0].0, SortedDsts(&dsts)) {
+                Ok(n) => inserted += n,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        self.scratch.batch_dsts = dsts;
+        result.map(|()| inserted)
+    }
+
+    /// Insert every edge `(src, dst)` for `dst` in `dsts`, publishing
+    /// `src`'s new tree once.
+    ///
+    /// Ingest streams are heavily source-clustered. A batch that is large
+    /// next to the existing degree merges the old neighbors with `dsts` and
+    /// builds the new tree in one pass — O(degree + batch) arena bytes. A
+    /// small batch into a large tree instead chains path-copying inserts
+    /// off to the side and publishes the last — O(batch × depth) — so one
+    /// new edge on a million-neighbor hub costs a root-to-leaf path, not a
+    /// rebuild of the hub.
     ///
     /// Returns the number of edges actually new (duplicates are skipped).
-    ///
-    /// # Panics
-    /// Debug-asserts that `dsts` is strictly ascending.
-    pub fn insert_edges_sorted(&mut self, src: u32, dsts: &[u32]) -> Result<u64, InsertError> {
-        debug_assert!(
-            dsts.windows(2).all(|w| w[0] < w[1]),
-            "insert_edges_sorted requires strictly ascending dsts"
-        );
-        if (src as usize) >= self.graph.num_vertices {
-            return Err(InsertError::VertexOutOfRange { src, dst: 0 });
+    /// An empty `dsts` is a no-op, whatever `src` is.
+    pub fn insert_edges_sorted(
+        &mut self,
+        src: u32,
+        dsts: SortedDsts<'_>,
+    ) -> Result<u64, InsertError> {
+        let dsts = dsts.0;
+        let Some(&first) = dsts.first() else {
+            return Ok(0);
+        };
+        let nv = self.graph.num_vertices;
+        if src as usize >= nv {
+            return Err(InsertError::VertexOutOfRange { src, dst: first });
         }
-        if let Some(&bad) = dsts
-            .iter()
-            .find(|&&d| (d as usize) >= self.graph.num_vertices)
+        // Ascending: only the last destination can be the largest.
+        if let Some(&last) = dsts.last()
+            && last as usize >= nv
         {
+            let bad = dsts[dsts.partition_point(|&d| (d as usize) < nv)];
             return Err(InsertError::VertexOutOfRange { src, dst: bad });
         }
-        if dsts.is_empty() {
-            return Ok(0);
-        }
+        self.check_wal()?;
 
         // Relaxed: see `insert_edge`.
-        let current_root = self.graph.roots[src as usize].load(Ordering::Relaxed);
-        let tree = CTree { root: current_root };
+        let old_root = self.graph.roots[src as usize].load(Ordering::Relaxed);
+        let tree = CTree { root: old_root };
+        let degree = tree.count(&self.graph.arena);
+        if prefer_path_copy(degree, dsts.len()) {
+            self.insert_sorted_by_path_copy(src, tree, dsts)
+        } else {
+            self.insert_sorted_by_rebuild(src, tree, dsts)
+        }
+    }
 
+    /// Chain path-copying inserts from `tree`, publishing only the last.
+    /// The intermediate trees are never reachable by readers; every node
+    /// the chain supersedes (old-tree paths included) is logged exactly
+    /// once and becomes unreachable at the single root store.
+    fn insert_sorted_by_path_copy(
+        &mut self,
+        src: u32,
+        tree: CTree,
+        dsts: &[u32],
+    ) -> Result<u64, InsertError> {
+        let chunks_mark = self.scratch.retire_log.chunks.len();
+        let interiors_mark = self.scratch.retire_log.interiors.len();
+        let mut retried = false;
+        let new_tree = 'chain: loop {
+            self.scratch.new_dsts.clear();
+            let mut cur = tree;
+            for &d in dsts {
+                match cur.insert_with_scratch(
+                    &mut self.arena,
+                    d,
+                    &mut self.scratch.rebalance,
+                    &mut self.scratch.retire_log,
+                ) {
+                    InsertResult::Inserted(t) => {
+                        cur = t;
+                        self.scratch.new_dsts.push(d);
+                    }
+                    InsertResult::Duplicate => {}
+                    InsertResult::ArenaFull => {
+                        // `tree` is still published: un-log what the chain
+                        // superseded (its fresh nodes leak until compact).
+                        self.scratch.retire_log.chunks.truncate(chunks_mark);
+                        self.scratch.retire_log.interiors.truncate(interiors_mark);
+                        if retried {
+                            return Err(InsertError::ArenaFull);
+                        }
+                        retried = true;
+                        // Everything left in the log was unpublished by an
+                        // earlier root store; stamp it so the exhausted
+                        // allocator can reclaim, then retry once.
+                        // SAFETY: see above.
+                        unsafe {
+                            self.arena
+                                .retire(&mut self.scratch.retire_log, self.retire_stamp)
+                        };
+                        continue 'chain;
+                    }
+                }
+            }
+            break cur;
+        };
+        if self.scratch.new_dsts.is_empty() {
+            return Ok(0);
+        }
+        if let Err(e) = self.append_batch(src) {
+            self.scratch.retire_log.chunks.truncate(chunks_mark);
+            self.scratch.retire_log.interiors.truncate(interiors_mark);
+            return Err(e);
+        }
+        let inserted = self.publish_batch(src, new_tree);
+        self.maybe_stamp_retired();
+        Ok(inserted)
+    }
+
+    /// Merge the existing neighbors with `dsts` and build the new tree in
+    /// one pass; the whole old tree is retired once it is published.
+    fn insert_sorted_by_rebuild(
+        &mut self,
+        src: u32,
+        tree: CTree,
+        dsts: &[u32],
+    ) -> Result<u64, InsertError> {
         // Merge existing (sorted) neighbors with the new sorted dsts,
         // recording the genuinely-new dsts in their own scratch — the
-        // batch's WAL records and dirty marks. A failed batch simply
-        // leaves the scratch to be cleared by the next call; nothing is
-        // rolled back.
-        self.new_dsts.clear();
-        let existing = &mut self.rebalance_scratch;
+        // batch's WAL records and dirty marks.
+        self.scratch.new_dsts.clear();
+        let existing = &mut self.scratch.rebalance;
         existing.clear();
         tree.collect_into(&self.graph.arena, existing);
-        let merged = &mut self.merge_scratch;
+        let merged = &mut self.scratch.merge;
         merged.clear();
         merged.reserve(existing.len() + dsts.len());
         let (mut i, mut j) = (0usize, 0usize);
@@ -294,7 +476,7 @@ impl<'a> Writer<'a> {
                 }
                 std::cmp::Ordering::Greater => {
                     merged.push(dsts[j]);
-                    self.new_dsts.push(dsts[j]);
+                    self.scratch.new_dsts.push(dsts[j]);
                     j += 1;
                 }
                 std::cmp::Ordering::Equal => {
@@ -307,80 +489,95 @@ impl<'a> Writer<'a> {
         merged.extend_from_slice(&existing[i..]);
         for &d in &dsts[j..] {
             merged.push(d);
-            self.new_dsts.push(d);
+            self.scratch.new_dsts.push(d);
         }
-        let new_count = self.new_dsts.len() as u64;
-        if new_count == 0 {
+        if self.scratch.new_dsts.is_empty() {
             return Ok(0);
         }
 
         // Build the replacement tree first (invisible to readers), then
         // log, then publish — a WAL failure leaves readers on the old
         // root with no record of the unpublished edges.
-        let mut built = CTree::from_sorted(&mut self.arena, &self.merge_scratch);
+        let mut built = CTree::from_sorted(&mut self.arena, &self.scratch.merge);
         if built.is_none() {
             // Stamp already-unpublished retirements so the exhausted
             // allocator can reclaim grace-cleared slots, then retry once
             // (see `insert_edge`).
             // SAFETY: everything in the log was unpublished by a prior
             // root store.
-            unsafe { self.arena.retire(&mut self.retire_log, self.commit_epoch) };
-            built = CTree::from_sorted(&mut self.arena, &self.merge_scratch);
+            unsafe {
+                self.arena
+                    .retire(&mut self.scratch.retire_log, self.retire_stamp)
+            };
+            built = CTree::from_sorted(&mut self.arena, &self.scratch.merge);
         }
         let Some(new_tree) = built else {
             return Err(InsertError::ArenaFull);
         };
-
-        #[cfg(feature = "wal")]
-        if let Some(w) = self.wal_guard.as_mut() {
-            for &dst in &self.new_dsts {
-                if let Err(e) = w.append_edge(EdgeRecord { src, dst }) {
-                    self.wal_failed = true;
-                    tracing::error!(error = %e, "WAL append failed");
-                    return Err(InsertError::WalAppend);
-                }
-            }
-        }
-
-        self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
-        self.note_root_store(src);
+        self.append_batch(src)?;
+        let inserted = self.publish_batch(src, new_tree);
         // The old tree is superseded in full now that the merged rebuild
         // is published; log every one of its nodes for recycling.
-        if current_root != crate::ctree::NULL {
+        if tree.root != crate::ctree::NULL {
             // SAFETY: the old tree is unreachable from the just-published
             // root, and none of its slots were logged before.
             unsafe {
                 crate::ctree::retire_subtree(
                     self.arena.arena(),
-                    current_root,
-                    &mut self.retire_log,
+                    tree.root,
+                    &mut self.scratch.retire_log,
                 );
             };
         }
-        self.pending_edges += new_count;
-        for i in 0..self.new_dsts.len() {
-            let d = self.new_dsts[i];
+        self.maybe_stamp_retired();
+        Ok(inserted)
+    }
+
+    /// Log the batch in `scratch.new_dsts` for `src`, all or nothing: a
+    /// failed append stages none of it, so no record of these unpublished
+    /// edges can be flushed later.
+    fn append_batch(&mut self, src: u32) -> Result<(), InsertError> {
+        #[cfg(feature = "wal")]
+        if let Some(w) = self.wal_guard.as_mut()
+            && let Err(e) = w.append_edges(src, &self.scratch.new_dsts)
+        {
+            self.wal_failed = true;
+            tracing::error!(error = %e, "WAL append failed");
+            return Err(InsertError::WalAppend);
+        }
+        #[cfg(not(feature = "wal"))]
+        let _ = src;
+        Ok(())
+    }
+
+    /// Publish `new_tree` as `src`'s root and account for the batch in
+    /// `scratch.new_dsts`. Returns the number of edges it added.
+    fn publish_batch(&mut self, src: u32, new_tree: CTree) -> u64 {
+        self.graph.roots[src as usize].store(new_tree.root, Ordering::Release);
+        self.note_root_store(src);
+        let inserted = self.scratch.new_dsts.len() as u64;
+        self.pending_edges += inserted;
+        for i in 0..self.scratch.new_dsts.len() {
+            let d = self.scratch.new_dsts[i];
             self.note_dirty(d);
         }
         self.note_dirty(src);
-        self.maybe_stamp_retired();
-
-        Ok(new_count)
+        inserted
     }
 
-    /// Record that this guard stored a root in `src`'s page.
+    /// Record that this guard stored a root in `src`'s root-table leaf.
     #[inline]
     fn note_root_store(&mut self, src: u32) {
-        let page = src >> crate::snapshot::PAGE_BITS;
-        if self.touched_pages.last() == Some(&page) {
+        let leaf = src >> crate::snapshot::LEAF_BITS;
+        if self.scratch.touched_leaves.last() == Some(&leaf) {
             return;
         }
-        self.touched_pages.push(page);
-        if self.touched_pages.len() >= self.touched_dedup_limit {
-            self.touched_pages.sort_unstable();
-            self.touched_pages.dedup();
+        self.scratch.touched_leaves.push(leaf);
+        if self.scratch.touched_leaves.len() >= self.touched_dedup_limit {
+            self.scratch.touched_leaves.sort_unstable();
+            self.scratch.touched_leaves.dedup();
             self.touched_dedup_limit =
-                (self.touched_pages.len() * 2).max(TOUCHED_PAGES_DEDUP_START);
+                (self.scratch.touched_leaves.len() * 2).max(TOUCHED_LEAVES_DEDUP_START);
         }
     }
 
@@ -388,22 +585,22 @@ impl<'a> Writer<'a> {
     /// watermark so the buffer never grows on the insert path.
     #[inline]
     fn note_dirty(&mut self, v: u32) {
-        if self.dirty_buf.len() == DIRTY_BUF_FLUSH_THRESHOLD {
+        if self.scratch.dirty.len() == DIRTY_BUF_FLUSH_THRESHOLD {
             self.flush_dirty();
         }
-        self.dirty_buf.push(v);
+        self.scratch.dirty.push(v);
     }
 
     /// Sort, dedup, and fold the buffered dirty vertices into the bitmap
     /// in one sequential pass, keeping the buffer's capacity.
     fn flush_dirty(&mut self) {
-        if self.dirty_buf.is_empty() {
+        if self.scratch.dirty.is_empty() {
             return;
         }
-        self.dirty_buf.sort_unstable();
-        self.dirty_buf.dedup();
-        self.graph.dirty.mark_sorted(&self.dirty_buf);
-        self.dirty_buf.clear();
+        self.scratch.dirty.sort_unstable();
+        self.scratch.dirty.dedup();
+        self.graph.dirty.mark_sorted(&self.scratch.dirty);
+        self.scratch.dirty.clear();
     }
 
     /// Fold this guard's buffered bookkeeping into the shared state: one
@@ -450,7 +647,7 @@ impl Drop for Writer<'_> {
                 tracing::error!(error = %e, "failed to discard pending WAL records");
             }
             tracing::warn!("DynamicGraph writer panicked — graph poisoned");
-            self.graph.writer_locked.store(false, Ordering::Release);
+            self.release();
             return;
         }
 
@@ -474,33 +671,81 @@ impl Drop for Writer<'_> {
         }
 
         if durable_failure {
-            // The un-stamped retire log dies with the guard: its slots are
-            // never reused, which is exactly right — some of them may
-            // belong to trees that are still the published state.
+            // The un-stamped retire log dies with the guard (`release`
+            // clears it): its slots are never reused, which is exactly
+            // right — some may belong to trees that are still published.
             self.graph.poisoned.store(true, Ordering::Release);
         } else {
             self.flush_bookkeeping();
-            // Publish this commit's pinned snapshot before stamping, so
-            // retire batches from the next guard can never outrun it.
-            if !self.touched_pages.is_empty() {
-                self.graph
-                    .publish_snapshot(self.commit_epoch, &mut self.touched_pages);
-            }
-            // Stamp this guard's remaining retirements (all root stores
-            // are done) and fold in any batches whose grace has passed,
-            // so a subsequent guard starts with a warm free list.
+            // The table is built off-lock; the epoch advances and the
+            // snapshot swaps in under one lock, so a reader that observes
+            // the new epoch and then acquires sees this commit. Done before
+            // releasing the writer lock so the next writer's commit orders
+            // after this one's.
+            let table = (!self.scratch.touched_leaves.is_empty())
+                .then(|| self.graph.build_table(&mut self.scratch.touched_leaves));
+            let epoch = self.graph.publish_commit(table);
+            // Stamp this guard's remaining retirements (all root stores are
+            // done, and the snapshot published above cannot reach them) and
+            // fold in any batches whose grace has passed, so a subsequent
+            // guard starts with a warm free list.
             // SAFETY: every logged slot was unpublished by its root store.
-            unsafe { self.arena.retire(&mut self.retire_log, self.commit_epoch) };
+            unsafe { self.arena.retire(&mut self.scratch.retire_log, epoch) };
             self.arena.reclaim();
-            // Publish a new epoch so readers pinning the clock see this
-            // writer's edits. Done before releasing the writer lock so
-            // the next writer can't bump the clock first.
-            let new_epoch = self.graph.epoch.advance().as_u64();
-            debug_assert_eq!(new_epoch, self.commit_epoch);
-            tracing::trace!(epoch = new_epoch, "DynamicGraph writer committed");
+            tracing::trace!(epoch, "DynamicGraph writer committed");
         }
+        self.release();
+    }
+}
+
+impl Writer<'_> {
+    /// Park the scratch on the graph for the next guard and free the slot.
+    fn release(&mut self) {
+        self.scratch.park();
+        let mut parked = self
+            .graph
+            .writer_scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::swap(&mut *parked, &mut self.scratch);
+        drop(parked);
         self.graph.writer_locked.store(false, Ordering::Release);
     }
+}
+
+/// Strictly ascending destinations for
+/// [`Writer::insert_edges_sorted`], proven so at construction — the insert
+/// path merges and chains on the order without re-checking it.
+#[derive(Clone, Copy, Debug)]
+pub struct SortedDsts<'a>(&'a [u32]);
+
+impl<'a> SortedDsts<'a> {
+    /// `dsts` if it is strictly ascending, else `None`.
+    pub fn new(dsts: &'a [u32]) -> Option<Self> {
+        dsts.windows(2).all(|w| w[0] < w[1]).then_some(Self(dsts))
+    }
+
+    /// Sort and deduplicate `dsts` in place.
+    pub fn sort_dedup(dsts: &'a mut Vec<u32>) -> Self {
+        dsts.sort_unstable();
+        dsts.dedup();
+        Self(dsts)
+    }
+
+    pub fn as_slice(&self) -> &'a [u32] {
+        self.0
+    }
+}
+
+/// Should `k` new edges into a `degree`-element tree chain path-copying
+/// inserts instead of merging and rebuilding? Compares arena slots
+/// written: a path copy per edge (≈ depth + 1 slots) against a rebuild of
+/// the merged list (≈ 2 slots per leaf), which also reads the whole old
+/// tree.
+fn prefer_path_copy(degree: usize, k: usize) -> bool {
+    let cap = crate::chunk::CHUNK_CAP;
+    let depth = degree.div_ceil(cap).max(1).ilog2() as usize + 2;
+    k.saturating_mul(depth) < 2 * (degree + k).div_ceil(cap)
 }
 
 /// Reason [`DynamicGraph::writer`] cannot hand out a writer.
@@ -557,3 +802,50 @@ impl std::fmt::Display for InsertError {
 }
 
 impl std::error::Error for InsertError {}
+
+#[cfg(all(test, feature = "wal"))]
+mod wal_tests {
+    use crate::DynamicGraph;
+    use crate::wal::{BUF_CAPACITY, RECORD_LEN};
+    use crate::writer::{InsertError, SortedDsts};
+
+    #[test]
+    fn failed_batch_append_publishes_and_persists_nothing() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // Stage records until the batch below no longer fits beside them,
+        // so appending it must first spill — the step the fault fails.
+        let staged = (BUF_CAPACITY / RECORD_LEN - 4) as u32;
+        {
+            let g = DynamicGraph::open_with_wal(&path, 1 << 12, 64 << 20).unwrap();
+            let mut w = g.writer().unwrap();
+            for i in 0..staged {
+                w.insert_edge(i % 1024, 1024 + i / 1024).unwrap();
+            }
+            w.wal_guard.as_mut().unwrap().inject_write_fault(0);
+            let batch: Vec<u32> = (2048..2112).collect();
+            let got = w.insert_edges_sorted(3000, SortedDsts::new(&batch).unwrap());
+            assert_eq!(got, Err(InsertError::WalAppend));
+            assert_eq!(g.degree(3000), 0, "the failed batch was published");
+            assert_eq!(
+                w.insert_edge(1, 2),
+                Err(InsertError::WalAppend),
+                "a guard whose WAL failed must refuse further inserts"
+            );
+            drop(w);
+            assert!(g.is_poisoned());
+        }
+        let mut srcs = Vec::new();
+        crate::wal::replay(&path, |r| {
+            srcs.push(r.src);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            srcs.len(),
+            staged as usize,
+            "every published edge is durable"
+        );
+        assert!(!srcs.contains(&3000), "no record of the failed batch");
+    }
+}

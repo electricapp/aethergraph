@@ -251,6 +251,11 @@ impl FeatureCache {
         })
     }
 
+    /// Width of every row the cache stores and returns.
+    pub fn feature_dim(&self) -> usize {
+        self.config.feature_dim
+    }
+
     /// Get features for a node, loading from slower tiers if needed.
     pub async fn get(&self, node: NodeId) -> Result<FeatureVector> {
         let mut out = vec![0f32; self.config.feature_dim];
@@ -262,7 +267,12 @@ impl FeatureCache {
     /// needed. The zero-allocation variant of [`get`](Self::get) for
     /// callers gathering into a preallocated batch buffer.
     pub async fn get_into(&self, node: NodeId, out: &mut [f32]) -> Result<()> {
-        debug_assert_eq!(out.len(), self.config.feature_dim);
+        anyhow::ensure!(
+            out.len() == self.config.feature_dim,
+            "output buffer is {} long, expected feature_dim {}",
+            out.len(),
+            self.config.feature_dim
+        );
         // Try GPU cache first (hot tier). Hits take only the READ lock —
         // marking the entry visited is an atomic store inside it — so
         // concurrent loaders hitting the hot tier don't serialize on one
@@ -303,7 +313,8 @@ impl FeatureCache {
             self.stats.cpu_hits.fetch_add(1, Ordering::Relaxed);
             trace!("CPU cache hit for node {}", node);
             crate::probe!(cache_hit, node as usize, 1);
-            self.promote_to_gpu(node, out).await;
+            let spills = self.promote_from_cpu(&[(node, &*out)]);
+            self.spill(spills).await;
             return Ok(());
         }
 
@@ -320,7 +331,8 @@ impl FeatureCache {
                 out.copy_from_slice(&features);
                 self.stats.nvme_hits.fetch_add(1, Ordering::Relaxed);
                 crate::probe!(cache_hit, node as usize, 2);
-                self.promote_to_cpu(node, &features).await;
+                let spills = self.admit_cpu(&[(node, &features[..])]);
+                self.spill(spills).await;
                 Ok(())
             }
             None => {
@@ -334,7 +346,8 @@ impl FeatureCache {
                         .context("task panicked")??;
                     out.copy_from_slice(&features);
                     self.stats.cold_hits.fetch_add(1, Ordering::Relaxed);
-                    self.promote_to_cpu(node, &features).await;
+                    let spills = self.admit_cpu(&[(node, &features[..])]);
+                    self.spill(spills).await;
                     return Ok(());
                 }
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
@@ -401,14 +414,17 @@ impl FeatureCache {
                 None => true,
             });
         }
+        // Rows displaced from the CPU tier that still need an NVMe record,
+        // written together once the batch is resolved.
+        let mut spills: Vec<(NodeId, Vec<f32>)> = Vec::new();
         if !cpu_found.is_empty() {
             self.stats
                 .cpu_hits
                 .fetch_add(cpu_found.len() as u64, Ordering::Relaxed);
-            for (node, features) in cpu_found {
-                self.promote_to_gpu(node, &features).await;
-                resolved.insert(node, features);
-            }
+            let rows: Vec<(NodeId, &[f32])> =
+                cpu_found.iter().map(|(n, f)| (*n, f.as_slice())).collect();
+            spills.extend(self.promote_from_cpu(&rows));
+            resolved.extend(cpu_found);
         }
 
         // NVMe spill: one blocking task runs a pipelined batch gather
@@ -422,13 +438,10 @@ impl FeatureCache {
             let fetched = tokio::task::spawn_blocking(move || tier.load_batch(&chunk))
                 .await
                 .context("task panicked")??;
+            let mut loaded: Vec<(NodeId, FeatureVector)> = Vec::with_capacity(fetched.len());
             for (node, result) in fetched {
                 match result {
-                    Some(features) => {
-                        self.stats.nvme_hits.fetch_add(1, Ordering::Relaxed);
-                        self.promote_to_cpu(node, &features).await;
-                        resolved.insert(node, features);
-                    }
+                    Some(features) => loaded.push((node, features)),
                     None => {
                         #[cfg(feature = "zstd-tier")]
                         if self.cold.is_some() {
@@ -442,6 +455,13 @@ impl FeatureCache {
                     }
                 }
             }
+            self.stats
+                .nvme_hits
+                .fetch_add(loaded.len() as u64, Ordering::Relaxed);
+            let rows: Vec<(NodeId, &[f32])> =
+                loaded.iter().map(|(n, f)| (*n, f.as_slice())).collect();
+            spills.extend(self.admit_cpu(&rows));
+            resolved.extend(loaded);
         }
 
         // The compressed backing tier serves whatever NVMe never spilled,
@@ -470,12 +490,17 @@ impl FeatureCache {
             self.stats
                 .cold_hits
                 .fetch_add(cold_missing.len() as u64, Ordering::Relaxed);
-            for (i, &node) in cold_missing.iter().enumerate() {
-                let features = gathered[i * dim..(i + 1) * dim].to_vec();
-                self.promote_to_cpu(node, &features).await;
-                resolved.insert(node, features);
+            let rows: Vec<(NodeId, &[f32])> = cold_missing
+                .iter()
+                .zip(gathered.chunks_exact(dim))
+                .map(|(&n, row)| (n, row))
+                .collect();
+            spills.extend(self.admit_cpu(&rows));
+            for (node, row) in rows {
+                resolved.insert(node, row.to_vec());
             }
         }
+        self.spill(spills).await;
 
         // Assemble in input order. `resolved` holds one entry per distinct
         // node and is dropped on return, so when the batch has no repeats
@@ -505,58 +530,126 @@ impl FeatureCache {
         Ok(out)
     }
 
-    /// Insert features for a node into the cache
+    /// Insert features for a node into the cache.
+    ///
+    /// `features` must be exactly `feature_dim` long. That is checked here,
+    /// once, before anything is written, so every tier below stores rows of
+    /// one width.
     pub async fn insert(&self, node: NodeId, features: FeatureVector) -> Result<()> {
+        anyhow::ensure!(
+            features.len() == self.config.feature_dim,
+            "feature row for node {node} has {} values, expected feature_dim {}",
+            features.len(),
+            self.config.feature_dim
+        );
         // Persist first, then promote — the NVMe record is what makes the
         // node recoverable after it falls out of both memory tiers.
         self.save_to_nvme(node, &features).await?;
-        self.promote_to_gpu(node, &features).await;
+        let spills = self.promote_from_cpu(&[(node, &features[..])]);
+        self.spill(spills).await;
         Ok(())
     }
 
-    /// Promote features to GPU cache (with eviction if needed)
-    async fn promote_to_gpu(&self, node: NodeId, features: &[f32]) {
-        let outcome = {
+    /// Place `rows` in the GPU tier and take them out of the CPU tier, so
+    /// the two tiers hold disjoint nodes and their capacities add up.
+    ///
+    /// Each lock is held once for the whole slice. Rows the GPU tier
+    /// displaces — its eviction victims, or newcomers refused because every
+    /// slot is pinned — move down to the CPU tier. Returns the CPU tier's
+    /// own displaced rows that still need an NVMe record.
+    fn promote_from_cpu(&self, rows: &[(NodeId, &[f32])]) -> Vec<(NodeId, Vec<f32>)> {
+        let mut demoted: Vec<(NodeId, Vec<f32>)> = Vec::new();
+        {
             let mut gpu = self.gpu_cache.write();
-            gpu.insert(node, features)
-        };
+            for &(node, features) in rows {
+                match gpu.insert(node, features) {
+                    InsertOutcome::Stored => {}
+                    InsertOutcome::StoredEvicting(victim, evicted) => {
+                        trace!("Evicting node {} from GPU to CPU", victim);
+                        demoted.push((victim, evicted));
+                    }
+                    InsertOutcome::Refused => demoted.push((node, features.to_vec())),
+                }
+            }
+        }
+        self.stats
+            .evictions
+            .fetch_add(demoted.len() as u64, Ordering::Relaxed);
 
-        match outcome {
-            InsertOutcome::Stored => {}
-            InsertOutcome::StoredEvicting(victim, evicted) => {
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                trace!("Evicting node {} from GPU to CPU", victim);
-                self.promote_to_cpu(victim, &evicted).await;
-            }
-            InsertOutcome::Refused => {
-                // Every GPU slot is pinned: demote the newcomer directly.
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                self.promote_to_cpu(node, features).await;
-            }
+        let mut cpu = self.cpu_cache.write();
+        for &(node, _) in rows {
+            cpu.remove(node);
+        }
+        let mut spills = Vec::new();
+        for (node, features) in demoted {
+            self.admit_one_cpu(&mut cpu, node, &features, &mut spills);
+        }
+        spills
+    }
+
+    /// Place `rows` in the CPU tier under one lock hold. Returns displaced
+    /// rows that still need an NVMe record.
+    fn admit_cpu(&self, rows: &[(NodeId, &[f32])]) -> Vec<(NodeId, Vec<f32>)> {
+        let mut spills = Vec::new();
+        let mut cpu = self.cpu_cache.write();
+        for &(node, features) in rows {
+            self.admit_one_cpu(&mut cpu, node, features, &mut spills);
+        }
+        spills
+    }
+
+    fn admit_one_cpu(
+        &self,
+        cpu: &mut SieveCache,
+        node: NodeId,
+        features: &[f32],
+        spills: &mut Vec<(NodeId, Vec<f32>)>,
+    ) {
+        let displaced = match cpu.insert(node, features) {
+            InsertOutcome::Stored => return,
+            InsertOutcome::StoredEvicting(victim, evicted) => (victim, evicted),
+            InsertOutcome::Refused => (node, features.to_vec()),
+        };
+        self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+        // Every row enters a memory tier with a backing copy — an NVMe
+        // record (inserted or loaded from there) or the compressed tier —
+        // so dropping it loses nothing. Only a row without one is written.
+        if !self.is_backed(displaced.0) {
+            trace!("Spilling node {} from CPU to NVMe", displaced.0);
+            spills.push(displaced);
         }
     }
 
-    /// Promote features to CPU cache (with eviction if needed)
-    async fn promote_to_cpu(&self, node: NodeId, features: &[f32]) {
-        let outcome = {
-            let mut cpu = self.cpu_cache.write();
-            cpu.insert(node, features)
-        };
+    /// Whether `node` can be recovered once it leaves the memory tiers.
+    fn is_backed(&self, node: NodeId) -> bool {
+        #[cfg(feature = "zstd-tier")]
+        if self
+            .cold
+            .as_ref()
+            .is_some_and(|c| (node as usize) < c.num_rows())
+        {
+            return true;
+        }
+        self.nvme.contains(node)
+    }
 
-        match outcome {
-            InsertOutcome::Stored => {}
-            InsertOutcome::StoredEvicting(victim, evicted) => {
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                trace!("Evicting node {} from CPU to NVMe", victim);
-                if let Err(e) = self.save_to_nvme(victim, &evicted).await {
-                    warn!("Failed to save evicted features to NVMe: {}", e);
-                }
+    /// Write displaced rows to the NVMe tier in one blocking task.
+    async fn spill(&self, rows: Vec<(NodeId, Vec<f32>)>) {
+        if rows.is_empty() {
+            return;
+        }
+        let tier = Arc::clone(&self.nvme);
+        let written = tokio::task::spawn_blocking(move || {
+            for (node, features) in &rows {
+                tier.save_blocking(*node, features)?;
             }
-            InsertOutcome::Refused => {
-                if let Err(e) = self.save_to_nvme(node, features).await {
-                    warn!("Failed to save demoted features to NVMe: {}", e);
-                }
-            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Failed to spill evicted features to NVMe: {e:#}"),
+            Err(e) => warn!("NVMe spill task failed: {e}"),
         }
     }
 
@@ -866,12 +959,95 @@ mod tests {
             assert_eq!(f, vec![i as f32; 4], "node {i} corrupted through spill");
         }
 
-        // The whole tier is a single slot file — no per-node files.
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(entries, vec![std::ffi::OsString::from("features.dat")]);
+        // The whole tier is one anonymous slot file — no per-node files,
+        // and nothing left in the directory.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Two caches pointed at one directory each get a private spill file:
+    /// one cache's records can neither clobber nor leak into the other's.
+    #[tokio::test]
+    async fn caches_sharing_an_nvme_path_do_not_clobber_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = FeatureCacheConfig {
+            gpu_capacity: 1,
+            cpu_capacity: 1,
+            feature_dim: 4,
+            nvme_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let a = FeatureCache::new(config.clone()).await.unwrap();
+        for i in 0..8u32 {
+            a.insert(i, vec![i as f32; 4]).await.unwrap();
+        }
+        let b = FeatureCache::new(config).await.unwrap();
+        for i in 0..8u32 {
+            b.insert(i, vec![100.0 + i as f32; 4]).await.unwrap();
+        }
+        for i in 0..8u32 {
+            assert_eq!(
+                a.get(i).await.unwrap(),
+                vec![i as f32; 4],
+                "cache a node {i}"
+            );
+            assert_eq!(b.get(i).await.unwrap(), vec![100.0 + i as f32; 4]);
+        }
+    }
+
+    /// A row of the wrong width is refused before anything is written, so
+    /// it cannot overrun a neighbour's spilled record or tear its own.
+    #[tokio::test]
+    async fn wrong_width_rows_are_rejected_at_the_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = FeatureCacheConfig {
+            gpu_capacity: 1,
+            cpu_capacity: 1,
+            feature_dim: 4,
+            nvme_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let cache = FeatureCache::new(config).await.unwrap();
+        for i in 0..4u32 {
+            cache.insert(i, vec![i as f32; 4]).await.unwrap();
+        }
+        assert!(cache.insert(1, vec![9.0; 8]).await.is_err());
+        assert!(cache.insert(2, vec![9.0; 2]).await.is_err());
+        for i in 0..4u32 {
+            assert_eq!(cache.get(i).await.unwrap(), vec![i as f32; 4]);
+        }
+        let mut short = vec![0f32; 3];
+        assert!(cache.get_into(0, &mut short).await.is_err());
+    }
+
+    /// The memory tiers are exclusive: a warm hit moves the row up rather
+    /// than copying it, so the two tiers together hold `gpu + cpu` distinct
+    /// rows and a working set of that size never reaches NVMe.
+    #[tokio::test]
+    async fn memory_tiers_hold_disjoint_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = FeatureCacheConfig {
+            gpu_capacity: 2,
+            cpu_capacity: 2,
+            feature_dim: 4,
+            nvme_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let cache = FeatureCache::new(config).await.unwrap();
+        for i in 0..4u32 {
+            cache.insert(i, vec![i as f32; 4]).await.unwrap();
+        }
+        for _ in 0..3 {
+            for i in 0..4u32 {
+                assert_eq!(cache.get(i).await.unwrap(), vec![i as f32; 4]);
+            }
+            let batch = cache.get_batch(&[3, 1, 2, 0]).await.unwrap();
+            for (row, n) in batch.iter().zip([3u32, 1, 2, 0]) {
+                assert_eq!(row, &vec![n as f32; 4]);
+            }
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.nvme_hits, 0, "{stats:?}");
+        assert!(stats.cpu_hits > 0 && stats.gpu_hits > 0, "{stats:?}");
     }
 
     #[tokio::test]

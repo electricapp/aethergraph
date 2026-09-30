@@ -33,48 +33,65 @@ def rng() -> np.random.Generator:
 
 @pytest.fixture
 def reddit_graph(rng: np.random.Generator) -> HeteroCsrGraph:
-    """Reddit-shaped heterogeneous graph.
+    """Reddit-shaped heterogeneous graph with PyG-style reverse relations.
 
     Node types: user(100), post(500), comment(1000), subreddit(50)
     Edge types:
-      - (user, votes, post):           2000 edges
-      - (user, writes, comment):       3000 edges
-      - (comment, reply_to, comment):  1500 edges
-      - (post, belongs_to, subreddit): 500 edges
+      - (user, votes, post):               2000 edges
+      - (user, writes, comment):           3000 edges
+      - (comment, reply_to, comment):      1500 edges
+      - (post, belongs_to, subreddit):     500 edges
+      - (post, rev_votes, user):           2000 edges (transpose of votes)
+      - (comment, rev_writes, user):       3000 edges (transpose of writes)
+      - (subreddit, rev_belongs_to, post): 500 edges (transpose of belongs_to)
+
+    Sampling expands a node along the relations that point into its type,
+    so the reverse relations are what give user seeds neighbors.
     """
+    votes = (
+        rng.integers(0, 100, 2000).astype(np.uint32),
+        rng.integers(0, 500, 2000).astype(np.uint32),
+    )
+    writes = (
+        rng.integers(0, 100, 3000).astype(np.uint32),
+        rng.integers(0, 1000, 3000).astype(np.uint32),
+    )
+    reply_to = (
+        rng.integers(0, 1000, 1500).astype(np.uint32),
+        rng.integers(0, 1000, 1500).astype(np.uint32),
+    )
+    belongs_to = (
+        rng.integers(0, 500, 500).astype(np.uint32),
+        rng.integers(0, 50, 500).astype(np.uint32),
+    )
     return HeteroCsrGraph.from_edge_arrays(
         node_types={"user": 100, "post": 500, "comment": 1000, "subreddit": 50},
         edge_types=[
-            (
-                "user",
-                "votes",
-                "post",
-                rng.integers(0, 100, 2000).astype(np.uint32),
-                rng.integers(0, 500, 2000).astype(np.uint32),
-            ),
-            (
-                "user",
-                "writes",
-                "comment",
-                rng.integers(0, 100, 3000).astype(np.uint32),
-                rng.integers(0, 1000, 3000).astype(np.uint32),
-            ),
-            (
-                "comment",
-                "reply_to",
-                "comment",
-                rng.integers(0, 1000, 1500).astype(np.uint32),
-                rng.integers(0, 1000, 1500).astype(np.uint32),
-            ),
-            (
-                "post",
-                "belongs_to",
-                "subreddit",
-                rng.integers(0, 500, 500).astype(np.uint32),
-                rng.integers(0, 50, 500).astype(np.uint32),
-            ),
+            ("user", "votes", "post", *votes),
+            ("user", "writes", "comment", *writes),
+            ("comment", "reply_to", "comment", *reply_to),
+            ("post", "belongs_to", "subreddit", *belongs_to),
+            ("post", "rev_votes", "user", votes[1], votes[0]),
+            ("comment", "rev_writes", "user", writes[1], writes[0]),
+            ("subreddit", "rev_belongs_to", "post", belongs_to[1], belongs_to[0]),
         ],
     )
+
+
+FANOUT_1HOP: dict[tuple[str, str, str], list[int]] = {
+    ("user", "votes", "post"): [10],
+    ("user", "writes", "comment"): [5],
+    ("comment", "reply_to", "comment"): [3],
+    ("post", "belongs_to", "subreddit"): [2],
+    ("post", "rev_votes", "user"): [10],
+    ("comment", "rev_writes", "user"): [5],
+    ("subreddit", "rev_belongs_to", "post"): [2],
+}
+
+
+def fanout(*hops: int) -> dict[tuple[str, str, str], list[int]]:
+    """Every relation of the reddit fixture with the same per-hop counts."""
+    return {edge_type: list(hops) for edge_type in FANOUT_1HOP}
 
 
 @pytest.fixture
@@ -109,13 +126,7 @@ class TestHeteroCsrGraph:
 
     def test_edge_types(self, reddit_graph: HeteroCsrGraph) -> None:
         types = reddit_graph.edge_types()
-        expected = {
-            ("user", "votes", "post"),
-            ("user", "writes", "comment"),
-            ("comment", "reply_to", "comment"),
-            ("post", "belongs_to", "subreddit"),
-        }
-        assert set(types) == expected
+        assert set(types) == set(FANOUT_1HOP)
 
     def test_node_counts(self, reddit_graph: HeteroCsrGraph) -> None:
         assert reddit_graph.num_nodes("user") == 100
@@ -125,13 +136,14 @@ class TestHeteroCsrGraph:
 
     def test_total_counts(self, reddit_graph: HeteroCsrGraph) -> None:
         assert reddit_graph.total_nodes() == 1650
-        assert reddit_graph.total_edges() == 7000
+        assert reddit_graph.total_edges() == 12500
 
     def test_edge_counts(self, reddit_graph: HeteroCsrGraph) -> None:
         assert reddit_graph.num_edges("user", "votes", "post") == 2000
         assert reddit_graph.num_edges("user", "writes", "comment") == 3000
         assert reddit_graph.num_edges("comment", "reply_to", "comment") == 1500
         assert reddit_graph.num_edges("post", "belongs_to", "subreddit") == 500
+        assert reddit_graph.num_edges("post", "rev_votes", "user") == 2000
 
     def test_unknown_node_type_raises(self, reddit_graph: HeteroCsrGraph) -> None:
         with pytest.raises(KeyError, match="unknown node type"):
@@ -175,51 +187,29 @@ class TestHeteroCsrGraph:
 
 class TestHeteroSampler:
     def test_basic_sampling(self, reddit_graph: HeteroCsrGraph) -> None:
-        config = HeteroSamplingConfig(
-            num_neighbors={
-                ("user", "votes", "post"): [10],
-                ("user", "writes", "comment"): [5],
-                ("comment", "reply_to", "comment"): [3],
-                ("post", "belongs_to", "subreddit"): [2],
-            },
-        )
+        config = HeteroSamplingConfig(num_neighbors=FANOUT_1HOP)
         sampler = HeteroNeighborSampler(reddit_graph, config)
         seeds = np.array([0, 1, 2], dtype=np.uint32)
         sub = sampler.sample("user", seeds)
 
         assert sub.seed_type == "user"
         assert list(sub.seeds) == [0, 1, 2]
-        # Should have sampled users (seeds) + posts + comments
         assert len(sub.nodes("user")) >= 3  # at least the seeds
+        assert len(sub.nodes("post")) > 0
 
     def test_two_hop_sampling(self, reddit_graph: HeteroCsrGraph) -> None:
-        config = HeteroSamplingConfig(
-            num_neighbors={
-                ("user", "votes", "post"): [5, 3],
-                ("user", "writes", "comment"): [5, 3],
-                ("comment", "reply_to", "comment"): [2, 2],
-                ("post", "belongs_to", "subreddit"): [2, 2],
-            },
-        )
+        config = HeteroSamplingConfig(num_neighbors=fanout(5, 3))
         sampler = HeteroNeighborSampler(reddit_graph, config)
         seeds = np.array([0, 1, 2, 3, 4], dtype=np.uint32)
         sub = sampler.sample("user", seeds)
 
-        # 2-hop from users should reach posts, comments, and subreddits
         assert len(sub.nodes("user")) >= 5
         assert len(sub.nodes("post")) > 0
-        # Subreddits reached via user->votes->post->belongs_to->subreddit (2 hops)
+        # Subreddits reached via user <- rev_votes <- post <- rev_belongs_to.
         assert len(sub.nodes("subreddit")) > 0
 
     def test_edge_index_local_shape(self, reddit_graph: HeteroCsrGraph) -> None:
-        config = HeteroSamplingConfig(
-            num_neighbors={
-                ("user", "votes", "post"): [10],
-                ("user", "writes", "comment"): [5],
-                ("comment", "reply_to", "comment"): [3],
-                ("post", "belongs_to", "subreddit"): [2],
-            },
-        )
+        config = HeteroSamplingConfig(num_neighbors=fanout(5, 3))
         sampler = HeteroNeighborSampler(reddit_graph, config)
         sub = sampler.sample("user", np.array([0, 1], dtype=np.uint32))
 
@@ -229,34 +219,61 @@ class TestHeteroSampler:
             assert ei.shape[0] == 2
             # Local indices should be < number of sampled nodes of that type
             if ei.shape[1] > 0:
-                src_nodes = sub.nodes(src)
-                dst_nodes = sub.nodes(dst)
-                assert ei[0].max() < len(src_nodes)
-                assert ei[1].max() < len(dst_nodes)
+                assert ei[0].max() < len(sub.nodes(src))
+                assert ei[1].max() < len(sub.nodes(dst))
+
+    def test_edges_flow_toward_seeds(self, reddit_graph: HeteroCsrGraph) -> None:
+        """Hop-1 edges end at seeds; nothing points out of them."""
+        config = HeteroSamplingConfig(num_neighbors=FANOUT_1HOP, seed=3)
+        sampler = HeteroNeighborSampler(reddit_graph, config)
+        sub = sampler.sample("user", np.array([4, 7, 9], dtype=np.uint32))
+
+        ei = sub.edge_index_local("post", "rev_votes", "user")
+        assert ei.shape[1] > 0
+        assert set(ei[1].tolist()) <= set(sub.seed_indices.tolist())
+        assert sub.edge_index_local("user", "votes", "post").shape[1] == 0
+
+    def test_edges_keep_stored_direction(self) -> None:
+        """Each sampled edge is a stored edge of its relation, source first."""
+        posts = np.arange(4, dtype=np.uint32)
+        voters = posts % 2  # post p was voted on by user p % 2
+        g = HeteroCsrGraph.from_edge_arrays(
+            node_types={"user": 2, "post": 4},
+            edge_types=[
+                ("user", "votes", "post", voters, posts),
+                ("post", "rev_votes", "user", posts, voters),
+            ],
+        )
+        config = HeteroSamplingConfig(
+            num_neighbors={("post", "rev_votes", "user"): [10], ("user", "votes", "post"): [10]},
+            seed=3,
+        )
+        sub = HeteroNeighborSampler(g, config).sample("user", np.array([1], dtype=np.uint32))
+        ei = sub.edge_index_local("post", "rev_votes", "user")
+        post_ids, user_ids = sub.nodes("post"), sub.nodes("user")
+        edges = {
+            (int(post_ids[p]), int(user_ids[u]))
+            for p, u in zip(ei[0].tolist(), ei[1].tolist(), strict=True)
+        }
+        assert edges == {(1, 1), (3, 1)}
 
     def test_empty_seeds(self, reddit_graph: HeteroCsrGraph) -> None:
-        config = HeteroSamplingConfig(
-            num_neighbors={
-                ("user", "votes", "post"): [10],
-                ("user", "writes", "comment"): [5],
-                ("comment", "reply_to", "comment"): [3],
-                ("post", "belongs_to", "subreddit"): [2],
-            },
-        )
+        config = HeteroSamplingConfig(num_neighbors=FANOUT_1HOP)
         sampler = HeteroNeighborSampler(reddit_graph, config)
         sub = sampler.sample("user", np.array([], dtype=np.uint32))
         assert len(sub.seeds) == 0
 
+    def test_out_of_range_seed_raises(self, reddit_graph: HeteroCsrGraph) -> None:
+        from aethergraph._core import SamplingError
+
+        config = HeteroSamplingConfig(num_neighbors=FANOUT_1HOP)
+        sampler = HeteroNeighborSampler(reddit_graph, config)
+        # 100 users: 100 is out of range even though it fits other types.
+        with pytest.raises(SamplingError, match="out of range"):
+            sampler.sample("user", np.array([0, 100], dtype=np.int64))
+
     def test_reproducible_with_seed(self, reddit_graph: HeteroCsrGraph) -> None:
-        config = HeteroSamplingConfig(
-            num_neighbors={
-                ("user", "votes", "post"): [10],
-                ("user", "writes", "comment"): [5],
-                ("comment", "reply_to", "comment"): [3],
-                ("post", "belongs_to", "subreddit"): [2],
-            },
-            seed=123,
-        )
+        config = HeteroSamplingConfig(num_neighbors=FANOUT_1HOP, seed=123)
         seeds = np.array([0, 1, 2], dtype=np.uint32)
 
         s1 = HeteroNeighborSampler(reddit_graph, config)
@@ -269,7 +286,7 @@ class TestHeteroSampler:
             np.testing.assert_array_equal(sub1.nodes(nt), sub2.nodes(nt))
 
     def test_single_edge_type(self) -> None:
-        """Graph with only one edge type."""
+        """Graph with only one edge type, sampled from its destination type."""
         g = HeteroCsrGraph.from_edge_arrays(
             node_types={"user": 50, "post": 100},
             edge_types=[
@@ -286,9 +303,12 @@ class TestHeteroSampler:
             num_neighbors={("user", "likes", "post"): [5]},
         )
         sampler = HeteroNeighborSampler(g, config)
-        sub = sampler.sample("user", np.array([0, 1, 2], dtype=np.uint32))
-        assert len(sub.nodes("user")) >= 3
-        assert len(sub.nodes("post")) > 0
+        sub = sampler.sample("post", np.array([0, 1, 2], dtype=np.uint32))
+        assert len(sub.nodes("post")) >= 3
+        assert len(sub.nodes("user")) > 0
+        # A type no relation points into gains no neighbors.
+        users_only = sampler.sample("user", np.array([0, 1], dtype=np.uint32))
+        assert len(users_only.nodes("post")) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +337,7 @@ class TestHeteroGraphPython:
     def test_properties(self, reddit_hetero_graph: HeteroGraph) -> None:
         g = reddit_hetero_graph
         assert g.total_nodes == 1650
-        assert g.total_edges == 7000
+        assert g.total_edges == 12500
 
 
 # ---------------------------------------------------------------------------
@@ -335,12 +355,7 @@ class TestHeteroNeighborLoader:
 
         loader = HeteroNeighborLoader(
             reddit_hetero_graph,
-            num_neighbors={
-                ("user", "votes", "post"): [10, 5],
-                ("user", "writes", "comment"): [5, 3],
-                ("comment", "reply_to", "comment"): [3, 2],
-                ("post", "belongs_to", "subreddit"): [2, 1],
-            },
+            num_neighbors=fanout(10, 5),
             input_nodes=("user", torch.arange(20)),
             batch_size=10,
         )
@@ -353,10 +368,29 @@ class TestHeteroNeighborLoader:
             # Seed type should have nodes
             assert batch["user"].num_nodes > 0
             assert hasattr(batch["user"], "n_id")
-            # Should have edge indices
+            # Hop 1 draws posts into the seeds; hop 2 draws users into posts.
+            assert ("post", "rev_votes", "user") in batch.edge_types
             assert ("user", "votes", "post") in batch.edge_types
-            ei = batch["user", "votes", "post"].edge_index
+            ei = batch["post", "rev_votes", "user"].edge_index
             assert ei.shape[0] == 2
+
+    def test_seeds_receive_messages(self, reddit_hetero_graph: HeteroGraph) -> None:
+        """Every hop-1 edge into the seed type ends at a seed (PyG flow)."""
+        import torch
+
+        from aethergraph.pytorch import HeteroNeighborLoader
+
+        loader = HeteroNeighborLoader(
+            reddit_hetero_graph,
+            num_neighbors=FANOUT_1HOP,
+            input_nodes=("user", torch.arange(10)),
+            batch_size=10,
+        )
+        batch = next(iter(loader))
+        user = batch["user"]
+        ei = batch["post", "rev_votes", "user"].edge_index
+        assert ei.shape[1] > 0
+        assert set(ei[1].tolist()) <= set(user.input_id.tolist())
 
     def test_features_attached(
         self,
@@ -369,12 +403,7 @@ class TestHeteroNeighborLoader:
 
         loader = HeteroNeighborLoader(
             reddit_hetero_graph,
-            num_neighbors={
-                ("user", "votes", "post"): [5],
-                ("user", "writes", "comment"): [3],
-                ("comment", "reply_to", "comment"): [2],
-                ("post", "belongs_to", "subreddit"): [1],
-            },
+            num_neighbors=fanout(5),
             input_nodes=("user", torch.arange(10)),
             batch_size=10,
             features=reddit_hetero_features,
@@ -397,12 +426,7 @@ class TestHeteroNeighborLoader:
 
         loader = HeteroNeighborLoader(
             reddit_hetero_graph,
-            num_neighbors={
-                ("user", "votes", "post"): [5],
-                ("user", "writes", "comment"): [3],
-                ("comment", "reply_to", "comment"): [2],
-                ("post", "belongs_to", "subreddit"): [1],
-            },
+            num_neighbors=fanout(5),
             input_nodes=("user", torch.arange(50)),
             batch_size=16,
         )
@@ -420,12 +444,7 @@ class TestHeteroNeighborLoader:
 
         loader = HeteroNeighborLoader(
             reddit_hetero_graph,
-            num_neighbors={
-                ("user", "votes", "post"): [5],
-                ("user", "writes", "comment"): [3],
-                ("comment", "reply_to", "comment"): [2],
-                ("post", "belongs_to", "subreddit"): [1],
-            },
+            num_neighbors=fanout(5),
             input_nodes=("user", torch.arange(50)),
             batch_size=10,
             shuffle=True,
@@ -448,12 +467,7 @@ class TestHeteroNeighborLoader:
 
         loader = HeteroNeighborLoader(
             reddit_hetero_graph,
-            num_neighbors={
-                ("user", "votes", "post"): [5],
-                ("user", "writes", "comment"): [3],
-                ("comment", "reply_to", "comment"): [2],
-                ("post", "belongs_to", "subreddit"): [1],
-            },
+            num_neighbors=fanout(5),
             input_nodes=("user", torch.arange(60)),
             batch_size=10,
             shuffle=False,
@@ -463,15 +477,19 @@ class TestHeteroNeighborLoader:
         batches = list(loader)
         assert len(batches) == 6
 
-        # Delivery order across the pool is unordered; each subgraph carries
-        # its own seeds. input_id is local indices (homo contract); recover
-        # globals via n_id[input_id].
+        # Delivery order across the pool is unordered; each batch's input_id
+        # still names its own seeds' positions in input_nodes (PyG), and
+        # seed_index their local indices into n_id.
         seen: list[int] = []
+        positions: list[int] = []
         for batch in batches:
-            n_id = batch["user"].n_id
-            input_id = batch["user"].input_id
-            seen.extend(n_id[input_id].tolist())
+            u = batch["user"]
+            seeds = u.n_id[u.seed_index]
+            seen.extend(seeds.tolist())
+            positions.extend(u.input_id.tolist())
+            assert u.input_id.tolist() == seeds.tolist()  # input_nodes is arange(60)
         assert sorted(seen) == list(range(60))
+        assert sorted(positions) == list(range(60))
 
     def test_pin_memory(self, reddit_hetero_graph: HeteroGraph) -> None:
         import torch
@@ -483,12 +501,7 @@ class TestHeteroNeighborLoader:
 
         loader = HeteroNeighborLoader(
             reddit_hetero_graph,
-            num_neighbors={
-                ("user", "votes", "post"): [5],
-                ("user", "writes", "comment"): [3],
-                ("comment", "reply_to", "comment"): [2],
-                ("post", "belongs_to", "subreddit"): [1],
-            },
+            num_neighbors=fanout(5),
             input_nodes=("user", torch.arange(10)),
             batch_size=10,
             pin_memory=True,
@@ -505,12 +518,7 @@ class TestHeteroNeighborLoader:
 
         loader = HeteroNeighborLoader(
             reddit_hetero_graph,
-            num_neighbors={
-                ("user", "votes", "post"): [5],
-                ("user", "writes", "comment"): [3],
-                ("comment", "reply_to", "comment"): [2],
-                ("post", "belongs_to", "subreddit"): [1],
-            },
+            num_neighbors=fanout(5),
             input_nodes=("user", torch.tensor([1, 1, 2])),
             batch_size=3,
             shuffle=False,
@@ -518,10 +526,10 @@ class TestHeteroNeighborLoader:
         batch = next(iter(loader))
         u = batch["user"]
         assert u.batch_size == 3
-        assert len(u.input_id) == 3
+        assert u.input_id.tolist() == [0, 1, 2]
         # Locals: first two seeds collide → same local index.
-        assert u.input_id[0].item() == u.input_id[1].item()
-        assert u.n_id[u.input_id].tolist() == [1, 1, 2]
+        assert u.seed_index[0].item() == u.seed_index[1].item()
+        assert u.n_id[u.seed_index].tolist() == [1, 1, 2]
 
     def test_rejects_empty_and_negative_fanout(self, reddit_hetero_graph: HeteroGraph) -> None:
         import torch
@@ -561,18 +569,12 @@ class TestHeteroNeighborLoader:
         from aethergraph.pytorch import HeteroNeighborLoader
 
         g = reddit_hetero_graph
-        fanout = {
-            ("user", "votes", "post"): [5, 3],
-            ("user", "writes", "comment"): [3, 2],
-            ("comment", "reply_to", "comment"): [2, 2],
-            ("post", "belongs_to", "subreddit"): [1, 1],
-        }
         seeds = torch.arange(40)
 
         def epoch(workers: int) -> list[tuple[tuple[int, ...], ...]]:
             ld = HeteroNeighborLoader(
                 g,
-                num_neighbors=fanout,
+                num_neighbors=fanout(3, 2),
                 input_nodes=("user", seeds),
                 batch_size=8,
                 seed=42,
@@ -583,7 +585,7 @@ class TestHeteroNeighborLoader:
             out: list[tuple[tuple[int, ...], ...]] = []
             for batch in ld:
                 u = batch["user"]
-                globals_ = tuple(u.n_id[u.input_id].tolist())
+                globals_ = tuple(u.n_id[u.seed_index].tolist())
                 n_id = tuple(u.n_id.tolist())
                 out.append((globals_, n_id))
             return out
@@ -591,3 +593,98 @@ class TestHeteroNeighborLoader:
         a = epoch(1)
         assert a == epoch(1)
         assert a == epoch(4)
+
+    def test_seeded_epochs_resample_neighborhoods(self, reddit_hetero_graph: HeteroGraph) -> None:
+        """A seeded loader draws fresh neighborhoods every epoch, reproducibly."""
+        import torch
+
+        from aethergraph.pytorch import HeteroNeighborLoader
+
+        def make() -> HeteroNeighborLoader:
+            return HeteroNeighborLoader(
+                reddit_hetero_graph,
+                num_neighbors={("post", "rev_votes", "user"): [2]},
+                input_nodes=("user", torch.arange(40)),
+                batch_size=40,
+                seed=5,
+                shuffle=False,
+            )
+
+        def post_ids(ld: HeteroNeighborLoader) -> list[int]:
+            return next(iter(ld))["post"].n_id.tolist()
+
+        loader = make()
+        first, second = post_ids(loader), post_ids(loader)
+        assert first != second
+        replay = make()
+        assert post_ids(replay) == first
+        assert post_ids(replay) == second
+
+
+class TestHeteroRawLoader:
+    """The `_core.HeteroNeighborLoader` pipeline contract."""
+
+    def test_next_batch_echoes_batch_idx_and_reuses_across_epochs(
+        self, reddit_hetero_graph: HeteroGraph
+    ) -> None:
+        from aethergraph._core import HeteroNeighborLoader, HeteroSamplingConfig
+
+        cfg = HeteroSamplingConfig({("post", "rev_votes", "user"): [2]}, seed=1)
+        with HeteroNeighborLoader(reddit_hetero_graph.csr, cfg, "user", 2, 3) as loader:
+            for _epoch in range(2):
+                for i in range(6):
+                    loader.submit(batch_idx=i, seeds=[i])
+                got = [loader.next_batch() for _ in range(6)]
+                assert [g[0] for g in got if g is not None] == list(range(6))
+        assert loader.next() is None
+
+    def test_seed_past_its_type_fails_at_submit(self, reddit_hetero_graph: HeteroGraph) -> None:
+        """Seeds are checked against the seed type's count, not the graph's."""
+        from aethergraph._core import HeteroNeighborLoader, HeteroSamplingConfig, SamplingError
+
+        cfg = HeteroSamplingConfig({("post", "rev_votes", "user"): [2]})
+        with HeteroNeighborLoader(reddit_hetero_graph.csr, cfg, "user") as loader:
+            # 100 users, 500 posts: 150 is a valid post but not a valid user.
+            with pytest.raises(SamplingError, match="out of range"):
+                loader.submit(0, [150])
+            loader.submit(1, [99])
+            got = loader.next_batch()
+            assert got is not None and got[0] == 1
+
+    def test_duplicate_edge_type_raises_value_error(self) -> None:
+        src = np.array([0], dtype=np.uint32)
+        with pytest.raises(ValueError, match="duplicate edge type"):
+            HeteroGraph.from_edge_arrays(
+                node_types={"a": 2},
+                edge_types=[("a", "r", "a", src, src), ("a", "r", "a", src, src)],
+            )
+
+    def test_too_many_edge_types_raises_value_error(self) -> None:
+        src = np.array([0], dtype=np.uint32)
+        with pytest.raises(ValueError, match="too many edge types"):
+            HeteroGraph.from_edge_arrays(
+                node_types={"a": 2},
+                edge_types=[("a", f"r{i}", "a", src, src) for i in range(256)],
+            )
+
+    def test_endpoint_past_its_type_raises_value_error(self) -> None:
+        src = np.array([0], dtype=np.uint32)
+        dst = np.array([4], dtype=np.uint32)
+        with pytest.raises(ValueError, match=r"\(a, r, b\)"):
+            HeteroCsrGraph.from_edge_arrays(
+                node_types={"a": 1, "b": 4},
+                edge_types=[("a", "r", "b", src, dst)],
+            )
+
+    def test_lopsided_edge_type_samples_far_destinations(self) -> None:
+        """A 2-user x 200k-item relation reaches the highest item ids."""
+        users = np.array([0, 1], dtype=np.uint32)
+        items = np.array([7, 199_999], dtype=np.uint32)
+        g = HeteroCsrGraph.from_edge_arrays(
+            node_types={"user": 2, "item": 200_000},
+            edge_types=[("user", "buys", "item", users, items)],
+        )
+        assert g.num_edges("user", "buys", "item") == 2
+        config = HeteroSamplingConfig(num_neighbors={("user", "buys", "item"): [4]}, seed=0)
+        sub = HeteroNeighborSampler(g, config).sample("item", np.array([199_999], dtype=np.uint32))
+        assert sub.nodes("user").tolist() == [1]

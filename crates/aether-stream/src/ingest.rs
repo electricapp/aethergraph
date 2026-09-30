@@ -9,8 +9,10 @@
 use crate::umem::Umem;
 use crate::xdp::rings::RxTxDesc;
 use crate::xdp::socket::XdpSocket;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// An inbound frame received from the NIC.
 #[derive(Debug)]
@@ -47,14 +49,16 @@ impl Default for IngestConfig {
 
 /// Run the ingestion loop for a single NIC queue.
 ///
-/// This function does not return — it busy-polls in a loop until the
-/// channel is disconnected (receiver dropped).
+/// Busy-polls until `stop` is set or a send finds the channel disconnected
+/// (receiver dropped). An idle queue never sends, so a dropped receiver
+/// alone does not stop it: `stop` is what ends an idle loop.
 ///
 /// # Arguments
 /// * `socket` - AF_XDP socket bound to a NIC queue
 /// * `umem` - Shared UMEM frame pool
 /// * `tx` - Channel for sending received frames to processing threads
 /// * `config` - Batching configuration
+/// * `stop` - Checked every iteration; set it to end the loop
 ///
 /// Core pinning is done by the caller ([`spawn_ingest_threads`]) before this
 /// loop starts, not here.
@@ -63,6 +67,7 @@ pub fn ingest_loop(
     umem: &Arc<Umem>,
     tx: &Sender<Vec<InboundFrame>>,
     config: &IngestConfig,
+    stop: &AtomicBool,
 ) {
     // Frame size is a power of two (asserted by Umem::new); shift/mask
     // replace the u64 divide + modulo the loop would otherwise pay per
@@ -71,7 +76,7 @@ pub fn ingest_loop(
     let frame_mask = (umem.frame_size() - 1) as u64;
     let mut completed_scratch: Vec<usize> = Vec::with_capacity(config.fill_batch_size as usize);
 
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         // 1. Drain completion ring → return frames to UMEM
         drain_completions(socket, umem, &mut completed_scratch, frame_shift);
 
@@ -136,19 +141,32 @@ pub fn ingest_loop(
             continue;
         }
 
-        // Bounded channel: `send` BLOCKS when the queue is full — that is
-        // the intended backpressure (this pinned busy-poll thread parks
-        // until a consumer drains). `Err` only means the receiver
-        // disconnected: release the in-hand frames and shut down. Batches
-        // already inside the channel are dropped at shutdown.
-        if let Err(returned) = tx.send(frames) {
-            completed_scratch.clear();
-            completed_scratch.extend(returned.0.iter().map(|f| f.umem_idx));
-            umem.release_frames(&completed_scratch);
-            return; // receiver gone, shut down
+        // Bounded channel: a full queue BLOCKS this thread — that is the
+        // intended backpressure (the pinned busy-poll thread parks until a
+        // consumer drains) — but in slices, so a stop request still lands.
+        // A disconnected receiver or a stop releases the in-hand frames and
+        // shuts down; batches already inside the channel are dropped then.
+        let mut pending = frames;
+        loop {
+            match tx.send_timeout(pending, SEND_STOP_POLL) {
+                Ok(()) => break,
+                Err(SendTimeoutError::Timeout(back)) if !stop.load(Ordering::Relaxed) => {
+                    pending = back;
+                }
+                Err(SendTimeoutError::Timeout(back) | SendTimeoutError::Disconnected(back)) => {
+                    completed_scratch.clear();
+                    completed_scratch.extend(back.iter().map(|f| f.umem_idx));
+                    umem.release_frames(&completed_scratch);
+                    return;
+                }
+            }
         }
     }
 }
+
+/// How long a send blocked on a full channel waits before re-checking the
+/// stop flag.
+const SEND_STOP_POLL: Duration = Duration::from_millis(10);
 
 /// Drain the completion ring and return frames to the UMEM pool in one
 /// batched free-list splice (one CAS per drain instead of one per frame).
@@ -263,32 +281,59 @@ impl std::error::Error for SpawnError {
     }
 }
 
-/// A running ingest pool: the frame receiver plus one join handle per
-/// spawned thread.
-pub type IngestHandles = (
-    crossbeam_channel::Receiver<Vec<InboundFrame>>,
-    Vec<std::thread::JoinHandle<()>>,
-);
+/// A running ingest pool: the frame receiver and the threads feeding it.
+///
+/// Dropping the pool raises the stop flag, which every thread observes
+/// within one poll (idle or parked on a full channel), and joins them.
+pub struct IngestPool {
+    rx: Receiver<Vec<InboundFrame>>,
+    stop: Arc<AtomicBool>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl IngestPool {
+    /// Inbound frame batches from every queue.
+    pub fn receiver(&self) -> &Receiver<Vec<InboundFrame>> {
+        &self.rx
+    }
+
+    /// Stop and join every thread. Equivalent to dropping the pool.
+    pub fn shutdown(self) {}
+}
+
+impl Drop for IngestPool {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            if handle.join().is_err() {
+                tracing::error!("ingestion thread panicked");
+            }
+        }
+    }
+}
 
 /// Spawn ingestion threads — one per socket, each pinned to a core.
 ///
-/// Returns the crossbeam receiver for inbound frames along with the join
-/// handles. On thread spawn failure, already-spawned threads are not cancelled
-/// (they keep polling) but the function returns the error so the caller can
-/// decide.
+/// On thread spawn failure the threads already spawned are stopped and
+/// joined before the error returns.
 pub fn spawn_ingest_threads(
     mut sockets: Vec<XdpSocket>,
     umem: Arc<Umem>,
     core_ids: &[usize],
     config: IngestConfig,
-) -> Result<IngestHandles, SpawnError> {
+) -> Result<IngestPool, SpawnError> {
     let (tx, rx) = crossbeam_channel::bounded(sockets.len() * 1024);
-    let mut handles = Vec::with_capacity(sockets.len());
+    let mut pool = IngestPool {
+        rx,
+        stop: Arc::new(AtomicBool::new(false)),
+        handles: Vec::with_capacity(sockets.len()),
+    };
 
     for (i, mut socket) in sockets.drain(..).enumerate() {
         let umem = umem.clone();
         let tx = tx.clone();
         let config = config.clone();
+        let stop = Arc::clone(&pool.stop);
         let core_id = core_ids.get(i).copied();
 
         let handle = std::thread::Builder::new()
@@ -300,12 +345,13 @@ pub fn spawn_ingest_threads(
                     tracing::info!(core = id, queue = i, "Ingestion thread pinned to core");
                 }
 
-                ingest_loop(&mut socket, &umem, &tx, &config);
+                ingest_loop(&mut socket, &umem, &tx, &config, &stop);
                 tracing::info!(queue = i, "Ingestion thread exiting");
             })
+            // Dropping `pool` on this path stops and joins what spawned.
             .map_err(SpawnError::Thread)?;
-        handles.push(handle);
+        pool.handles.push(handle);
     }
 
-    Ok((rx, handles))
+    Ok(pool)
 }

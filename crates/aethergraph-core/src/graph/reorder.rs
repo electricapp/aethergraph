@@ -1,588 +1,370 @@
 //! Graph reordering for improved cache locality in GNN training.
 //!
-//! Implements Rabbit Order (Arai et al., IPDPS 2016) with a parallel
-//! merge phase using lock-free concurrent union-find.
+//! Implements Rabbit Order (Arai et al., IPDPS 2016): modularity-driven
+//! incremental aggregation builds a community dendrogram, and a depth-first
+//! walk of it emits a permutation that keeps every community — at every
+//! level of the hierarchy — contiguous.
 //!
-//! All phases are parallelized except the dendrogram construction:
-//! 1. Each node picks its lowest-degree neighbor (parallel over V)
-//! 2. Union-find merges (parallel over E) — logs merge events
-//! 3. Build dendrogram from merge log + sequential traversal (O(V))
+//! 1. Degrees and the in-edge transpose are built in parallel; the graph is
+//!    treated as undirected (an arc in either direction joins its
+//!    endpoints), so directed inputs cluster on both edge directions.
+//! 2. Vertices are visited in ascending degree order. Each one aggregates
+//!    the edges of everything already merged into it, then merges into the
+//!    neighbor community with the largest modularity gain — only while that
+//!    gain is positive. Merging stops once no neighbor improves modularity,
+//!    so communities do not collapse into connected components.
+//! 3. A pre-order walk of the dendrogram (each community, then its merged
+//!    children in merge order) emits the permutation.
+//!
+//! The merge phase is sequential and fully deterministic: the same graph
+//! always yields the same permutation.
 
-use crate::graph::csr::{EdgeOffset, Graph, NodeId};
+use crate::graph::csr::{
+    EdgeOffset, Graph, GraphValidationMode, NodeId, alloc_hinted, as_atomic, par_fill_rows,
+};
+use anyhow::Result;
 use rayon::prelude::*;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 
-struct DendrogramNode {
-    left: u32,
-    right: u32,
+/// Marks "no vertex" in the dendrogram's child lists. Never a valid node id
+/// (`MAX_NODES` keeps ids below `u32::MAX`).
+const NONE: u32 = u32::MAX;
+
+/// Rabbit Order dendrogram: each vertex either tops a community or was
+/// merged into another.
+struct Dendrogram {
+    /// `parent[v] == v` for a top-level community; otherwise the community
+    /// `v` merged into. Path-compressed as merges are resolved.
+    parent: Vec<u32>,
+    /// First child merged into each vertex, `NONE` if none.
+    first_child: Vec<u32>,
+    /// Next child of the same parent, `NONE` at the end of the list.
+    next_sibling: Vec<u32>,
 }
 
-/// Lock-free concurrent union-find with path halving and union by id.
-///
-/// The link direction is chosen purely from the immutable node ids — the
-/// smaller id is always linked under the larger id. Because that choice is a
-/// pure function of the unordered pair `{ra, rb}`, two threads unioning the
-/// same two roots concurrently always pick the *same* direction, so they can
-/// never install opposite links. That makes the parent forest provably
-/// acyclic, which is what keeps `find`'s loop guaranteed to terminate.
-/// Union-by-rank cannot offer the same guarantee here without a lock: rank
-/// reads/increments are not atomic with the linking CAS, so concurrent unions
-/// can pick opposing directions and form a cycle.
-struct ConcurrentUnionFind {
-    parent: Vec<AtomicU32>,
-}
-
-impl ConcurrentUnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n as u32).map(AtomicU32::new).collect(),
+impl Dendrogram {
+    /// Top-level community of `v`, compressing the path behind it.
+    fn root(parent: &mut [u32], v: u32) -> u32 {
+        let mut r = v;
+        while parent[r as usize] != r {
+            r = parent[r as usize];
         }
+        let mut x = v;
+        while parent[x as usize] != r {
+            let next = parent[x as usize];
+            parent[x as usize] = r;
+            x = next;
+        }
+        r
     }
 
-    #[inline]
-    fn find(&self, mut x: u32) -> u32 {
-        loop {
-            let p = self.parent[x as usize].load(Ordering::Relaxed);
-            if p == x {
-                return x;
+    /// Pre-order walk: each community, then its children in merge order.
+    /// Every vertex belongs to exactly one tree, so the output is a
+    /// permutation of `0..n`.
+    fn permutation(&self) -> Vec<NodeId> {
+        let n = self.parent.len();
+        let mut perm = Vec::with_capacity(n);
+        let mut stack: Vec<u32> = Vec::with_capacity(64);
+        for root in 0..n as u32 {
+            if self.parent[root as usize] != root {
+                continue;
             }
-            let gp = self.parent[p as usize].load(Ordering::Relaxed);
-            let _ = self.parent[x as usize].compare_exchange_weak(
-                p,
-                gp,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-            x = gp;
-        }
-    }
-
-    /// Lock-free union. Returns `Some((winner, loser))` if a merge happened,
-    /// `None` if already in the same set. `winner` is the surviving
-    /// representative (the larger root id); `loser` is linked under it.
-    #[inline]
-    fn union(&self, a: u32, b: u32) -> Option<(u32, u32)> {
-        loop {
-            let ra = self.find(a);
-            let rb = self.find(b);
-            if ra == rb {
-                return None;
-            }
-
-            // Link smaller id under larger id. This direction is a pure
-            // function of the pair, so concurrent unions can never create a
-            // cycle (see the type-level comment).
-            let (winner, loser) = if ra < rb { (rb, ra) } else { (ra, rb) };
-
-            match self.parent[loser as usize].compare_exchange(
-                loser,
-                winner,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some((winner, loser)),
-                Err(_) => continue,
+            perm.push(root);
+            stack.push(self.first_child[root as usize]);
+            while let Some(top) = stack.last_mut() {
+                let c = *top;
+                if c == NONE {
+                    stack.pop();
+                    continue;
+                }
+                *top = self.next_sibling[c as usize];
+                perm.push(c);
+                stack.push(self.first_child[c as usize]);
             }
         }
+        debug_assert_eq!(perm.len(), n);
+        perm
     }
-}
 
-/// Merge log from Rabbit Order phases 1+2.
-struct RabbitMergeLog {
-    merges: Vec<(u32, u32)>,
+    /// Dense community ids, numbered by each community's first node id.
+    fn partitions(&mut self) -> Vec<u32> {
+        let n = self.parent.len();
+        let mut id_of_root = vec![NONE; n];
+        let mut next = 0u32;
+        let mut out = Vec::with_capacity(n);
+        for v in 0..n as u32 {
+            let r = Self::root(&mut self.parent, v) as usize;
+            if id_of_root[r] == NONE {
+                id_of_root[r] = next;
+                next += 1;
+            }
+            out.push(id_of_root[r]);
+        }
+        out
+    }
 }
 
 impl Graph {
-    /// Run Rabbit Order merge phases (parallel).
-    ///
-    /// Phase 1: each node picks lowest-degree neighbor.
-    /// Phase 2: merge remaining cross-community edges.
-    /// Returns the ordered merge log for dendrogram/partition construction.
-    fn rabbit_merge(&self) -> Option<RabbitMergeLog> {
+    /// The in-edge transpose: `(offsets, sources)` with `sources[offsets[v]
+    /// .. offsets[v + 1]]` the sources of arcs into `v`, in ascending
+    /// source order.
+    fn transpose(&self) -> (Vec<EdgeOffset>, Vec<NodeId>) {
         let n = self.num_nodes();
+        let view = self.csr_view();
+        let mut offsets: Vec<EdgeOffset> = alloc_hinted(n + 1);
+        {
+            let counts = as_atomic(&mut offsets[1..]);
+            view.edges().par_iter().for_each(|&d| {
+                counts[d as usize].fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        for i in 1..=n {
+            offsets[i] += offsets[i - 1];
+        }
+        // Backward scatter: offsets[v + 1] starts as row v's end and each
+        // arc claims the slot below it, leaving the row's start there.
+        let mut sources: Vec<NodeId> = alloc_hinted(self.num_edges());
+        for u in (0..n as NodeId).rev() {
+            for &d in view.neighbors(u).iter().rev() {
+                offsets[d as usize + 1] -= 1;
+                sources[offsets[d as usize + 1] as usize] = u;
+            }
+        }
+        offsets.copy_within(1.., 0);
+        offsets[n] = self.num_edges() as EdgeOffset;
+        (offsets, sources)
+    }
+
+    /// Rabbit Order community detection.
+    ///
+    /// Needs a homogeneous graph with every destination in range; proves
+    /// the latter once (a no-op on an already `Full` graph).
+    fn rabbit_dendrogram(&self) -> Result<Dendrogram> {
+        anyhow::ensure!(
+            self.is_homogeneous(),
+            "Rabbit Order needs sources and destinations in one id space \
+             (num_nodes {}, destination space {})",
+            self.num_nodes(),
+            self.num_dst_nodes()
+        );
+        self.validate_with_mode(GraphValidationMode::Full)?;
+
+        let n = self.num_nodes();
+        let mut dendro = Dendrogram {
+            parent: (0..n as u32).collect(),
+            first_child: vec![NONE; n],
+            next_sibling: vec![NONE; n],
+        };
         if n <= 1 || self.num_edges() == 0 {
-            return None;
+            return Ok(dendro);
         }
 
-        let degrees: Vec<u32> = (0..n)
-            .into_par_iter()
-            .map(|i| self.degree(i as NodeId) as u32)
-            .collect();
+        let view = self.csr_view();
+        let (in_offsets, in_sources) = self.transpose();
+        let in_neighbors = |v: u32| {
+            &in_sources[in_offsets[v as usize] as usize..in_offsets[v as usize + 1] as usize]
+        };
 
-        let m = self.num_edges() as u64;
-
-        // Phase 1: Each node picks lowest-degree neighbor (parallel).
-        let best_nbr: Vec<u32> = (0..n)
+        // Undirected degree, self-loops excluded. Becomes the community
+        // degree as vertices merge.
+        let mut degree: Vec<u64> = (0..n as u32)
             .into_par_iter()
-            .map(|u| {
-                let neighbors = self.neighbors(u as NodeId);
-                if neighbors.is_empty() {
-                    return u32::MAX;
-                }
-                let max_deg_v = m / u64::from(degrees[u]).max(1);
-                let mut best_v = u32::MAX;
-                let mut best_deg = u32::MAX;
-                for &v in neighbors {
-                    let dv = degrees[v as usize];
-                    if u64::from(dv) < max_deg_v && dv < best_deg {
-                        best_deg = dv;
-                        best_v = v;
-                    }
-                }
-                best_v
+            .map(|v| {
+                let out = view.neighbors(v).iter().filter(|&&d| d != v).count();
+                let inn = in_neighbors(v).iter().filter(|&&s| s != v).count();
+                (out + inn) as u64
             })
             .collect();
+        // Twice the undirected edge count.
+        let two_m: u64 = degree.par_iter().sum();
+        if two_m == 0 {
+            return Ok(dendro);
+        }
 
-        // Phase 2: Parallel merges with lock-free union-find.
-        let uf = ConcurrentUnionFind::new(n);
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.par_sort_unstable_by_key(|&v| (degree[v as usize], v));
 
-        // Pass 1: best-neighbor proposals (parallel)
-        let merges_pass1: Vec<(u32, u32)> = (0..n)
-            .into_par_iter()
-            .filter_map(|u| {
-                let v = best_nbr[u];
-                if v == u32::MAX {
-                    return None;
+        // Aggregated edge list of a vertex that merged into a community not
+        // yet visited; the community absorbs it when its turn comes.
+        let mut carried: Vec<Option<Vec<(u32, u64)>>> = vec![None; n];
+        let mut visited = vec![false; n];
+        let mut weight_to: Vec<u64> = vec![0; n];
+        let mut touched: Vec<u32> = Vec::new();
+
+        for &u in &order {
+            touched.clear();
+            let parent = &mut dendro.parent;
+            let mut add = |c: u32, w: u64, touched: &mut Vec<u32>| {
+                let c = Dendrogram::root(parent, c);
+                if c == u {
+                    return;
                 }
-                uf.union(u as u32, v)
-            })
-            .collect();
-
-        // Pass 2: remaining cross-community edges (parallel)
-        let degrees_ref = &degrees;
-        let uf_ref = &uf;
-        let merges_pass2: Vec<(u32, u32)> = (0..n)
-            .into_par_iter()
-            .flat_map_iter(|u| {
-                let u = u as NodeId;
-                let deg_u = u64::from(degrees_ref[u as usize]);
-                let max_deg_v = m / deg_u.max(1);
-
-                self.neighbors(u).iter().filter_map(move |&v| {
-                    if u >= v {
-                        return None;
+                if weight_to[c as usize] == 0 {
+                    touched.push(c);
+                }
+                weight_to[c as usize] += w;
+            };
+            for &v in view.neighbors(u) {
+                add(v, 1, &mut touched);
+            }
+            for &v in in_neighbors(u) {
+                add(v, 1, &mut touched);
+            }
+            let mut child = dendro.first_child[u as usize];
+            while child != NONE {
+                if let Some(list) = carried[child as usize].take() {
+                    for (c, w) in list {
+                        add(c, w, &mut touched);
                     }
-                    let dv = u64::from(degrees_ref[v as usize]);
-                    if dv >= max_deg_v {
-                        return None;
-                    }
-                    // `union` already returns `None` for the same-set case, so a
-                    // separate `find == find` pre-check would only add a
-                    // redundant traversal on this hot loop.
-                    uf_ref.union(u, v)
-                })
-            })
-            .collect();
+                }
+                child = dendro.next_sibling[child as usize];
+            }
 
-        // Append pass 2 into pass 1's allocation — a third full copy of the
-        // merge log (8n bytes, 2x peak memory at billion-node scale) buys
-        // nothing.
-        let mut merges = merges_pass1;
-        merges.extend_from_slice(&merges_pass2);
-        drop(merges_pass2);
+            // Modularity gain of joining community c, scaled by 2m²:
+            // 2m·w(u,c) − d(u)·d(c). Exact in i128.
+            let du = i128::from(degree[u as usize]);
+            let mut best: Option<(i128, u32)> = None;
+            for &c in &touched {
+                let gain = i128::from(two_m) * i128::from(weight_to[c as usize])
+                    - du * i128::from(degree[c as usize]);
+                let better = match best {
+                    None => gain > 0,
+                    Some((g, b)) => gain > g || (gain == g && c < b),
+                };
+                if better {
+                    best = Some((gain, c));
+                }
+            }
 
-        Some(RabbitMergeLog { merges })
+            if let Some((_, c)) = best {
+                dendro.parent[u as usize] = c;
+                degree[c as usize] += degree[u as usize];
+                // Prepend: children are walked most-recent-first, which keeps
+                // the child list O(1) per merge.
+                dendro.next_sibling[u as usize] = dendro.first_child[c as usize];
+                dendro.first_child[c as usize] = u;
+                if !visited[c as usize] {
+                    carried[u as usize] = Some(
+                        touched
+                            .iter()
+                            .map(|&t| (t, weight_to[t as usize]))
+                            .collect(),
+                    );
+                }
+            }
+            for &t in &touched {
+                weight_to[t as usize] = 0;
+            }
+            visited[u as usize] = true;
+        }
+        Ok(dendro)
     }
 
     /// Compute the Rabbit Order permutation for improved cache locality.
     ///
-    /// Parallel phases 1+2 (merge), sequential phase 3 (dendrogram traversal).
-    /// Returns `perm` where `perm[new_id] = old_id`.
-    ///
-    /// Dendrogram indices (leaves `0..n`, internal nodes `n..n+merges`) are
-    /// `u32`, so reordering is bounded to roughly 2.1B nodes even though the
-    /// rest of the crate allows up to 4B (`NodeId` is `u32`).
-    pub fn reorder_rabbit(&self) -> Vec<NodeId> {
-        let n = self.num_nodes();
-        let Some(merge_log) = self.rabbit_merge() else {
-            return (0..n as NodeId).collect();
-        };
-
-        // Phase 3: Build dendrogram from merge log (sequential).
-        //
-        // Each merge (winner, loser) means: loser's subtree becomes a child
-        // of winner's subtree. We process merges in order, building a binary tree.
-        //
-        // community_dendro[root] = current dendrogram index for that community.
-        // Leaves: node i => index i. Internal: n + k.
-        //
-        // Internal-node indices are `n + k`; the largest is `n + merges - 1`,
-        // and a forest over `n` leaves has at most `n - 1` internal nodes, so
-        // the index space fits u32 whenever `n` does (up to ~2.1B leaves).
-        debug_assert!(
-            (n as u64 + merge_log.merges.len() as u64) <= u64::from(u32::MAX),
-            "dendrogram index space exceeds u32"
-        );
-        let mut community_dendro: Vec<u32> = (0..n as u32).collect();
-        let mut dendrogram: Vec<DendrogramNode> = Vec::with_capacity(merge_log.merges.len());
-
-        // We need sequential find for dendrogram construction.
-        // Convert the concurrent UF's parent array, but rebuild a fresh
-        // sequential UF to replay merges in order.
-        // Actually: just replay the merge log with a sequential UF.
-        let mut seq_uf = SequentialUnionFind::new(n);
-
-        for &(winner, loser) in &merge_log.merges {
-            // The concurrent UF already merged these. Replay in sequential UF
-            // to track roots for dendrogram construction.
-            let rw = seq_uf.find(winner);
-            let rl = seq_uf.find(loser);
-            if rw == rl {
-                continue; // duplicate merge (concurrent UF may log redundant pairs)
-            }
-
-            let internal_idx = n as u32 + dendrogram.len() as u32;
-            dendrogram.push(DendrogramNode {
-                left: community_dendro[rw as usize],
-                right: community_dendro[rl as usize],
-            });
-            let new_root = seq_uf.union(rw, rl);
-            community_dendro[new_root as usize] = internal_idx;
-        }
-
-        // In-order traversal of dendrogram forest.
-        let mut perm = Vec::with_capacity(n);
-        let mut stack = Vec::with_capacity(64);
-        let mut visited = vec![false; n];
-
-        let mut root_seen = vec![false; n];
-        let mut roots = Vec::new();
-        for i in 0..n as u32 {
-            let root = seq_uf.find(i);
-            if !root_seen[root as usize] {
-                root_seen[root as usize] = true;
-                roots.push(community_dendro[root as usize]);
-            }
-        }
-
-        for root in roots {
-            stack.clear();
-            stack.push(root);
-            while let Some(idx) = stack.pop() {
-                if (idx as usize) < n {
-                    if !visited[idx as usize] {
-                        visited[idx as usize] = true;
-                        perm.push(idx);
-                    }
-                } else {
-                    let slot = (idx as usize) - n;
-                    if slot < dendrogram.len() {
-                        let node = &dendrogram[slot];
-                        stack.push(node.right);
-                        stack.push(node.left);
-                    }
-                }
-            }
-        }
-
-        for i in 0..n as u32 {
-            if !visited[i as usize] {
-                perm.push(i);
-            }
-        }
-
-        // The traversal flips `visited[idx]` before pushing, and the tail pushes
-        // exactly the still-unvisited ids, so each id in `0..n` appears once.
-        // A length check is enough to confirm the bijection given that gating.
-        debug_assert_eq!(perm.len(), n);
-        debug_assert!(perm.iter().all(|&id| (id as usize) < n));
-        perm
+    /// Returns `perm` where `perm[new_id] = old_id`. Errors on a graph whose
+    /// destinations fail validation or that is not homogeneous.
+    pub fn reorder_rabbit(&self) -> Result<Vec<NodeId>> {
+        Ok(self.rabbit_dendrogram()?.permutation())
     }
 
     /// Compute Rabbit Order community partitions.
     ///
-    /// Returns a vector of length `num_nodes` where `partitions[node] = partition_id`.
-    /// Partition IDs are dense (0..num_partitions). Nodes in the same community
-    /// get the same partition ID.
-    ///
-    /// This is a free byproduct of the Rabbit merge phases -- no dendrogram needed.
-    pub fn rabbit_partitions(&self) -> Vec<u32> {
-        let n = self.num_nodes();
-        let Some(merge_log) = self.rabbit_merge() else {
-            // Each node is its own partition
-            return (0..n as u32).collect();
-        };
-
-        // Replay merges in a sequential UF to recover community roots.
-        let mut uf = SequentialUnionFind::new(n);
-        for &(winner, loser) in &merge_log.merges {
-            let rw = uf.find(winner);
-            let rl = uf.find(loser);
-            if rw != rl {
-                uf.union(rw, rl);
-            }
-        }
-
-        dense_partition_ids(&mut uf, n)
+    /// Returns a vector of length `num_nodes` where `partitions[node] =
+    /// partition_id`. Partition IDs are dense (0..num_partitions), numbered
+    /// by each community's lowest node id. Nodes in the same top-level
+    /// community share an ID.
+    pub fn rabbit_partitions(&self) -> Result<Vec<u32>> {
+        Ok(self.rabbit_dendrogram()?.partitions())
     }
 
     /// Compute Rabbit Order permutation AND partition assignments in one pass.
     ///
-    /// Avoids running the parallel merge phases twice when both the reordered
+    /// Avoids running community detection twice when both the reordered
     /// graph and cluster-aligned batching are needed.
-    ///
-    /// Like [`Self::reorder_rabbit`], the `u32` dendrogram index space bounds
-    /// reordering to roughly 2.1B nodes.
-    pub fn reorder_rabbit_with_partitions(&self) -> (Vec<NodeId>, Vec<u32>) {
-        let n = self.num_nodes();
-        let Some(merge_log) = self.rabbit_merge() else {
-            return ((0..n as NodeId).collect(), (0..n as u32).collect());
-        };
-
-        // Build the dendrogram permutation (same as reorder_rabbit). The
-        // same sequential union-find drives the partition assignment below
-        // — replaying the identical merge sequence into a second UF (two
-        // more O(n) arrays and a full second replay of the sequential
-        // phase) produced byte-identical roots.
-        debug_assert!(
-            (n as u64 + merge_log.merges.len() as u64) <= u64::from(u32::MAX),
-            "dendrogram index space exceeds u32"
-        );
-        let mut community_dendro: Vec<u32> = (0..n as u32).collect();
-        let mut dendrogram: Vec<DendrogramNode> = Vec::with_capacity(merge_log.merges.len());
-        let mut seq_uf = SequentialUnionFind::new(n);
-        for &(winner, loser) in &merge_log.merges {
-            let rw = seq_uf.find(winner);
-            let rl = seq_uf.find(loser);
-            if rw == rl {
-                continue;
-            }
-            let internal_idx = n as u32 + dendrogram.len() as u32;
-            dendrogram.push(DendrogramNode {
-                left: community_dendro[rw as usize],
-                right: community_dendro[rl as usize],
-            });
-            let new_root = seq_uf.union(rw, rl);
-            community_dendro[new_root as usize] = internal_idx;
-        }
-
-        // Partition assignments from the same union-find.
-        let partitions = dense_partition_ids(&mut seq_uf, n);
-
-        let mut perm = Vec::with_capacity(n);
-        let mut stack = Vec::with_capacity(64);
-        let mut visited = vec![false; n];
-        let mut root_seen = vec![false; n];
-        let mut roots = Vec::new();
-        for i in 0..n as u32 {
-            let root = seq_uf.find(i);
-            if !root_seen[root as usize] {
-                root_seen[root as usize] = true;
-                roots.push(community_dendro[root as usize]);
-            }
-        }
-        for root in roots {
-            stack.clear();
-            stack.push(root);
-            while let Some(idx) = stack.pop() {
-                if (idx as usize) < n {
-                    if !visited[idx as usize] {
-                        visited[idx as usize] = true;
-                        perm.push(idx);
-                    }
-                } else {
-                    let slot = (idx as usize) - n;
-                    if slot < dendrogram.len() {
-                        let node = &dendrogram[slot];
-                        stack.push(node.right);
-                        stack.push(node.left);
-                    }
-                }
-            }
-        }
-        for i in 0..n as u32 {
-            if !visited[i as usize] {
-                perm.push(i);
-            }
-        }
-        debug_assert_eq!(perm.len(), n);
-        debug_assert!(perm.iter().all(|&id| (id as usize) < n));
-
-        (perm, partitions)
+    pub fn reorder_rabbit_with_partitions(&self) -> Result<(Vec<NodeId>, Vec<u32>)> {
+        let mut dendro = self.rabbit_dendrogram()?;
+        let perm = dendro.permutation();
+        Ok((perm, dendro.partitions()))
     }
 
     /// Apply a node permutation to produce a new reordered graph.
-    pub fn permute(&self, perm: &[NodeId]) -> anyhow::Result<Self> {
+    ///
+    /// `perm[new_id] = old_id`. Proves the source graph `Full` first (a
+    /// no-op when it already is): the rebuilt rows are sized from the same
+    /// neighbor ranges they are filled from, and every destination is
+    /// relabeled through the inverse permutation.
+    pub fn permute(&self, perm: &[NodeId]) -> Result<Self> {
+        anyhow::ensure!(
+            self.is_homogeneous(),
+            "permute relabels sources and destinations together; this graph has \
+             {} rows and a destination space of {}",
+            self.num_nodes(),
+            self.num_dst_nodes()
+        );
+        self.validate_with_mode(GraphValidationMode::Full)?;
         let n = self.num_nodes();
         anyhow::ensure!(perm.len() == n, "permutation length mismatch");
 
-        if n == 0 {
-            return Self::from_edges(0, &[], None);
-        }
-
         // The duplicate/range check folds into the inverse-permutation
-        // build: u32::MAX marks unassigned slots (new_id < n <= u32::MAX,
-        // so it can't collide), replacing a separate bool array and a
-        // second O(n) pass.
-        let mut inv_perm = vec![u32::MAX; n];
+        // build: NONE marks unassigned slots (new_id < n <= u32::MAX, so it
+        // can't collide).
+        let mut inv_perm = vec![NONE; n];
         for (new_id, &old_id) in perm.iter().enumerate() {
             anyhow::ensure!((old_id as usize) < n, "out-of-range node {old_id}");
-            anyhow::ensure!(
-                inv_perm[old_id as usize] == u32::MAX,
-                "duplicate node {old_id}"
-            );
+            anyhow::ensure!(inv_perm[old_id as usize] == NONE, "duplicate node {old_id}");
             inv_perm[old_id as usize] = new_id as u32;
         }
 
-        // The per-node degree lookup is a random access into the offsets
-        // array — serial and latency-bound at billion-node scale. Gather
-        // degrees in parallel, then run the cheap sequential prefix sum
-        // over the dense result.
-        let degrees: Vec<u64> = (0..n)
-            .into_par_iter()
-            .map(|new_id| self.degree(perm[new_id]) as u64)
-            .collect();
-        let mut new_offsets: Vec<EdgeOffset> = Vec::with_capacity(n + 1);
-        new_offsets.push(0);
-        let mut acc = 0u64;
-        for &d in &degrees {
-            acc += d;
-            new_offsets.push(acc);
+        // Row sizes come from `neighbors` — the same guarded range the fill
+        // below reads — so a row's slot and its contents always agree.
+        let mut new_offsets: Vec<EdgeOffset> = alloc_hinted(n + 1);
+        new_offsets[1..]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(new_id, slot)| *slot = self.neighbors(perm[new_id]).len() as u64);
+        for i in 1..=n {
+            new_offsets[i] += new_offsets[i - 1];
         }
-        drop(degrees);
-
         let num_edges = self.num_edges();
-        let has_weights = self.weights().is_some();
-        let has_timestamps = self.has_timestamps();
+        anyhow::ensure!(
+            new_offsets[n] == num_edges as EdgeOffset,
+            "permuted rows hold {} edges, graph has {num_edges}",
+            new_offsets[n]
+        );
 
-        let mut new_edges = vec![0u32; num_edges];
-        let mut new_weights = if has_weights {
-            vec![0.0f32; num_edges]
-        } else {
-            Vec::new()
-        };
-        let mut new_timestamps = if has_timestamps {
-            vec![0.0f64; num_edges]
-        } else {
-            Vec::new()
-        };
-
-        let ep = new_edges.as_mut_ptr() as usize;
-        let wp = new_weights.as_mut_ptr() as usize;
-        let tp = new_timestamps.as_mut_ptr() as usize;
-
-        (0..n).into_par_iter().for_each(|new_id| {
-            let old_id = perm[new_id];
-            let dst = new_offsets[new_id] as usize;
-            for (j, &old_nbr) in self.neighbors(old_id).iter().enumerate() {
-                // SAFETY: dst+j < new_offsets[new_id+1] <= num_edges (loop bounded by degree), so the
-                // pointer stays in-bounds of `new_edges`; each (new_id, j) pair is written by exactly
-                // one rayon task, so the writes don't race.
-                let p = unsafe { (ep as *mut NodeId).add(dst + j) };
-                // SAFETY: p is in-bounds and uniquely owned by this task (see above).
-                unsafe {
-                    *p = inv_perm[old_nbr as usize];
-                }
-            }
-            if has_weights && let Some(w) = self.neighbor_weights(old_id) {
-                // SAFETY: `dst` is in-bounds of `new_weights` (parallel to
-                // edges).
-                let base = unsafe { (wp as *mut f32).add(dst) };
-                // SAFETY: dst..dst+w.len() is uniquely owned by this task,
-                // so a temporary exclusive slice is sound — and unlike an
-                // element-at-a-time raw-pointer loop, `copy_from_slice`
-                // lowers to one memcpy.
-                let out = unsafe { std::slice::from_raw_parts_mut(base, w.len()) };
-                out.copy_from_slice(w);
-            }
-            if has_timestamps && let Some(ts) = self.neighbor_timestamps(old_id) {
-                // SAFETY: `dst` is in-bounds of `new_timestamps` (parallel
-                // to edges).
-                let base = unsafe { (tp as *mut f64).add(dst) };
-                // SAFETY: same ownership argument as the weights slice.
-                let out = unsafe { std::slice::from_raw_parts_mut(base, ts.len()) };
-                out.copy_from_slice(ts);
+        let mut new_edges: Vec<NodeId> = alloc_hinted(num_edges);
+        par_fill_rows(&mut new_edges, &new_offsets, |new_id, row| {
+            for (slot, &old_nbr) in row.iter_mut().zip(self.neighbors(perm[new_id])) {
+                *slot = inv_perm[old_nbr as usize];
             }
         });
+        let new_weights = self.weights().map(|_| {
+            let mut w: Vec<f32> = alloc_hinted(num_edges);
+            par_fill_rows(&mut w, &new_offsets, |new_id, row| {
+                if let Some(src) = self.neighbor_weights(perm[new_id]) {
+                    row.copy_from_slice(src);
+                }
+            });
+            w
+        });
+        let new_timestamps = self.timestamps().map(|_| {
+            let mut ts: Vec<f64> = alloc_hinted(num_edges);
+            par_fill_rows(&mut ts, &new_offsets, |new_id, row| {
+                if let Some(src) = self.neighbor_timestamps(perm[new_id]) {
+                    row.copy_from_slice(src);
+                }
+            });
+            ts
+        });
 
-        let weights_arc = if has_weights {
-            Some(Arc::from(new_weights))
-        } else {
-            None
-        };
-        let mut graph = Self::from_owned_parts(
-            n,
-            num_edges,
-            new_offsets.into(),
-            new_edges.into(),
-            weights_arc,
-        );
-        if has_timestamps {
-            // `new_timestamps` is built parallel to `new_edges` above, so the
-            // length contract holds; surface a clear error if a future refactor
-            // violates it rather than silently dropping the result.
-            graph.set_timestamps(new_timestamps).map_err(|e| {
-                anyhow::anyhow!("internal: reorder produced mismatched timestamps ({e})")
-            })?;
+        let mut graph = Self::from_trusted_parts(n, n, new_offsets, new_edges, new_weights);
+        if let Some(ts) = new_timestamps {
+            graph
+                .set_timestamps(ts)
+                .map_err(|e| anyhow::anyhow!("permuted timestamps: {e}"))?;
         }
         Ok(graph)
-    }
-}
-
-/// Simple sequential union-find for dendrogram replay.
-/// Assign dense partition ids over `0..n` by community root.
-///
-/// Every root is itself a node id in `0..n`, so the root-to-id table is
-/// direct-indexed rather than hashed: one array probe per node instead of a
-/// hash and bucket walk, and a flat `4n` bytes instead of a map that grows an
-/// entry per community.
-fn dense_partition_ids(uf: &mut SequentialUnionFind, n: usize) -> Vec<u32> {
-    const UNASSIGNED: u32 = u32::MAX;
-    let mut root_to_id = vec![UNASSIGNED; n];
-    let mut partitions = Vec::with_capacity(n);
-    let mut next_id = 0u32;
-    for i in 0..n as u32 {
-        let root = uf.find(i) as usize;
-        if root_to_id[root] == UNASSIGNED {
-            root_to_id[root] = next_id;
-            next_id += 1;
-        }
-        partitions.push(root_to_id[root]);
-    }
-    partitions
-}
-
-struct SequentialUnionFind {
-    parent: Vec<u32>,
-    rank: Vec<u8>,
-}
-
-impl SequentialUnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n as u32).collect(),
-            rank: vec![0; n],
-        }
-    }
-
-    #[inline(always)]
-    fn find(&mut self, mut x: u32) -> u32 {
-        while self.parent[x as usize] != x {
-            self.parent[x as usize] = self.parent[self.parent[x as usize] as usize];
-            x = self.parent[x as usize];
-        }
-        x
-    }
-
-    #[inline(always)]
-    fn union(&mut self, a: u32, b: u32) -> u32 {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra == rb {
-            return ra;
-        }
-        if self.rank[ra as usize] < self.rank[rb as usize] {
-            self.parent[ra as usize] = rb;
-            rb
-        } else if self.rank[ra as usize] > self.rank[rb as usize] {
-            self.parent[rb as usize] = ra;
-            ra
-        } else {
-            self.parent[rb as usize] = ra;
-            self.rank[ra as usize] += 1;
-            ra
-        }
     }
 }
 
@@ -594,7 +376,8 @@ impl SequentialUnionFind {
 ///
 /// Returns batches of seed node IDs, each batch containing at most
 /// `batch_size` seeds. Seeds within each batch belong to the same or
-/// nearby partitions.
+/// nearby partitions. Errors on `batch_size == 0` or a seed outside
+/// `partitions`.
 ///
 /// If `shuffle_partitions` is true, partitions are visited in random order
 /// (seeded by `seed`) to avoid bias from partition numbering. Within each
@@ -605,29 +388,25 @@ pub fn partition_aligned_batches(
     batch_size: usize,
     shuffle_partitions: bool,
     seed: u64,
-) -> Vec<Vec<NodeId>> {
-    assert!(batch_size > 0, "batch_size must be >= 1");
+) -> Result<Vec<Vec<NodeId>>> {
+    anyhow::ensure!(batch_size > 0, "batch_size must be >= 1");
 
     // Group seeds by partition with one u64 sort — (partition << 32 |
     // original index) keys group by partition and stay stable within it.
     // The single key vec is the whole grouping state: a per-partition Vec
     // map would allocate one heap Vec per distinct community (Rabbit
     // produces many small ones), approaching one allocation per seed each
-    // epoch. A seed id must index into `partitions` (length == num_nodes);
-    // otherwise it would silently fall into partition 0 and be mis-grouped.
-    let mut keyed: Vec<u64> = seeds
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| {
-            debug_assert!(
-                (s as usize) < partitions.len(),
+    // epoch.
+    let mut keyed: Vec<u64> = Vec::with_capacity(seeds.len());
+    for (i, &s) in seeds.iter().enumerate() {
+        let Some(&p) = partitions.get(s as usize) else {
+            anyhow::bail!(
                 "seed {s} is out of range for partitions of length {}",
                 partitions.len()
             );
-            let p = partitions.get(s as usize).copied().unwrap_or(0);
-            (u64::from(p) << 32) | i as u64
-        })
-        .collect();
+        };
+        keyed.push((u64::from(p) << 32) | i as u64);
+    }
     keyed.sort_unstable();
 
     // Contiguous runs of one partition in the sorted keys.
@@ -672,7 +451,7 @@ pub fn partition_aligned_batches(
         batches.push(current_batch);
     }
 
-    batches
+    Ok(batches)
 }
 
 #[cfg(test)]
@@ -698,6 +477,15 @@ mod tests {
         edges.push((3, 4));
         edges.push((4, 3));
         Graph::from_edges(8, &edges, None).unwrap()
+    }
+
+    fn assert_bijection(perm: &[NodeId], n: usize) {
+        assert_eq!(perm.len(), n);
+        let mut seen = vec![false; n];
+        for &id in perm {
+            assert!(!seen[id as usize], "{id} appears twice");
+            seen[id as usize] = true;
+        }
     }
 
     #[test]
@@ -729,7 +517,8 @@ mod tests {
             Graph::from_edges(3, &[(0, 1), (0, 2), (1, 2)], Some(&[1.0, 2.0, 3.0])).unwrap();
         let permuted = graph.permute(&[2, 1, 0]).unwrap();
         assert!(permuted.weights().is_some());
-        assert_eq!(permuted.neighbor_weights(2).unwrap().len(), 2);
+        assert_eq!(permuted.neighbor_weights(2).unwrap(), &[1.0, 2.0]);
+        assert_eq!(permuted.neighbor_weights(1).unwrap(), &[3.0]);
     }
 
     #[test]
@@ -748,22 +537,71 @@ mod tests {
         assert!(graph.permute(&[0, 1, 5]).is_err());
     }
 
+    /// A corrupt file admitted by header-only validation must be rejected by
+    /// `permute`, never reach the rebuild: offsets [0, 4, 0, 12] give
+    /// guarded degrees summing past the edge count.
+    #[test]
+    fn test_permute_rejects_corrupt_header_only_graph() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let good = Graph::from_csr_arrays(3, vec![0, 4, 8, 12], vec![0; 12], None).unwrap();
+        crate::internal::mmap::save_graph(&good, path.path()).unwrap();
+        let mut bytes = std::fs::read(path.path()).unwrap();
+        // offsets[2] lives at header (32) + 2 * 8.
+        bytes[48..56].copy_from_slice(&0u64.to_le_bytes());
+        // Drop the checksum so the body edit is what validation sees.
+        bytes[28..32].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(path.path(), &bytes).unwrap();
+
+        let corrupt =
+            crate::internal::mmap::load_graph_mmap(path.path(), GraphValidationMode::HeaderOnly)
+                .unwrap();
+        assert_eq!(corrupt.validated(), GraphValidationMode::HeaderOnly);
+        let err = corrupt.permute(&[0, 1, 2]).unwrap_err().to_string();
+        assert!(err.contains("monotonic"), "got: {err}");
+        assert!(corrupt.reorder_rabbit().is_err());
+    }
+
+    #[test]
+    fn test_permute_rejects_bipartite() {
+        let g = Graph::from_bipartite_src_dst(2, 5, &[0, 1], &[4, 3], None).unwrap();
+        assert!(g.permute(&[1, 0]).is_err());
+        assert!(g.reorder_rabbit().is_err());
+    }
+
+    #[test]
+    fn test_permute_large_matches_reference() {
+        let n = 20_000u32;
+        let edges: Vec<(u32, u32)> = (0..200_000u64)
+            .map(|i| {
+                (
+                    (i.wrapping_mul(2_654_435_761) % u64::from(n)) as u32,
+                    (i.wrapping_mul(97) % u64::from(n)) as u32,
+                )
+            })
+            .collect();
+        let w: Vec<f32> = (0..edges.len()).map(|i| i as f32).collect();
+        let g = Graph::from_edges(n as usize, &edges, Some(&w)).unwrap();
+        let perm: Vec<u32> = (0..n).rev().collect();
+        let p = g.permute(&perm).unwrap();
+        for new_id in 0..n {
+            let old = perm[new_id as usize];
+            let expect: Vec<u32> = g.neighbors(old).iter().map(|&x| n - 1 - x).collect();
+            assert_eq!(p.neighbors(new_id), &expect[..]);
+            assert_eq!(p.neighbor_weights(new_id), g.neighbor_weights(old));
+        }
+    }
+
     #[test]
     fn test_rabbit_valid_permutation() {
         let graph = make_two_cliques();
-        let perm = graph.reorder_rabbit();
-        assert_eq!(perm.len(), 8);
-        let mut seen = [false; 8];
-        for &id in &perm {
-            assert!(!seen[id as usize]);
-            seen[id as usize] = true;
-        }
+        let perm = graph.reorder_rabbit().unwrap();
+        assert_bijection(&perm, 8);
     }
 
     #[test]
     fn test_rabbit_clusters_communities() {
         let graph = make_two_cliques();
-        let perm = graph.reorder_rabbit();
+        let perm = graph.reorder_rabbit().unwrap();
         let mut inv = [0u32; 8];
         for (i, &old) in perm.iter().enumerate() {
             inv[old as usize] = i as u32;
@@ -779,9 +617,18 @@ mod tests {
     }
 
     #[test]
+    fn test_rabbit_is_deterministic() {
+        let graph = make_two_cliques();
+        assert_eq!(
+            graph.reorder_rabbit().unwrap(),
+            graph.reorder_rabbit().unwrap()
+        );
+    }
+
+    #[test]
     fn test_rabbit_then_permute_preserves_structure() {
         let graph = make_two_cliques();
-        let reordered = graph.permute(&graph.reorder_rabbit()).unwrap();
+        let reordered = graph.permute(&graph.reorder_rabbit().unwrap()).unwrap();
         assert_eq!(reordered.num_nodes(), graph.num_nodes());
         assert_eq!(reordered.num_edges(), graph.num_edges());
     }
@@ -792,6 +639,7 @@ mod tests {
             Graph::from_edges(0, &[], None)
                 .unwrap()
                 .reorder_rabbit()
+                .unwrap()
                 .is_empty()
         );
     }
@@ -799,7 +647,10 @@ mod tests {
     #[test]
     fn test_single_node() {
         assert_eq!(
-            Graph::from_edges(1, &[], None).unwrap().reorder_rabbit(),
+            Graph::from_edges(1, &[], None)
+                .unwrap()
+                .reorder_rabbit()
+                .unwrap(),
             vec![0]
         );
     }
@@ -808,13 +659,9 @@ mod tests {
     fn test_disconnected() {
         let perm = Graph::from_edges(5, &[(0, 1)], None)
             .unwrap()
-            .reorder_rabbit();
-        assert_eq!(perm.len(), 5);
-        let mut seen = [false; 5];
-        for &id in &perm {
-            seen[id as usize] = true;
-        }
-        assert!(seen.iter().all(|&s| s));
+            .reorder_rabbit()
+            .unwrap();
+        assert_bijection(&perm, 5);
     }
 
     // -- rabbit_partitions tests --
@@ -822,16 +669,14 @@ mod tests {
     #[test]
     fn test_partitions_length() {
         let graph = make_two_cliques();
-        let parts = graph.rabbit_partitions();
+        let parts = graph.rabbit_partitions().unwrap();
         assert_eq!(parts.len(), 8);
     }
 
     #[test]
     fn test_partitions_two_cliques_separated() {
         let graph = make_two_cliques();
-        let parts = graph.rabbit_partitions();
-        // Nodes 0..4 are one clique, 4..8 are another.
-        // They should get different partition IDs (bridge edge 3-4 is weak).
+        let parts = graph.rabbit_partitions().unwrap();
         let c1 = parts[0];
         for &n in &[1, 2, 3] {
             assert_eq!(parts[n], c1, "clique 1 nodes should share a partition");
@@ -840,14 +685,74 @@ mod tests {
         for &n in &[5, 6, 7] {
             assert_eq!(parts[n], c2, "clique 2 nodes should share a partition");
         }
-        // The two cliques may or may not merge (depends on Rabbit's threshold),
-        // but we at least verify internal consistency.
+        // Joining across the single bridge lowers modularity.
+        assert_ne!(c1, c2, "the cliques must stay separate communities");
+    }
+
+    /// Edges that only point from higher to lower ids (a citation graph's
+    /// shape) still cluster: the aggregation sees both edge directions.
+    #[test]
+    fn test_partitions_follow_backward_edges() {
+        let mut edges = Vec::new();
+        for base in [0u32, 4] {
+            for i in 0..4 {
+                for j in 0..i {
+                    edges.push((base + i, base + j));
+                }
+            }
+        }
+        edges.push((4, 3));
+        let graph = Graph::from_edges(8, &edges, None).unwrap();
+        let parts = graph.rabbit_partitions().unwrap();
+        assert!(parts[..4].iter().all(|&p| p == parts[0]));
+        assert!(parts[4..].iter().all(|&p| p == parts[4]));
+        assert_ne!(parts[0], parts[4]);
+    }
+
+    /// A ring of cliques is one connected component. No clique is ever
+    /// split, and the ring does not collapse into a single community —
+    /// greedy aggregation may still pair an occasional clique with a
+    /// neighbor whose bridge vertex has not been aggregated yet.
+    #[test]
+    fn test_partitions_do_not_collapse_to_components() {
+        const CLIQUES: u32 = 8;
+        const SIZE: u32 = 5;
+        let mut edges = Vec::new();
+        for c in 0..CLIQUES {
+            let base = c * SIZE;
+            for i in 0..SIZE {
+                for j in 0..SIZE {
+                    if i != j {
+                        edges.push((base + i, base + j));
+                    }
+                }
+            }
+            // Bridge: this clique's last node to the next clique's first.
+            let next = ((c + 1) % CLIQUES) * SIZE;
+            edges.push((base + SIZE - 1, next));
+            edges.push((next, base + SIZE - 1));
+        }
+        let graph = Graph::from_edges((CLIQUES * SIZE) as usize, &edges, None).unwrap();
+        let parts = graph.rabbit_partitions().unwrap();
+        for c in 0..CLIQUES {
+            let base = (c * SIZE) as usize;
+            let clique = &parts[base..base + SIZE as usize];
+            assert!(
+                clique.iter().all(|&p| p == clique[0]),
+                "clique {c} split: {clique:?}"
+            );
+        }
+        let communities = *parts.iter().max().unwrap() + 1;
+        assert!(
+            communities >= CLIQUES / 2,
+            "ring collapsed into {communities} communities: {parts:?}"
+        );
     }
 
     #[test]
     fn test_partitions_dense_ids() {
         let graph = make_two_cliques();
-        let parts = graph.rabbit_partitions();
+        let parts = graph.rabbit_partitions().unwrap();
         let max_id = *parts.iter().max().unwrap();
         // Partition IDs should be dense: max_id < num_unique_partitions
         let unique: std::collections::HashSet<u32> = parts.iter().copied().collect();
@@ -857,19 +762,19 @@ mod tests {
     #[test]
     fn test_partitions_empty_graph() {
         let graph = Graph::from_edges(0, &[], None).unwrap();
-        assert!(graph.rabbit_partitions().is_empty());
+        assert!(graph.rabbit_partitions().unwrap().is_empty());
     }
 
     #[test]
     fn test_partitions_single_node() {
         let graph = Graph::from_edges(1, &[], None).unwrap();
-        assert_eq!(graph.rabbit_partitions(), vec![0]);
+        assert_eq!(graph.rabbit_partitions().unwrap(), vec![0]);
     }
 
     #[test]
     fn test_partitions_disconnected() {
         let graph = Graph::from_edges(5, &[(0, 1)], None).unwrap();
-        let parts = graph.rabbit_partitions();
+        let parts = graph.rabbit_partitions().unwrap();
         assert_eq!(parts.len(), 5);
         // Nodes 0 and 1 should share a partition (they're connected).
         assert_eq!(parts[0], parts[1]);
@@ -878,13 +783,21 @@ mod tests {
         assert_eq!(unique.len(), 4); // {0,1}, {2}, {3}, {4}
     }
 
+    #[test]
+    fn test_reorder_with_partitions_agrees_with_separate_calls() {
+        let graph = make_two_cliques();
+        let (perm, parts) = graph.reorder_rabbit_with_partitions().unwrap();
+        assert_eq!(perm, graph.reorder_rabbit().unwrap());
+        assert_eq!(parts, graph.rabbit_partitions().unwrap());
+    }
+
     // -- partition_aligned_batches tests --
 
     #[test]
     fn test_batches_all_seeds_present() {
         let partitions = vec![0, 0, 1, 1, 2, 2];
         let seeds: Vec<NodeId> = vec![0, 1, 2, 3, 4, 5];
-        let batches = partition_aligned_batches(&partitions, &seeds, 2, false, 0);
+        let batches = partition_aligned_batches(&partitions, &seeds, 2, false, 0).unwrap();
         let mut all: Vec<NodeId> = batches.into_iter().flatten().collect();
         all.sort_unstable();
         assert_eq!(all, seeds);
@@ -894,7 +807,7 @@ mod tests {
     fn test_batches_respects_batch_size() {
         let partitions = vec![0; 10];
         let seeds: Vec<NodeId> = (0..10).collect();
-        let batches = partition_aligned_batches(&partitions, &seeds, 3, false, 0);
+        let batches = partition_aligned_batches(&partitions, &seeds, 3, false, 0).unwrap();
         for (i, batch) in batches.iter().enumerate() {
             if i < batches.len() - 1 {
                 assert_eq!(batch.len(), 3);
@@ -911,12 +824,8 @@ mod tests {
         // 3 partitions, batch_size=4 (big enough to hold all of partition 0)
         let partitions = vec![0, 0, 0, 1, 1, 1, 2, 2, 2];
         let seeds: Vec<NodeId> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let batches = partition_aligned_batches(&partitions, &seeds, 4, false, 0);
+        let batches = partition_aligned_batches(&partitions, &seeds, 4, false, 0).unwrap();
 
-        // First batch should be partition 0 (3 items) + 1 from partition 1
-        // Verify: within each batch, most nodes share a partition.
-        // More precisely: seeds from partition 0 are never split across batches
-        // that have partition 2 seeds (no interleaving).
         let batch_partitions: Vec<Vec<u32>> = batches
             .iter()
             .map(|b| b.iter().map(|&s| partitions[s as usize]).collect())
@@ -935,29 +844,34 @@ mod tests {
     #[test]
     fn test_batches_empty_seeds() {
         let partitions = vec![0, 1, 2];
-        let batches = partition_aligned_batches(&partitions, &[], 128, false, 0);
+        let batches = partition_aligned_batches(&partitions, &[], 128, false, 0).unwrap();
         assert!(batches.is_empty());
     }
 
     #[test]
     fn test_batches_single_seed() {
         let partitions = vec![0, 1, 2];
-        let batches = partition_aligned_batches(&partitions, &[1], 128, false, 0);
+        let batches = partition_aligned_batches(&partitions, &[1], 128, false, 0).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0], vec![1]);
+    }
+
+    #[test]
+    fn test_batches_reject_bad_input() {
+        let partitions = vec![0, 1, 2];
+        assert!(partition_aligned_batches(&partitions, &[3], 2, false, 0).is_err());
+        assert!(partition_aligned_batches(&partitions, &[0], 0, false, 0).is_err());
     }
 
     #[test]
     fn test_batches_shuffle_deterministic() {
         let partitions = vec![0, 0, 1, 1, 2, 2];
         let seeds: Vec<NodeId> = (0..6).collect();
-        let b1 = partition_aligned_batches(&partitions, &seeds, 2, true, 42);
-        let b2 = partition_aligned_batches(&partitions, &seeds, 2, true, 42);
+        let b1 = partition_aligned_batches(&partitions, &seeds, 2, true, 42).unwrap();
+        let b2 = partition_aligned_batches(&partitions, &seeds, 2, true, 42).unwrap();
         assert_eq!(b1, b2, "same seed should produce same shuffle");
 
-        let b3 = partition_aligned_batches(&partitions, &seeds, 2, true, 99);
-        // Different seed may produce different order (not guaranteed but very likely
-        // with 3 partitions). Just verify all seeds present.
+        let b3 = partition_aligned_batches(&partitions, &seeds, 2, true, 99).unwrap();
         let mut all: Vec<NodeId> = b3.into_iter().flatten().collect();
         all.sort_unstable();
         assert_eq!(all, seeds);
@@ -968,44 +882,28 @@ mod tests {
     #[test]
     fn test_end_to_end_partition_aligned_sampling() {
         let graph = make_two_cliques();
-        let partitions = graph.rabbit_partitions();
+        let partitions = graph.rabbit_partitions().unwrap();
 
-        // Use all nodes as seeds
-        let seeds: Vec<NodeId> = (0..8).collect();
-        let batches = partition_aligned_batches(&partitions, &seeds, 4, false, 0);
+        // Seeds interleave the two cliques, so grouping is the batcher's work.
+        let seeds: Vec<NodeId> = vec![0, 4, 1, 5, 2, 6, 3, 7];
+        let batches = partition_aligned_batches(&partitions, &seeds, 4, false, 0).unwrap();
 
-        // Should produce 2 batches of 4
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), 4);
-        assert_eq!(batches[1].len(), 4);
-
-        // Each batch should be dominated by one clique's nodes.
-        // Count how many clique-0 nodes (0..4) in each batch.
-        let c0_batch0 = batches[0].iter().filter(|&&n| n < 4).count();
-        let c0_batch1 = batches[1].iter().filter(|&&n| n < 4).count();
-
-        // One batch should have 3-4 clique-0 nodes, the other 0-1.
-        let (hi, lo) = if c0_batch0 >= c0_batch1 {
-            (c0_batch0, c0_batch1)
-        } else {
-            (c0_batch1, c0_batch0)
-        };
-        assert!(
-            hi >= 3,
-            "expected at least 3 same-clique nodes in aligned batch, got {hi}"
-        );
-        assert!(
-            lo <= 1,
-            "expected at most 1 cross-clique node in aligned batch, got {lo}"
-        );
+        let mut b0 = batches[0].clone();
+        let mut b1 = batches[1].clone();
+        b0.sort_unstable();
+        b1.sort_unstable();
+        let (lo, hi) = if b0[0] < b1[0] { (b0, b1) } else { (b1, b0) };
+        assert_eq!(lo, vec![0, 1, 2, 3]);
+        assert_eq!(hi, vec![4, 5, 6, 7]);
     }
 
     #[test]
     fn test_partition_aligned_with_neighbor_loader() {
         let graph = std::sync::Arc::new(make_two_cliques());
-        let partitions = graph.rabbit_partitions();
+        let partitions = graph.rabbit_partitions().unwrap();
         let seeds: Vec<NodeId> = (0..8).collect();
-        let batches = partition_aligned_batches(&partitions, &seeds, 4, false, 0);
+        let batches = partition_aligned_batches(&partitions, &seeds, 4, false, 0).unwrap();
 
         let config = crate::loader::SamplingConfig {
             fanout: vec![2],
@@ -1015,6 +913,10 @@ mod tests {
         };
         let num_batches = batches.len();
         let loader = crate::loader::NeighborLoader::new(graph, config, 2, 1).unwrap();
+        let batches = batches
+            .into_iter()
+            .map(|b| crate::loader::Seeds::new(b, loader.num_nodes()).unwrap())
+            .collect();
         loader.submit_epoch(batches).unwrap();
 
         // Consume all results

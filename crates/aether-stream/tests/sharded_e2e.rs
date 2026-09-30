@@ -78,7 +78,6 @@ fn sharded_concurrent_gather_correctness() {
             &client_ctx,
             ShardedConfig {
                 num_shards: NUM_SHARDS,
-                cq_size: 1024,
                 qp_cap: DEFAULT_QP_CAP,
                 worker_cores: vec![],
                 ..Default::default()
@@ -240,7 +239,6 @@ fn sharded_4shard_sequential_gather() {
         &client_ctx,
         ShardedConfig {
             num_shards: NUM_SHARDS,
-            cq_size: 64,
             qp_cap: DEFAULT_QP_CAP,
             worker_cores: vec![],
             ..Default::default()
@@ -314,7 +312,6 @@ fn sharded_single_shard_single_gather() {
         &client_ctx,
         ShardedConfig {
             num_shards: 1,
-            cq_size: 64,
             qp_cap: DEFAULT_QP_CAP,
             worker_cores: vec![],
             ..Default::default()
@@ -388,7 +385,6 @@ fn sharded_two_threads_minimal() {
             &client_ctx,
             ShardedConfig {
                 num_shards: 1,
-                cq_size: 64,
                 qp_cap: DEFAULT_QP_CAP,
                 worker_cores: vec![],
                 ..Default::default()
@@ -446,7 +442,6 @@ fn sharded_pool_drops_cleanly() {
         &ctx,
         ShardedConfig {
             num_shards: 2,
-            cq_size: 64,
             qp_cap: DEFAULT_QP_CAP,
             worker_cores: vec![],
             ..Default::default()
@@ -503,7 +498,6 @@ fn sharded_gather_blocks_on_completion_channel() {
         &client_ctx,
         ShardedConfig {
             num_shards: NUM_SHARDS,
-            cq_size: 256,
             // Zero spin budget: every completion goes through arm + block.
             spin_before_block: Some(std::time::Duration::ZERO),
             ..Default::default()

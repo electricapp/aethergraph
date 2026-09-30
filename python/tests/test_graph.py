@@ -120,6 +120,17 @@ class TestGraphPersistence:
         with pytest.raises(ValueError, match="Invalid validation mode"):
             Graph.load(path, validation="bad_mode")
 
+    def test_mode_strings_are_exact(self, small_graph: Graph, temp_dir: Path) -> None:
+        """Storage and validation take the exact lowercase names the stub
+        declares; other spellings are rejected, not normalized."""
+        path = temp_dir / "exact_modes.bin"
+        small_graph.save(path)
+
+        with pytest.raises(ValueError, match="Invalid storage mode"):
+            Graph.load(path, storage="MMAP")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Invalid validation mode"):
+            Graph.load(path, validation="Full")  # type: ignore[arg-type]
+
     def test_load_nonexistent_file(self, temp_dir: Path) -> None:
         """Loading non-existent file should raise GraphLoadError."""
         from aethergraph import GraphLoadError
@@ -219,3 +230,63 @@ class TestOffsetsOnlyCorruptDst:
         assert all(0 <= int(n) < num_nodes for n in sub.nodes)
         assert sub.num_edges == 0
         assert list(sub.nodes) == [0]
+
+
+def _two_cliques() -> Graph:
+    pairs = [
+        (i, j)
+        for base in (0, 4)
+        for i in range(base, base + 4)
+        for j in range(base, base + 4)
+        if i != j
+    ]
+    pairs += [(3, 4), (4, 3)]
+    src = np.array([p[0] for p in pairs], dtype=np.uint32)
+    dst = np.array([p[1] for p in pairs], dtype=np.uint32)
+    return Graph.from_edges(8, src, dst)
+
+
+class TestReorder:
+    """Rabbit Order and permutation through the Python API."""
+
+    def test_rabbit_separates_communities(self) -> None:
+        graph = _two_cliques()
+        parts = graph.rabbit_partitions()
+        assert len(set(parts[:4].tolist())) == 1
+        assert len(set(parts[4:].tolist())) == 1
+        assert parts[0] != parts[4]
+
+        perm = graph.reorder_rabbit()
+        assert sorted(perm.tolist()) == list(range(8))
+        np.testing.assert_array_equal(perm, graph.reorder_rabbit())
+
+        both_perm, both_parts = graph.reorder_rabbit_with_partitions()
+        np.testing.assert_array_equal(both_perm, perm)
+        np.testing.assert_array_equal(both_parts, parts)
+
+        reordered = graph.permute(perm)
+        assert reordered.num_edges == graph.num_edges
+
+    def test_rebuilds_refuse_a_corrupt_header_only_graph(self, temp_dir: Path) -> None:
+        """A header-only load does not check offsets; rebuilding such a graph
+        must raise rather than trust them."""
+        import struct
+
+        from aethergraph import GraphLoadError
+
+        src = np.zeros(12, dtype=np.uint32)
+        src[4:8] = 1
+        src[8:] = 2
+        graph = Graph.from_edges(3, src, np.zeros(12, dtype=np.uint32))
+        path = temp_dir / "corrupt_offsets.bin"
+        graph.save(path)
+        blob = bytearray(path.read_bytes())
+        struct.pack_into("<Q", blob, 32 + 2 * 8, 0)  # offsets [0, 4, 0, 12]
+        struct.pack_into("<I", blob, 28, 0)  # drop the checksum
+        path.write_bytes(blob)
+
+        loaded = Graph.load(path, storage="mmap", validation="header_only")
+        with pytest.raises(GraphLoadError, match="monotonic"):
+            loaded.permute(np.arange(3, dtype=np.uint32))
+        with pytest.raises(GraphLoadError):
+            loaded.reorder_rabbit()

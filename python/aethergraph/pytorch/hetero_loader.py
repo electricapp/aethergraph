@@ -35,7 +35,13 @@ from aethergraph._core import HeteroNeighborLoader as RustHeteroLoader
 from aethergraph._core import HeteroSampledSubgraph as RustHeteroSubgraph
 from aethergraph._core import HeteroSamplingConfig as RustHeteroSamplingConfig
 from aethergraph.pytorch.device_pipeline import DeviceTransferPipeline
-from aethergraph.pytorch.loader import _parse_features, make_batch_getter, normalize_input_nodes
+from aethergraph.pytorch.loader import (
+    _parse_features,
+    epoch_sampling_seed,
+    make_batch_getter,
+    normalize_input_nodes,
+    pinned_block,
+)
 from aethergraph.tracing import get_tracer
 
 if TYPE_CHECKING:
@@ -92,19 +98,25 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         prefetch_factor: Number of batches sampled ahead of the consumer.
         transform: Optional transform to apply to each batch.
 
+    Sampling matches PyG: a node of type ``T`` is expanded along the edge
+    types that point into ``T``, and each ``edge_index`` keeps its stored
+    direction with the expanded node as destination, so messages flow
+    toward the seeds. Seed types need incoming relations — add reverse
+    edge types as PyG's ``ToUndirected`` does.
+
     Example:
         >>> loader = HeteroNeighborLoader(
-        ...     hetero_graph,
+        ...     hetero_graph,  # (user, votes, post) plus (post, rev_votes, user)
         ...     num_neighbors={
-        ...         ("user", "votes", "post"): [15, 10],
-        ...         ("user", "replies", "comment"): [10, 5],
+        ...         ("post", "rev_votes", "user"): [15, 10],
+        ...         ("user", "votes", "post"): [10, 5],
         ...     },
         ...     input_nodes=("user", train_user_ids),
         ...     batch_size=128,
         ... )
         >>> for batch in loader:
         ...     user_x = batch["user"].x
-        ...     ei = batch["user", "votes", "post"].edge_index
+        ...     ei = batch["post", "rev_votes", "user"].edge_index
     """
 
     graph: HeteroGraph
@@ -144,7 +156,10 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         Args:
             data: HeteroGraph to sample from.
             num_neighbors: Dict mapping (src_type, rel, dst_type) to per-hop
-                neighbor counts. Example: {("user","votes","post"): [15, 10]}
+                counts of ``src_type`` nodes to draw into each expanded
+                ``dst_type`` node, as in PyG: a node is expanded along the
+                edge types that point into its type. Example:
+                {("post", "rev_votes", "user"): [15, 10]}
             input_nodes: Tuple of (node_type, node_ids) specifying which nodes
                 to iterate over as seeds. If None, raises ValueError.
                 node_ids can be a Tensor, numpy array, or list; a boolean
@@ -169,8 +184,12 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
                 ``device`` is set (default 2 = double buffering).
             prefetch_factor: Number of batches the Rust prefetch pipeline
                 keeps ready ahead of the consumer.
-            seed: Random seed for sampling reproducibility (passed to Rust).
-            max_degree: Maximum degree cap for hub nodes.
+            seed: Random seed. Seeds the shuffle, and each epoch draws a
+                fresh neighbor-sampling seed from it, so neighborhoods are
+                resampled every epoch while the run stays reproducible.
+            max_degree: Accepted for parity with ``NeighborLoader``; every
+                heterogeneous draw is uniform over the whole in-neighborhood,
+                so no cap applies.
             transform: Optional callable to apply to each batch after sampling.
             features: Per-node-type in-memory features. Normalized once to
                 contiguous ``float32`` here so the per-batch gather never
@@ -281,6 +300,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         # `__iter__` spawns a fresh child per epoch so concurrent iterators
         # don't share mutable RNG state.
         self._rng = np.random.default_rng(seed)
+        self._sampling_seeds = np.random.SeedSequence(seed) if seed is not None else None
         self._metrics = HeteroLoaderMetrics()
 
     @property
@@ -312,13 +332,16 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
 
         Yields:
             PyG HeteroData objects with per-type attributes:
-                - data[node_type].n_id: Global node IDs
+                - data[node_type].n_id: Global node IDs, seeds first for
+                  the seed type
                 - data[node_type].num_nodes: Number of nodes of this type
                 - data[node_type].x: Node features (if available)
                 - data[src, rel, dst].edge_index: Local edge connectivity
                 - data[seed_type].batch_size: Number of seed nodes
-                - data[seed_type].input_id: Local indices of seeds in
-                  ``n_id`` (homo contract; globals are ``n_id[input_id]``)
+                - data[seed_type].input_id: Each seed's position in the
+                  loader's ``input_nodes`` (PyG convention)
+                - data[seed_type].seed_index: Each seed's local index into
+                  ``n_id``
         """
         batch_size = self.batch_size
         num_batches = len(self)
@@ -333,7 +356,7 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         rust_config = RustHeteroSamplingConfig(
             num_neighbors=self.num_neighbors,
             replace=self.replace,
-            seed=self._seed,
+            seed=epoch_sampling_seed(self._sampling_seeds),
             max_degree=self._max_degree,
         )
         loader = RustHeteroLoader(
@@ -348,6 +371,16 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         epoch_start = time.perf_counter()
         submitted = 0
         received = 0
+        # Results arrive in completion order across an unseeded pool; each
+        # carries its batch_idx, which finds its input_id here.
+        input_ids: dict[int, npt.NDArray[np.int64]] = {}
+
+        def submit_next() -> None:
+            nonlocal submitted
+            batch = get_batch(submitted)
+            input_ids[submitted] = batch.input_id
+            loader.submit(submitted, batch.seeds)
+            submitted += 1
 
         tracer = get_tracer()
         epoch_span = tracer.start_span("hetero_epoch") if tracer else None
@@ -359,23 +392,24 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
 
         try:
             while submitted < min(self.prefetch_factor, num_batches):
-                loader.submit(submitted, get_batch(submitted))
-                submitted += 1
+                submit_next()
 
             while received < num_batches:
-                subgraph = loader.next()
-                if subgraph is None:
+                got = loader.next_batch()
+                if got is None:
                     raise RuntimeError(
                         f"hetero sampler stopped early: received {received} "
                         f"of {num_batches} batches"
                     )
+                batch_idx, subgraph = got
                 received += 1
 
                 if submitted < num_batches:
-                    loader.submit(submitted, get_batch(submitted))
-                    submitted += 1
+                    submit_next()
 
-                data = self._to_pyg_hetero_data(subgraph, in_memory_features)
+                data = self._to_pyg_hetero_data(
+                    subgraph, in_memory_features, input_ids.pop(batch_idx)
+                )
                 if self.transform is not None:
                     data = self.transform(data)
                 yield data
@@ -400,58 +434,70 @@ class HeteroNeighborLoader(IterableDataset[HeteroData]):
         self,
         subgraph: RustHeteroSubgraph,
         in_memory_features: dict[str, torch.Tensor] | None,
+        input_id: npt.NDArray[np.int64],
     ) -> HeteroData:
         """Convert a heterogeneous sampled subgraph to a PyG HeteroData object.
 
         Feature rows gather in a single ``index_select`` pass straight into
-        the final (optionally pinned) buffer.
+        the final buffer. With pinning, every tensor of the batch is a view
+        into one pinned block (:func:`pinned_block`) rather than a pinned
+        allocation per type.
 
         Args:
             subgraph: Rust HeteroSampledSubgraph.
             in_memory_features: Per-type feature tensors (zero-copy torch
                 views over the normalized float32 arrays), or None.
+            input_id: Each seed's position in the loader's ``input_nodes``.
 
         Returns:
             PyG HeteroData object ready for GNN forward pass.
         """
-        data = HeteroData()
-        pin = self._pin
-        node_types = self._node_types
-        edge_types = self._edge_types
+        seed_type = subgraph.seed_type
+        node_ids = {nt: subgraph.nodes(nt) for nt in self._node_types}
+        edge_indices = {et: subgraph.edge_index_local(*et) for et in self._edge_types}
+        seed_index_np = subgraph.seed_indices
+        feats = {nt: feat for nt, feat in (in_memory_features or {}).items() if nt in node_ids}
 
-        for nt in node_types:
-            nodes = subgraph.nodes(nt)
-            n_id = torch.from_numpy(nodes)
-            if pin:
-                n_id = n_id.pin_memory()
+        ints: list[npt.NDArray[np.int64]] = [
+            *node_ids.values(),
+            *edge_indices.values(),
+            seed_index_np,
+            input_id,
+        ]
+        if self._pin:
+            specs = [(a.shape, torch.int64) for a in ints]
+            specs += [((len(node_ids[nt]), f.shape[1]), torch.float32) for nt, f in feats.items()]
+            views = pinned_block(specs)
+            for view, arr in zip(views, ints, strict=False):
+                view.copy_(torch.from_numpy(arr))
+            x_out = dict(zip(feats, views[len(ints) :], strict=True))
+        else:
+            views = [torch.from_numpy(a) for a in ints]
+            x_out = {
+                nt: torch.empty((len(node_ids[nt]), f.shape[1]), dtype=torch.float32)
+                for nt, f in feats.items()
+            }
+        it = iter(views)
+
+        data = HeteroData()
+        for nt in self._node_types:
+            n_id = next(it)
             store = data[nt]
             store.n_id = n_id
-            store.num_nodes = len(nodes)
+            store.num_nodes = n_id.shape[0]
+            if nt in x_out:
+                torch.index_select(feats[nt], 0, n_id, out=x_out[nt])
+                store.x = x_out[nt]
 
-            if in_memory_features is not None:
-                feat = in_memory_features.get(nt)
-                if feat is not None:
-                    out = torch.empty(
-                        (len(nodes), feat.shape[1]), dtype=torch.float32, pin_memory=pin
-                    )
-                    torch.index_select(feat, 0, n_id, out=out)
-                    store.x = out
+        for src, rel, dst in self._edge_types:
+            data[src, rel, dst].edge_index = next(it)
 
-        for src, rel, dst in edge_types:
-            edge_index = torch.from_numpy(subgraph.edge_index_local(src, rel, dst))
-            if pin:
-                edge_index = edge_index.pin_memory()
-            data[src, rel, dst].edge_index = edge_index
-
-        # Homo contract: input_id = local seed indices, batch_size = len(seeds)
-        # including duplicates. seed_indices preserves one entry per input seed.
-        seed_type = subgraph.seed_type
-        seed_indices = torch.from_numpy(subgraph.seed_indices)
-        if pin:
-            seed_indices = seed_indices.pin_memory()
+        # batch_size counts every input seed, duplicates included.
+        seed_index = next(it)
         seed_store = data[seed_type]
-        seed_store.batch_size = len(seed_indices)
-        seed_store.input_id = seed_indices
+        seed_store.batch_size = seed_index.shape[0]
+        seed_store.seed_index = seed_index
+        seed_store.input_id = next(it)
 
         return data
 

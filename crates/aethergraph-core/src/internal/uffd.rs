@@ -21,10 +21,11 @@
 
 use anyhow::{Context, Result, bail};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::os::unix::io::RawFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 // --- userfaultfd ABI (linux/userfaultfd.h) --------------------------------
 
@@ -35,10 +36,15 @@ const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 /// for the unprivileged path.
 const UFFD_USER_MODE_ONLY: i32 = 1;
 
-const fn iowr(nr: u32, size: usize) -> libc::c_ulong {
-    const DIR_RW: libc::c_ulong = 3; // (READ|WRITE)
+const fn ioc(dir: libc::c_ulong, nr: u32, size: usize) -> libc::c_ulong {
     const TYPE: libc::c_ulong = 0xAA; // UFFDIO
-    (DIR_RW << 30) | ((size as libc::c_ulong) << 16) | (TYPE << 8) | nr as libc::c_ulong
+    (dir << 30) | ((size as libc::c_ulong) << 16) | (TYPE << 8) | nr as libc::c_ulong
+}
+const fn iowr(nr: u32, size: usize) -> libc::c_ulong {
+    ioc(3, nr, size) // READ|WRITE
+}
+const fn ior(nr: u32, size: usize) -> libc::c_ulong {
+    ioc(2, nr, size)
 }
 
 #[repr(C)]
@@ -67,6 +73,12 @@ struct UffdioCopy {
     mode: u64,
     copy: i64,
 }
+#[repr(C)]
+struct UffdioZeropage {
+    range: UffdioRange,
+    mode: u64,
+    zeropage: i64,
+}
 /// `uffd_msg` — 32 bytes. Only the pagefault arm is read; the union is
 /// modeled as its largest member (three u64s).
 #[repr(C)]
@@ -88,8 +100,40 @@ fn uffdio_api() -> libc::c_ulong {
 fn uffdio_register() -> libc::c_ulong {
     iowr(0x00, core::mem::size_of::<UffdioRegister>())
 }
+fn uffdio_unregister() -> libc::c_ulong {
+    ior(0x01, core::mem::size_of::<UffdioRange>())
+}
 fn uffdio_copy() -> libc::c_ulong {
     iowr(0x03, core::mem::size_of::<UffdioCopy>())
+}
+fn uffdio_zeropage() -> libc::c_ulong {
+    iowr(0x04, core::mem::size_of::<UffdioZeropage>())
+}
+
+/// Errnos that clear on retry: interrupted, momentarily out of memory, or
+/// racing a concurrent change to the address space.
+fn is_transient(errno: Option<i32>) -> bool {
+    matches!(
+        errno,
+        Some(libc::EINTR | libc::EAGAIN | libc::ENOMEM | libc::EBUSY)
+    )
+}
+
+/// Run `op` until it succeeds or fails with a non-transient error, backing
+/// off between attempts. A transient error that persists past the budget
+/// (about a second) is returned as permanent.
+fn retry_transient<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut backoff = Duration::from_micros(50);
+    for _ in 0..100 {
+        match op() {
+            Err(e) if is_transient(e.raw_os_error()) => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+    op()
 }
 
 // --- backing store -------------------------------------------------------
@@ -118,12 +162,22 @@ impl FileSource {
 impl PageSource for FileSource {
     fn fill(&self, offset: u64, page: &mut [u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        // Short reads past EOF leave the tail zero — the region may be
-        // larger than the backing file (sparse feature stores).
-        let n = self.file.read_at(page, offset).context("backing read")?;
-        for b in &mut page[n..] {
-            *b = 0;
+        // A short read is not EOF by itself; keep reading until the page is
+        // full or the file ends. Past EOF the tail is zero — the region may
+        // be larger than the backing file (sparse feature stores).
+        let mut filled = 0;
+        while filled < page.len() {
+            match self
+                .file
+                .read_at(&mut page[filled..], offset + filled as u64)
+            {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e).context("backing read"),
+            }
         }
+        page[filled..].fill(0);
         Ok(())
     }
 }
@@ -135,16 +189,51 @@ impl PageSource for FileSource {
 ///
 /// The region is one flat address range: read any offset and the pager
 /// materializes it. Residency is capped at `budget_pages`; installing a
-/// page over budget first evicts the lowest-weight resident page.
+/// page over budget first evicts the lowest-weight resident page that was
+/// not among the most recent installs.
+///
+/// Two conditions make reads return something other than the source's
+/// contents, and [`Self::check`] reports both:
+///
+/// - The pager hit an error it could not retry past. It resolves that
+///   fault — and, if it cannot keep serving, every later one — with zero
+///   pages rather than leave readers blocked forever, and the failure
+///   sticks.
+/// - The region was inherited across `fork`. It is mapped `MADV_DONTFORK`,
+///   so a child has no mapping there at all and faults instead of reading
+///   silent zeros.
+///
+/// Copying readers should call [`Self::check`] after copying; a borrowed
+/// view is only as good as the check made after its last access.
 pub struct PagedRegion {
     base: *mut u8,
     len: usize,
     page_size: usize,
     uffd: RawFd,
+    owner_pid: u32,
     shutdown: Arc<AtomicBool>,
+    health: Arc<PagerHealth>,
     faults: Arc<AtomicU64>,
     evictions: Arc<AtomicU64>,
     pager: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Sticky pager failure, set once and never cleared.
+#[derive(Default)]
+struct PagerHealth {
+    failed: AtomicBool,
+    reason: Mutex<Option<String>>,
+}
+
+impl PagerHealth {
+    fn fail(&self, reason: String) {
+        let mut slot = self.reason.lock().unwrap_or_else(|p| p.into_inner());
+        slot.get_or_insert(reason);
+        // Released after the reason is stored, and before the fault it
+        // describes is resolved, so a reader that saw the zero page sees
+        // the failure too.
+        self.failed.store(true, Ordering::Release);
+    }
 }
 
 // SAFETY: the mapping and uffd are owned; the pager thread is the only
@@ -159,6 +248,12 @@ impl PagedRegion {
     /// holding at most `budget_pages` resident. `weights` optionally gives
     /// a per-page retention weight (e.g. node degree); higher weight is
     /// evicted later. Missing/short `weights` default to weight 0.
+    ///
+    /// `budget_pages` must be at least 2: one access can straddle a page
+    /// boundary, and both pages have to be resident at once for it to
+    /// complete. Half the budget (at most 64 pages) protects the most
+    /// recent installs, which is what lets several threads' straddling
+    /// accesses complete concurrently.
     pub fn new(
         len: usize,
         budget_pages: usize,
@@ -170,8 +265,11 @@ impl PagedRegion {
         if len == 0 {
             bail!("PagedRegion length must be > 0");
         }
-        if budget_pages == 0 {
-            bail!("budget_pages must be > 0");
+        if budget_pages < 2 {
+            bail!(
+                "budget_pages must be at least 2 (got {budget_pages}): an access \
+                 straddling two pages needs both resident"
+            );
         }
 
         // Create the userfaultfd. O_CLOEXEC | O_NONBLOCK; USER_MODE_ONLY
@@ -211,8 +309,21 @@ impl PagedRegion {
         }
         let base = base as *mut u8;
 
-        // Register the whole range in missing-fault mode.
-        let reg = UffdioRegister {
+        // A forked child inherits neither the pager thread nor (without
+        // EVENT_FORK) the registration, so its faults on this range would
+        // zero-fill silently. Leaving the range out of the child makes an
+        // access there fault loudly instead.
+        // SAFETY: `base`/`len` is exactly the mapping just created.
+        if unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_DONTFORK) } != 0 {
+            let e = std::io::Error::last_os_error();
+            unmap_region(base, len);
+            close_uffd(uffd);
+            bail!("MADV_DONTFORK failed: {e}");
+        }
+
+        // Register the whole range in missing-fault mode. The kernel
+        // writes the supported ioctls back into `reg`.
+        let mut reg = UffdioRegister {
             range: UffdioRange {
                 start: base as u64,
                 len: len as u64,
@@ -220,8 +331,9 @@ impl PagedRegion {
             mode: UFFDIO_REGISTER_MODE_MISSING,
             ioctls: 0,
         };
-        // SAFETY: the range is exactly the mapping just created.
-        if unsafe { libc::ioctl(uffd, uffdio_register(), &reg) } != 0 {
+        // SAFETY: the range is exactly the mapping just created; `reg` is a
+        // valid in/out argument.
+        if unsafe { libc::ioctl(uffd, uffdio_register(), &mut reg) } != 0 {
             let e = std::io::Error::last_os_error();
             unmap_region(base, len);
             close_uffd(uffd);
@@ -229,11 +341,13 @@ impl PagedRegion {
         }
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let health = Arc::new(PagerHealth::default());
         let faults = Arc::new(AtomicU64::new(0));
         let evictions = Arc::new(AtomicU64::new(0));
 
-        let pager = {
+        let spawned = {
             let shutdown = Arc::clone(&shutdown);
+            let health = Arc::clone(&health);
             let faults = Arc::clone(&faults);
             let evictions = Arc::clone(&evictions);
             let base_addr = base as usize;
@@ -243,18 +357,29 @@ impl PagedRegion {
                     let mut pager = Pager {
                         uffd,
                         base: base_addr,
+                        len,
                         page_size,
                         budget_pages,
                         source,
                         weights,
                         resident: HashMap::new(),
                         evict_queue: BinaryHeap::new(),
+                        recent: VecDeque::new(),
+                        protect: (budget_pages / 2).clamp(1, RECENT_INSTALLS),
+                        health,
                         faults,
                         evictions,
                     };
                     pager.run(&shutdown);
                 })
-                .context("spawn pager thread")?
+        };
+        let pager = match spawned {
+            Ok(p) => p,
+            Err(e) => {
+                unmap_region(base, len);
+                close_uffd(uffd);
+                return Err(e).context("spawn pager thread");
+            }
         };
 
         Ok(Self {
@@ -262,11 +387,36 @@ impl PagedRegion {
             len,
             page_size,
             uffd,
+            owner_pid: std::process::id(),
             shutdown,
+            health,
             faults,
             evictions,
             pager: Some(pager),
         })
+    }
+
+    /// Whether reads through this region return the source's contents:
+    /// an error if the pager failed permanently (it then serves zero pages)
+    /// or if this is a forked copy of the region.
+    pub fn check(&self) -> Result<()> {
+        if std::process::id() != self.owner_pid {
+            bail!(
+                "paged feature region used in a forked child; its pager lives in \
+                 the parent — reopen the store in the child"
+            );
+        }
+        if self.health.failed.load(Ordering::Acquire) {
+            let reason = self
+                .health
+                .reason
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .unwrap_or_default();
+            bail!("paged feature region's pager failed; reads may be zero-filled: {reason}");
+        }
+        Ok(())
     }
 
     /// The region as a read-only slice. Touching any byte demand-loads its
@@ -296,6 +446,16 @@ impl PagedRegion {
 
 impl Drop for PagedRegion {
     fn drop(&mut self) {
+        if std::process::id() != self.owner_pid {
+            // A forked copy: the pager thread and the mapping exist only in
+            // the parent, and joining a thread the child never had would
+            // block forever. Only the fd is the child's to close.
+            if let Some(pager) = self.pager.take() {
+                std::mem::forget(pager);
+            }
+            close_uffd(self.uffd);
+            return;
+        }
         self.shutdown.store(true, Ordering::SeqCst);
         // Nudge the pager off its poll and join it before unmapping, so no
         // fault handling races the munmap.
@@ -360,10 +520,18 @@ impl PageWeights {
     }
 }
 
+/// Most recent installs shielded from eviction. The pager cannot see
+/// accesses, only faults, so a page it just installed may not have been
+/// read yet: evicting it could undo the install before the faulting access
+/// retries. An access straddling two pages needs both, so each concurrently
+/// faulting thread needs two of these.
+const RECENT_INSTALLS: usize = 64;
+
 /// The pager thread's private state.
 struct Pager {
     uffd: RawFd,
     base: usize,
+    len: usize,
     page_size: usize,
     budget_pages: usize,
     source: Arc<dyn PageSource>,
@@ -378,6 +546,13 @@ struct Pager {
     /// is the right one. The queue is rebuilt from `resident` when the
     /// stale entries outgrow the live ones.
     evict_queue: BinaryHeap<Reverse<(u32, usize)>>,
+    /// The last `protect` pages installed, oldest first; never evicted.
+    recent: VecDeque<usize>,
+    /// Half the budget, between 1 and [`RECENT_INSTALLS`]: the newest
+    /// install always survives, and the other half of the budget is still
+    /// retained by weight.
+    protect: usize,
+    health: Arc<PagerHealth>,
     faults: Arc<AtomicU64>,
     evictions: Arc<AtomicU64>,
 }
@@ -414,67 +589,161 @@ impl Pager {
             if msg.event != UFFD_EVENT_PAGEFAULT {
                 continue;
             }
-            if let Err(e) = self.service_fault(msg.arg1, &mut staging) {
-                tracing::error!(error = %e, "uffd pager fault handling failed");
-                // A failed install leaves the faulting thread blocked; the
-                // region is unusable, so stop rather than spin.
+            let Err(e) = self.service_fault(msg.arg1, &mut staging) else {
+                continue;
+            };
+            // The faulting thread stays blocked until its page is
+            // installed. Record the failure first, so a reader that gets
+            // past the fault also sees why its data is zeros, then give it
+            // a zero page.
+            tracing::error!(error = %e, "uffd pager could not load a page");
+            self.health.fail(format!("{e:#}"));
+            if let Err(e) = self.install_zero_page(msg.arg1) {
+                // Nothing can be installed. Unregistering wakes every
+                // blocked reader, and later faults zero-fill without the
+                // pager — the failure recorded above reports it.
+                tracing::error!(error = %e, "uffd pager releasing the region");
+                self.unregister_all();
                 break;
             }
         }
     }
 
-    fn service_fault(&mut self, fault_addr: u64, staging: &mut [u8]) -> Result<()> {
+    fn page_of(&self, fault_addr: u64) -> (usize, usize) {
         let page_start = (fault_addr as usize) & !(self.page_size - 1);
-        let offset = (page_start - self.base) as u64;
-        let page_no = offset as usize / self.page_size;
+        (page_start, (page_start - self.base) / self.page_size)
+    }
+
+    fn service_fault(&mut self, fault_addr: u64, staging: &mut [u8]) -> Result<()> {
+        let (page_start, page_no) = self.page_of(fault_addr);
+        let offset = (page_no * self.page_size) as u64;
 
         // Evict down to budget-1 before installing the newcomer. A pass
-        // that cannot free anything ends the loop: the only page left to
-        // drop is the one being installed, and retrying would spin the
-        // pager thread forever with every faulting reader blocked behind
-        // it.
+        // that cannot free anything ends the loop: every candidate is
+        // protected, and retrying would spin the pager thread forever with
+        // every faulting reader blocked behind it.
         while self.resident.len() >= self.budget_pages {
             if !self.evict_one(page_no)? {
                 break;
             }
         }
 
-        self.source.fill(offset, staging)?;
+        let mut attempts = 0;
+        loop {
+            match self.source.fill(offset, staging) {
+                Ok(()) => break,
+                Err(e) => {
+                    let transient = e
+                        .chain()
+                        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                        .any(|io| is_transient(io.raw_os_error()));
+                    attempts += 1;
+                    if !transient || attempts >= 100 {
+                        return Err(e);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
         // Count the fault and record residency *before* UFFDIO_COPY: the
         // copy is what unblocks the faulting thread, so a reader that sees
         // its access complete also sees this fault reflected in the
         // counters (the copy ioctl and the thread's resume bracket the
         // store with kernel barriers).
+        self.record_install(page_no);
+        self.faults.fetch_add(1, Ordering::Relaxed);
+        let uffd = self.uffd;
+        let result = retry_transient(|| {
+            let mut copy = UffdioCopy {
+                dst: page_start as u64,
+                src: staging.as_ptr() as u64,
+                len: self.page_size as u64,
+                mode: 0,
+                copy: 0,
+            };
+            // SAFETY: `dst` is the faulting page inside the registered
+            // range; `src` is a full page of staging owned by this thread;
+            // `copy` is a valid in/out argument.
+            if unsafe { libc::ioctl(uffd, uffdio_copy(), &mut copy) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+        match result {
+            // EEXIST: another thread's access already installed it — the
+            // fault is resolved either way.
+            Err(e) if e.raw_os_error() != Some(libc::EEXIST) => bail!("UFFDIO_COPY failed: {e}"),
+            _ => Ok(()),
+        }
+    }
+
+    /// Record `page_no` as resident and among the protected recent
+    /// installs.
+    fn record_install(&mut self, page_no: usize) {
         let weight = self.weights.weight(page_no);
         if self.resident.insert(page_no, weight).is_none() {
             self.evict_queue.push(Reverse((weight, page_no)));
         }
-        self.faults.fetch_add(1, Ordering::Relaxed);
-        let copy = UffdioCopy {
-            dst: page_start as u64,
-            src: staging.as_ptr() as u64,
-            len: self.page_size as u64,
-            mode: 0,
-            copy: 0,
-        };
-        // SAFETY: `dst` is the faulting page inside the registered range;
-        // `src` is a full page of staging owned by this thread.
-        if unsafe { libc::ioctl(self.uffd, uffdio_copy(), &copy) } != 0 {
-            let e = std::io::Error::last_os_error();
-            // EEXIST means another thread's access already installed it —
-            // benign, the fault is resolved either way.
-            if e.raw_os_error() != Some(libc::EEXIST) {
-                bail!("UFFDIO_COPY failed: {e}");
-            }
+        self.recent.retain(|&p| p != page_no);
+        self.recent.push_back(page_no);
+        while self.recent.len() > self.protect {
+            self.recent.pop_front();
         }
-        Ok(())
     }
 
-    /// Evict the lowest-weight resident page (never the one about to be
-    /// installed). `MADV_DONTNEED` drops it and re-arms its fault.
+    /// Resolve the fault at `fault_addr` with a zero page, for when its
+    /// contents cannot be loaded.
+    fn install_zero_page(&mut self, fault_addr: u64) -> Result<()> {
+        let (page_start, page_no) = self.page_of(fault_addr);
+        self.record_install(page_no);
+        let uffd = self.uffd;
+        let result = retry_transient(|| {
+            let mut zero = UffdioZeropage {
+                range: UffdioRange {
+                    start: page_start as u64,
+                    len: self.page_size as u64,
+                },
+                mode: 0,
+                zeropage: 0,
+            };
+            // SAFETY: the range is one page inside the registered mapping;
+            // `zero` is a valid in/out argument.
+            if unsafe { libc::ioctl(uffd, uffdio_zeropage(), &mut zero) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+        match result {
+            Err(e) if e.raw_os_error() != Some(libc::EEXIST) => {
+                bail!("UFFDIO_ZEROPAGE failed: {e}")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Drop the whole range's registration, waking every blocked fault.
+    fn unregister_all(&self) {
+        let range = UffdioRange {
+            start: self.base as u64,
+            len: self.len as u64,
+        };
+        // SAFETY: the range is exactly the registered mapping.
+        if unsafe { libc::ioctl(self.uffd, uffdio_unregister(), &range) } != 0 {
+            tracing::error!(
+                error = %std::io::Error::last_os_error(),
+                "UFFDIO_UNREGISTER failed; readers of unloaded pages stay blocked"
+            );
+        }
+    }
+
+    /// Evict the lowest-weight resident page that is neither `keep` (the
+    /// page about to be installed) nor a protected recent install.
+    /// `MADV_DONTNEED` drops it and re-arms its fault.
     ///
-    /// Returns whether a page was actually evicted. `false` means the only
-    /// candidate left is `keep`, and the caller must stop asking.
+    /// Returns whether a page was actually evicted. `false` means every
+    /// candidate left is protected, and the caller must stop asking.
     ///
     /// Pulling the victim from a weight-ordered queue keeps this
     /// O(log n): scanning `resident` for the minimum would make every
@@ -490,7 +759,7 @@ impl Pager {
                 // Stale: the page was evicted since this entry was pushed.
                 continue;
             }
-            if page == keep {
+            if page == keep || self.recent.contains(&page) {
                 set_aside.push(Reverse((weight, page)));
                 continue;
             }
@@ -503,17 +772,22 @@ impl Pager {
             return Ok(false);
         };
         let addr = self.base + victim * self.page_size;
-        // SAFETY: `addr` is a page inside the registered mapping.
-        let ret = unsafe {
-            libc::madvise(
-                addr as *mut libc::c_void,
-                self.page_size,
-                libc::MADV_DONTNEED,
-            )
-        };
-        if ret != 0 {
-            bail!("MADV_DONTNEED failed: {}", std::io::Error::last_os_error());
-        }
+        retry_transient(|| {
+            // SAFETY: `addr` is a page inside the registered mapping.
+            let ret = unsafe {
+                libc::madvise(
+                    addr as *mut libc::c_void,
+                    self.page_size,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if ret == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        })
+        .context("MADV_DONTNEED failed")?;
         self.resident.remove(&victim);
         self.evictions.fetch_add(1, Ordering::Relaxed);
 
@@ -629,49 +903,211 @@ mod tests {
         );
     }
 
-    /// A one-page budget is the degenerate case for eviction: every fault
-    /// has to drop the only resident page, and several threads racing on
-    /// the same page can fault it again while it is already installed. The
-    /// eviction pass has nothing it may drop then, so it must give up
-    /// rather than retry — a pager thread spinning here blocks every
-    /// reader behind it, and the test would hang rather than fail.
+    fn page_file(npages: usize) -> std::fs::File {
+        let ps = page_size();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        for p in 0..npages {
+            tmp.write_all(&vec![(p % 251) as u8; ps]).unwrap();
+        }
+        tmp.flush().unwrap();
+        tmp.reopen().unwrap()
+    }
+
+    /// Run `f` on its own thread, failing (instead of hanging the suite)
+    /// if it does not finish: a livelocked pager blocks its reader forever.
+    fn within_deadline<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("read did not complete: the pager is stuck")
+    }
+
+    /// One 8-byte load spanning `data[boundary - 4..boundary + 4]`, so it
+    /// touches both pages in a single instruction.
+    fn load_across(data: &[u8], boundary: usize) -> [u8; 8] {
+        let span = &data[boundary - 4..boundary + 4];
+        // SAFETY: `span` is 8 in-bounds bytes; the read is unaligned-safe.
+        unsafe { (span.as_ptr() as *const u64).read_unaligned() }.to_ne_bytes()
+    }
+
+    /// One access can straddle a page boundary and needs both pages at
+    /// once, so a single-page budget can never serve it.
     #[test]
-    fn single_page_budget_serves_concurrent_faults() {
+    fn budget_below_two_pages_is_refused() {
+        if !uffd_available() {
+            eprintln!("userfaultfd unavailable; skipping");
+            return;
+        }
+        let source = Arc::new(FileSource::new(page_file(4)));
+        let err = PagedRegion::new(4 * page_size(), 1, source, Arc::default())
+            .err()
+            .expect("a one-page budget must be refused");
+        assert!(err.to_string().contains("at least 2"), "{err}");
+    }
+
+    /// A load straddling two pages faults them one at a time and completes
+    /// only once both are resident. With uniform weights the two are also
+    /// the lowest-numbered — the first eviction candidates — so without
+    /// protection each install evicts the other and the access retries
+    /// forever. A tight two-page budget is the sharpest case.
+    #[test]
+    fn straddling_access_completes_under_a_tight_budget() {
         if !uffd_available() {
             eprintln!("userfaultfd unavailable; skipping");
             return;
         }
         let ps = page_size();
         let npages = 8usize;
+        let source = Arc::new(FileSource::new(page_file(npages)));
+        let region = Arc::new(PagedRegion::new(npages * ps, 2, source, Arc::default()).unwrap());
 
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        for p in 0..npages {
-            tmp.write_all(&vec![(p % 251) as u8; ps]).unwrap();
-        }
-        tmp.flush().unwrap();
-        let file = tmp.reopen().unwrap();
-
-        let source = Arc::new(FileSource::new(file));
-        let weights = Arc::new(PageWeights::default());
-        let region = Arc::new(PagedRegion::new(npages * ps, 1, source, weights).unwrap());
-
-        std::thread::scope(|s| {
-            for _ in 0..4 {
-                let region = Arc::clone(&region);
-                s.spawn(move || {
-                    let data = region.as_slice();
-                    for round in 0..16 {
-                        // Every thread hammers the same page each round, so
-                        // the second and later faults land on a page that is
-                        // already resident.
-                        let p = round % npages;
-                        assert_eq!(data[p * ps], (p % 251) as u8, "page {p} first byte");
-                    }
-                });
+        let r = Arc::clone(&region);
+        within_deadline(move || {
+            let data = r.as_slice();
+            // Fill the budget with high-numbered pages first.
+            assert_eq!(data[5 * ps], 5);
+            assert_eq!(data[6 * ps], 6);
+            for boundary in 1..npages {
+                let bytes = load_across(data, boundary * ps);
+                assert_eq!(bytes[..4], [((boundary - 1) % 251) as u8; 4]);
+                assert_eq!(bytes[4..], [(boundary % 251) as u8; 4]);
             }
         });
+        region.check().unwrap();
+    }
 
-        assert!(region.fault_count() > 0, "faults must have been served");
+    /// Many threads straddling different boundaries at once, with room for
+    /// every thread's pair.
+    #[test]
+    fn concurrent_straddling_accesses_all_complete() {
+        if !uffd_available() {
+            eprintln!("userfaultfd unavailable; skipping");
+            return;
+        }
+        let ps = page_size();
+        let npages = 64usize;
+        let source = Arc::new(FileSource::new(page_file(npages)));
+        let region = Arc::new(PagedRegion::new(npages * ps, 16, source, Arc::default()).unwrap());
+
+        let r = Arc::clone(&region);
+        within_deadline(move || {
+            std::thread::scope(|s| {
+                for t in 0..4usize {
+                    let r = &r;
+                    s.spawn(move || {
+                        let data = r.as_slice();
+                        for round in 0..64 {
+                            let boundary = 1 + (round * 7 + t * 13) % (npages - 1);
+                            let bytes = load_across(data, boundary * ps);
+                            assert_eq!(bytes[4], (boundary % 251) as u8);
+                        }
+                    });
+                }
+            });
+        });
+        assert!(
+            region.eviction_count() > 0,
+            "64 pages under a 16-page budget"
+        );
+        region.check().unwrap();
+    }
+
+    /// A source that fails transiently a few times, then permanently for
+    /// one page.
+    struct FlakySource {
+        inner: FileSource,
+        transient_left: std::sync::atomic::AtomicU32,
+        broken_page: u64,
+    }
+
+    impl PageSource for FlakySource {
+        fn fill(&self, offset: u64, page: &mut [u8]) -> Result<()> {
+            if offset == self.broken_page * page.len() as u64 {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO))
+                    .context("simulated bad sector");
+            }
+            if self
+                .transient_left
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EAGAIN).into());
+            }
+            self.inner.fill(offset, page)
+        }
+    }
+
+    /// Transient source errors are retried invisibly. A permanent one must
+    /// neither hang the reader nor pass silently: the reader gets zeros,
+    /// the region reports the failure from then on, and other pages keep
+    /// loading.
+    #[test]
+    fn source_failures_are_retried_or_reported_never_hung() {
+        if !uffd_available() {
+            eprintln!("userfaultfd unavailable; skipping");
+            return;
+        }
+        let ps = page_size();
+        let npages = 8usize;
+        let source = Arc::new(FlakySource {
+            inner: FileSource::new(page_file(npages)),
+            transient_left: std::sync::atomic::AtomicU32::new(3),
+            broken_page: 3,
+        });
+        let region = Arc::new(PagedRegion::new(npages * ps, 4, source, Arc::default()).unwrap());
+
+        let r = Arc::clone(&region);
+        let broken_first_byte = within_deadline(move || {
+            let data = r.as_slice();
+            assert_eq!(data[ps], 1, "a page behind transient errors loads");
+            r.check().unwrap();
+            data[3 * ps]
+        });
+        assert_eq!(broken_first_byte, 0, "an unloadable page reads as zeros");
+        let err = region.check().unwrap_err();
+        assert!(err.to_string().contains("simulated bad sector"), "{err:#}");
+
+        let r = Arc::clone(&region);
+        let later = within_deadline(move || r.as_slice()[5 * ps]);
+        assert_eq!(later, 5, "the pager keeps serving other pages");
+        assert!(region.check().is_err(), "the failure is sticky");
+    }
+
+    /// A forked child has no pager: the region must not be mapped there,
+    /// so a child access faults rather than zero-filling silently.
+    #[test]
+    fn forked_child_cannot_read_the_region_silently() {
+        if !uffd_available() {
+            eprintln!("userfaultfd unavailable; skipping");
+            return;
+        }
+        let ps = page_size();
+        let source = Arc::new(FileSource::new(page_file(4)));
+        let region = PagedRegion::new(4 * ps, 4, source, Arc::default()).unwrap();
+        assert_eq!(region.as_slice()[ps], 1, "resident in the parent");
+        let addr = region.as_slice().as_ptr() as usize + ps;
+
+        // SAFETY: the child only touches memory and exits, without
+        // allocating or taking locks another thread may have held at fork.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // SAFETY: deliberately reads an address that must be unmapped
+            // in the child; a SIGSEGV here is the expected outcome.
+            let byte = unsafe { std::ptr::read_volatile(addr as *const u8) };
+            // SAFETY: `_exit` is async-signal-safe.
+            unsafe { libc::_exit(i32::from(byte) + 1) };
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is our child; `status` is a valid out-pointer.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV,
+            "child read the region instead of faulting (status {status:#x})"
+        );
+        region.check().unwrap();
     }
 
     #[test]

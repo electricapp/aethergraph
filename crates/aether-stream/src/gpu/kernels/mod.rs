@@ -30,12 +30,13 @@ pub mod validate;
 
 pub use coherent::apply_coherent_placement;
 pub use decompress::{
-    EliasFanoDecoder, EliasFanoDeviceParts, StreamVByteDecoder, cpu_streamvbyte_delta_decode,
+    EliasFanoDecoder, EliasFanoDeviceParts, StreamVByteDecoder, StreamVByteDevice,
+    cpu_streamvbyte_delta_decode,
 };
 pub use ibgda::IbgdaPoster;
 pub use persistent::{PersistentWork, PersistentWorkKind, PersistentWorker};
 pub use quant::{FeatureDequantizer, QuantizedRowsDevice};
-pub use sampler::{SampleRequest, WarpSampler, philox};
+pub use sampler::{DeviceCsr, SAMPLE_PAD, SampleBatch, SampleRequest, WarpSampler, philox};
 pub use seqlock::{SeqlockSnapshotReader, cpu_seqlock_accept};
 pub use tma::{TensorTileShape, TensorTileStage, TmaAggregator};
 pub use validate::SeqlockValidator;

@@ -387,6 +387,7 @@ pub const IBV_QPS_RESET: u32 = 0;
 pub const IBV_QPS_INIT: u32 = 1;
 pub const IBV_QPS_RTR: u32 = 2;
 pub const IBV_QPS_RTS: u32 = 3;
+pub const IBV_QPS_ERR: u32 = 6;
 
 // QP type
 pub const IBV_QPT_RC: u32 = 2;
@@ -469,7 +470,9 @@ pub const IBV_QP_SQ_PSN: i32 = 1 << 16;
 pub const IBV_QP_MAX_DEST_RD_ATOMIC: i32 = 1 << 17;
 pub const IBV_QP_DEST_QPN: i32 = 1 << 20;
 
-// Path MTU
+// Path MTU (enum ibv_mtu)
+pub const IBV_MTU_256: u32 = 1;
+pub const IBV_MTU_1024: u32 = 3;
 pub const IBV_MTU_4096: u32 = 5;
 
 // Work completion status

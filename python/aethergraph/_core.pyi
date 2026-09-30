@@ -73,16 +73,17 @@ class CsrGraph:
     def load(
         path: PathLike,
         *,
-        storage: str = "auto",
-        validation: str = "auto",
+        storage: Literal["auto", "mmap", "owned"] = "auto",
+        validation: Literal["auto", "header_only", "offsets_only", "full"] = "auto",
     ) -> CsrGraph:
         """Load a graph from disk, in either the flat or the compressed
-        format. `storage` is one of ``"auto" | "mmap" | "owned"``;
-        `validation` is one of
-        ``"auto" | "header_only" | "offsets_only" | "full"``.
+        format.
 
-        A compressed file always decodes into owned arrays, so
-        ``storage="mmap"`` raises on one."""
+        `validation` sets what an mmap load proves before returning; an
+        owned or compressed load reads every byte and always proves the
+        whole structure (`validation` then only selects checksum
+        verification). A compressed file always decodes into owned
+        arrays, so ``storage="mmap"`` raises on one."""
 
     @staticmethod
     def from_edges(
@@ -117,7 +118,15 @@ class CsrGraph:
     def neighbor_weights(self, node: int) -> npt.NDArray[np.float32] | None: ...
     def set_timestamps(self, timestamps: npt.NDArray[np.float64]) -> None: ...
     def stats(self) -> dict[str, Any]: ...
-    def reorder_rabbit(self) -> npt.NDArray[np.uint32]: ...
+    def reorder_rabbit(self) -> npt.NDArray[np.uint32]:
+        """Rabbit Order permutation, ``perm[new_id] = old_id``. Deterministic.
+        Raises `GraphLoadError` if the graph's edges fail validation."""
+    def rabbit_partitions(self) -> npt.NDArray[np.uint32]:
+        """Rabbit Order community of every node, dense ids from 0."""
+    def reorder_rabbit_with_partitions(
+        self,
+    ) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]:
+        """``(reorder_rabbit(), rabbit_partitions())`` from one pass."""
     def permute(self, perm: npt.NDArray[np.uint32]) -> CsrGraph: ...
     def __len__(self) -> int: ...
     def __getitem__(self, node: int) -> npt.NDArray[np.uint32]: ...
@@ -141,7 +150,14 @@ def save_features(
 # -- Sampling ----------------------------------------------------------------
 
 class SamplingConfig:
-    """Configuration for neighborhood sampling."""
+    """Configuration for neighborhood sampling.
+
+    The constructor validates every field and raises ``ValueError`` on an
+    empty or negative ``num_neighbors``, a non-positive ``max_degree``, or an
+    unknown ``subgraph_type`` / ``temporal_strategy``. ``cumulative=False``
+    is PyG's semantics (each hop expands the previous hop's new nodes);
+    ``deterministic`` has no effect, since a fixed ``seed`` is already
+    bit-reproducible."""
 
     def __init__(
         self,
@@ -149,7 +165,7 @@ class SamplingConfig:
         replace: bool = False,
         seed: int | None = None,
         max_degree: int | None = None,
-        cumulative: bool = True,
+        cumulative: bool = False,
         weighted: bool = False,
         subgraph_type: SubgraphType = "directional",
         track_edge_ids: bool = True,
@@ -198,7 +214,20 @@ class SampledSubgraph:
     (``torch.from_numpy``) needs no defensive copy. The *same* array object
     may be returned on every access (accessors cache), so treat the result
     as immutable — a mutation would be visible through every later access
-    and through ``to_dict()``. Copy first if you need to write."""
+    and through ``to_dict()``. Copy first if you need to write.
+
+    Edge orientation follows PyG's source-to-target convention: row 0 of
+    ``edge_index`` / ``edge_index_local`` is the sampled neighbor and row 1
+    the node whose adjacency row was expanded, so messages flow toward the
+    seeds. ``edge_ids[i]`` is the CSR position of the stored edge from
+    ``edge_index[1, i]`` to ``edge_index[0, i]``. A CSR row is read as the
+    nodes a node aggregates from: for PyG parity on a directed graph, build
+    the CSR from ``(dst, src)``; for an undirected graph (both directions
+    stored) the two coincide. ``to_arrow()`` edge columns use the same
+    orientation.
+
+    ``num_sampled_nodes_per_hop`` is ``[seed nodes, hop 1, ..., hop k]`` and
+    ``num_sampled_edges_per_hop`` has one entry per hop, as PyG expects."""
 
     # Counts.
     @property
@@ -232,7 +261,13 @@ class SampledSubgraph:
     def __len__(self) -> int: ...
 
 class NeighborSampler:
-    """Single-graph neighborhood sampler."""
+    """Single-graph neighborhood sampler.
+
+    The constructor raises ``ValueError`` when ``weighted`` or
+    ``temporal_strategy`` asks for edge data the graph lacks. ``sample``
+    raises ``SamplingError`` for a seed outside the graph, or for
+    ``input_times`` given without a temporal strategy or with a length other
+    than the seed count; ``input_times=None`` leaves every seed unbounded."""
 
     def __init__(self, graph: CsrGraph, config: SamplingConfig) -> None: ...
     def sample(
@@ -244,8 +279,10 @@ class NeighborSampler:
 class ParallelBatchSampler:
     """Rayon-parallel batch sampler for high-throughput training.
 
-    Output is statistically reproducible given a seed; for bit-deterministic
-    output set ``SamplingConfig.deterministic = True``."""
+    Each batch draws from an RNG stream derived from the config's seed and
+    the batch's position among every batch this sampler has handled, so a
+    fixed seed reproduces the same sequence of calls bit-for-bit at any
+    thread count, and repeated calls draw fresh samples."""
 
     def __init__(self, graph: CsrGraph, config: SamplingConfig) -> None: ...
     def sample_batches(self, batches: list[Sequence[int] | SeedArray]) -> list[SampledSubgraph]: ...
@@ -322,7 +359,9 @@ class GraphSnapshot:
 # -- Prefetch loader (low-level) --------------------------------------------
 
 class PrefetchStats:
-    """Counters from the prefetch worker."""
+    """Counters from the prefetch worker. ``hits`` counts batches that were
+    ready when requested, ``misses`` batches the consumer waited for;
+    ``total`` is their sum."""
 
     @property
     def hits(self) -> int: ...
@@ -342,9 +381,17 @@ class NeighborLoader:
     """Prefetching neighbor loader. Spawns `sampler_threads` worker
     threads over an MPMC work queue (plus one feature-loader thread when
     features are configured); bounded submission and result channels apply
-    backpressure both ways. Results arrive unordered across the pool —
-    each subgraph carries its own seeds, so consumers never rely on
-    arrival order."""
+    backpressure both ways.
+
+    With a config seed, results come back in submission order and each
+    batch reseeds from its position in that order, so any pool size yields
+    the same stream and one loader serves any number of epochs. Without a
+    seed, results arrive as workers finish; `next_batch()` reports each
+    one's `batch_idx`.
+
+    Every method is safe from any thread: `shutdown()` (or leaving a `with`
+    block) wakes threads blocked in `submit()` or `next*()`, and a worker
+    failure is raised by the next call rather than after a timeout."""
 
     def __init__(
         self,
@@ -367,13 +414,19 @@ class NeighborLoader:
         config: SamplingConfig,
         prefetch_depth: int = 2,
     ) -> NeighborLoader: ...
-    def submit(self, batch_id: int, seeds: SeedArray | list[int]) -> None: ...
+    def submit(self, batch_idx: int, seeds: SeedArray | list[int]) -> None:
+        """`batch_idx` is echoed back by `next_batch()`; any value is
+        accepted, repeats and gaps included."""
     def submit_epoch(self, batches: list[Any]) -> None: ...
     def next(self) -> SampledSubgraph | None: ...
     def try_next(self) -> SampledSubgraph | None: ...
     def next_with_features(
         self,
     ) -> tuple[SampledSubgraph, npt.NDArray[np.float32] | None] | None: ...
+    def next_batch(
+        self,
+    ) -> tuple[int, SampledSubgraph, npt.NDArray[np.float32] | None] | None:
+        """`(batch_idx, subgraph, features)`, or None after `shutdown()`."""
 
     # The two methods below only exist on wheels built with the `gpudirect`
     # Cargo feature. Default builds raise AttributeError on access. Callers
@@ -388,33 +441,27 @@ class NeighborLoader:
         prefetch_depth: int = 2,
         gid_index: int = 1,
         sampler_threads: int = 1,
-        pooled: bool = False,
-        staging_rows: int = 0,
-    ) -> NeighborLoader:
-        """`pooled=True` serves gathers from one reusable VRAM pool instead
-        of allocating per batch, taking the CUDA allocator off the per-batch
-        critical path; the consumer must then finish with a batch before
-        requesting the next. `staging_rows` attaches a managed-memory tier
-        for `prefetch_upcoming()`."""
-
-    def next_with_gpu_features(self) -> tuple[SampledSubgraph, Any] | None: ...
-    def prefetch_upcoming(self, nodes: npt.NDArray[np.uint32]) -> bool:
-        """Migrate an upcoming batch's rows to the GPU so the transfer
-        overlaps the current batch's compute. False when the loader has no
-        pool or staging tier."""
-
-    def export_pool_fd(self) -> tuple[int, int]:
-        """`(fd, bytes)` for a peer process to map the same VRAM. Send the
-        descriptor over a Unix socket with SCM_RIGHTS. Requires
-        `pooled=True`."""
+    ) -> NeighborLoader: ...
+    def next_batch_gpu(self) -> tuple[int, SampledSubgraph, Any] | None:
+        """`(batch_idx, subgraph, capsule)`: the capsule is a DLPack tensor
+        owning its VRAM, for `torch.from_dlpack`. None after `shutdown()`."""
     @property
     def feature_dim(self) -> int | None: ...
     @property
     def has_features(self) -> bool: ...
     @property
+    def num_nodes(self) -> int: ...
+    @property
     def prefetch_depth(self) -> int: ...
     def shutdown(self) -> None: ...
     def stats(self) -> PrefetchStats: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None: ...
 
 # -- Metrics rollup ----------------------------------------------------------
 
@@ -446,12 +493,15 @@ class FeatureStore:
     ) -> FeatureStore:
         """Demand-page the store from disk with at most `budget_pages`
         pages resident, instead of mapping it and letting the kernel choose.
-        `degrees` (one per node) makes eviction degree-weighted so hub nodes
-        outlive leaves.
+        `budget_pages` must be at least 2, since one row can straddle a page
+        boundary. `degrees` (one per node) makes eviction degree-weighted so
+        hub nodes outlive leaves.
 
-        Linux only, and needs ``vm.unprivileged_userfaultfd=1`` or
-        CAP_SYS_PTRACE; raises OSError otherwise, where `load` is the
-        fallback."""
+        Open the store in the process that reads it: a paged store opened
+        before a fork raises in the child rather than reading zeros.
+
+        Linux only; raises OSError where the kernel withholds userfaultfd,
+        and `load` is the fallback."""
 
     @property
     def num_nodes(self) -> int: ...
@@ -572,7 +622,12 @@ class HeteroCsrGraph:
     def total_edges(self) -> int: ...
 
 class HeteroSamplingConfig:
-    """Configuration for heterogeneous neighborhood sampling."""
+    """Configuration for heterogeneous neighborhood sampling.
+
+    ``num_neighbors[(src, rel, dst)]`` is, per hop, how many ``src`` nodes
+    with an edge into each expanded ``dst`` node to draw — PyG's meaning.
+    Edge types left out draw nothing. ``max_degree`` has no effect: every
+    heterogeneous draw is uniform over the whole in-neighborhood."""
 
     def __init__(
         self,
@@ -598,8 +653,16 @@ class HeteroSampledSubgraph:
     Array accessors return Python-owned arrays that never alias Rust
     memory; here each access allocates fresh, so results are independently
     mutable (unlike `SampledSubgraph`, whose accessors cache). `sample`
-    accepts int64 seed arrays directly — IDs are range-checked at this
-    boundary, so callers never pre-narrow to uint32."""
+    accepts int64 seed arrays directly — IDs are range-checked against the
+    seed type's node count at this boundary, so callers never pre-narrow
+    to uint32.
+
+    Sampling follows PyG: a node of type ``T`` is expanded along every edge
+    type whose destination is ``T``. ``edge_index_local(src, rel, dst)``
+    keeps the stored direction (row 0 indexes ``nodes(src)``, row 1
+    ``nodes(dst)``), with the expanded node as destination, so messages
+    flow toward the seeds. Seeds of a type no edge type points into gain
+    no neighbors — add reverse relations, as PyG's ``ToUndirected`` does."""
 
     @property
     def node_types(self) -> list[str]: ...
@@ -616,7 +679,8 @@ class HeteroSampledSubgraph:
     def edge_index_local(self, src: str, rel: str, dst: str) -> npt.NDArray[np.int64]: ...
 
 class HeteroNeighborSampler:
-    """Heterogeneous neighborhood sampler."""
+    """Heterogeneous neighborhood sampler. ``sample`` raises
+    ``SamplingError`` for a seed outside ``seed_type``'s node range."""
 
     def __init__(self, graph: HeteroCsrGraph, config: HeteroSamplingConfig) -> None: ...
     def sample(
@@ -627,13 +691,9 @@ class HeteroNeighborSampler:
 
 class HeteroNeighborLoader:
     """Prefetching heterogeneous neighbor loader. Spawns `sampler_threads`
-    worker threads over an MPMC work queue — the same pipeline as
-    `NeighborLoader`; bounded submission and result channels apply
-    backpressure both ways. When constructed with a seed, results are
-    reordered by `batch_idx` so multi-worker pools stay bit-identical to a
-    single worker; without a seed, delivery order across the pool is
-    unordered. Every submitted batch is rooted at the `seed_type` fixed at
-    construction."""
+    worker threads over an MPMC work queue — the same pipeline, ordering,
+    and shutdown contract as `NeighborLoader`. Every submitted batch is
+    rooted at the `seed_type` fixed at construction."""
 
     def __init__(
         self,
@@ -643,12 +703,21 @@ class HeteroNeighborLoader:
         prefetch_depth: int = 2,
         sampler_threads: int = 1,
     ) -> None: ...
-    def submit(self, batch_id: int, seeds: SeedArray | list[int]) -> None: ...
+    def submit(self, batch_idx: int, seeds: SeedArray | list[int]) -> None: ...
     def next(self) -> HeteroSampledSubgraph | None: ...
+    def next_batch(self) -> tuple[int, HeteroSampledSubgraph] | None:
+        """`(batch_idx, subgraph)`, or None after `shutdown()`."""
     @property
     def prefetch_depth(self) -> int: ...
     def shutdown(self) -> None: ...
     def stats(self) -> PrefetchStats: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None: ...
 
 # -- FeatureCache (async) ----------------------------------------------------
 
@@ -689,7 +758,9 @@ class FeatureCache:
     async def create(config: FeatureCacheConfig) -> FeatureCache: ...
     async def get(self, node: int) -> npt.NDArray[np.float32]: ...
     async def get_batch(self, nodes: list[int]) -> npt.NDArray[np.float32]: ...
-    async def insert(self, node: int, features: npt.NDArray[np.float32]) -> None: ...
+    async def insert(self, node: int, features: npt.NDArray[np.float32]) -> None:
+        """`features` must hold exactly `feature_dim` values; any other
+        length raises before anything is written."""
     def stats(self) -> dict[str, int | float]: ...
     def print_stats(self) -> None: ...
 

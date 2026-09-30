@@ -20,6 +20,15 @@
 //!                              No tokio. No async. Just threads + io_uring.
 //! ```
 //!
+//! # Delivery and shutdown
+//!
+//! Every submission gets a loader-assigned sequence number. A seeded loader
+//! reseeds per submission from that number and yields results in submission
+//! order, so a multi-worker pool reproduces a single worker exactly. Every
+//! blocking point — `submit`, the workers' receive and send, the consumer's
+//! receive — also watches one stop signal, tripped by `shutdown` or by the
+//! first worker fault, so either wakes every thread at once.
+//!
 //! # io_uring Performance Tiers
 //!
 //! 1. **SQPOLL + IOPOLL + O_DIRECT**: True zero-syscall I/O (best)
@@ -36,19 +45,23 @@
 //!    - Still faster than sequential sync I/O due to batching
 
 use super::hetero_sampler::{HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig};
-use super::sampler::{NeighborSampler, SampledSubgraph, SamplingConfig, batch_seed};
+use super::sampler::{
+    NeighborSampler, SampledSubgraph, SamplingConfig, Seeds, batch_seed, check_config,
+};
 use crate::features::header::{FeatureDtype, parse_feature_header};
 use crate::graph::hetero::{HeteroGraph, NodeTypeId};
 use crate::graph::{Graph, NodeId};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use crate::internal::genstamp::WyRand;
 use crate::internal::hint;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select};
 use parking_lot::Mutex;
+#[cfg(any(target_os = "linux", test))]
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -71,45 +84,57 @@ const MAX_GRAPH_NODES: u64 = 10_000_000_000;
 #[cfg(target_os = "linux")]
 const MAX_GRAPH_EDGES: u64 = 100_000_000_000;
 
-/// Upper bound on a single readahead hint span. A random batch over a large
-/// feature file has a min..max span approximating the whole file, so the hint
-/// is clamped here to avoid faulting in (and evicting) gigabytes of pages.
-const PREFETCH_SPAN_CAP_BYTES: u64 = 8 * 1024 * 1024;
+/// Rows within one page of each other share a readahead hint. A hint
+/// faults whole pages anyway, so a merge wastes at most a page and saves a
+/// syscall per row.
+const HINT_MERGE_GAP_BYTES: u64 = 4096;
 
 /// How long a blocking consumer call waits for the worker before reporting
 /// [`PrefetchError::Timeout`].
 const RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Holds out-of-order prefetch results until `next_idx` is ready.
-/// Used when the loader was constructed with a seed so yield order matches
-/// submit order even with a multi-worker pool.
+/// A queued item tagged with the loader-assigned submission number.
+struct Sequenced<T> {
+    seq: usize,
+    item: T,
+}
+
+/// Holds out-of-order results until the next submission number arrives.
+/// Used by seeded loaders so yield order matches submit order even with a
+/// multi-worker pool.
 struct BatchReorder<T> {
-    next_idx: usize,
+    next_seq: usize,
     pending: BTreeMap<usize, T>,
 }
 
 impl<T> BatchReorder<T> {
     fn new() -> Self {
         Self {
-            next_idx: 0,
+            next_seq: 0,
             pending: BTreeMap::new(),
         }
+    }
+
+    fn pop_ready(&mut self) -> Option<T> {
+        let item = self.pending.remove(&self.next_seq)?;
+        self.next_seq += 1;
+        Some(item)
     }
 }
 
 /// Work item for the prefetch thread.
 #[derive(Debug)]
 pub struct PrefetchWork {
-    /// Batch index (for ordering)
+    /// Caller bookkeeping, echoed back on the result.
     pub batch_idx: usize,
-    /// Seed nodes for this batch
-    pub seeds: Vec<NodeId>,
+    /// Seed nodes for this batch, range-checked against the loader's graph.
+    pub seeds: Seeds,
 }
 
 /// Completed prefetch result.
 #[derive(Debug)]
 pub struct PrefetchResult {
-    /// Batch index
+    /// The `batch_idx` the submission carried.
     pub batch_idx: usize,
     /// Sampled subgraph
     pub subgraph: SampledSubgraph,
@@ -124,10 +149,19 @@ pub struct PrefetchResult {
 /// Completed hetero prefetch result.
 #[derive(Debug)]
 pub struct HeteroPrefetchResult {
-    /// Batch index
+    /// The `batch_idx` the submission carried.
     pub batch_idx: usize,
     /// Sampled heterogeneous subgraph
     pub subgraph: HeteroSampledSubgraph,
+}
+
+/// One delivered batch: the `batch_idx` its submission carried, the sampled
+/// subgraph, and its features when the loader has a feature column.
+#[derive(Debug)]
+pub struct LoadedBatch {
+    pub batch_idx: usize,
+    pub subgraph: SampledSubgraph,
+    pub features: Option<Vec<f32>>,
 }
 
 /// A sampled subgraph paired with its features. The feature slot is `Some`
@@ -144,8 +178,10 @@ pub enum PrefetchError {
         /// How long the call waited before giving up.
         waited: Duration,
     },
-    /// The worker exited without `shutdown()` being requested (panic or
-    /// internal error). `message` carries the captured panic payload or
+    /// A worker exited without `shutdown()` being requested (panic or
+    /// internal error). Reported as soon as the fault happens, even while
+    /// other workers keep running: the faulted batch is lost, so the stream
+    /// cannot complete. `message` carries the captured panic payload or
     /// worker error when one is available.
     WorkerExited { message: Option<String> },
     /// A feature column is attached but loading features for this batch
@@ -186,20 +222,106 @@ impl std::error::Error for PrefetchError {
     }
 }
 
-/// Runs a worker body, recording a panic payload or error into `fault` so the
-/// consumer can report why the result channel disconnected.
-fn run_worker(fault: &OnceLock<String>, body: impl FnOnce() -> anyhow::Result<()>) {
+impl PrefetchResult {
+    fn into_loaded(self) -> Result<LoadedBatch, PrefetchError> {
+        let features = match self.features {
+            None => None,
+            Some(Ok(features)) => Some(features),
+            Some(Err(source)) => {
+                return Err(PrefetchError::FeatureLoad {
+                    batch_idx: self.batch_idx,
+                    source,
+                });
+            }
+        };
+        Ok(LoadedBatch {
+            batch_idx: self.batch_idx,
+            subgraph: self.subgraph,
+            features,
+        })
+    }
+}
+
+/// Stop state shared by one loader's threads.
+///
+/// Tripped at most once — by `shutdown` or by the first worker fault — and
+/// every blocking point in the pipeline selects on `tripped`, which
+/// disconnects on the trip and so wakes all of them.
+struct StopSignal {
+    stopped: AtomicBool,
+    shutdown: AtomicBool,
+    fault: OnceLock<String>,
+    trip: Mutex<Option<Sender<()>>>,
+    tripped: Receiver<()>,
+}
+
+impl StopSignal {
+    fn new() -> Self {
+        let (trip, tripped) = bounded(0);
+        Self {
+            stopped: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            fault: OnceLock::new(),
+            trip: Mutex::new(Some(trip)),
+            tripped,
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Records a worker fault and stops the pipeline. The first fault wins;
+    /// later ones describe its fallout.
+    fn fail(&self, message: String) {
+        let _ = self.fault.set(message);
+        self.stop();
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.stop();
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        // Dropping the only sender disconnects `tripped` for every waiter.
+        drop(self.trip.lock().take());
+    }
+
+    /// What a consumer sees once the pipeline stopped or its channels
+    /// closed: the clean end of stream after `shutdown`, the fault otherwise.
+    fn outcome<T>(&self) -> Result<Option<T>, PrefetchError> {
+        if self.shutdown.load(Ordering::Acquire) {
+            Ok(None)
+        } else {
+            Err(PrefetchError::WorkerExited {
+                message: self.fault.get().cloned(),
+            })
+        }
+    }
+
+    fn refusal(&self) -> SubmitError {
+        if self.shutdown.load(Ordering::Acquire) {
+            SubmitError::Shutdown
+        } else {
+            SubmitError::WorkerExited
+        }
+    }
+}
+
+/// Runs a worker body, recording a panic payload or error as the pipeline's
+/// fault so every blocked consumer and submitter wakes with it. Workers only
+/// finish cleanly after the loader stops; any earlier exit is a fault too.
+fn run_worker(stop: &StopSignal, body: impl FnOnce() -> anyhow::Result<()>) {
     let message = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-        Ok(Ok(())) => return,
+        Ok(Ok(())) if stop.is_stopped() => return,
+        Ok(Ok(())) => "worker finished before the loader stopped".to_string(),
         Ok(Err(e)) => format!("{e:#}"),
         Err(payload) => panic_message(payload.as_ref()),
     };
     warn!("prefetch worker fault: {}", message);
-    // First fault wins. `set` returning Err means another worker already
-    // recorded one, which is the same outcome the old `get_or_insert` had —
-    // and unlike a mutex there is no poisoning to unwrap past, since a
-    // panic here cannot leave the slot half-written.
-    let _ = fault.set(message);
+    stop.fail(message);
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -212,16 +334,252 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Next queued item, or `None` once the loader stops or the queue closes.
+fn recv_work<W>(rx: &Receiver<W>, stop: &StopSignal) -> Option<W> {
+    if stop.is_stopped() {
+        return None;
+    }
+    select! {
+        recv(rx) -> item => item.ok(),
+        recv(stop.tripped) -> _ => None,
+    }
+}
+
+/// Hands `item` downstream; `false` once the loader stops or the receiving
+/// side is gone.
+fn deliver<T>(tx: &Sender<T>, item: T, stop: &StopSignal) -> bool {
+    select! {
+        send(tx, item) -> sent => sent.is_ok(),
+        recv(stop.tripped) -> _ => false,
+    }
+}
+
+/// The submit/deliver machinery every loader shares: a bounded work queue
+/// into a thread pool, a bounded result queue back, a stop signal every
+/// blocking point watches, and — for seeded loaders — a reorder buffer that
+/// yields in submission order. All methods take `&self`, so one thread can
+/// shut the loader down while others are blocked in `submit` or `next`.
+struct Pipeline<T> {
+    work_tx: Sender<Sequenced<PrefetchWork>>,
+    result_rx: Receiver<Sequenced<T>>,
+    /// Keeps the result queue connected for the pipeline's lifetime. A
+    /// panicking worker drops its own sender while unwinding, before its
+    /// fault is recorded; with this one held, consumers learn why the
+    /// stream ended from the stop signal, never from a bare disconnect.
+    _result_hold: Sender<Sequenced<T>>,
+    stop: Arc<StopSignal>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+    next_seq: AtomicUsize,
+    stats: Arc<PrefetchStats>,
+    prefetch_depth: usize,
+    ordered: bool,
+    reorder: Mutex<BatchReorder<T>>,
+    /// Node count submitted seeds must be checked within: the graph's, or
+    /// the seed type's.
+    seed_nodes: usize,
+}
+
+/// The pool side of a [`Pipeline`]'s queues. The constructor clones what
+/// each thread needs and drops the rest.
+struct PoolEnds<T> {
+    work_rx: Receiver<Sequenced<PrefetchWork>>,
+    result_tx: Sender<Sequenced<T>>,
+    stop: Arc<StopSignal>,
+    stats: Arc<PrefetchStats>,
+}
+
+impl<T> Clone for PoolEnds<T> {
+    fn clone(&self) -> Self {
+        Self {
+            work_rx: self.work_rx.clone(),
+            result_tx: self.result_tx.clone(),
+            stop: Arc::clone(&self.stop),
+            stats: Arc::clone(&self.stats),
+        }
+    }
+}
+
+impl<T: Send + 'static> Pipeline<T> {
+    /// Both queues are bounded. `submit` blocks once the pool falls
+    /// `prefetch_depth * 8` batches behind, so a producer staging many
+    /// epochs cannot grow RAM without limit; workers block once the
+    /// consumer falls `result_capacity` results behind.
+    fn new(
+        prefetch_depth: usize,
+        result_capacity: usize,
+        ordered: bool,
+        seed_nodes: usize,
+    ) -> (Self, PoolEnds<T>) {
+        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
+        let (work_tx, work_rx) = bounded(work_capacity);
+        let (result_tx, result_rx) = bounded(result_capacity.max(1));
+        let stop = Arc::new(StopSignal::new());
+        let stats = Arc::new(PrefetchStats::default());
+        let pipe = Self {
+            work_tx,
+            result_rx,
+            _result_hold: result_tx.clone(),
+            stop: Arc::clone(&stop),
+            handles: Mutex::new(Vec::new()),
+            next_seq: AtomicUsize::new(0),
+            stats: Arc::clone(&stats),
+            prefetch_depth,
+            ordered,
+            reorder: Mutex::new(BatchReorder::new()),
+            seed_nodes,
+        };
+        let ends = PoolEnds {
+            work_rx,
+            result_tx,
+            stop,
+            stats,
+        };
+        (pipe, ends)
+    }
+
+    /// Spawns one pool thread. A panic or error `body` returns becomes the
+    /// pipeline's fault.
+    fn spawn(
+        &self,
+        name: String,
+        body: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) -> std::io::Result<()> {
+        let stop = Arc::clone(&self.stop);
+        let handle = thread::Builder::new()
+            .name(name)
+            .spawn(move || run_worker(&stop, body))?;
+        self.handles.lock().push(handle);
+        Ok(())
+    }
+}
+
+impl<T> Pipeline<T> {
+    fn submit(&self, batch_idx: usize, seeds: Seeds) -> Result<(), SubmitError> {
+        if seeds.num_nodes() > self.seed_nodes {
+            return Err(SubmitError::SeedsExceedGraph {
+                checked_against: seeds.num_nodes(),
+                num_nodes: self.seed_nodes,
+            });
+        }
+        if self.stop.is_stopped() {
+            return Err(self.stop.refusal());
+        }
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let work = Sequenced {
+            seq,
+            item: PrefetchWork { batch_idx, seeds },
+        };
+        select! {
+            send(self.work_tx, work) -> sent => sent.map_err(|_| self.stop.refusal()),
+            recv(self.stop.tripped) -> _ => Err(self.stop.refusal()),
+        }
+    }
+
+    /// Blocking receive with an explicit wait window.
+    fn next_timeout(&self, timeout: Duration) -> Result<Option<T>, PrefetchError> {
+        if self.stop.is_stopped() {
+            return self.stop.outcome();
+        }
+        let deadline = Instant::now() + timeout;
+        let mut waited = false;
+        loop {
+            if self.ordered
+                && let Some(item) = self.reorder.lock().pop_ready()
+            {
+                self.stats.record_delivery(waited);
+                return Ok(Some(item));
+            }
+            let delivered = match self.result_rx.try_recv() {
+                Ok(delivered) => delivered,
+                Err(TryRecvError::Disconnected) => return self.stop.outcome(),
+                Err(TryRecvError::Empty) => {
+                    waited = true;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    select! {
+                        recv(self.result_rx) -> delivered => match delivered {
+                            Ok(delivered) => delivered,
+                            Err(_) => return self.stop.outcome(),
+                        },
+                        recv(self.stop.tripped) -> _ => return self.stop.outcome(),
+                        default(remaining) => {
+                            warn!(
+                                "Prefetch timeout after {:?} - worker may have deadlocked or I/O is very slow",
+                                timeout
+                            );
+                            return Err(PrefetchError::Timeout { waited: timeout });
+                        }
+                    }
+                }
+            };
+            if !self.ordered {
+                self.stats.record_delivery(waited);
+                return Ok(Some(delivered.item));
+            }
+            self.reorder
+                .lock()
+                .pending
+                .insert(delivered.seq, delivered.item);
+        }
+    }
+
+    fn try_next(&self) -> Result<Option<T>, PrefetchError> {
+        if self.stop.is_stopped() {
+            return self.stop.outcome();
+        }
+        loop {
+            if self.ordered
+                && let Some(item) = self.reorder.lock().pop_ready()
+            {
+                self.stats.record_delivery(false);
+                return Ok(Some(item));
+            }
+            match self.result_rx.try_recv() {
+                Ok(delivered) if self.ordered => {
+                    self.reorder
+                        .lock()
+                        .pending
+                        .insert(delivered.seq, delivered.item);
+                }
+                Ok(delivered) => {
+                    self.stats.record_delivery(false);
+                    return Ok(Some(delivered.item));
+                }
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => return self.stop.outcome(),
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        self.stop.request_shutdown();
+        let handles = std::mem::take(&mut *self.handles.lock());
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
+impl<T> Drop for Pipeline<T> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Sync feature store for use in prefetch thread.
 ///
 /// Unlike AsyncFeatureStore, this is designed for synchronous access
 /// from the prefetch thread, optionally using io_uring for parallel reads.
 ///
-/// On Linux, uses O_DIRECT with aligned buffers for true async NVMe I/O.
+/// On Linux, the ring reads through O_DIRECT with aligned buffers when the
+/// layout allows it; readahead hints and the pread fallback always go
+/// through a buffered descriptor on the same inode.
 pub struct SyncFeatureStore {
-    /// File handle (may be O_DIRECT on Linux)
+    /// Buffered descriptor: parsed at load, and serving readahead hints and
+    /// the pread fallback.
     file: Arc<File>,
-    /// Path to feature file
+    /// O_DIRECT descriptor on the same inode, used by the ring.
+    #[cfg(target_os = "linux")]
+    direct: Option<File>,
     /// Number of nodes
     num_nodes: usize,
     /// Feature dimension per node
@@ -234,73 +592,26 @@ pub struct SyncFeatureStore {
     /// submission (Linux only)
     #[cfg(target_os = "linux")]
     uring: Option<crate::internal::uring::UringLane>,
-    /// Whether O_DIRECT is enabled (required for IOPOLL)
-    #[cfg(target_os = "linux")]
-    direct_io: bool,
+    /// Sorted-row scratch for readahead hints.
+    hint_rows: Vec<NodeId>,
 }
 
 impl SyncFeatureStore {
     /// Load feature store from disk.
     ///
-    /// On Linux, attempts to open with O_DIRECT for use with io_uring IOPOLL.
-    /// Falls back gracefully if:
+    /// On Linux, attempts to open a second, O_DIRECT descriptor for the
+    /// io_uring IOPOLL path. Skips it when:
     /// - O_DIRECT is not supported (tmpfs, network FS)
     /// - Feature layout isn't O_DIRECT compatible (unaligned offsets)
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         debug!("Loading sync feature store from {}", path.display());
 
-        // Open without O_DIRECT first so we can read + validate the header.
-        let header_file = File::open(path)?;
-        let header = parse_feature_header(&header_file)?;
+        let file = File::open(path)?;
+        let header = parse_feature_header(&file)?;
 
-        // On Linux, check if layout is O_DIRECT compatible before trying O_DIRECT
         #[cfg(target_os = "linux")]
-        let (file, direct_io) = {
-            use crate::internal::uring::{
-                DIRECT_IO_OFFSET_ALIGNMENT, direct_io_offset_alignment,
-                is_layout_direct_io_compatible_with, open_direct_or_fallback,
-            };
-
-            // Ask the file what its device actually requires. The 512-byte
-            // default is only a floor: on a 4Kn device a layout that clears
-            // 512 but not 4096 would pass the check and then fail every
-            // read with EINVAL.
-            let alignment =
-                direct_io_offset_alignment(&header_file).unwrap_or(DIRECT_IO_OFFSET_ALIGNMENT);
-            let layout_compatible = is_layout_direct_io_compatible_with(
-                header.features_start_offset,
-                header.feature_size,
-                alignment,
-            );
-
-            if layout_compatible {
-                // Layout is aligned, try O_DIRECT
-                drop(header_file);
-                let (f, direct) = open_direct_or_fallback(path)?;
-                if direct {
-                    debug!(
-                        "Feature layout is O_DIRECT compatible (offset={}, size={}, alignment={})",
-                        header.features_start_offset, header.feature_size, alignment
-                    );
-                }
-                (f, direct)
-            } else {
-                // Layout not aligned, O_DIRECT would fail with EINVAL
-                warn!(
-                    "Feature layout not O_DIRECT compatible at {}-byte alignment: offset={} (aligned={}), size={} (aligned={})",
-                    alignment,
-                    header.features_start_offset,
-                    (header.features_start_offset as usize).is_multiple_of(alignment),
-                    header.feature_size,
-                    header.feature_size.is_multiple_of(alignment)
-                );
-                (header_file, false)
-            }
-        };
-
-        #[cfg(not(target_os = "linux"))]
-        let file = header_file;
+        let direct = Self::open_direct(path, &file, &header)?;
 
         debug!(
             "Feature store: {} nodes, {} dims, data_offset={}, O_DIRECT={}",
@@ -310,7 +621,7 @@ impl SyncFeatureStore {
             cfg!(target_os = "linux") && {
                 #[cfg(target_os = "linux")]
                 {
-                    direct_io
+                    direct.is_some()
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -319,26 +630,78 @@ impl SyncFeatureStore {
             }
         );
 
-        // Setup io_uring on Linux
         #[cfg(target_os = "linux")]
-        let uring = Self::setup_uring(&file, direct_io);
+        let uring = Self::setup_uring(direct.as_ref().unwrap_or(&file));
 
         Ok(Self {
             file: Arc::new(file),
+            #[cfg(target_os = "linux")]
+            direct,
             num_nodes: header.num_nodes,
             feature_dim: header.feature_dim,
             features_start_offset: header.features_start_offset,
             dtype: header.dtype,
             #[cfg(target_os = "linux")]
             uring,
-            #[cfg(target_os = "linux")]
-            direct_io,
+            hint_rows: Vec::new(),
         })
     }
 
+    /// Opens the O_DIRECT descriptor the ring reads through, when the
+    /// device and layout allow it.
     #[cfg(target_os = "linux")]
-    fn setup_uring(file: &File, direct_io: bool) -> Option<crate::internal::uring::UringLane> {
-        let mut handle = crate::internal::uring::create_feature_uring(direct_io)?;
+    fn open_direct(
+        path: &Path,
+        file: &File,
+        header: &crate::features::header::FeatureHeader,
+    ) -> anyhow::Result<Option<File>> {
+        use crate::internal::uring::{
+            DirectIoAlignment, is_layout_direct_io_compatible_with, open_direct_or_fallback,
+        };
+        use std::os::unix::fs::MetadataExt;
+
+        // Ask the file what its device actually requires: on a 4Kn device
+        // a layout that clears 512 but not 4096 would fail every read with
+        // EINVAL.
+        let alignment = DirectIoAlignment::probe(file);
+        if !is_layout_direct_io_compatible_with(
+            header.features_start_offset,
+            header.feature_size,
+            alignment,
+        ) {
+            warn!(
+                "Feature layout not O_DIRECT compatible at {} alignment: offset={} (aligned={}), size={} (aligned={})",
+                alignment,
+                header.features_start_offset,
+                (header.features_start_offset as usize).is_multiple_of(alignment.bytes()),
+                header.feature_size,
+                header.feature_size.is_multiple_of(alignment.bytes())
+            );
+            return Ok(None);
+        }
+
+        let (direct, is_direct) = open_direct_or_fallback(path)?;
+        if !is_direct {
+            return Ok(None);
+        }
+        // The header was parsed from `file`; the ring must read that inode,
+        // not whatever the path names by now.
+        let (parsed, reopened) = (file.metadata()?, direct.metadata()?);
+        anyhow::ensure!(
+            parsed.dev() == reopened.dev() && parsed.ino() == reopened.ino(),
+            "feature file {} was replaced while it was being opened",
+            path.display()
+        );
+        debug!(
+            "Feature layout is O_DIRECT compatible (offset={}, size={}, alignment={})",
+            header.features_start_offset, header.feature_size, alignment
+        );
+        Ok(Some(direct))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn setup_uring(file: &File) -> Option<crate::internal::uring::UringLane> {
+        let mut handle = crate::internal::uring::create_feature_uring(file)?;
         if let Err(e) = handle.register_fd(file) {
             warn!("Failed to register FD: {}", e);
         }
@@ -355,7 +718,7 @@ impl SyncFeatureStore {
         self.num_nodes
     }
 
-    /// Get file handle (for prefetch hints)
+    /// Buffered handle on the feature file.
     pub fn file(&self) -> &File {
         &self.file
     }
@@ -365,20 +728,52 @@ impl SyncFeatureStore {
         self.features_start_offset
     }
 
-    /// Issue prefetch hint for a set of nodes (for lookahead).
+    fn row_bytes(&self) -> usize {
+        self.feature_dim * self.dtype.element_size()
+    }
+
+    /// Whether this store's reads bypass the page cache.
+    fn reads_bypass_cache(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.uring.is_some() && self.direct.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Hint the kernel to read ahead the rows of `nodes`.
     ///
-    /// The min..max span is computed in `u64` and clamped to a few MB so a
-    /// single low+high node pair can't hint the whole file (which would fault
-    /// in gigabytes and evict the page cache).
-    pub fn prefetch_nodes(&self, nodes: &[NodeId]) {
-        let feature_size = self.feature_dim * self.dtype.element_size();
-        if let (Some(&min), Some(&max)) = (nodes.iter().min(), nodes.iter().max()) {
-            let offset = self.features_start_offset + (u64::from(min) * feature_size as u64);
-            let span_rows = (u64::from(max) - u64::from(min)) + 1;
-            let len = span_rows
-                .saturating_mul(feature_size as u64)
-                .min(PREFETCH_SPAN_CAP_BYTES);
-            hint::prefetch_file_range(&*self.file, offset, len as usize);
+    /// Skipped when reads go through O_DIRECT, which bypasses the page cache
+    /// the hint would fill. Otherwise one hint covers each run of rows
+    /// within a page of each other, so readahead tracks the rows the batch
+    /// reads rather than the span between its lowest and highest node.
+    pub fn prefetch_nodes(&mut self, nodes: &[NodeId]) {
+        if self.reads_bypass_cache() {
+            return;
+        }
+        let row_bytes = self.row_bytes() as u64;
+        self.hint_rows.clear();
+        self.hint_rows.extend_from_slice(nodes);
+        self.hint_rows.sort_unstable();
+        self.hint_rows.dedup();
+        let mut run: Option<(u64, u64)> = None;
+        for &node in &self.hint_rows {
+            let start = self.features_start_offset + u64::from(node) * row_bytes;
+            let end = start + row_bytes;
+            run = match run {
+                Some((s, e)) if start <= e + HINT_MERGE_GAP_BYTES => Some((s, end)),
+                Some((s, e)) => {
+                    hint::prefetch_file_range(&*self.file, s, (e - s) as usize);
+                    Some((start, end))
+                }
+                None => Some((start, end)),
+            };
+        }
+        if let Some((s, e)) = run {
+            hint::prefetch_file_range(&*self.file, s, (e - s) as usize);
         }
     }
 
@@ -386,21 +781,26 @@ impl SyncFeatureStore {
     ///
     /// With O_DIRECT + io_uring IOPOLL, this achieves near-zero-syscall I/O.
     pub fn get_batch(&mut self, nodes: &[NodeId]) -> anyhow::Result<Vec<f32>> {
-        let feature_size = self.feature_dim * self.dtype.element_size();
+        for &node in nodes {
+            anyhow::ensure!(
+                (node as usize) < self.num_nodes,
+                "node {node} out of bounds (max {})",
+                self.num_nodes
+            );
+        }
+        let feature_size = self.row_bytes();
 
         #[cfg(target_os = "linux")]
         {
-            if self.uring.is_some() {
-                // Take the io_uring lane out temporarily to avoid borrow conflict
-                let mut lane = self.uring.take().unwrap();
-                let result = Self::batch_read_uring_aligned(
-                    &self.file,
-                    nodes,
-                    feature_size,
-                    self.num_nodes,
-                    self.features_start_offset,
+            if let Some(mut lane) = self.uring.take() {
+                let fd = self.direct.as_ref().unwrap_or(&self.file).as_raw_fd();
+                let result = crate::features::gather::uring_gather_rows(
                     &mut lane,
-                    self.direct_io,
+                    fd,
+                    nodes,
+                    self.features_start_offset,
+                    feature_size,
+                    self.direct.is_some(),
                     self.dtype,
                     self.feature_dim,
                 );
@@ -408,7 +808,7 @@ impl SyncFeatureStore {
                     // The ring was accepted at setup, but this filesystem
                     // cannot serve the reads it was built for. Drop the lane
                     // — leaving `self.uring` empty — and let this call and
-                    // every later one take the portable path below.
+                    // every later one take the buffered path below.
                     Err(ref e) if crate::internal::uring::is_ring_unsupported(e) => {
                         debug!("io_uring gather unsupported for this file ({e}); using pread");
                         drop(lane);
@@ -421,70 +821,16 @@ impl SyncFeatureStore {
             }
         }
 
-        // Sync fallback: issue single prefetch hint for the range, computed in
-        // u64 and clamped so a low+high node pair can't hint the whole file.
-        if let (Some(&min_node), Some(&max_node)) = (nodes.iter().min(), nodes.iter().max()) {
-            let min_offset =
-                self.features_start_offset + (u64::from(min_node) * feature_size as u64);
-            let span_rows = (u64::from(max_node) - u64::from(min_node)) + 1;
-            let range_len = span_rows
-                .saturating_mul(feature_size as u64)
-                .min(PREFETCH_SPAN_CAP_BYTES);
-            hint::prefetch_file_range(&*self.file, min_offset, range_len as usize);
-        }
-
+        // Hint every row first so the kernel reads them in parallel while
+        // the preads below consume them in order.
+        self.prefetch_nodes(nodes);
         self.batch_read_sync(nodes, feature_size)
     }
 
-    /// Batch read using io_uring: bounds-checks `nodes`, then gathers and
-    /// decodes through [`crate::features::gather::uring_gather_rows`]
-    /// (shared with `AsyncFeatureStore`) — the lane's persistent buffers
-    /// land the reads, one pipelined submission covers the whole batch,
-    /// and rows decode straight into the output vector.
-    #[cfg(target_os = "linux")]
-    #[allow(clippy::too_many_arguments)]
-    fn batch_read_uring_aligned(
-        file: &File,
-        nodes: &[NodeId],
-        feature_size: usize,
-        num_nodes: usize,
-        features_start_offset: u64,
-        lane: &mut crate::internal::uring::UringLane,
-        direct_io: bool,
-        dtype: FeatureDtype,
-        feature_dim: usize,
-    ) -> anyhow::Result<Vec<f32>> {
-        // Validate all nodes first
-        for &node in nodes {
-            if node as usize >= num_nodes {
-                anyhow::bail!("node {} out of bounds (max {})", node, num_nodes);
-            }
-        }
-
-        crate::features::gather::uring_gather_rows(
-            lane,
-            file.as_raw_fd(),
-            nodes,
-            features_start_offset,
-            feature_size,
-            direct_io,
-            dtype,
-            feature_dim,
-        )
-    }
-
-    /// Sync batch read fallback.
-    ///
-    /// Bounds are checked up front, the landing buffer and the dtype
-    /// dispatch are hoisted out of the row loop, and each row decodes as a
-    /// block rather than element by element.
+    /// Buffered pread fallback. The landing buffer and the dtype dispatch are
+    /// hoisted out of the row loop, and each row decodes as a block rather
+    /// than element by element.
     fn batch_read_sync(&self, nodes: &[NodeId], feature_size: usize) -> anyhow::Result<Vec<f32>> {
-        for &node in nodes {
-            if node as usize >= self.num_nodes {
-                anyhow::bail!("node {node} out of bounds");
-            }
-        }
-
         let decoder = self.dtype.row_decoder();
         let mut all_features = vec![0f32; nodes.len() * self.feature_dim];
         let mut buffer = vec![0u8; feature_size];
@@ -505,11 +851,11 @@ impl SyncFeatureStore {
 /// Lock-free statistics.
 #[derive(Debug, Default)]
 pub struct PrefetchStats {
-    /// Batches immediately available (no wait)
+    /// Batches delivered without waiting
     pub hits: AtomicU64,
-    /// Consumer had to wait
+    /// Batches the consumer had to wait for
     pub misses: AtomicU64,
-    /// Total batches processed
+    /// Total batches delivered
     pub total: AtomicU64,
     /// Cumulative nanoseconds spent sampling
     pub sample_time_ns: AtomicU64,
@@ -539,176 +885,178 @@ impl PrefetchStats {
         self.sample_time_ns.store(0, Ordering::Relaxed);
         self.feature_load_time_ns.store(0, Ordering::Relaxed);
     }
+
+    fn record_delivery(&self, waited: bool) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        let counter = if waited { &self.misses } else { &self.hits };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_sampling(&self, started: Instant) {
+        self.sample_time_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
 }
 
-/// Message passed from sampler thread to feature loader thread.
+/// A sampled batch on its way from a sampler thread to the feature loader.
 struct SampledWork {
     work: PrefetchWork,
     subgraph: SampledSubgraph,
 }
 
-/// Sampler-only worker loop for the two-thread pipeline.
-fn worker_loop_sampler(
-    graph: Arc<Graph>,
+/// Worker loop for the in-memory pool: sample, deliver, repeat. Sampling
+/// goes through [`NeighborSampler::sample`], which routes disjoint,
+/// temporal, and subgraph modes; the constructor already checked the
+/// config against the graph.
+fn worker_loop_inmemory(
+    graph: &Graph,
     config: SamplingConfig,
-    work_rx: Receiver<PrefetchWork>,
-    sample_tx: Sender<SampledWork>,
-    shutdown: Arc<AtomicBool>,
-    stats: Arc<PrefetchStats>,
-) {
-    debug!("Sampler thread started");
+    ends: &PoolEnds<PrefetchResult>,
+) -> anyhow::Result<()> {
+    debug!("In-memory prefetch worker started");
     let base_seed = config.seed;
-    let mut sampler = NeighborSampler::new(&graph, config);
+    let mut sampler = NeighborSampler::new(graph, config);
 
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let work = match work_rx.recv() {
-            Ok(w) => w,
-            Err(_) => break,
-        };
-
+    while let Some(Sequenced { seq, item: work }) = recv_work(&ends.work_rx, &ends.stop) {
         trace!(
             batch_idx = work.batch_idx,
             seeds = work.seeds.len(),
             "sampling"
         );
         if let Some(base) = base_seed {
-            sampler.reseed(batch_seed(base, work.batch_idx));
+            sampler.reseed(batch_seed(base, seq));
         }
-        let t0 = std::time::Instant::now();
-        let subgraph = sampler.sample_neighbors(&work.seeds);
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        stats
-            .sample_time_ns
-            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        let t0 = Instant::now();
+        let subgraph = sampler.sample(&work.seeds, None)?;
+        ends.stats.record_sampling(t0);
 
-        let msg = SampledWork { work, subgraph };
+        let result = PrefetchResult {
+            batch_idx: work.batch_idx,
+            subgraph,
+            features: None,
+            feature_dim: None,
+        };
+        if !deliver(&ends.result_tx, Sequenced { seq, item: result }, &ends.stop) {
+            break;
+        }
+    }
 
-        if sample_tx.send(msg).is_err() {
+    debug!("In-memory prefetch worker stopped");
+    Ok(())
+}
+
+/// Sampler-only worker loop for the feature pipeline.
+fn worker_loop_sampler(
+    graph: &Graph,
+    config: SamplingConfig,
+    work_rx: &Receiver<Sequenced<PrefetchWork>>,
+    sample_tx: &Sender<Sequenced<SampledWork>>,
+    stop: &StopSignal,
+    stats: &PrefetchStats,
+) -> anyhow::Result<()> {
+    debug!("Sampler thread started");
+    let base_seed = config.seed;
+    let mut sampler = NeighborSampler::new(graph, config);
+
+    while let Some(Sequenced { seq, item: work }) = recv_work(work_rx, stop) {
+        trace!(
+            batch_idx = work.batch_idx,
+            seeds = work.seeds.len(),
+            "sampling"
+        );
+        if let Some(base) = base_seed {
+            sampler.reseed(batch_seed(base, seq));
+        }
+        let t0 = Instant::now();
+        let subgraph = sampler.sample(&work.seeds, None)?;
+        stats.record_sampling(t0);
+
+        let item = SampledWork { work, subgraph };
+        if !deliver(sample_tx, Sequenced { seq, item }, stop) {
             break;
         }
     }
 
     debug!("Sampler thread stopped");
+    Ok(())
 }
 
 /// Sampler worker loop for the hetero pool.
 ///
 /// Each worker owns its own [`HeteroNeighborSampler`] (the sampler's scratch
 /// buffers are per-instance) over the shared `Arc<HeteroGraph>` and drains
-/// the MPMC work channel until it closes or shutdown is requested.
+/// the MPMC work channel until it closes or the loader stops.
 fn worker_loop_hetero(
-    graph: Arc<HeteroGraph>,
+    graph: &HeteroGraph,
     config: HeteroSamplingConfig,
     seed_type: NodeTypeId,
-    work_rx: Receiver<PrefetchWork>,
-    result_tx: Sender<HeteroPrefetchResult>,
-    shutdown: Arc<AtomicBool>,
-    stats: Arc<PrefetchStats>,
-) {
+    ends: &PoolEnds<HeteroPrefetchResult>,
+) -> anyhow::Result<()> {
     debug!("Hetero sampler thread started");
     let base_seed = config.seed;
-    let mut sampler = HeteroNeighborSampler::new(&graph, config);
+    let mut sampler = HeteroNeighborSampler::new(graph, config);
 
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let work = match work_rx.recv() {
-            Ok(w) => w,
-            Err(_) => break,
-        };
-
+    while let Some(Sequenced { seq, item: work }) = recv_work(&ends.work_rx, &ends.stop) {
         trace!(
             batch_idx = work.batch_idx,
             seeds = work.seeds.len(),
             "hetero sampling"
         );
         if let Some(base) = base_seed {
-            sampler.reseed(super::sampler::batch_seed(base, work.batch_idx));
+            sampler.reseed(batch_seed(base, seq));
         }
-        let t0 = std::time::Instant::now();
-        let subgraph = sampler.sample_neighbors(seed_type, &work.seeds);
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        stats
-            .sample_time_ns
-            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        let t0 = Instant::now();
+        let subgraph = sampler.sample(seed_type, &work.seeds)?;
+        ends.stats.record_sampling(t0);
 
         let result = HeteroPrefetchResult {
             batch_idx: work.batch_idx,
             subgraph,
         };
-
-        if result_tx.send(result).is_err() {
+        if !deliver(&ends.result_tx, Sequenced { seq, item: result }, &ends.stop) {
             break;
         }
     }
 
     debug!("Hetero sampler thread stopped");
+    Ok(())
 }
 
-/// Feature-loader worker loop for the two-thread pipeline.
+/// Feature-loader worker loop for the feature pipeline.
+///
+/// Loading batch N overlaps readahead for batch N+1: the loader takes the
+/// next sampled batch early, hints its rows, then loads the current one.
 fn worker_loop_feature_loader(
-    sample_rx: Receiver<SampledWork>,
-    result_tx: Sender<PrefetchResult>,
-    shutdown: Arc<AtomicBool>,
+    sample_rx: &Receiver<Sequenced<SampledWork>>,
+    result_tx: &Sender<Sequenced<PrefetchResult>>,
+    stop: &StopSignal,
     mut feature_store: SyncFeatureStore,
-    stats: Arc<PrefetchStats>,
+    stats: &PrefetchStats,
 ) {
     debug!("Feature loader thread started");
-    let mut pending: Option<SampledWork> = None;
+    let mut pending: Option<Sequenced<SampledWork>> = None;
 
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        // Get current item: use pending if available, otherwise recv
-        let sampled = if let Some(s) = pending.take() {
-            trace!(batch_idx = s.work.batch_idx, "using pending sampled work");
-            s
-        } else {
-            match sample_rx.recv() {
-                Ok(s) => s,
-                Err(_) => break,
-            }
-        };
-
-        // Lookahead: try to grab next item and issue prefetch hints
-        if let Ok(next_sampled) = sample_rx.try_recv() {
-            feature_store.prefetch_nodes(&next_sampled.subgraph.nodes);
+    while let Some(Sequenced { seq, item: sampled }) =
+        pending.take().or_else(|| recv_work(sample_rx, stop))
+    {
+        if let Ok(next) = sample_rx.try_recv() {
+            feature_store.prefetch_nodes(&next.item.subgraph.nodes);
             trace!(
-                batch_idx = next_sampled.work.batch_idx,
-                nodes = next_sampled.subgraph.nodes.len(),
+                batch_idx = next.item.work.batch_idx,
+                nodes = next.item.subgraph.nodes.len(),
                 "prefetch hints issued for next batch"
             );
-            pending = Some(next_sampled);
+            pending = Some(next);
         }
 
-        // Load features for current batch
-        let t0 = std::time::Instant::now();
-        let features = match feature_store.get_batch(&sampled.subgraph.nodes) {
-            Ok(feats) => {
-                trace!(
-                    batch_idx = sampled.work.batch_idx,
-                    nodes = sampled.subgraph.nodes.len(),
-                    "features loaded"
-                );
-                Ok(feats)
-            }
-            Err(e) => {
-                warn!(batch_idx = sampled.work.batch_idx, error = %e, "feature load failed");
-                Err(e)
-            }
-        };
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        let t0 = Instant::now();
+        let features = feature_store.get_batch(&sampled.subgraph.nodes);
+        if let Err(e) = &features {
+            warn!(batch_idx = sampled.work.batch_idx, error = %e, "feature load failed");
+        }
         stats
             .feature_load_time_ns
-            .fetch_add(elapsed_ns, Ordering::Relaxed);
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         let result = PrefetchResult {
             batch_idx: sampled.work.batch_idx,
@@ -716,8 +1064,7 @@ fn worker_loop_feature_loader(
             features: Some(features),
             feature_dim: Some(feature_store.feature_dim()),
         };
-
-        if result_tx.send(result).is_err() {
+        if !deliver(result_tx, Sequenced { seq, item: result }, stop) {
             break;
         }
     }
@@ -730,28 +1077,15 @@ fn worker_loop_feature_loader(
 /// Spawns a dedicated thread that samples batches ahead of time.
 /// On Linux with io_uring support, uses zero-syscall I/O for NVMe-backed graphs.
 /// Optionally also loads features for sampled nodes.
+///
+/// Every method takes `&self`: one thread may call `shutdown` while others
+/// are blocked in `submit` or `next`, and all of them return promptly.
 pub struct NeighborLoader {
-    /// Send work to prefetch thread (Option so we can take it on shutdown)
-    work_tx: Option<Sender<PrefetchWork>>,
-    /// Receive results from prefetch thread (Option so shutdown can drop it
-    /// and unblock a worker mid-`send` on a full result channel)
-    result_rx: Option<Receiver<PrefetchResult>>,
-    /// Shutdown signal
-    shutdown: Arc<AtomicBool>,
-    /// Thread handles (1 for no-features mode, 2 for with-features mode)
-    handles: Vec<JoinHandle<()>>,
-    /// Statistics
-    stats: Arc<PrefetchStats>,
-    /// Prefetch depth
-    prefetch_depth: usize,
+    pipe: Pipeline<PrefetchResult>,
     /// Feature dimension (if features are being loaded)
     feature_dim: Option<usize>,
-    /// Why a worker exited on its own (captured panic or error), if it did
-    worker_fault: Arc<OnceLock<String>>,
-    /// When true (seeded construction), `next*` yields in `batch_idx` order
-    /// so multi-worker pools stay bit-identical to a single worker.
-    order_by_batch: bool,
-    reorder: Mutex<BatchReorder<PrefetchResult>>,
+    /// Node count of the sampled graph
+    num_nodes: usize,
 }
 
 impl NeighborLoader {
@@ -759,15 +1093,18 @@ impl NeighborLoader {
     ///
     /// # Arguments
     /// * `graph` - Arc to CSR graph (shared with prefetch threads)
-    /// * `config` - Sampling configuration
+    /// * `config` - Sampling configuration. `disjoint` gives each seed its
+    ///   own subgraph, with the per-node `batch` vector attached.
     /// * `prefetch_depth` - How many batches to keep ready (default: 2-3)
     /// * `sampler_threads` - Sampler worker count (0 is treated as 1). The
-    ///   work channel is MPMC and results carry their `batch_idx`, so extra
-    ///   workers scale sampling throughput with no ordering machinery —
-    ///   consumers must already match results by content, not arrival order.
+    ///   work channel is MPMC; with `config.seed` set, results are
+    ///   reordered to submission order, otherwise they arrive as workers
+    ///   finish.
     ///
     /// # Errors
-    /// Returns an error if a prefetch thread cannot be spawned.
+    /// Returns `InvalidInput` if `prefetch_depth` is 0 or `config` asks for
+    /// edge weights or timestamps the graph lacks, and an error if a prefetch
+    /// thread cannot be spawned.
     #[tracing::instrument(
         skip(graph, config),
         fields(num_nodes = graph.num_nodes(), prefetch_depth)
@@ -784,47 +1121,25 @@ impl NeighborLoader {
                 "prefetch_depth must be >= 1",
             ));
         }
+        check_config(&graph, &config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let sampler_threads = sampler_threads.max(1);
-        let order_by_batch = config.seed.is_some();
+        let (pipe, ends) = Pipeline::new(
+            prefetch_depth,
+            prefetch_depth.max(sampler_threads),
+            config.seed.is_some(),
+            graph.num_nodes(),
+        );
 
-        // Both channels bounded:
-        //   - work channel  : producer blocks when the workers fall behind
-        //                     by more than `prefetch_depth * 8` submitted
-        //                     batches. Prevents unbounded RAM growth when a
-        //                     producer stages many epochs at once but the
-        //                     workers are slow / stuck.
-        //   - result channel: workers block when the consumer falls behind
-        //                     by `prefetch_depth` produced subgraphs. This is
-        //                     the canonical pipeline-stall backpressure.
-        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
-        let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
-        let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth.max(sampler_threads));
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(PrefetchStats::default());
-        let worker_fault = Arc::new(OnceLock::new());
-
-        let mut handles = Vec::with_capacity(sampler_threads);
+        let home = crate::internal::numa::current_node();
         for t in 0..sampler_threads {
-            let shutdown = shutdown.clone();
-            let fault = worker_fault.clone();
+            let ends = ends.clone();
             let graph = Arc::clone(&graph);
             let config = config.clone();
-            let work_rx = work_rx.clone();
-            let result_tx = result_tx.clone();
-            handles.push(
-                thread::Builder::new()
-                    .name(format!("aethergraph-prefetch-{t}"))
-                    .spawn(move || {
-                        crate::internal::numa::pin_worker(t);
-                        run_worker(&fault, move || {
-                            Self::worker_loop_inmemory(
-                                graph, config, work_rx, result_tx, shutdown, None,
-                            );
-                            Ok(())
-                        });
-                    })?,
-            );
+            pipe.spawn(format!("aethergraph-prefetch-{t}"), move || {
+                crate::internal::numa::pin_worker(t, home);
+                worker_loop_inmemory(&graph, config, &ends)
+            })?;
         }
 
         debug!(
@@ -833,16 +1148,9 @@ impl NeighborLoader {
         );
 
         Ok(Self {
-            work_tx: Some(work_tx),
-            result_rx: Some(result_rx),
-            shutdown,
-            handles,
-            stats,
-            prefetch_depth,
+            pipe,
             feature_dim: None,
-            worker_fault,
-            order_by_batch,
-            reorder: Mutex::new(BatchReorder::new()),
+            num_nodes: graph.num_nodes(),
         })
     }
 
@@ -861,8 +1169,8 @@ impl NeighborLoader {
     /// * `sampler_threads` - Sampler worker count (0 is treated as 1)
     ///
     /// # Errors
-    /// Returns an error if the feature file cannot be loaded or a pipeline
-    /// thread cannot be spawned.
+    /// Returns an error if `config` asks for edge data the graph lacks, the
+    /// feature file cannot be loaded, or a pipeline thread cannot be spawned.
     pub fn with_features(
         graph: Arc<Graph>,
         config: SamplingConfig,
@@ -871,73 +1179,53 @@ impl NeighborLoader {
         sampler_threads: usize,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(prefetch_depth > 0, "prefetch_depth must be >= 1");
+        check_config(&graph, &config)?;
         let sampler_threads = sampler_threads.max(1);
-        let order_by_batch = config.seed.is_some();
 
-        // Load feature store to get metadata
         let feature_store = SyncFeatureStore::load(feature_path.as_ref())?;
         let feature_dim = feature_store.feature_dim();
 
-        // Same bounding strategy as the in-memory path: producers see
-        // backpressure rather than silently growing the work queue. The
-        // sample channel holds at least one slot per sampler so a burst of
-        // simultaneous completions doesn't immediately block the pool.
-        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
-        let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
-        let (sample_tx, sample_rx) = bounded::<SampledWork>(sampler_threads.max(2));
-        let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth);
+        let (pipe, ends) = Pipeline::new(
+            prefetch_depth,
+            prefetch_depth,
+            config.seed.is_some(),
+            graph.num_nodes(),
+        );
+        // At least one slot per sampler so a burst of simultaneous
+        // completions doesn't immediately block the pool.
+        let (sample_tx, sample_rx) = bounded::<Sequenced<SampledWork>>(sampler_threads.max(2));
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(PrefetchStats::default());
-        let worker_fault = Arc::new(OnceLock::new());
-
-        let mut handles = Vec::with_capacity(sampler_threads + 1);
+        let home = crate::internal::numa::current_node();
         for t in 0..sampler_threads {
-            let shutdown = shutdown.clone();
-            let stats = stats.clone();
-            let fault = worker_fault.clone();
+            let work_rx = ends.work_rx.clone();
+            let sample_tx = sample_tx.clone();
+            let stop = Arc::clone(&ends.stop);
+            let stats = Arc::clone(&ends.stats);
             let graph = Arc::clone(&graph);
             let config = config.clone();
-            let work_rx = work_rx.clone();
-            let sample_tx = sample_tx.clone();
-            handles.push(
-                thread::Builder::new()
-                    .name(format!("aethergraph-sampler-{t}"))
-                    .spawn(move || {
-                        crate::internal::numa::pin_worker(t);
-                        run_worker(&fault, move || {
-                            worker_loop_sampler(graph, config, work_rx, sample_tx, shutdown, stats);
-                            Ok(())
-                        });
-                    })
-                    .map_err(|e| anyhow::anyhow!("failed to spawn sampler thread: {e}"))?,
-            );
+            pipe.spawn(format!("aethergraph-sampler-{t}"), move || {
+                crate::internal::numa::pin_worker(t, home);
+                worker_loop_sampler(&graph, config, &work_rx, &sample_tx, &stop, &stats)
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn sampler thread: {e}"))?;
         }
-        // The workers own the only senders after this point, so the loader's
-        // recv disconnects when they all exit.
+        // The samplers own the only senders after this point, so the
+        // loader's recv disconnects when they all exit.
         drop(sample_tx);
 
-        let loader_handle = {
-            let shutdown = shutdown.clone();
-            let stats = stats.clone();
-            let fault = worker_fault.clone();
-            thread::Builder::new()
-                .name("aethergraph-feat-loader".into())
-                .spawn(move || {
-                    run_worker(&fault, move || {
-                        worker_loop_feature_loader(
-                            sample_rx,
-                            result_tx,
-                            shutdown,
-                            feature_store,
-                            stats,
-                        );
-                        Ok(())
-                    });
-                })
-                .map_err(|e| anyhow::anyhow!("failed to spawn feature loader thread: {e}"))?
-        };
-        handles.push(loader_handle);
+        {
+            let PoolEnds {
+                result_tx,
+                stop,
+                stats,
+                ..
+            } = ends;
+            pipe.spawn("aethergraph-feat-loader".into(), move || {
+                worker_loop_feature_loader(&sample_rx, &result_tx, &stop, feature_store, &stats);
+                Ok(())
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn feature loader thread: {e}"))?;
+        }
 
         debug!(
             prefetch_depth,
@@ -947,31 +1235,26 @@ impl NeighborLoader {
         );
 
         Ok(Self {
-            work_tx: Some(work_tx),
-            result_rx: Some(result_rx),
-            shutdown,
-            handles,
-            stats,
-            prefetch_depth,
+            pipe,
             feature_dim: Some(feature_dim),
-            worker_fault,
-            order_by_batch,
-            reorder: Mutex::new(BatchReorder::new()),
+            num_nodes: graph.num_nodes(),
         })
     }
 
     /// Create a prefetching sampler for NVMe-backed graphs (Linux only).
     ///
-    /// Uses io_uring with SQPOLL for zero-syscall I/O. The io_uring sampling
-    /// path honors only `fanout`, `replace`, `cumulative`, and `seed`; edge
-    /// ids are always tracked regardless of `track_edge_ids`.
+    /// The header and offsets array are read and validated here; the edge
+    /// body stays on disk, and each batch reads only the neighbor positions
+    /// it samples. The io_uring sampling path honors only `fanout`,
+    /// `replace`, `cumulative`, and `seed`; edge ids are always tracked
+    /// regardless of `track_edge_ids`.
     ///
     /// # Errors
     /// Returns `InvalidInput` if `config` sets a field the io_uring path does
     /// not implement: `weighted`, `temporal_strategy`, `disjoint`,
-    /// `deterministic`, `max_degree` (note: `SamplingConfig::default()` sets
-    /// `max_degree`), or a non-default `subgraph_type`. Also returns an error
-    /// if the prefetch thread cannot be spawned.
+    /// `deterministic`, `max_degree`, or a non-default `subgraph_type`. Also
+    /// returns an error if the graph file is invalid or the prefetch thread
+    /// cannot be spawned.
     #[cfg(target_os = "linux")]
     pub fn new_nvme(
         graph_path: &std::path::Path,
@@ -1049,39 +1332,20 @@ impl NeighborLoader {
             ));
         }
         Self::validate_nvme_config(&config)?;
-        let order_by_batch = config.seed.is_some();
+        let graph = NvmeGraph::open(graph_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
+        let num_nodes = graph.num_nodes();
 
-        // Same bounding strategy as the other constructors: bounded work
-        // channel applies producer-side backpressure so a runaway submit
-        // loop can't grow RAM without limit.
-        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
-        let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
-        let (result_tx, result_rx) = bounded::<PrefetchResult>(prefetch_depth);
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(PrefetchStats::default());
-        let worker_fault = Arc::new(OnceLock::new());
-
-        let feature_dim = feature_store.as_ref().map(|s| s.feature_dim());
-        let path = graph_path.to_path_buf();
-        let handle = {
-            let shutdown = shutdown.clone();
-            let fault = worker_fault.clone();
-            thread::Builder::new()
-                .name("aethergraph-prefetch-nvme".into())
-                .spawn(move || {
-                    run_worker(&fault, move || {
-                        Self::worker_loop_nvme(
-                            &path,
-                            config,
-                            work_rx,
-                            result_tx,
-                            shutdown,
-                            feature_store,
-                        )
-                    });
-                })?
-        };
+        let (pipe, ends) = Pipeline::new(
+            prefetch_depth,
+            prefetch_depth,
+            config.seed.is_some(),
+            num_nodes,
+        );
+        let feature_dim = feature_store.as_ref().map(SyncFeatureStore::feature_dim);
+        pipe.spawn("aethergraph-prefetch-nvme".into(), move || {
+            worker_loop_nvme(graph, &config, &ends, feature_store)
+        })?;
 
         debug!(
             prefetch_depth,
@@ -1090,34 +1354,29 @@ impl NeighborLoader {
         );
 
         Ok(Self {
-            work_tx: Some(work_tx),
-            result_rx: Some(result_rx),
-            shutdown,
-            handles: vec![handle],
-            stats,
-            prefetch_depth,
+            pipe,
             feature_dim,
-            worker_fault,
-            order_by_batch,
-            reorder: Mutex::new(BatchReorder::new()),
+            num_nodes,
         })
     }
 
     /// Submit a batch to be sampled.
-    pub fn submit(&self, batch_idx: usize, seeds: Vec<NodeId>) -> Result<(), SubmitError> {
-        if self.shutdown.load(Ordering::Relaxed) {
-            return Err(SubmitError::Shutdown);
-        }
-        match &self.work_tx {
-            Some(tx) => tx
-                .send(PrefetchWork { batch_idx, seeds })
-                .map_err(|_| SubmitError::ChannelClosed),
-            None => Err(SubmitError::Shutdown),
-        }
+    ///
+    /// `seeds` carry their range check: build them with
+    /// `Seeds::new(ids, loader.num_nodes())`. `batch_idx` is caller
+    /// bookkeeping echoed back on the result; any value is accepted, repeats
+    /// and gaps included. Ordering (for seeded loaders) follows submission
+    /// order, not `batch_idx`.
+    ///
+    /// Blocks while the work queue is full; returns an error once the loader
+    /// is shut down or a worker has faulted, or when `seeds` were checked
+    /// against more nodes than this loader samples.
+    pub fn submit(&self, batch_idx: usize, seeds: Seeds) -> Result<(), SubmitError> {
+        self.pipe.submit(batch_idx, seeds)
     }
 
-    /// Submit all batches for an epoch.
-    pub fn submit_epoch(&self, batches: Vec<Vec<NodeId>>) -> Result<(), SubmitError> {
+    /// Submit all batches for an epoch, indexed from 0.
+    pub fn submit_epoch(&self, batches: Vec<Seeds>) -> Result<(), SubmitError> {
         for (idx, seeds) in batches.into_iter().enumerate() {
             self.submit(idx, seeds)?;
         }
@@ -1132,160 +1391,50 @@ impl NeighborLoader {
     /// - `Err(PrefetchError::Timeout { .. })` when no result arrived within
     ///   30s (logged at warn); the worker may just be slow, so the caller may
     ///   call again.
-    /// - `Err(PrefetchError::WorkerExited { .. })` when the worker exited
-    ///   without `shutdown()` being requested (panic or internal error).
+    /// - `Err(PrefetchError::WorkerExited { .. })` as soon as a worker
+    ///   faults without `shutdown()` being requested (panic or internal
+    ///   error).
     pub fn next(&self) -> Result<Option<SampledSubgraph>, PrefetchError> {
-        Ok(self.next_timeout(RECV_TIMEOUT)?.map(|r| r.subgraph))
+        Ok(self.pipe.next_timeout(RECV_TIMEOUT)?.map(|r| r.subgraph))
     }
 
-    /// Blocking receive with an explicit wait window (shared by the
-    /// `next*` methods).
-    fn next_timeout(&self, timeout: Duration) -> Result<Option<PrefetchResult>, PrefetchError> {
-        let Some(result_rx) = self.result_rx.as_ref() else {
-            return Ok(None);
-        };
-        self.stats.total.fetch_add(1, Ordering::Relaxed);
-
-        if !self.order_by_batch {
-            return self.recv_unordered(result_rx, timeout);
-        }
-
-        // Seeded runs: buffer until `next_idx` arrives so multi-worker
-        // completion order cannot scramble the epoch stream.
-        let deadline = Instant::now() + timeout;
-        loop {
-            {
-                let mut buf = self.reorder.lock();
-                let idx = buf.next_idx;
-                if let Some(r) = buf.pending.remove(&idx) {
-                    buf.next_idx = idx + 1;
-                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Some(r));
-                }
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                warn!(
-                    "Prefetch timeout after {:?} waiting for ordered batch - worker may have deadlocked or I/O is very slow",
-                    timeout
-                );
-                return Err(PrefetchError::Timeout { waited: timeout });
-            }
-
-            match result_rx.recv_timeout(remaining) {
-                Ok(r) => {
-                    self.reorder.lock().pending.insert(r.batch_idx, r);
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    warn!(
-                        "Prefetch timeout after {:?} - worker may have deadlocked or I/O is very slow",
-                        timeout
-                    );
-                    return Err(PrefetchError::Timeout { waited: timeout });
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    return self.disconnected();
-                }
-            }
-        }
-    }
-
-    fn recv_unordered(
-        &self,
-        result_rx: &Receiver<PrefetchResult>,
-        timeout: Duration,
-    ) -> Result<Option<PrefetchResult>, PrefetchError> {
-        match result_rx.try_recv() {
-            Ok(result) => {
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                trace!(batch_idx = result.batch_idx, "prefetch hit");
-                Ok(Some(result))
-            }
-            Err(TryRecvError::Empty) => {
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                trace!("prefetch miss - blocking");
-                match result_rx.recv_timeout(timeout) {
-                    Ok(r) => Ok(Some(r)),
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        warn!(
-                            "Prefetch timeout after {:?} - worker may have deadlocked or I/O is very slow",
-                            timeout
-                        );
-                        Err(PrefetchError::Timeout { waited: timeout })
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => self.disconnected(),
-                }
-            }
-            Err(TryRecvError::Disconnected) => self.disconnected(),
-        }
-    }
-
-    /// Maps a disconnected result channel to its meaning: clean end of
-    /// stream when shutdown was requested, worker death otherwise.
-    fn disconnected(&self) -> Result<Option<PrefetchResult>, PrefetchError> {
-        if self.shutdown.load(Ordering::Relaxed) {
-            debug!("prefetch channel disconnected - loader shut down");
-            Ok(None)
-        } else {
-            Err(PrefetchError::WorkerExited {
-                message: self.worker_fault.get().cloned(),
-            })
-        }
+    /// Get the next batch with its `batch_idx` and features (blocking).
+    ///
+    /// Same return contract as [`NeighborLoader::next_with_features`].
+    pub fn next_batch(&self) -> Result<Option<LoadedBatch>, PrefetchError> {
+        self.pipe
+            .next_timeout(RECV_TIMEOUT)?
+            .map(PrefetchResult::into_loaded)
+            .transpose()
     }
 
     /// Try to get next without blocking.
     ///
     /// Returns `Ok(None)` when no batch is ready yet or the loader has been
-    /// shut down, and `Err(PrefetchError::WorkerExited { .. })` when the
-    /// worker exited without `shutdown()` being requested.
+    /// shut down, and `Err(PrefetchError::WorkerExited { .. })` when a
+    /// worker faulted without `shutdown()` being requested.
     pub fn try_next(&self) -> Result<Option<SampledSubgraph>, PrefetchError> {
-        let Some(result_rx) = self.result_rx.as_ref() else {
-            return Ok(None);
-        };
-        if self.order_by_batch {
-            while let Ok(r) = result_rx.try_recv() {
-                self.reorder.lock().pending.insert(r.batch_idx, r);
-            }
-            let mut buf = self.reorder.lock();
-            let idx = buf.next_idx;
-            if let Some(r) = buf.pending.remove(&idx) {
-                buf.next_idx = idx + 1;
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                self.stats.total.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(r.subgraph));
-            }
-            return match result_rx.try_recv() {
-                Err(TryRecvError::Disconnected) => {
-                    self.disconnected().map(|r| r.map(|r| r.subgraph))
-                }
-                _ => Ok(None),
-            };
-        }
-        match result_rx.try_recv() {
-            Ok(result) => {
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                self.stats.total.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(result.subgraph))
-            }
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => self.disconnected().map(|r| r.map(|r| r.subgraph)),
-        }
+        Ok(self.pipe.try_next()?.map(|r| r.subgraph))
     }
 
     /// Get statistics.
     pub fn stats(&self) -> &PrefetchStats {
-        &self.stats
+        &self.pipe.stats
     }
 
     /// Get prefetch depth.
     pub fn prefetch_depth(&self) -> usize {
-        self.prefetch_depth
+        self.pipe.prefetch_depth
     }
 
     /// Get feature dimension (if features are being loaded).
     pub fn feature_dim(&self) -> Option<usize> {
         self.feature_dim
+    }
+
+    /// Node count of the graph this loader samples; seeds must lie below it.
+    pub fn num_nodes(&self) -> usize {
+        self.num_nodes
     }
 
     /// Get next sampled subgraph with features (blocking).
@@ -1299,176 +1448,42 @@ impl NeighborLoader {
     /// - `Ok(None)` after `shutdown()` — the clean end-of-stream state.
     /// - `Err(PrefetchError::Timeout { .. })` when no result arrived within
     ///   30s; the caller may call again.
-    /// - `Err(PrefetchError::WorkerExited { .. })` when the worker exited
+    /// - `Err(PrefetchError::WorkerExited { .. })` when a worker faulted
     ///   without `shutdown()` being requested.
     /// - `Err(PrefetchError::FeatureLoad { .. })` when a feature column is
     ///   attached but loading this batch's features failed.
     pub fn next_with_features(&self) -> Result<Option<SubgraphWithFeatures>, PrefetchError> {
-        match self.next_timeout(RECV_TIMEOUT)? {
-            None => Ok(None),
-            Some(result) => match result.features {
-                None => Ok(Some((result.subgraph, None))),
-                Some(Ok(features)) => Ok(Some((result.subgraph, Some(features)))),
-                Some(Err(source)) => Err(PrefetchError::FeatureLoad {
-                    batch_idx: result.batch_idx,
-                    source,
-                }),
-            },
-        }
+        Ok(self.next_batch()?.map(|b| (b.subgraph, b.features)))
     }
 
-    /// Shutdown the prefetch thread(s).
+    /// Shut the pipeline down and join its threads.
     ///
-    /// Closes the work channel, drops the result receiver so a worker blocked
-    /// mid-`send` on a full result channel unblocks, then joins the workers.
-    /// Undelivered results are discarded; subsequent consumer calls return
-    /// `Ok(None)`.
-    #[tracing::instrument(skip(self), fields(num_handles = self.handles.len()))]
-    pub fn shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Drop sender to unblock workers waiting for work (take it so the
-        // channel actually closes)
-        drop(self.work_tx.take());
-        // Drop receiver to unblock workers waiting to deliver a result
-        drop(self.result_rx.take());
-        for h in self.handles.drain(..) {
-            let _ = h.join();
-        }
+    /// Wakes every thread blocked in `submit`, `next`, or a worker queue;
+    /// undelivered results are discarded. Afterwards consumer calls return
+    /// `Ok(None)` and `submit` returns [`SubmitError::Shutdown`].
+    #[tracing::instrument(skip(self))]
+    pub fn shutdown(&self) {
+        self.pipe.shutdown();
     }
+}
 
-    /// Worker loop for in-memory graphs (optionally with feature loading).
-    ///
-    /// Uses lookahead prefetching: while loading batch N's features, we sample
-    /// batch N+1 and issue kernel prefetch hints for its feature offsets.
-    fn worker_loop_inmemory(
-        graph: Arc<Graph>,
-        config: SamplingConfig,
-        work_rx: Receiver<PrefetchWork>,
-        result_tx: Sender<PrefetchResult>,
-        shutdown: Arc<AtomicBool>,
-        feature_store: Option<SyncFeatureStore>,
-    ) {
-        let has_features = feature_store.is_some();
-        debug!(
-            has_features,
-            "In-memory prefetch worker started (with lookahead)"
-        );
+/// A validated on-disk CSR: the header and offsets array read and checked
+/// once at open, the edge body left on disk for the sampler to read.
+#[cfg(target_os = "linux")]
+struct NvmeGraph {
+    file: File,
+    offsets: Vec<u64>,
+    edges_start: u64,
+}
 
-        let base_seed = config.seed;
-        let mut sampler = NeighborSampler::new(&graph, config);
-        let mut feature_store = feature_store;
-
-        // Lookahead state: pre-sampled next batch
-        let mut pending: Option<(PrefetchWork, SampledSubgraph)> = None;
-
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // Get current work item: use pending if available, otherwise recv
-            let (work, subgraph) = if let Some((w, sg)) = pending.take() {
-                trace!(batch_idx = w.batch_idx, "using pre-sampled batch");
-                (w, sg)
-            } else {
-                match work_rx.recv() {
-                    Ok(work) => {
-                        trace!(
-                            batch_idx = work.batch_idx,
-                            seeds = work.seeds.len(),
-                            "sampling"
-                        );
-                        if let Some(base) = base_seed {
-                            sampler.reseed(batch_seed(base, work.batch_idx));
-                        }
-                        let subgraph = sampler.sample_neighbors(&work.seeds);
-                        (work, subgraph)
-                    }
-                    Err(_) => break,
-                }
-            };
-
-            // Lookahead: try to get and pre-process next batch
-            // Issue prefetch hints for N+1 while we load N's features
-            if let Ok(next_work) = work_rx.try_recv() {
-                trace!(batch_idx = next_work.batch_idx, "lookahead sampling");
-                if let Some(base) = base_seed {
-                    sampler.reseed(batch_seed(base, next_work.batch_idx));
-                }
-                let next_subgraph = sampler.sample_neighbors(&next_work.seeds);
-
-                // Issue kernel prefetch hints for next batch's features
-                if let Some(ref store) = feature_store {
-                    store.prefetch_nodes(&next_subgraph.nodes);
-                    trace!(
-                        batch_idx = next_work.batch_idx,
-                        nodes = next_subgraph.nodes.len(),
-                        "prefetch hints issued"
-                    );
-                }
-
-                pending = Some((next_work, next_subgraph));
-            }
-
-            // Load current batch features (kernel may be prefetching next batch in parallel)
-            let (features, feature_dim) = if let Some(ref mut store) = feature_store {
-                match store.get_batch(&subgraph.nodes) {
-                    Ok(feats) => {
-                        trace!(
-                            batch_idx = work.batch_idx,
-                            nodes = subgraph.nodes.len(),
-                            "features loaded"
-                        );
-                        (Some(Ok(feats)), Some(store.feature_dim()))
-                    }
-                    Err(e) => {
-                        warn!(batch_idx = work.batch_idx, error = %e, "feature load failed");
-                        (Some(Err(e)), Some(store.feature_dim()))
-                    }
-                }
-            } else {
-                (None, None)
-            };
-
-            let result = PrefetchResult {
-                batch_idx: work.batch_idx,
-                subgraph,
-                features,
-                feature_dim,
-            };
-
-            if result_tx.send(result).is_err() {
-                break; // Consumer gone
-            }
-        }
-
-        debug!("In-memory prefetch worker stopped");
-    }
-
-    /// Worker loop for NVMe-backed graphs using io_uring.
-    ///
-    /// Uses SQPOLL for reduced syscalls. Note: Graph adjacency reads are
-    /// variable-sized, so we don't use O_DIRECT/IOPOLL here (would require
-    /// complex buffer alignment for each variable-length read).
-    #[cfg(target_os = "linux")]
-    fn worker_loop_nvme(
-        path: &std::path::Path,
-        config: SamplingConfig,
-        work_rx: Receiver<PrefetchWork>,
-        result_tx: Sender<PrefetchResult>,
-        shutdown: Arc<AtomicBool>,
-        mut feature_store: Option<SyncFeatureStore>,
-    ) -> anyhow::Result<()> {
-        use crate::internal::uring::UringHandle;
+#[cfg(target_os = "linux")]
+impl NvmeGraph {
+    fn open(path: &Path) -> anyhow::Result<Self> {
         use anyhow::Context;
 
-        debug!("NVMe prefetch worker starting with io_uring");
-
-        // Open graph file (no O_DIRECT - variable-sized reads are complex to align)
+        // No O_DIRECT: adjacency reads are variable-sized and unaligned.
         let file = File::open(path).context("failed to open graph file")?;
-        let fd = file.as_raw_fd();
 
-        // Read + validate graph header
         let mut header = [0u8; GRAPH_HEADER_SIZE as usize];
         file.read_exact_at(&mut header, 0)
             .context("failed to read header")?;
@@ -1503,10 +1518,7 @@ impl NeighborLoader {
         );
         let num_nodes = usize::try_from(num_nodes_u64)
             .map_err(|_| anyhow::anyhow!("num_nodes does not fit in usize"))?;
-        let num_edges = usize::try_from(num_edges_u64)
-            .map_err(|_| anyhow::anyhow!("num_edges does not fit in usize"))?;
 
-        // Read offsets array into memory (small)
         let offsets_size = num_nodes
             .checked_add(1)
             .and_then(|n| n.checked_mul(std::mem::size_of::<u64>()))
@@ -1515,7 +1527,7 @@ impl NeighborLoader {
         let edges_start = offsets_start
             .checked_add(offsets_size as u64)
             .ok_or_else(|| anyhow::anyhow!("edges_start overflow"))?;
-        let min_edges_bytes = (num_edges as u64)
+        let min_edges_bytes = num_edges_u64
             .checked_mul(std::mem::size_of::<NodeId>() as u64)
             .ok_or_else(|| anyhow::anyhow!("edge byte size overflow"))?;
         let min_file_size = edges_start
@@ -1532,7 +1544,6 @@ impl NeighborLoader {
         let mut offsets_bytes = vec![0u8; offsets_size];
         file.read_exact_at(&mut offsets_bytes, offsets_start)
             .context("failed to read offsets")?;
-
         let offsets: Vec<u64> = offsets_bytes
             .chunks_exact(8)
             .map(|c| {
@@ -1542,7 +1553,6 @@ impl NeighborLoader {
                 u64::from_le_bytes(arr)
             })
             .collect();
-        anyhow::ensure!(offsets.len() == num_nodes + 1, "invalid offsets length");
         anyhow::ensure!(offsets[0] == 0, "invalid offsets: offsets[0] must be 0");
         for (i, window) in offsets.windows(2).enumerate() {
             anyhow::ensure!(
@@ -1553,107 +1563,369 @@ impl NeighborLoader {
                 i + 1,
                 window[1]
             );
-            anyhow::ensure!(
-                window[1] <= num_edges as u64,
-                "invalid offsets: offsets[{}]={} exceeds num_edges {}",
-                i + 1,
-                window[1],
-                num_edges
-            );
         }
         anyhow::ensure!(
-            offsets[num_nodes] == num_edges as u64,
+            offsets[num_nodes] == num_edges_u64,
             "invalid offsets tail: offsets[last]={} != num_edges {}",
             offsets[num_nodes],
-            num_edges
+            num_edges_u64
         );
 
         debug!(num_nodes, "Loaded offsets array for NVMe graph");
+        Ok(Self {
+            file,
+            offsets,
+            edges_start,
+        })
+    }
 
-        // Setup io_uring with SQPOLL (reduced syscalls via kernel SQ polling)
-        // Note: We don't use IOPOLL since we're not using O_DIRECT
-        let mut handle = UringHandle::new(crate::internal::uring::DEFAULT_RING_ENTRIES, 1000)?;
-
-        // Register file descriptor for faster access
-        if let Err(e) = handle.register_fd(&file) {
-            warn!("Failed to register graph fd: {}", e);
-        }
-
-        if handle.is_sqpoll() {
-            debug!("io_uring: SQPOLL enabled (reduced syscalls)");
-        } else {
-            debug!("io_uring: standard mode (batched I/O)");
-        }
-
-        // Main sampling loop
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let work = match work_rx.recv() {
-                Ok(w) => w,
-                Err(_) => break,
-            };
-
-            trace!(
-                batch_idx = work.batch_idx,
-                seeds = work.seeds.len(),
-                "NVMe sampling"
-            );
-
-            // Per-batch reseed matches the in-memory worker path so a shared
-            // config.seed stays reproducible across multi-worker pools.
-            let mut sample_config = config.clone();
-            sample_config.seed = Some(
-                config
-                    .seed
-                    .map(|base| batch_seed(base, work.batch_idx))
-                    .unwrap_or_else(rand::random),
-            );
-            let subgraph = sample_with_uring(
-                &mut handle,
-                fd,
-                &offsets,
-                edges_start,
-                num_nodes,
-                &work.seeds,
-                &sample_config,
-            )?;
-
-            let (features, feature_dim) = if let Some(ref mut store) = feature_store {
-                match store.get_batch(&subgraph.nodes) {
-                    Ok(feats) => (Some(Ok(feats)), Some(store.feature_dim())),
-                    Err(e) => {
-                        warn!(batch_idx = work.batch_idx, error = %e, "NVMe feature load failed");
-                        (Some(Err(e)), Some(store.feature_dim()))
-                    }
-                }
-            } else {
-                (None, None)
-            };
-
-            let result = PrefetchResult {
-                batch_idx: work.batch_idx,
-                subgraph,
-                features,
-                feature_dim,
-            };
-
-            if result_tx.send(result).is_err() {
-                break;
-            }
-        }
-
-        debug!("NVMe prefetch worker stopped");
-        Ok(())
+    fn num_nodes(&self) -> usize {
+        self.offsets.len() - 1
     }
 }
 
-impl Drop for NeighborLoader {
-    fn drop(&mut self) {
-        self.shutdown();
+/// Worker loop for NVMe-backed graphs using io_uring.
+///
+/// Uses SQPOLL for reduced syscalls. Graph adjacency reads are
+/// variable-sized, so the ring runs without O_DIRECT/IOPOLL (which would
+/// require aligning every variable-length read).
+#[cfg(target_os = "linux")]
+fn worker_loop_nvme(
+    graph: NvmeGraph,
+    config: &SamplingConfig,
+    ends: &PoolEnds<PrefetchResult>,
+    mut feature_store: Option<SyncFeatureStore>,
+) -> anyhow::Result<()> {
+    use crate::internal::uring::{UringHandle, batch_read};
+
+    debug!("NVMe prefetch worker starting with io_uring");
+
+    // SQPOLL without IOPOLL: the graph file is buffered, and the kernel
+    // rejects every polled read on a buffered file.
+    let mut handle =
+        UringHandle::new_sqpoll_only(crate::internal::uring::DEFAULT_RING_ENTRIES, 1000)?;
+
+    // Register file descriptor for faster access
+    if let Err(e) = handle.register_fd(&graph.file) {
+        warn!("Failed to register graph fd: {}", e);
     }
+
+    if handle.is_sqpoll() {
+        debug!("io_uring: SQPOLL enabled (reduced syscalls)");
+    } else {
+        debug!("io_uring: standard mode (batched I/O)");
+    }
+
+    let fd = graph.file.as_raw_fd();
+    let edges_start = graph.edges_start;
+    let mut scratch = NvmeScratch::default();
+    let mut rng = WyRand::new(config.seed.unwrap_or_else(rand::random));
+
+    while let Some(Sequenced { seq, item: work }) = recv_work(&ends.work_rx, &ends.stop) {
+        trace!(
+            batch_idx = work.batch_idx,
+            seeds = work.seeds.len(),
+            "NVMe sampling"
+        );
+
+        // Per-submission reseed matches the in-memory workers, so a seeded
+        // loader draws the same stream for the same submission.
+        if let Some(base) = config.seed {
+            rng = WyRand::new(batch_seed(base, seq));
+        }
+        let t0 = Instant::now();
+        let subgraph = sample_from_offsets(
+            &graph.offsets,
+            &work.seeds,
+            config,
+            &mut rng,
+            &mut scratch,
+            |runs, landing| {
+                if runs.is_empty() {
+                    return Ok(());
+                }
+                let base = landing.as_mut_ptr().cast::<u8>();
+                let reads: Vec<(u64, *mut u8, usize)> = runs
+                    .iter()
+                    .map(|run| {
+                        // SAFETY: the plan sized `landing` to cover every
+                        // run's `base..base + len` entries.
+                        let ptr = unsafe { base.add(run.base * size_of::<NodeId>()) };
+                        (
+                            edges_start + run.start * size_of::<NodeId>() as u64,
+                            ptr,
+                            run.len * size_of::<NodeId>(),
+                        )
+                    })
+                    .collect();
+                // SAFETY: each ptr addresses `len` writable bytes inside
+                // `landing`, which outlives this call; batch_read reaps every
+                // submitted completion before returning.
+                unsafe { batch_read(&mut handle, fd, &reads) }
+            },
+        )?;
+        ends.stats.record_sampling(t0);
+
+        let (features, feature_dim) = if let Some(ref mut store) = feature_store {
+            let loaded = store.get_batch(&subgraph.nodes);
+            if let Err(e) = &loaded {
+                warn!(batch_idx = work.batch_idx, error = %e, "NVMe feature load failed");
+            }
+            (Some(loaded), Some(store.feature_dim()))
+        } else {
+            (None, None)
+        };
+
+        let result = PrefetchResult {
+            batch_idx: work.batch_idx,
+            subgraph,
+            features,
+            feature_dim,
+        };
+        if !deliver(&ends.result_tx, Sequenced { seq, item: result }, &ends.stop) {
+            break;
+        }
+    }
+
+    debug!("NVMe prefetch worker stopped");
+    Ok(())
+}
+
+/// Picked edge positions this close share one read: a single request
+/// covers a page of neighbors, so a node's picks cost one request per
+/// cluster and a hub costs its picks, not its whole adjacency list.
+#[cfg(any(target_os = "linux", test))]
+const EDGE_RUN_GAP: u64 = 1024;
+
+/// Upper bound on one coalesced read, in edges.
+#[cfg(any(target_os = "linux", test))]
+const EDGE_RUN_MAX: u64 = 1 << 20;
+
+/// One coalesced read of the edge body: `len` entries starting at edge
+/// `start`, landing at entry `base` of the landing buffer.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EdgeRun {
+    start: u64,
+    len: usize,
+    base: usize,
+}
+
+/// Reusable scratch for the NVMe sampler, one per worker and cleared per
+/// batch, so steady-state sampling allocates only the returned subgraph.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
+struct NvmeScratch {
+    local: FxHashMap<NodeId, u32>,
+    nodes: Vec<NodeId>,
+    frontier: Vec<NodeId>,
+    next_frontier: Vec<NodeId>,
+    positions: Vec<u64>,
+    seen: FxHashSet<u64>,
+    /// `(frontier index, absolute edge index)` per pick, in draw order.
+    picks: Vec<(u32, u64)>,
+    order: Vec<u32>,
+    slots: Vec<usize>,
+    runs: Vec<EdgeRun>,
+    landing: Vec<NodeId>,
+    /// Cumulative mode: hop at which each edge id was first emitted.
+    emitted_at: FxHashMap<u64, usize>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl NvmeScratch {
+    /// Registers `node`, returning whether it is new to this batch. Local
+    /// ids follow discovery order, so the seeds come first.
+    fn register(&mut self, node: NodeId) -> bool {
+        let next = self.nodes.len() as u32;
+        match self.local.entry(node) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(next);
+                self.nodes.push(node);
+                true
+            }
+        }
+    }
+
+    /// Plans the reads covering every pick: sorts the picked edges, merges
+    /// neighbors within [`EDGE_RUN_GAP`] into one run, and records where each
+    /// pick lands. Sizes `landing` to hold every run.
+    fn plan_reads(&mut self) {
+        self.order.clear();
+        self.order.extend(0..self.picks.len() as u32);
+        let picks = &self.picks;
+        self.order.sort_unstable_by_key(|&i| picks[i as usize].1);
+        self.slots.clear();
+        self.slots.resize(self.picks.len(), 0);
+        self.runs.clear();
+
+        let mut total = 0usize;
+        for &i in &self.order {
+            let edge = self.picks[i as usize].1;
+            let extends = self.runs.last().is_some_and(|run| {
+                edge < run.start + run.len as u64 + EDGE_RUN_GAP && edge - run.start < EDGE_RUN_MAX
+            });
+            if !extends {
+                self.runs.push(EdgeRun {
+                    start: edge,
+                    len: 0,
+                    base: total,
+                });
+            }
+            let run = self.runs.last_mut().expect("a run was just ensured");
+            let covered = run.start + run.len as u64;
+            if edge >= covered {
+                let grow = (edge + 1 - covered) as usize;
+                run.len += grow;
+                total += grow;
+            }
+            self.slots[i as usize] = run.base + (edge - run.start) as usize;
+        }
+        self.landing.clear();
+        self.landing.resize(total, 0);
+    }
+}
+
+/// Draws the positions to sample from a node of degree `degree` into
+/// `out`: all of them when `degree <= k`, else `k` uniform draws — with
+/// replacement, or distinct via Floyd's algorithm.
+#[cfg(any(target_os = "linux", test))]
+fn draw_positions(
+    rng: &mut WyRand,
+    degree: u64,
+    k: usize,
+    replace: bool,
+    out: &mut Vec<u64>,
+    seen: &mut FxHashSet<u64>,
+) {
+    out.clear();
+    if degree <= k as u64 {
+        out.extend(0..degree);
+        return;
+    }
+    // Multiply-high maps a 64-bit draw onto `[0, n)` without modulo bias
+    // worth measuring, and reaches every position of any degree.
+    let below =
+        |rng: &mut WyRand, n: u64| ((u128::from(rng.next_u64()) * u128::from(n)) >> 64) as u64;
+    if replace {
+        out.extend((0..k).map(|_| below(rng, degree)));
+        return;
+    }
+    seen.clear();
+    for i in (degree - k as u64)..degree {
+        let j = below(rng, i + 1);
+        let pick = if seen.insert(j) { j } else { i };
+        seen.insert(pick);
+        out.push(pick);
+    }
+}
+
+/// k-hop sampling over an on-disk CSR whose offsets are in memory.
+///
+/// Positions are drawn from the known degrees first, then `fetch` fills
+/// the landing buffer for the planned runs — the NVMe worker reads them
+/// through io_uring. Seeds are registered first, so they take local ids
+/// `0..` in first-occurrence order; each node is expanded once per hop.
+/// `num_sampled_nodes` follows PyG: the seed count, then one entry per hop.
+///
+/// This path honors `fanout`, `replace`, `cumulative`, and `seed` with the
+/// in-memory sampler's semantics. Edge ids are always tracked and edges
+/// are always returned directional; the constructors reject the remaining
+/// `SamplingConfig` fields. `seeds` were checked against this graph's node
+/// count at `submit`.
+#[cfg(any(target_os = "linux", test))]
+fn sample_from_offsets(
+    offsets: &[u64],
+    seeds: &Seeds,
+    config: &SamplingConfig,
+    rng: &mut WyRand,
+    s: &mut NvmeScratch,
+    mut fetch: impl FnMut(&[EdgeRun], &mut [NodeId]) -> anyhow::Result<()>,
+) -> anyhow::Result<SampledSubgraph> {
+    let num_nodes = offsets.len() - 1;
+    s.local.clear();
+    s.nodes.clear();
+    s.frontier.clear();
+    s.emitted_at.clear();
+    for &seed in seeds.ids() {
+        if s.register(seed) {
+            s.frontier.push(seed);
+        }
+    }
+
+    let num_hops = config.fanout.len();
+    let mut edge_src = Vec::new();
+    let mut edge_dst = Vec::new();
+    let mut edge_ids = Vec::new();
+    let mut num_sampled_nodes = Vec::with_capacity(num_hops + 1);
+    let mut num_sampled_edges = Vec::with_capacity(num_hops);
+    num_sampled_nodes.push(s.nodes.len());
+
+    for (hop, &fanout) in config.fanout.iter().enumerate() {
+        s.picks.clear();
+        for (fi, &node) in s.frontier.iter().enumerate() {
+            let start = offsets[node as usize];
+            let degree = offsets[node as usize + 1] - start;
+            draw_positions(
+                rng,
+                degree,
+                fanout,
+                config.replace,
+                &mut s.positions,
+                &mut s.seen,
+            );
+            s.picks
+                .extend(s.positions.iter().map(|&p| (fi as u32, start + p)));
+        }
+        s.plan_reads();
+        fetch(&s.runs, &mut s.landing)?;
+
+        let edges_before = edge_src.len();
+        s.next_frontier.clear();
+        for pick in 0..s.picks.len() {
+            let (fi, edge) = s.picks[pick];
+            let src = s.frontier[fi as usize];
+            let dst = u32::from_le(s.landing[s.slots[pick]]);
+            // The edge body is not validated at open; a corrupt entry is
+            // dropped rather than minting a node past the graph.
+            if dst as usize >= num_nodes {
+                continue;
+            }
+            // Cumulative mode re-expands earlier nodes: an edge an earlier
+            // hop emitted is dropped, while repeats within this hop (drawn
+            // with replacement) stay.
+            if config.cumulative && *s.emitted_at.entry(edge).or_insert(hop) != hop {
+                continue;
+            }
+            edge_src.push(src);
+            edge_dst.push(dst);
+            edge_ids.push(edge);
+            if s.register(dst) {
+                s.next_frontier.push(dst);
+            }
+        }
+        num_sampled_nodes.push(s.next_frontier.len());
+        num_sampled_edges.push(edge_src.len() - edges_before);
+
+        if config.cumulative {
+            s.frontier.extend_from_slice(&s.next_frontier);
+        } else {
+            std::mem::swap(&mut s.frontier, &mut s.next_frontier);
+        }
+    }
+
+    let next_capacity = super::planned_capacity(s.nodes.len(), 0);
+    let nodes = std::mem::replace(&mut s.nodes, Vec::with_capacity(next_capacity));
+    Ok(SampledSubgraph::from_parts(
+        nodes,
+        edge_src,
+        edge_dst,
+        edge_ids,
+        seeds.ids().to_vec(),
+        num_sampled_nodes,
+        num_sampled_edges,
+    ))
 }
 
 /// Prefetching heterogeneous neighbor sampler.
@@ -1661,29 +1933,12 @@ impl Drop for NeighborLoader {
 /// Same pipeline shape as [`NeighborLoader`]: `sampler_threads` worker
 /// threads pull seed batches from a bounded MPMC work channel, sample with
 /// their own [`HeteroNeighborSampler`], and deliver results tagged with
-/// their `batch_idx`. When `config.seed` is set, `next*` reorders by
-/// `batch_idx` so multi-worker pools stay bit-identical to a single worker.
-/// The seed node type is fixed at construction; every submitted batch is
-/// rooted at it.
+/// their `batch_idx`. When `config.seed` is set, `next*` yields in
+/// submission order so multi-worker pools stay bit-identical to a single
+/// worker. The seed node type is fixed at construction; every submitted
+/// batch is rooted at it.
 pub struct HeteroNeighborLoader {
-    /// Send work to the sampler pool (Option so we can take it on shutdown)
-    work_tx: Option<Sender<PrefetchWork>>,
-    /// Receive results from the pool (Option so shutdown can drop it and
-    /// unblock a worker mid-`send` on a full result channel)
-    result_rx: Option<Receiver<HeteroPrefetchResult>>,
-    /// Shutdown signal
-    shutdown: Arc<AtomicBool>,
-    /// Sampler thread handles
-    handles: Vec<JoinHandle<()>>,
-    /// Statistics
-    stats: Arc<PrefetchStats>,
-    /// Prefetch depth
-    prefetch_depth: usize,
-    /// Why a worker exited on its own (captured panic or error), if it did
-    worker_fault: Arc<OnceLock<String>>,
-    /// When true (seeded construction), `next*` yields in `batch_idx` order.
-    order_by_batch: bool,
-    reorder: Mutex<BatchReorder<HeteroPrefetchResult>>,
+    pipe: Pipeline<HeteroPrefetchResult>,
 }
 
 impl HeteroNeighborLoader {
@@ -1694,10 +1949,7 @@ impl HeteroNeighborLoader {
     /// * `config` - Sampling configuration (per-edge-type fanout per hop)
     /// * `seed_type` - Node type every submitted seed batch is rooted at
     /// * `prefetch_depth` - How many batches to keep ready (default: 2-3)
-    /// * `sampler_threads` - Sampler worker count (0 is treated as 1). The
-    ///   work channel is MPMC and results carry their `batch_idx`, so extra
-    ///   workers scale sampling throughput with no ordering machinery —
-    ///   consumers must already match results by content, not arrival order.
+    /// * `sampler_threads` - Sampler worker count (0 is treated as 1)
     ///
     /// # Errors
     /// Returns `InvalidInput` if `prefetch_depth` is 0 or `seed_type` is not
@@ -1731,81 +1983,42 @@ impl HeteroNeighborLoader {
             ));
         }
         let sampler_threads = sampler_threads.max(1);
-        let order_by_batch = config.seed.is_some();
+        let (pipe, ends) = Pipeline::new(
+            prefetch_depth,
+            prefetch_depth.max(sampler_threads),
+            config.seed.is_some(),
+            graph.num_nodes(seed_type),
+        );
 
-        // Same bounding strategy as `NeighborLoader::new`:
-        //   - work channel  : producer blocks when the workers fall behind
-        //                     by more than `prefetch_depth * 8` submitted
-        //                     batches, preventing unbounded RAM growth.
-        //   - result channel: workers block when the consumer falls behind;
-        //                     at least one slot per sampler so a burst of
-        //                     simultaneous completions doesn't immediately
-        //                     block the pool.
-        let work_capacity = prefetch_depth.saturating_mul(8).max(prefetch_depth);
-        let (work_tx, work_rx) = bounded::<PrefetchWork>(work_capacity);
-        let (result_tx, result_rx) =
-            bounded::<HeteroPrefetchResult>(prefetch_depth.max(sampler_threads));
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(PrefetchStats::default());
-        let worker_fault = Arc::new(OnceLock::new());
-
-        let mut handles = Vec::with_capacity(sampler_threads);
+        let home = crate::internal::numa::current_node();
         for t in 0..sampler_threads {
-            let shutdown = shutdown.clone();
-            let stats = stats.clone();
-            let fault = worker_fault.clone();
+            let ends = ends.clone();
             let graph = Arc::clone(&graph);
             let config = config.clone();
-            let work_rx = work_rx.clone();
-            let result_tx = result_tx.clone();
-            handles.push(
-                thread::Builder::new()
-                    .name(format!("aethergraph-hetero-sampler-{t}"))
-                    .spawn(move || {
-                        crate::internal::numa::pin_worker(t);
-                        run_worker(&fault, move || {
-                            worker_loop_hetero(
-                                graph, config, seed_type, work_rx, result_tx, shutdown, stats,
-                            );
-                            Ok(())
-                        });
-                    })?,
-            );
+            pipe.spawn(format!("aethergraph-hetero-sampler-{t}"), move || {
+                crate::internal::numa::pin_worker(t, home);
+                worker_loop_hetero(&graph, config, seed_type, &ends)
+            })?;
         }
-        // The workers own the only result senders after this point, so the
-        // consumer's recv disconnects when they all exit.
-        drop(result_tx);
 
         debug!(
             prefetch_depth,
             sampler_threads, "HeteroNeighborLoader started (sampler pool)"
         );
 
-        Ok(Self {
-            work_tx: Some(work_tx),
-            result_rx: Some(result_rx),
-            shutdown,
-            handles,
-            stats,
-            prefetch_depth,
-            worker_fault,
-            order_by_batch,
-            reorder: Mutex::new(BatchReorder::new()),
-        })
+        Ok(Self { pipe })
     }
 
-    /// Submit a batch to be sampled.
-    pub fn submit(&self, batch_idx: usize, seeds: Vec<NodeId>) -> Result<(), SubmitError> {
-        if self.shutdown.load(Ordering::Relaxed) {
-            return Err(SubmitError::Shutdown);
-        }
-        match &self.work_tx {
-            Some(tx) => tx
-                .send(PrefetchWork { batch_idx, seeds })
-                .map_err(|_| SubmitError::ChannelClosed),
-            None => Err(SubmitError::Shutdown),
-        }
+    /// Submit a batch of seeds of the loader's seed type, checked with
+    /// `Seeds::new(ids, loader.seed_nodes())`. `batch_idx` is caller
+    /// bookkeeping echoed back on the result; see [`NeighborLoader::submit`].
+    pub fn submit(&self, batch_idx: usize, seeds: Seeds) -> Result<(), SubmitError> {
+        self.pipe.submit(batch_idx, seeds)
+    }
+
+    /// Node count of the seed type; seeds must lie below it.
+    pub fn seed_nodes(&self) -> usize {
+        self.pipe.seed_nodes
     }
 
     /// Get next sampled subgraph (blocking).
@@ -1816,415 +2029,70 @@ impl HeteroNeighborLoader {
     /// - `Err(PrefetchError::Timeout { .. })` when no result arrived within
     ///   30s (logged at warn); the workers may just be slow, so the caller
     ///   may call again.
-    /// - `Err(PrefetchError::WorkerExited { .. })` when the workers exited
-    ///   without `shutdown()` being requested (panic or internal error).
+    /// - `Err(PrefetchError::WorkerExited { .. })` as soon as a worker
+    ///   faults without `shutdown()` being requested.
     pub fn next(&self) -> Result<Option<HeteroSampledSubgraph>, PrefetchError> {
-        Ok(self.next_timeout(RECV_TIMEOUT)?.map(|r| r.subgraph))
+        Ok(self.next_batch()?.map(|r| r.subgraph))
     }
 
-    /// Blocking receive with an explicit wait window (shared by the
-    /// `next*` methods).
-    fn next_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<Option<HeteroPrefetchResult>, PrefetchError> {
-        let Some(result_rx) = self.result_rx.as_ref() else {
-            return Ok(None);
-        };
-        self.stats.total.fetch_add(1, Ordering::Relaxed);
-
-        if !self.order_by_batch {
-            return self.recv_unordered(result_rx, timeout);
-        }
-
-        let deadline = Instant::now() + timeout;
-        loop {
-            {
-                let mut buf = self.reorder.lock();
-                let idx = buf.next_idx;
-                if let Some(r) = buf.pending.remove(&idx) {
-                    buf.next_idx = idx + 1;
-                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Some(r));
-                }
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                warn!(
-                    "Hetero prefetch timeout after {:?} waiting for ordered batch - workers may have deadlocked or are very slow",
-                    timeout
-                );
-                return Err(PrefetchError::Timeout { waited: timeout });
-            }
-
-            match result_rx.recv_timeout(remaining) {
-                Ok(r) => {
-                    self.reorder.lock().pending.insert(r.batch_idx, r);
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    warn!(
-                        "Hetero prefetch timeout after {:?} - workers may have deadlocked or are very slow",
-                        timeout
-                    );
-                    return Err(PrefetchError::Timeout { waited: timeout });
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    return self.disconnected();
-                }
-            }
-        }
-    }
-
-    fn recv_unordered(
-        &self,
-        result_rx: &Receiver<HeteroPrefetchResult>,
-        timeout: Duration,
-    ) -> Result<Option<HeteroPrefetchResult>, PrefetchError> {
-        match result_rx.try_recv() {
-            Ok(result) => {
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                trace!(batch_idx = result.batch_idx, "hetero prefetch hit");
-                Ok(Some(result))
-            }
-            Err(TryRecvError::Empty) => {
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                trace!("hetero prefetch miss - blocking");
-                match result_rx.recv_timeout(timeout) {
-                    Ok(r) => Ok(Some(r)),
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        warn!(
-                            "Hetero prefetch timeout after {:?} - workers may have deadlocked or are very slow",
-                            timeout
-                        );
-                        Err(PrefetchError::Timeout { waited: timeout })
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => self.disconnected(),
-                }
-            }
-            Err(TryRecvError::Disconnected) => self.disconnected(),
-        }
-    }
-
-    /// Maps a disconnected result channel to its meaning: clean end of
-    /// stream when shutdown was requested, worker death otherwise.
-    fn disconnected(&self) -> Result<Option<HeteroPrefetchResult>, PrefetchError> {
-        if self.shutdown.load(Ordering::Relaxed) {
-            debug!("hetero prefetch channel disconnected - loader shut down");
-            Ok(None)
-        } else {
-            Err(PrefetchError::WorkerExited {
-                message: self.worker_fault.get().cloned(),
-            })
-        }
+    /// Get the next batch with the `batch_idx` its submission carried
+    /// (blocking). Same return contract as [`HeteroNeighborLoader::next`].
+    pub fn next_batch(&self) -> Result<Option<HeteroPrefetchResult>, PrefetchError> {
+        self.pipe.next_timeout(RECV_TIMEOUT)
     }
 
     /// Try to get next without blocking.
     ///
     /// Returns `Ok(None)` when no batch is ready yet or the loader has been
-    /// shut down, and `Err(PrefetchError::WorkerExited { .. })` when the
-    /// workers exited without `shutdown()` being requested.
+    /// shut down, and `Err(PrefetchError::WorkerExited { .. })` when a
+    /// worker faulted without `shutdown()` being requested.
     pub fn try_next(&self) -> Result<Option<HeteroSampledSubgraph>, PrefetchError> {
-        let Some(result_rx) = self.result_rx.as_ref() else {
-            return Ok(None);
-        };
-        if self.order_by_batch {
-            while let Ok(r) = result_rx.try_recv() {
-                self.reorder.lock().pending.insert(r.batch_idx, r);
-            }
-            let mut buf = self.reorder.lock();
-            let idx = buf.next_idx;
-            if let Some(r) = buf.pending.remove(&idx) {
-                buf.next_idx = idx + 1;
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                self.stats.total.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(r.subgraph));
-            }
-            return match result_rx.try_recv() {
-                Err(TryRecvError::Disconnected) => {
-                    self.disconnected().map(|r| r.map(|r| r.subgraph))
-                }
-                _ => Ok(None),
-            };
-        }
-        match result_rx.try_recv() {
-            Ok(result) => {
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                self.stats.total.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(result.subgraph))
-            }
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => self.disconnected().map(|r| r.map(|r| r.subgraph)),
-        }
+        Ok(self.pipe.try_next()?.map(|r| r.subgraph))
     }
 
     /// Get statistics.
     pub fn stats(&self) -> &PrefetchStats {
-        &self.stats
+        &self.pipe.stats
     }
 
     /// Get prefetch depth.
     pub fn prefetch_depth(&self) -> usize {
-        self.prefetch_depth
+        self.pipe.prefetch_depth
     }
 
-    /// Shutdown the sampler pool.
-    ///
-    /// Closes the work channel, drops the result receiver so a worker blocked
-    /// mid-`send` on a full result channel unblocks, then joins the workers.
-    /// Undelivered results are discarded; subsequent consumer calls return
-    /// `Ok(None)`.
-    #[tracing::instrument(skip(self), fields(num_handles = self.handles.len()))]
-    pub fn shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Drop sender to unblock workers waiting for work (take it so the
-        // channel actually closes)
-        drop(self.work_tx.take());
-        // Drop receiver to unblock workers waiting to deliver a result
-        drop(self.result_rx.take());
-        for h in self.handles.drain(..) {
-            let _ = h.join();
-        }
+    /// Shut the sampler pool down and join its threads. Same contract as
+    /// [`NeighborLoader::shutdown`].
+    #[tracing::instrument(skip(self))]
+    pub fn shutdown(&self) {
+        self.pipe.shutdown();
     }
-}
-
-impl Drop for HeteroNeighborLoader {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// io_uring-based k-hop sampling for NVMe graphs.
-///
-/// This path honors `fanout`, `replace`, `cumulative`, and `seed`. Edge ids
-/// are always tracked (`track_edge_ids` is ignored) and edges are always
-/// returned directional. The remaining `SamplingConfig` fields (`weighted`,
-/// `temporal_strategy`, `disjoint`, `deterministic`, `max_degree`,
-/// non-default `subgraph_type`) are rejected by the NVMe constructors;
-/// callers needing those must use the in-memory [`NeighborSampler`] path.
-#[cfg(target_os = "linux")]
-fn sample_with_uring(
-    handle: &mut crate::internal::uring::UringHandle,
-    fd: i32,
-    offsets: &[u64],
-    edges_start: u64,
-    num_nodes: usize,
-    seeds: &[NodeId],
-    config: &SamplingConfig,
-) -> anyhow::Result<SampledSubgraph> {
-    use rustc_hash::FxHashSet;
-
-    let num_hops = config.fanout.len();
-    let mut all_nodes: FxHashSet<NodeId> = seeds.iter().copied().collect();
-    let mut frontier: Vec<NodeId> = seeds.to_vec();
-    let mut edge_src = Vec::new();
-    let mut edge_dst = Vec::new();
-    let mut edge_ids = Vec::new();
-    let mut num_sampled_nodes = Vec::with_capacity(num_hops);
-    let mut num_sampled_edges = Vec::with_capacity(num_hops);
-
-    // Caller installs a concrete seed (batch_seed or entropy) on `config.seed`.
-    let mut rng = WyRand::new(
-        config
-            .seed
-            .expect("NVMe sample_with_uring requires config.seed"),
-    );
-
-    for hop in 0..num_hops {
-        let fanout = config.fanout[hop];
-        if frontier.is_empty() {
-            num_sampled_nodes.push(0);
-            num_sampled_edges.push(0);
-            continue;
-        }
-
-        let edges_before = edge_src.len();
-
-        // Batch read all frontier neighbors via io_uring into one flat
-        // arena; `spans` locates each node's slice.
-        let (flat_neighbors, spans) =
-            batch_read_neighbors_uring(handle, fd, offsets, edges_start, num_nodes, &frontier)?;
-
-        let mut next_frontier = Vec::new();
-
-        for (&node, &(span_start, span_len)) in frontier.iter().zip(spans.iter()) {
-            if span_len == 0 {
-                continue;
-            }
-            let neighbors =
-                &flat_neighbors[span_start as usize..span_start as usize + span_len as usize];
-
-            let node_idx = node as usize;
-            // Frontier nodes are valid IDs, so this index is always in range.
-            // Skip rather than mint a bogus edge id 0 if it somehow is not.
-            debug_assert!(node_idx < offsets.len());
-            if node_idx >= offsets.len() {
-                continue;
-            }
-            let edge_offset = offsets[node_idx];
-
-            // Sample fanout neighbors (returns indices into neighbors array)
-            let sampled_indices =
-                sample_neighbor_indices(&mut rng, neighbors.len(), fanout, config.replace);
-
-            for idx in sampled_indices {
-                let neighbor = neighbors[idx];
-                edge_src.push(node);
-                edge_dst.push(neighbor);
-                edge_ids.push(edge_offset + idx as u64);
-                if all_nodes.insert(neighbor) {
-                    next_frontier.push(neighbor);
-                }
-            }
-        }
-
-        num_sampled_nodes.push(next_frontier.len());
-        num_sampled_edges.push(edge_src.len() - edges_before);
-
-        if config.cumulative {
-            // Reuse the frontier allocation instead of reallocating the
-            // whole accumulated list every hop.
-            frontier.append(&mut next_frontier);
-        } else {
-            frontier = next_frontier;
-        }
-    }
-
-    let nodes: Vec<NodeId> = all_nodes.into_iter().collect();
-
-    Ok(SampledSubgraph::from_parts(
-        nodes,
-        edge_src,
-        edge_dst,
-        edge_ids,
-        seeds.to_vec(),
-        num_sampled_nodes,
-        num_sampled_edges,
-    ))
-}
-
-/// All neighbor lists back-to-back in one flat allocation, with
-/// `spans[i]` giving `(start, len)` into it for input node `i`
-/// (zero-length for invalid/zero-degree nodes).
-#[cfg(target_os = "linux")]
-type FlatNeighbors = (Vec<NodeId>, Vec<(u32, u32)>);
-
-/// Batch read neighbors for multiple nodes using io_uring.
-///
-/// Uses SQPOLL-aware submission and registered file descriptors. All
-/// neighbor lists land back-to-back in one flat `Vec<NodeId>` — a single
-/// allocation whose typed backing io_uring writes into directly, so on
-/// little-endian targets there is no per-node buffer, no second decode
-/// pass, and no copy.
-#[cfg(target_os = "linux")]
-fn batch_read_neighbors_uring(
-    handle: &mut crate::internal::uring::UringHandle,
-    fd: i32,
-    offsets: &[u64],
-    edges_start: u64,
-    num_nodes: usize,
-    nodes: &[NodeId],
-) -> anyhow::Result<FlatNeighbors> {
-    use crate::internal::uring::batch_read;
-
-    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(nodes.len());
-    let mut total: usize = 0;
-    for &node in nodes {
-        let idx = node as usize;
-        if idx >= num_nodes {
-            spans.push((total as u32, 0));
-            continue;
-        }
-        let start = offsets[idx] as usize;
-        let end = offsets[idx + 1] as usize;
-        spans.push((total as u32, (end - start) as u32));
-        total += end - start;
-    }
-
-    let mut flat: Vec<NodeId> = vec![0; total];
-    if total > 0 {
-        let mut reads: Vec<(u64, *mut u8, usize)> = Vec::with_capacity(nodes.len());
-        {
-            let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut flat);
-            let base = bytes.as_mut_ptr();
-            for (&node, &(span_start, span_len)) in nodes.iter().zip(spans.iter()) {
-                if span_len == 0 {
-                    continue;
-                }
-                let start = offsets[node as usize] as usize;
-                let byte_offset = edges_start + (start * 4) as u64;
-                // SAFETY: span offsets were accumulated to fit exactly in
-                // `flat`, so `span_start * 4 .. span_start * 4 + span_len * 4`
-                // is in bounds.
-                let ptr = unsafe { base.add(span_start as usize * 4) };
-                reads.push((byte_offset, ptr, span_len as usize * 4));
-            }
-        }
-        // SAFETY: every ptr in `reads` points into `flat`'s backing, which
-        // lives until this function returns; batch_read reaps every
-        // submitted completion before returning.
-        batch_read(handle, fd, &reads)?;
-    }
-
-    Ok((flat, spans))
-}
-
-/// Sample k neighbor indices using Lemire's method.
-/// Returns indices into the neighbors array, not the actual neighbor values.
-#[cfg(target_os = "linux")]
-fn sample_neighbor_indices(
-    rng: &mut WyRand,
-    num_neighbors: usize,
-    k: usize,
-    replace: bool,
-) -> Vec<usize> {
-    if num_neighbors == 0 {
-        return Vec::new();
-    }
-
-    if num_neighbors <= k {
-        return (0..num_neighbors).collect();
-    }
-
-    let n = num_neighbors as u64;
-    let mut result = Vec::with_capacity(k);
-
-    if replace {
-        for _ in 0..k {
-            let idx = ((rng.next_u32() as u64 * n) >> 32) as usize;
-            result.push(idx);
-        }
-    } else {
-        // Floyd's algorithm for sampling without replacement
-        use rustc_hash::FxHashSet;
-        let mut seen = FxHashSet::default();
-
-        for i in (num_neighbors - k)..num_neighbors {
-            let j = ((rng.next_u32() as u64 * (i as u64 + 1)) >> 32) as usize;
-            if seen.contains(&j) {
-                result.push(i);
-                seen.insert(i);
-            } else {
-                result.push(j);
-                seen.insert(j);
-            }
-        }
-    }
-
-    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitError {
+    /// `shutdown()` was requested.
     Shutdown,
-    ChannelClosed,
+    /// A worker faulted; the loader accepts no more work.
+    WorkerExited,
+    /// The seeds were checked against more nodes than the loader samples.
+    SeedsExceedGraph {
+        checked_against: usize,
+        num_nodes: usize,
+    },
 }
 
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Shutdown => write!(f, "prefetcher shut down"),
-            Self::ChannelClosed => write!(f, "channel closed"),
+            Self::WorkerExited => write!(f, "prefetch worker exited"),
+            Self::SeedsExceedGraph {
+                checked_against,
+                num_nodes,
+            } => write!(
+                f,
+                "seeds were checked against {checked_against} nodes, but the loader samples {num_nodes}"
+            ),
         }
     }
 }
@@ -2236,6 +2104,44 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// A loader the tests submit raw IDs to, checked against its bound.
+    trait Submits {
+        fn seed_bound(&self) -> usize;
+        fn submit_seeds(&self, batch_idx: usize, seeds: Seeds) -> Result<(), SubmitError>;
+    }
+
+    impl Submits for NeighborLoader {
+        fn seed_bound(&self) -> usize {
+            self.num_nodes()
+        }
+        fn submit_seeds(&self, batch_idx: usize, seeds: Seeds) -> Result<(), SubmitError> {
+            self.submit(batch_idx, seeds)
+        }
+    }
+
+    impl Submits for HeteroNeighborLoader {
+        fn seed_bound(&self) -> usize {
+            self.seed_nodes()
+        }
+        fn submit_seeds(&self, batch_idx: usize, seeds: Seeds) -> Result<(), SubmitError> {
+            self.submit(batch_idx, seeds)
+        }
+    }
+
+    impl<T> Submits for Pipeline<T> {
+        fn seed_bound(&self) -> usize {
+            self.seed_nodes
+        }
+        fn submit_seeds(&self, batch_idx: usize, seeds: Seeds) -> Result<(), SubmitError> {
+            self.submit(batch_idx, seeds)
+        }
+    }
+
+    fn submit(loader: &impl Submits, batch_idx: usize, ids: &[NodeId]) -> Result<(), SubmitError> {
+        let seeds = Seeds::new(ids.to_vec(), loader.seed_bound()).expect("test seeds in range");
+        loader.submit_seeds(batch_idx, seeds)
+    }
 
     fn create_test_graph() -> Arc<Graph> {
         let edges = vec![
@@ -2251,6 +2157,13 @@ mod tests {
         Arc::new(Graph::from_edges(5, &edges, None).unwrap())
     }
 
+    /// Node 0 points at every other node, so a small fanout from it draws
+    /// from a large pool and repeated draws are distinguishable.
+    fn create_star_graph(leaves: u32) -> Arc<Graph> {
+        let edges: Vec<(NodeId, NodeId)> = (1..=leaves).map(|leaf| (0, leaf)).collect();
+        Arc::new(Graph::from_edges(leaves as usize + 1, &edges, None).unwrap())
+    }
+
     #[test]
     fn test_prefetch_inmemory() {
         let graph = create_test_graph();
@@ -2263,9 +2176,9 @@ mod tests {
 
         let prefetcher = NeighborLoader::new(graph, config, 2, 1).unwrap();
 
-        prefetcher.submit(0, vec![0]).unwrap();
-        prefetcher.submit(1, vec![1]).unwrap();
-        prefetcher.submit(2, vec![2]).unwrap();
+        submit(&prefetcher, 0, &[0]).unwrap();
+        submit(&prefetcher, 1, &[1]).unwrap();
+        submit(&prefetcher, 2, &[2]).unwrap();
 
         let sg1 = prefetcher.next().unwrap().unwrap();
         assert_eq!(sg1.num_seeds(), 1);
@@ -2291,22 +2204,133 @@ mod tests {
         // backpressure deadlocking the test, not a pool property.
         let n = 24usize;
         for i in 0..n {
-            prefetcher.submit(i, vec![(i % 5) as u32]).unwrap();
+            submit(&prefetcher, i, &[(i % 5) as u32]).unwrap();
         }
 
-        // Results may arrive in any order across the pool; every batch
-        // index must arrive exactly once with a valid subgraph.
+        // Seeded: batches come back in submission order across the pool.
+        for i in 0..n {
+            let b = prefetcher.next_batch().unwrap().unwrap();
+            assert_eq!(b.batch_idx, i);
+            assert_eq!(b.subgraph.seeds, vec![(i % 5) as u32]);
+        }
+    }
+
+    #[test]
+    fn unseeded_pool_delivers_every_batch_once() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            seed: None,
+            ..Default::default()
+        };
+        let prefetcher = NeighborLoader::new(graph, config, 4, 4).unwrap();
+        let n = 24usize;
+        for i in 0..n {
+            submit(&prefetcher, i, &[(i % 5) as u32]).unwrap();
+        }
         let mut seen = vec![false; n];
         for _ in 0..n {
-            let r = prefetcher
-                .next_timeout(Duration::from_secs(30))
-                .unwrap()
-                .unwrap();
-            assert!(!seen[r.batch_idx], "batch {} delivered twice", r.batch_idx);
-            seen[r.batch_idx] = true;
-            assert_eq!(r.subgraph.num_seeds(), 1);
+            let b = prefetcher.next_batch().unwrap().unwrap();
+            assert!(!seen[b.batch_idx], "batch {} delivered twice", b.batch_idx);
+            seen[b.batch_idx] = true;
+            assert_eq!(b.subgraph.seeds, vec![(b.batch_idx % 5) as u32]);
         }
         assert!(seen.iter().all(|&s| s), "missing batches: {seen:?}");
+    }
+
+    #[test]
+    fn seeded_loader_accepts_repeated_and_gapped_batch_indices() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            fanout: vec![2],
+            seed: Some(3),
+            ..Default::default()
+        };
+        let loader = NeighborLoader::new(graph, config, 2, 3).unwrap();
+        for idx in [5usize, 5, 9, 1] {
+            submit(&loader, idx, &[0]).unwrap();
+        }
+        let got: Vec<usize> = (0..4)
+            .map(|_| loader.next_batch().unwrap().unwrap().batch_idx)
+            .collect();
+        assert_eq!(got, vec![5, 5, 9, 1]);
+    }
+
+    #[test]
+    fn seeded_loader_is_reusable_across_epochs() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            fanout: vec![2],
+            seed: Some(11),
+            ..Default::default()
+        };
+        let loader = NeighborLoader::new(graph, config, 4, 2).unwrap();
+        for _epoch in 0..3 {
+            loader
+                .submit_epoch((0..5u32).map(|s| Seeds::new(vec![s], 5).unwrap()).collect())
+                .unwrap();
+            for idx in 0..5 {
+                let b = loader.next_batch().unwrap().unwrap();
+                assert_eq!(b.batch_idx, idx);
+            }
+        }
+    }
+
+    #[test]
+    fn resubmitted_seeds_draw_fresh_samples() {
+        // Reseeding follows submission order, so resubmitting a batch (a
+        // new epoch on the same loader) draws a new neighborhood.
+        let graph = create_star_graph(1000);
+        let config = SamplingConfig {
+            fanout: vec![5],
+            seed: Some(1),
+            ..Default::default()
+        };
+        let loader = NeighborLoader::new(graph, config, 2, 1).unwrap();
+        submit(&loader, 0, &[0]).unwrap();
+        submit(&loader, 0, &[0]).unwrap();
+        let a = loader.next().unwrap().unwrap().nodes;
+        let b = loader.next().unwrap().unwrap().nodes;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn same_seed_reproduces_the_stream_across_pool_sizes() {
+        let graph = create_star_graph(500);
+        let run = |threads: usize| -> Vec<Vec<NodeId>> {
+            let config = SamplingConfig {
+                fanout: vec![4, 2],
+                seed: Some(99),
+                ..Default::default()
+            };
+            let loader = NeighborLoader::new(Arc::clone(&graph), config, 4, threads).unwrap();
+            for i in 0..16u32 {
+                submit(&loader, i as usize, &[i % 7]).unwrap();
+            }
+            (0..16)
+                .map(|_| loader.next().unwrap().unwrap().nodes)
+                .collect()
+        };
+        assert_eq!(run(1), run(4));
+    }
+
+    #[test]
+    fn disjoint_loader_attaches_per_seed_batch() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            fanout: vec![2],
+            disjoint: true,
+            seed: Some(5),
+            ..Default::default()
+        };
+        let loader = NeighborLoader::new(graph, config, 2, 2).unwrap();
+        submit(&loader, 0, &[0, 0, 2]).unwrap();
+        let sg = loader.next().unwrap().unwrap();
+        let batch = sg
+            .batch
+            .expect("disjoint subgraph carries its batch vector");
+        assert_eq!(batch.len(), sg.nodes.len());
+        // Each seed owns its own copy of itself: no dedup across seeds.
+        assert!(sg.nodes.iter().filter(|&&n| n == 0).count() >= 2);
     }
 
     fn create_test_hetero_graph() -> Arc<HeteroGraph> {
@@ -2336,27 +2360,17 @@ mod tests {
         let user_type: NodeTypeId = 0;
 
         let loader = HeteroNeighborLoader::new(graph, config, user_type, 4, 4).unwrap();
-        // Stay inside the bounded work channel (prefetch_depth * 8): the
-        // producer here is also the consumer, so overfilling would just be
-        // backpressure deadlocking the test, not a pool property.
         let n = 24usize;
         for i in 0..n {
-            loader.submit(i, vec![(i % 50) as u32]).unwrap();
+            submit(&loader, i, &[(i % 50) as u32]).unwrap();
         }
 
-        // Results may arrive in any order across the pool; every batch
-        // index must arrive exactly once with a valid subgraph.
-        let mut seen = vec![false; n];
-        for _ in 0..n {
-            let r = loader
-                .next_timeout(Duration::from_secs(30))
-                .unwrap()
-                .unwrap();
-            assert!(!seen[r.batch_idx], "batch {} delivered twice", r.batch_idx);
-            seen[r.batch_idx] = true;
-            assert_eq!(r.subgraph.seeds, vec![(r.batch_idx % 50) as u32]);
+        // Seeded: submission order is preserved across the pool.
+        for i in 0..n {
+            let r = loader.next_batch().unwrap().unwrap();
+            assert_eq!(r.batch_idx, i);
+            assert_eq!(r.subgraph.seeds, vec![(i % 50) as u32]);
         }
-        assert!(seen.iter().all(|&s| s), "missing batches: {seen:?}");
     }
 
     #[test]
@@ -2368,7 +2382,7 @@ mod tests {
 
         // Submit all upfront
         for i in 0..10 {
-            prefetcher.submit(i, vec![i as u32 % 5]).unwrap();
+            submit(&prefetcher, i, &[i as u32 % 5]).unwrap();
         }
 
         // Let worker prefetch
@@ -2380,10 +2394,10 @@ mod tests {
         }
 
         let hit_rate = prefetcher.stats().hit_rate();
-        println!("Hit rate: {:.1}%", hit_rate * 100.0);
         // With prefetch_depth=3 and 10 batches, we expect some hits
         // The exact rate depends on timing, so just verify we got some hits
         assert!(hit_rate >= 0.3, "Expected hit_rate >= 0.3, got {hit_rate}");
+        assert_eq!(prefetcher.stats().total.load(Ordering::Relaxed), 10);
     }
 
     #[test]
@@ -2410,6 +2424,25 @@ mod tests {
     }
 
     #[test]
+    fn sync_feature_store_gathers_scattered_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let dim = 3;
+        let features: Vec<f32> = (0..20 * dim).map(|v| v as f32).collect();
+        crate::features::save_features(temp_file.path(), features.clone(), 20, dim).unwrap();
+
+        let mut store = SyncFeatureStore::load(temp_file.path()).unwrap();
+        let nodes = [19u32, 0, 7, 7, 3];
+        store.prefetch_nodes(&nodes);
+        let got = store.get_batch(&nodes).unwrap();
+        let want: Vec<f32> = nodes
+            .iter()
+            .flat_map(|&n| features[n as usize * dim..(n as usize + 1) * dim].to_vec())
+            .collect();
+        assert_eq!(got, want);
+        assert!(store.get_batch(&[20]).is_err());
+    }
+
+    #[test]
     fn test_shutdown_unblocks_blocked_worker() {
         let graph = create_test_graph();
         let config = SamplingConfig {
@@ -2421,9 +2454,9 @@ mod tests {
 
         // prefetch_depth 1 => result channel capacity 1. Submitting several
         // batches leaves the worker blocked mid-`send` on a full channel.
-        let mut prefetcher = NeighborLoader::new(graph, config, 1, 1).unwrap();
+        let prefetcher = NeighborLoader::new(graph, config, 1, 1).unwrap();
         for i in 0..4 {
-            prefetcher.submit(i, vec![i as u32 % 5]).unwrap();
+            submit(&prefetcher, i, &[i as u32 % 5]).unwrap();
         }
         std::thread::sleep(Duration::from_millis(100));
 
@@ -2434,6 +2467,46 @@ mod tests {
         assert!(matches!(prefetcher.next(), Ok(None)));
         assert!(matches!(prefetcher.try_next(), Ok(None)));
         assert!(matches!(prefetcher.next_with_features(), Ok(None)));
+        assert_eq!(submit(&prefetcher, 9, &[0]), Err(SubmitError::Shutdown));
+    }
+
+    #[test]
+    fn shutdown_wakes_a_blocked_submitter_and_consumer() {
+        let graph = create_star_graph(100);
+        let config = SamplingConfig {
+            fanout: vec![5],
+            seed: Some(2),
+            ..Default::default()
+        };
+        // Tiny queues so the submitter blocks: nothing consumes results.
+        let loader = NeighborLoader::new(graph, config, 1, 1).unwrap();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let submitter = scope.spawn(|| {
+                let mut outcome = Ok(());
+                for i in 0..1000 {
+                    outcome = submit(&loader, i, &[0]);
+                    if outcome.is_err() {
+                        break;
+                    }
+                }
+                outcome
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            loader.shutdown();
+            assert_eq!(submitter.join().unwrap(), Err(SubmitError::Shutdown));
+        });
+
+        // A consumer blocked on an empty stream wakes on shutdown too.
+        let graph = create_test_graph();
+        let loader = NeighborLoader::new(graph, SamplingConfig::default(), 2, 1).unwrap();
+        std::thread::scope(|scope| {
+            let consumer = scope.spawn(|| loader.next());
+            std::thread::sleep(Duration::from_millis(100));
+            loader.shutdown();
+            assert!(matches!(consumer.join().unwrap(), Ok(None)));
+        });
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
@@ -2443,55 +2516,42 @@ mod tests {
 
         // Nothing submitted: the worker is alive but has no results.
         let waited = Duration::from_millis(50);
-        match prefetcher.next_timeout(waited) {
+        match prefetcher.pipe.next_timeout(waited) {
             Err(PrefetchError::Timeout { waited: w }) => assert_eq!(w, waited),
             other => panic!("expected Timeout, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_worker_exit_surfaces_error() {
-        // Build a loader whose worker panics immediately, without shutdown()
-        // being requested. The fault is recorded before the channel closes,
-        // so the consumer sees the panic message.
-        let (work_tx, _work_rx) = bounded::<PrefetchWork>(1);
-        let (result_tx, result_rx) = bounded::<PrefetchResult>(1);
-        let worker_fault = Arc::new(OnceLock::new());
-        let handle = {
-            let fault = worker_fault.clone();
-            thread::Builder::new()
-                .name("aethergraph-test-worker".into())
-                .spawn(move || {
-                    let _result_tx = result_tx;
-                    run_worker(&fault, || panic!("worker died"));
-                })
-                .unwrap()
-        };
-        let loader = NeighborLoader {
-            work_tx: Some(work_tx),
-            result_rx: Some(result_rx),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            handles: vec![handle],
-            stats: Arc::new(PrefetchStats::default()),
-            prefetch_depth: 1,
-            feature_dim: None,
-            worker_fault,
-            order_by_batch: false,
-            reorder: Mutex::new(BatchReorder::new()),
-        };
+    fn worker_fault_surfaces_while_other_workers_live() {
+        // One worker panics; its peer stays alive and keeps the result queue
+        // open, so only the stop signal can tell the consumer.
+        let (pipe, ends) = Pipeline::<PrefetchResult>::new(2, 2, false, 1);
+        {
+            let ends = ends.clone();
+            pipe.spawn("aethergraph-test-survivor".into(), move || {
+                while recv_work(&ends.work_rx, &ends.stop).is_some() {}
+                Ok(())
+            })
+            .unwrap();
+        }
+        pipe.spawn("aethergraph-test-faulty".into(), || panic!("worker died"))
+            .unwrap();
+        drop(ends);
 
-        match loader.next() {
+        let started = Instant::now();
+        match pipe.next_timeout(Duration::from_secs(30)) {
             Err(PrefetchError::WorkerExited {
                 message: Some(message),
-            }) => {
-                assert!(message.contains("worker died"), "got: {message}");
-            }
+            }) => assert!(message.contains("worker died"), "got: {message}"),
             other => panic!("expected WorkerExited, got {other:?}"),
         }
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(matches!(
-            loader.try_next(),
+            pipe.try_next(),
             Err(PrefetchError::WorkerExited { .. })
         ));
+        assert_eq!(submit(&pipe, 0, &[0]), Err(SubmitError::WorkerExited));
     }
 
     #[test]
@@ -2510,7 +2570,7 @@ mod tests {
             ..Default::default()
         };
         let loader = NeighborLoader::with_features(graph, config, temp_file.path(), 2, 1).unwrap();
-        loader.submit(0, vec![4]).unwrap();
+        submit(&loader, 0, &[4]).unwrap();
 
         match loader.next_with_features() {
             Err(PrefetchError::FeatureLoad { batch_idx, source }) => {
@@ -2522,5 +2582,256 @@ mod tests {
             }
             other => panic!("expected FeatureLoad, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn feature_pipeline_delivers_rows_matching_nodes() {
+        let graph = create_test_graph();
+        let temp_file = NamedTempFile::new().unwrap();
+        let dim = 2;
+        let features: Vec<f32> = (0..5 * dim).map(|v| v as f32).collect();
+        crate::features::save_features(temp_file.path(), features.clone(), 5, dim).unwrap();
+
+        let config = SamplingConfig {
+            fanout: vec![3],
+            seed: Some(4),
+            ..Default::default()
+        };
+        let loader = NeighborLoader::with_features(graph, config, temp_file.path(), 2, 2).unwrap();
+        for i in 0..6 {
+            submit(&loader, i, &[(i % 5) as u32]).unwrap();
+        }
+        for i in 0..6 {
+            let b = loader.next_batch().unwrap().unwrap();
+            assert_eq!(b.batch_idx, i);
+            let x = b.features.expect("feature column attached");
+            let want: Vec<f32> = b
+                .subgraph
+                .nodes
+                .iter()
+                .flat_map(|&n| features[n as usize * dim..(n as usize + 1) * dim].to_vec())
+                .collect();
+            assert_eq!(x, want);
+        }
+    }
+
+    /// Offsets and edges for the NVMe sampler tests: node `i` points at
+    /// `i+1..=i+degree[i]` (mod n).
+    fn offsets_graph(degrees: &[u64]) -> (Vec<u64>, Vec<NodeId>) {
+        let n = degrees.len() as u64;
+        let mut offsets = vec![0u64];
+        let mut edges = Vec::new();
+        for (i, &d) in degrees.iter().enumerate() {
+            for j in 1..=d {
+                edges.push(((i as u64 + j) % n) as NodeId);
+            }
+            offsets.push(offsets.last().unwrap() + d);
+        }
+        (offsets, edges)
+    }
+
+    fn in_memory_fetch(
+        edges: &[NodeId],
+    ) -> impl FnMut(&[EdgeRun], &mut [NodeId]) -> anyhow::Result<()> {
+        move |runs, landing| {
+            for run in runs {
+                let src = &edges[run.start as usize..run.start as usize + run.len];
+                landing[run.base..run.base + run.len].copy_from_slice(src);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn nvme_sampler_registers_seeds_first_and_reads_true_neighbors() {
+        let (offsets, edges) = offsets_graph(&[3, 1, 4, 0, 2, 5, 1]);
+        let config = SamplingConfig {
+            fanout: vec![2, 2],
+            cumulative: false,
+            max_degree: None,
+            seed: Some(9),
+            ..Default::default()
+        };
+        let mut rng = WyRand::new(9);
+        let mut scratch = NvmeScratch::default();
+        let seeds = Seeds::new(vec![5, 2, 5], 7).unwrap();
+        let sg = sample_from_offsets(
+            &offsets,
+            &seeds,
+            &config,
+            &mut rng,
+            &mut scratch,
+            in_memory_fetch(&edges),
+        )
+        .unwrap();
+
+        // Unique seeds take the first local ids, in first-occurrence order.
+        assert_eq!(&sg.nodes[..2], &[5, 2]);
+        let unique: FxHashSet<NodeId> = sg.nodes.iter().copied().collect();
+        assert_eq!(unique.len(), sg.nodes.len(), "nodes must be deduplicated");
+        // Every emitted edge is a real edge with its true CSR id.
+        for ((&s, &d), &e) in sg.edge_src.iter().zip(&sg.edge_dst).zip(&sg.edge_ids) {
+            let (lo, hi) = (offsets[s as usize], offsets[s as usize + 1]);
+            assert!((lo..hi).contains(&e), "edge id {e} outside node {s}'s list");
+            assert_eq!(edges[e as usize], d);
+        }
+        assert_eq!(sg.seed_indices_local().unwrap().into_owned(), vec![0, 1, 0]);
+        // PyG layout: the seed count first, then one entry per hop.
+        assert_eq!(sg.num_sampled_nodes.len(), 3);
+        assert_eq!(sg.num_sampled_nodes[0], 2);
+        assert_eq!(sg.num_sampled_nodes.iter().sum::<usize>(), sg.nodes.len());
+    }
+
+    #[test]
+    fn nvme_cumulative_sampling_emits_each_edge_once() {
+        // Every degree is within the fanout, so each hop re-expanding the
+        // earlier nodes draws their whole lists again.
+        let (offsets, edges) = offsets_graph(&[2, 2, 2, 2, 2]);
+        let config = SamplingConfig {
+            fanout: vec![4, 4, 4],
+            cumulative: true,
+            max_degree: None,
+            ..Default::default()
+        };
+        let mut rng = WyRand::new(3);
+        let mut scratch = NvmeScratch::default();
+        let seeds = Seeds::new(vec![0], 5).unwrap();
+        let sg = sample_from_offsets(
+            &offsets,
+            &seeds,
+            &config,
+            &mut rng,
+            &mut scratch,
+            in_memory_fetch(&edges),
+        )
+        .unwrap();
+        let unique: FxHashSet<u64> = sg.edge_ids.iter().copied().collect();
+        assert_eq!(unique.len(), sg.edge_ids.len(), "an edge was emitted twice");
+        assert_eq!(
+            sg.num_sampled_edges.iter().sum::<usize>(),
+            sg.edge_ids.len()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvme_loader_samples_real_edges_from_disk() {
+        let mut edges: Vec<(NodeId, NodeId)> = (1..=300u32).map(|leaf| (0, leaf)).collect();
+        edges.extend((1..300u32).map(|n| (n, n + 1)));
+        let graph = Graph::from_edges(301, &edges, None).unwrap();
+        let file = NamedTempFile::new().unwrap();
+        crate::internal::mmap::save_graph(&graph, file.path()).unwrap();
+
+        let config = SamplingConfig {
+            fanout: vec![5, 2],
+            max_degree: None,
+            seed: Some(1),
+            ..Default::default()
+        };
+        let loader = NeighborLoader::new_nvme(file.path(), config, 2).unwrap();
+        assert_eq!(loader.num_nodes(), 301);
+        for i in 0..4 {
+            submit(&loader, i, &[0, 7]).unwrap();
+        }
+        for i in 0..4 {
+            let batch = match loader.next_batch() {
+                Ok(Some(batch)) => batch,
+                Err(PrefetchError::WorkerExited { message }) => {
+                    eprintln!("io_uring unavailable ({message:?}); skipping");
+                    return;
+                }
+                other => panic!("expected a batch, got {other:?}"),
+            };
+            assert_eq!(batch.batch_idx, i);
+            let sg = batch.subgraph;
+            assert_eq!(&sg.nodes[..2], &[0, 7]);
+            assert!(!sg.edge_src.is_empty());
+            let (offsets, body) = (graph.offsets(), graph.edges());
+            for ((&s, &d), &e) in sg.edge_src.iter().zip(&sg.edge_dst).zip(&sg.edge_ids) {
+                let range = offsets[s as usize]..offsets[s as usize + 1];
+                assert!(range.contains(&e), "edge id {e} not in node {s}'s list");
+                assert_eq!(body[e as usize], d);
+            }
+        }
+    }
+
+    #[test]
+    fn submit_refuses_seeds_checked_against_a_larger_graph() {
+        let graph = create_test_graph();
+        let loader = NeighborLoader::new(graph, SamplingConfig::default(), 2, 1).unwrap();
+        let seeds = Seeds::new(vec![7], 10).unwrap();
+        assert_eq!(
+            loader.submit(0, seeds),
+            Err(SubmitError::SeedsExceedGraph {
+                checked_against: 10,
+                num_nodes: 5
+            })
+        );
+        // The loader stays usable after refusing a batch.
+        submit(&loader, 1, &[4]).unwrap();
+        assert_eq!(loader.next_batch().unwrap().unwrap().batch_idx, 1);
+    }
+
+    #[test]
+    fn construction_rejects_configs_the_graph_cannot_serve() {
+        let graph = create_test_graph();
+        let config = SamplingConfig {
+            weighted: true,
+            ..Default::default()
+        };
+        let err = NeighborLoader::new(graph, config, 2, 1).err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn nvme_read_plan_touches_only_picked_clusters() {
+        // A hub of degree 10M with three picks costs three small reads, not
+        // a 40 MB list.
+        let mut s = NvmeScratch {
+            picks: vec![(0, 9_000_000), (0, 12), (0, 9_000_001), (1, 5_000_000)],
+            ..NvmeScratch::default()
+        };
+        s.plan_reads();
+        assert_eq!(
+            s.runs,
+            vec![
+                EdgeRun {
+                    start: 12,
+                    len: 1,
+                    base: 0
+                },
+                EdgeRun {
+                    start: 5_000_000,
+                    len: 1,
+                    base: 1
+                },
+                EdgeRun {
+                    start: 9_000_000,
+                    len: 2,
+                    base: 2
+                },
+            ]
+        );
+        assert_eq!(s.landing.len(), 4);
+        assert_eq!(s.slots, vec![2, 0, 3, 1]);
+    }
+
+    #[test]
+    fn draw_positions_is_distinct_and_in_range() {
+        let mut rng = WyRand::new(123);
+        let mut out = Vec::new();
+        let mut seen = FxHashSet::default();
+        for degree in [0u64, 1, 5, 6, 1_000, 5_000_000_000] {
+            draw_positions(&mut rng, degree, 5, false, &mut out, &mut seen);
+            assert_eq!(out.len() as u64, degree.min(5));
+            assert!(out.iter().all(|&p| p < degree.max(1)));
+            let distinct: FxHashSet<u64> = out.iter().copied().collect();
+            assert_eq!(distinct.len(), out.len());
+        }
+        draw_positions(&mut rng, 3, 8, true, &mut out, &mut seen);
+        assert_eq!(out, vec![0, 1, 2]);
+        draw_positions(&mut rng, 100, 8, true, &mut out, &mut seen);
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(|&p| p < 100));
     }
 }

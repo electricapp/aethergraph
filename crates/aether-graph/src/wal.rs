@@ -73,7 +73,7 @@ pub(crate) const RECORD_LEN: usize = 12;
 /// Writer/reader buffer size. Sized so a full commit interval's records
 /// (65,536 edges from the ingest drivers) reach the file in one `write(2)`
 /// and replay pulls the log in 1 MiB reads.
-const BUF_CAPACITY: usize = 1 << 20;
+pub(crate) const BUF_CAPACITY: usize = 1 << 20;
 
 /// Errors surfaced by WAL writes / replay. Corruption is not an error:
 /// a torn or corrupt tail is reported through
@@ -169,6 +169,10 @@ pub struct WalWriter {
     /// without io_uring is probed exactly once.
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     ring_probed: bool,
+    /// Test-only fault: bytes the file may still accept before one write
+    /// fails with an injected error.
+    #[cfg(test)]
+    fault_after: Option<usize>,
 }
 
 /// Wrapper existing solely because `io_uring::IoUring` has no `Debug`.
@@ -185,6 +189,35 @@ impl std::fmt::Debug for UringCommit {
 }
 
 impl WalWriter {
+    /// Open (or create) the WAL at `path` under its exclusive lock, replay
+    /// every clean record through `apply`, and truncate a torn tail —
+    /// fsynced — before returning the writer positioned for appends.
+    ///
+    /// Replay and truncation run only once the lock is held, so an opener
+    /// that loses the race for the lock fails with [`WalError::Locked`]
+    /// before reading, and can never cut records the lock holder is
+    /// appending. An `Err` from `apply` aborts before any truncation.
+    pub fn open_replaying<F>(
+        path: impl AsRef<Path>,
+        apply: F,
+    ) -> Result<(Self, ReplayOutcome), WalError>
+    where
+        F: FnMut(EdgeRecord) -> Result<(), WalError>,
+    {
+        let mut wal = Self::create_or_open(path)?;
+        let total_len = wal.file.metadata()?.len();
+        wal.file.seek(SeekFrom::Start(HEADER_LEN))?;
+        let outcome = replay_records(&wal.file, total_len, apply)?;
+        if let Some(off) = outcome.truncate_to {
+            // An unsynced set_len could be undone by a later crash,
+            // resurrecting the torn bytes mid-log under new appends.
+            wal.file.set_len(off)?;
+            wal.file.sync_data()?;
+        }
+        wal.file.seek(SeekFrom::End(0))?;
+        Ok((wal, outcome))
+    }
+
     /// Open an existing WAL or create one at `path`. The header is
     /// written and fsynced before this returns, so an interrupted
     /// open never leaves a half-initialized file.
@@ -264,23 +297,38 @@ impl WalWriter {
             ring: None,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             ring_probed: false,
+            #[cfg(test)]
+            fault_after: None,
         })
     }
 
     /// Append one edge record. The bytes stage in the in-process buffer; a
-    /// later [`sync`](Self::sync) writes and fsyncs them.
+    /// later [`sync`](Self::sync) writes and fsyncs them. An `Err` stages
+    /// nothing.
     pub fn append_edge(&mut self, rec: EdgeRecord) -> Result<(), WalError> {
-        let mut buf = [0u8; RECORD_LEN];
-        buf[0..4].copy_from_slice(&rec.src.to_le_bytes());
-        buf[4..8].copy_from_slice(&rec.dst.to_le_bytes());
-        let crc = crc32fast::hash(&buf[..8]);
-        buf[8..12].copy_from_slice(&crc.to_le_bytes());
+        self.append_edges(rec.src, &[rec.dst])
+    }
 
-        if self.buf.len() + RECORD_LEN > BUF_CAPACITY {
+    /// Append one record per `(src, dst)` for `dst` in `dsts`, all or
+    /// nothing: the only fallible step — spilling earlier records to make
+    /// room — runs before any of these is staged, so an `Err` leaves none
+    /// of them to be flushed later. A batch larger than the buffer grows it
+    /// rather than spilling part of itself.
+    pub fn append_edges(&mut self, src: u32, dsts: &[u32]) -> Result<(), WalError> {
+        let need = dsts.len() * RECORD_LEN;
+        if !self.buf.is_empty() && self.buf.len() + need > BUF_CAPACITY {
             self.flush_buf()?;
         }
-        self.buf.extend_from_slice(&buf);
-        self.pending += RECORD_LEN as u64;
+        self.buf.reserve(need);
+        for &dst in dsts {
+            let mut rec = [0u8; RECORD_LEN];
+            rec[0..4].copy_from_slice(&src.to_le_bytes());
+            rec[4..8].copy_from_slice(&dst.to_le_bytes());
+            let crc = crc32fast::hash(&rec[..8]);
+            rec[8..12].copy_from_slice(&crc.to_le_bytes());
+            self.buf.extend_from_slice(&rec);
+        }
+        self.pending += need as u64;
         Ok(())
     }
 
@@ -288,12 +336,53 @@ impl WalWriter {
     /// durability barrier. `pending` is deliberately left alone: it tracks
     /// what is unsynced, and these bytes are in the page cache, not on the
     /// medium.
+    ///
+    /// On a write error, the bytes the kernel already accepted are dropped
+    /// from the buffer, so a retry resumes exactly where the file ends
+    /// instead of writing that prefix twice.
     fn flush_buf(&mut self) -> Result<(), WalError> {
-        if !self.buf.is_empty() {
-            self.file.write_all(&self.buf)?;
-            self.buf.clear();
+        let mut written = 0;
+        while written < self.buf.len() {
+            match self.write_some(written) {
+                Ok(0) => {
+                    self.buf.drain(..written);
+                    return Err(WalError::Io(io::ErrorKind::WriteZero.into()));
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.buf.drain(..written);
+                    return Err(WalError::Io(e));
+                }
+            }
         }
+        self.buf.clear();
+        // A batch that outgrew the buffer doesn't keep its capacity.
+        self.buf.shrink_to(BUF_CAPACITY);
         Ok(())
+    }
+
+    /// One `write(2)` of the staged bytes from `from` onward.
+    fn write_some(&mut self, from: usize) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(left) = self.fault_after {
+            if left == 0 {
+                self.fault_after = None;
+                return Err(io::Error::other("injected WAL write fault"));
+            }
+            let end = from + left.min(self.buf.len() - from);
+            let n = self.file.write(&self.buf[from..end])?;
+            self.fault_after = Some(left - n);
+            return Ok(n);
+        }
+        self.file.write(&self.buf[from..])
+    }
+
+    /// Test-only: let the file accept `bytes` more bytes, then fail the
+    /// next write once.
+    #[cfg(test)]
+    pub(crate) fn inject_write_fault(&mut self, bytes: usize) {
+        self.fault_after = Some(bytes);
     }
 
     /// Write the staged bytes and fsync — every record durably written
@@ -371,8 +460,9 @@ impl WalWriter {
             .expect("ring presence checked immediately above");
 
         // Offset -1: append at the file's own cursor and advance it,
-        // exactly like the write(2) the portable path would issue.
-        let write_sqe = opcode::Write::new(fd, buf_ptr, len as u32)
+        // exactly like the write(2) the portable path would issue. A buffer
+        // past u32::MAX is written short and finished by the portable path.
+        let write_sqe = opcode::Write::new(fd, buf_ptr, len.min(u32::MAX as usize) as u32)
             .offset(u64::MAX)
             .build()
             .flags(io_uring::squeue::Flags::IO_LINK)
@@ -385,8 +475,8 @@ impl WalWriter {
         {
             let mut sq = commit.ring.submission();
             // SAFETY: `buf_ptr` addresses `self.buf`, which nothing touches
-            // until both CQEs are reaped below, and `submit_and_wait` does
-            // not return until the kernel is done reading it.
+            // until both CQEs are reaped below; if they can't be, the
+            // buffer is leaked rather than freed under the kernel.
             let pushed = unsafe { sq.push(&write_sqe) };
             pushed.expect("empty 4-entry ring accepts the write SQE");
             // SAFETY: the fsync SQE references only the fd, which stays
@@ -394,28 +484,19 @@ impl WalWriter {
             let pushed = unsafe { sq.push(&fsync_sqe) };
             pushed.expect("4-entry ring accepts the linked fsync SQE");
         }
-        if let Err(e) = commit.ring.submit_and_wait(2) {
-            // Both SQEs may already be in flight, and their CQEs carry the
-            // same user_data every commit does, so a later sync reaping
-            // this ring could read this commit's results as its own.
-            // Retire the ring; subsequent syncs take the portable path.
-            self.ring = None;
-            return Err(WalError::Io(e));
-        }
-
-        let mut written: Option<i32> = None;
-        let mut synced: Option<i32> = None;
-        for cqe in commit.ring.completion() {
-            match cqe.user_data() {
-                1 => written = Some(cqe.result()),
-                2 => synced = Some(cqe.result()),
-                _ => {}
+        let (written, synced) = match reap_commit(&mut commit.ring) {
+            Ok(results) => results,
+            Err(e) => {
+                // Completion can't be confirmed, so the kernel may still be
+                // reading the buffer, and a later sync would reap this
+                // commit's CQEs as its own. Leak both rather than free or
+                // reuse them; the log's tail is unknown, so the error
+                // poisons the graph.
+                std::mem::forget(std::mem::take(&mut self.buf));
+                std::mem::forget(self.ring.take());
+                return Err(WalError::Io(e));
             }
-        }
-        let (written, synced) = (
-            written.expect("write CQE present after submit_and_wait(2)"),
-            synced.expect("fsync CQE present after submit_and_wait(2)"),
-        );
+        };
 
         if written < 0 {
             return Err(WalError::Io(io::Error::from_raw_os_error(-written)));
@@ -441,7 +522,51 @@ impl WalWriter {
         self.pending = 0;
         Ok(true)
     }
+}
 
+/// Transient `io_uring_enter` failures retried before a commit is given up.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+const MAX_RING_STALLS: u32 = 10_000;
+
+/// Submit and reap the group commit's two CQEs — `(write, fsync)` results.
+///
+/// A signal can end the wait with the SQEs submitted and only some CQEs
+/// posted, so this loops until both are in hand, re-entering on EINTR and
+/// on transient EAGAIN/EBUSY. An `Err` means completion can no longer be
+/// confirmed.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+fn reap_commit(ring: &mut io_uring::IoUring) -> io::Result<(i32, i32)> {
+    let mut written: Option<i32> = None;
+    let mut synced: Option<i32> = None;
+    let mut stalls = 0u32;
+    loop {
+        for cqe in ring.completion() {
+            match cqe.user_data() {
+                1 => written = Some(cqe.result()),
+                2 => synced = Some(cqe.result()),
+                _ => {}
+            }
+        }
+        if let (Some(w), Some(s)) = (written, synced) {
+            return Ok((w, s));
+        }
+        let want = usize::from(written.is_none()) + usize::from(synced.is_none());
+        match ring.submit_and_wait(want) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EBUSY))
+                    && stalls < MAX_RING_STALLS =>
+            {
+                stalls += 1;
+                std::thread::yield_now();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+impl WalWriter {
     /// Discard every buffered record that has not yet been flushed to the
     /// OS, without writing it. Called from the panicked-writer drop path:
     /// a guard that never committed must not have its records persisted
@@ -486,12 +611,16 @@ impl Drop for WalWriter {
 /// error. A file shorter than the header is a header torn during initial
 /// creation; it holds no records and surfaces as `truncate_to: Some(0)` so
 /// the caller can clear the partial header before reopening.
-pub fn replay<F>(path: impl AsRef<Path>, mut apply: F) -> Result<ReplayOutcome, WalError>
+///
+/// This reads without the writer's lock: it inspects the log as of the
+/// length measured at open and ignores bytes appended afterwards. Recovery
+/// that will append goes through [`WalWriter::open_replaying`].
+pub fn replay<F>(path: impl AsRef<Path>, apply: F) -> Result<ReplayOutcome, WalError>
 where
     F: FnMut(EdgeRecord) -> Result<(), WalError>,
 {
     let path = path.as_ref();
-    let file = match File::open(path) {
+    let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Ok(ReplayOutcome {
@@ -508,9 +637,6 @@ where
             truncate_to: None,
         });
     }
-    // 1 MiB buffer: the default 8 KiB would issue a read(2) every ~680
-    // records on a recovery path that must chew the whole log.
-    let mut reader = BufReader::with_capacity(BUF_CAPACITY, file);
 
     // A header torn by a crash during initial creation (0 < len < HEADER_LEN,
     // since len == 0 returned above) holds no records. Report a truncate-to-0
@@ -524,7 +650,7 @@ where
     }
 
     let mut header = [0u8; HEADER_LEN as usize];
-    reader.read_exact(&mut header)?;
+    file.read_exact(&mut header)?;
     let mut magic = [0u8; 8];
     magic.copy_from_slice(&header[..8]);
     if magic != MAGIC {
@@ -534,7 +660,20 @@ where
     if version != VERSION {
         return Err(WalError::UnknownVersion(version));
     }
+    replay_records(file, total_len, apply)
+}
 
+/// Walk the records of a log `total_len` bytes long from a reader
+/// positioned just past the header. Bytes past `total_len` are never read,
+/// so a log growing underneath is not mistaken for a torn tail.
+fn replay_records<R, F>(inner: R, total_len: u64, mut apply: F) -> Result<ReplayOutcome, WalError>
+where
+    R: Read,
+    F: FnMut(EdgeRecord) -> Result<(), WalError>,
+{
+    // 1 MiB buffer: the default 8 KiB would issue a read(2) every ~680
+    // records on a recovery path that must chew the whole log.
+    let mut reader = BufReader::with_capacity(BUF_CAPACITY, inner.take(total_len - HEADER_LEN));
     let mut applied: u64 = 0;
     let mut offset: u64 = HEADER_LEN;
     let mut buf = [0u8; RECORD_LEN];
@@ -871,6 +1010,100 @@ mod tests {
             let i = i as u32;
             assert_eq!(*rec, EdgeRecord { src: i, dst: i + 1 }, "record {i}");
         }
+    }
+
+    /// A spill that fails part-way leaves the file holding a prefix of the
+    /// staged bytes. The retry must resume after that prefix: rewriting it
+    /// would misalign every later record.
+    #[test]
+    fn partially_failed_spill_resumes_without_duplicating_bytes() {
+        let tmp = tmp_wal();
+        let count = (BUF_CAPACITY / RECORD_LEN) as u32 + 100;
+        {
+            let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
+            // The first spill accepts 1000 bytes — mid-record — then fails.
+            w.inject_write_fault(1000);
+            let mut i = 0;
+            let mut failures = 0;
+            while i < count {
+                match w.append_edge(EdgeRecord { src: i, dst: i + 1 }) {
+                    Ok(()) => i += 1,
+                    // A failed append staged nothing; retry the same record.
+                    Err(_) => failures += 1,
+                }
+            }
+            assert_eq!(failures, 1, "the injected fault fires once");
+            w.sync().unwrap();
+        }
+        let mut got = Vec::new();
+        let out = replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            out.truncate_to.is_none(),
+            "the log must stay record-aligned"
+        );
+        assert_eq!(got.len(), count as usize);
+        for (i, rec) in got.iter().enumerate() {
+            let i = i as u32;
+            assert_eq!(*rec, EdgeRecord { src: i, dst: i + 1 }, "record {i}");
+        }
+    }
+
+    #[test]
+    fn failed_batch_append_stages_none_of_it() {
+        let tmp = tmp_wal();
+        let filler = (BUF_CAPACITY / RECORD_LEN) as u32 - 4;
+        {
+            let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
+            for i in 0..filler {
+                w.append_edge(EdgeRecord { src: 0, dst: i }).unwrap();
+            }
+            w.inject_write_fault(0);
+            let batch: Vec<u32> = (0..64).collect();
+            assert!(w.append_edges(7, &batch).is_err());
+            w.sync().unwrap();
+        }
+        let mut got = Vec::new();
+        replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got.len(), filler as usize);
+        assert!(
+            got.iter().all(|r| r.src == 0),
+            "no record of the failed batch"
+        );
+    }
+
+    /// A batch larger than the staging buffer is staged whole.
+    #[test]
+    fn oversized_batch_round_trips() {
+        let tmp = tmp_wal();
+        let dsts: Vec<u32> = (0..(BUF_CAPACITY / RECORD_LEN) as u32 * 3).collect();
+        {
+            let mut w = WalWriter::create_or_open(tmp.path()).unwrap();
+            w.append_edge(EdgeRecord { src: 1, dst: 2 }).unwrap();
+            w.append_edges(3, &dsts).unwrap();
+            w.sync().unwrap();
+        }
+        let mut got = Vec::new();
+        replay(tmp.path(), |r| {
+            got.push(r);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got.len(), dsts.len() + 1);
+        assert_eq!(got[0], EdgeRecord { src: 1, dst: 2 });
+        assert!(
+            got[1..]
+                .iter()
+                .zip(&dsts)
+                .all(|(r, &d)| r.src == 3 && r.dst == d)
+        );
     }
 
     /// A discard after the buffer has already spilled keeps the spilled

@@ -164,6 +164,22 @@ impl SieveCache {
         }
     }
 
+    /// Drop `node` from the tier, if resident. Returns whether it was.
+    ///
+    /// A hand parked on the entry steps to its neighbour first, exactly as
+    /// an eviction would leave it.
+    pub(super) fn remove(&mut self, node: NodeId) -> bool {
+        let Some(row) = self.cache.remove(&node) else {
+            return false;
+        };
+        if self.hand == row {
+            self.hand = self.links[row as usize].next;
+        }
+        self.unlink(row);
+        self.slab.release(row);
+        true
+    }
+
     /// Advance the hand until an unvisited, unpinned entry is found and
     /// evict it, returning it with its row (copied out so the slab slot can
     /// be recycled).
@@ -487,6 +503,37 @@ mod tests {
             efficiency > 0.75,
             "hit rate {rate:.4} is only {efficiency:.3} of the {oracle:.4} ceiling"
         );
+    }
+
+    /// Removal frees the slot and the row, keeps the queue intact, and moves
+    /// a hand parked on the removed entry to its neighbour.
+    #[test]
+    fn remove_unlinks_and_frees_the_slot() {
+        let mut c = cache(3);
+        for n in 0..3 {
+            insert(&mut c, n);
+        }
+        // Evicting 1 leaves the hand on 2, so removing 2 is the
+        // parked-hand case.
+        c.get(0);
+        assert_eq!(insert(&mut c, 3), Some(1));
+        assert_eq!(c.hand, c.cache[&2]);
+        assert!(c.remove(2));
+        assert!(!c.remove(2), "second removal is a no-op");
+        assert_eq!(c.len(), 2);
+        assert!(c.get(2).is_none());
+
+        // The freed slot is reused without evicting anyone.
+        assert_eq!(insert(&mut c, 4), None);
+        assert_eq!(c.len(), 3);
+
+        let mut seen = 0usize;
+        let mut cur = c.tail;
+        while cur != NIL {
+            seen += 1;
+            cur = c.links[cur as usize].next;
+        }
+        assert_eq!(seen, c.len());
     }
 
     /// Slab rows are recycled, and the queue is indexed by row — so a long

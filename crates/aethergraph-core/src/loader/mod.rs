@@ -30,10 +30,12 @@ pub(crate) fn planned_capacity(produced: usize, floor: usize) -> usize {
 
 pub use hetero_sampler::{HeteroNeighborSampler, HeteroSampledSubgraph, HeteroSamplingConfig};
 pub use prefetch::{
-    HeteroNeighborLoader, HeteroPrefetchResult, NeighborLoader, PrefetchError, PrefetchResult,
-    PrefetchStats, PrefetchWork, SubgraphWithFeatures, SubmitError, SyncFeatureStore,
+    HeteroNeighborLoader, HeteroPrefetchResult, LoadedBatch, NeighborLoader, PrefetchError,
+    PrefetchResult, PrefetchStats, PrefetchWork, SubgraphWithFeatures, SubmitError,
+    SyncFeatureStore,
 };
 pub use sampler::{
-    LocalEdgeIndex, NeighborSampler, ParallelBatchSampler, SampledSubgraph, SamplingConfig,
-    SeedIndicesLocal, SubgraphType, TemporalSamplingError, TemporalStrategy, batch_seed,
+    LocalEdgeIndex, NeighborSampler, ParallelBatchSampler, SampleError, SampledSubgraph,
+    SamplerConfigError, SamplingConfig, SeedIndicesLocal, SeedOutOfRange, Seeds, SubgraphType,
+    TemporalSamplingError, TemporalStrategy, batch_seed,
 };

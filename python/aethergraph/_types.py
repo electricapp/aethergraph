@@ -2,8 +2,8 @@
 
 These aliases give enum-ish parameters a static domain: mypy rejects a typo
 like ``subgraph_type="directed"`` at the call site, and the single runtime
-validation for untyped callers lives at the boundary that consumes the value
-(``SamplingConfig.__post_init__`` / the Rust FFI converter).
+validation for untyped callers lives in the Rust FFI converter that consumes
+the value (``_core.SamplingConfig``).
 """
 
 from __future__ import annotations

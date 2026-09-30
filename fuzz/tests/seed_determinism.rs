@@ -15,7 +15,11 @@ use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGETS: &[&str] = &["ctree_insert_sequences", "csr_loader_bytes"];
+const TARGETS: &[&str] = &[
+    "ctree_insert_sequences",
+    "csr_loader_bytes",
+    "compressed_loader_bytes",
+];
 
 fn snapshot_corpus(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut snap = BTreeMap::new();

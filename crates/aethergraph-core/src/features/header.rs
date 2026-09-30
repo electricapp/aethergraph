@@ -132,23 +132,48 @@ pub struct FeatureHeader {
     /// Only used by Linux-gated O_DIRECT alignment checks today, but validated
     /// for overflow on every load.
     pub feature_size: usize,
+    /// `num_nodes * feature_size` -- bytes of payload, known to fit the file.
+    pub payload_bytes: usize,
     /// Element data type (F32, F16 or BF16).
     pub dtype: FeatureDtype,
 }
 
+/// Bytes of file prefix [`parse_feature_header_bytes`] reads: the fixed
+/// header plus the dtype tag at byte 32.
+pub(crate) const HEADER_PREFIX_LEN: usize = HEADER_SIZE as usize + 1;
+
 /// Read + validate the header. Also confirms the file is at least as large
 /// as the payload the header claims, so later reads can't tear at EOF.
 pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
-    let mut header = [0u8; HEADER_SIZE as usize];
-    file.read_exact_at(&mut header, 0)
+    let file_size = file
+        .metadata()
+        .context("failed to stat feature file")?
+        .len();
+    let mut prefix = [0u8; HEADER_PREFIX_LEN];
+    let len = HEADER_PREFIX_LEN.min(usize::try_from(file_size).unwrap_or(HEADER_PREFIX_LEN));
+    file.read_exact_at(&mut prefix[..len], 0)
         .context("failed to read header")?;
+    parse_feature_header_bytes(&prefix[..len], file_size)
+}
 
-    if &header[0..8] != FEATURE_MAGIC {
-        anyhow::bail!("Invalid feature file format");
-    }
+/// Validate a header from the file's leading bytes and its total size.
+///
+/// The single header parser: every store, mapped or read through a
+/// descriptor, turns file bytes into a [`FeatureHeader`] here. `prefix`
+/// holds the file's first bytes (at least [`HEADER_PREFIX_LEN`] of them
+/// when the file has that many); `file_size` bounds every offset.
+pub(crate) fn parse_feature_header_bytes(prefix: &[u8], file_size: u64) -> Result<FeatureHeader> {
+    anyhow::ensure!(
+        prefix.len() >= HEADER_SIZE as usize,
+        "feature file too small: {file_size} bytes"
+    );
+    anyhow::ensure!(
+        &prefix[0..8] == FEATURE_MAGIC,
+        "invalid feature file format (bad magic)"
+    );
 
-    let num_nodes_u64 = u64::from_le_bytes(header[8..16].try_into()?);
-    let feature_dim_u64 = u64::from_le_bytes(header[16..24].try_into()?);
+    let num_nodes_u64 = u64::from_le_bytes(prefix[8..16].try_into()?);
+    let feature_dim_u64 = u64::from_le_bytes(prefix[16..24].try_into()?);
     anyhow::ensure!(
         num_nodes_u64 <= MAX_FEATURE_NODES,
         "num_nodes {num_nodes_u64} exceeds maximum {MAX_FEATURE_NODES}"
@@ -158,30 +183,30 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         "feature_dim {feature_dim_u64} exceeds maximum {MAX_FEATURE_DIM}"
     );
 
-    let features_start_offset = u64::from_le_bytes(header[24..32].try_into()?);
+    let features_start_offset = u64::from_le_bytes(prefix[24..32].try_into()?);
     // The dtype tag lives at byte 32, so the payload must start past it.
     anyhow::ensure!(
         features_start_offset > HEADER_SIZE,
-        "invalid feature payload offset {features_start_offset} (must be > {HEADER_SIZE})"
+        "invalid data_offset {features_start_offset} (must be > {HEADER_SIZE})"
     );
-    // Mirror FeatureStore::load: the f32 fast path casts the payload to
-    // &[f32], which requires a 4-byte-aligned start. Written files (offset
-    // 512) are always aligned; reject anything else here so every reader
-    // validates it consistently.
+    // The f32 fast path casts the payload to &[f32], which requires a
+    // 4-byte-aligned start.
     anyhow::ensure!(
-        features_start_offset % std::mem::align_of::<f32>() as u64 == 0,
-        "invalid feature payload offset {} (must be {}-byte aligned)",
+        features_start_offset.is_multiple_of(std::mem::align_of::<f32>() as u64),
+        "invalid data_offset {} (must be {}-byte aligned)",
         features_start_offset,
         std::mem::align_of::<f32>()
     );
+    anyhow::ensure!(
+        features_start_offset <= file_size,
+        "invalid data_offset {features_start_offset} for file size {file_size}"
+    );
 
-    // Read the dtype tag at byte 32 (first byte of the padding region).
-    let dtype = {
-        let mut tag = [0u8; 1];
-        file.read_exact_at(&mut tag, HEADER_SIZE)
-            .context("failed to read dtype tag")?;
-        FeatureDtype::from_u8(tag[0])?
-    };
+    // In bounds: data_offset > HEADER_SIZE and data_offset <= file_size.
+    let tag = *prefix
+        .get(HEADER_SIZE as usize)
+        .context("failed to read dtype tag")?;
+    let dtype = FeatureDtype::from_u8(tag)?;
 
     // Do the byte-size and file-size validation entirely in u64 first, so a
     // 32-bit usize can't truncate the intermediate products before they're
@@ -195,10 +220,6 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
     let min_file_size = features_start_offset
         .checked_add(total_bytes_u64)
         .ok_or_else(|| anyhow::anyhow!("minimum feature file size overflow"))?;
-    let file_size = file
-        .metadata()
-        .context("failed to stat feature file")?
-        .len();
     anyhow::ensure!(
         file_size >= min_file_size,
         "feature file truncated: expected at least {min_file_size} bytes, got {file_size}"
@@ -209,12 +230,61 @@ pub fn parse_feature_header(file: &File) -> Result<FeatureHeader> {
         usize::try_from(feature_dim_u64).context("feature_dim does not fit in usize")?;
     let feature_size =
         usize::try_from(feature_size_u64).context("feature_size does not fit in usize")?;
+    let payload_bytes =
+        usize::try_from(total_bytes_u64).context("feature payload does not fit in usize")?;
 
     Ok(FeatureHeader {
         num_nodes,
         feature_dim,
         features_start_offset,
         feature_size,
+        payload_bytes,
         dtype,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(num_nodes: u64, dim: u64, offset: u64, tag: u8) -> Vec<u8> {
+        let mut b = vec![0u8; HEADER_PREFIX_LEN];
+        b[0..8].copy_from_slice(FEATURE_MAGIC);
+        b[8..16].copy_from_slice(&num_nodes.to_le_bytes());
+        b[16..24].copy_from_slice(&dim.to_le_bytes());
+        b[24..32].copy_from_slice(&offset.to_le_bytes());
+        b[32] = tag;
+        b
+    }
+
+    #[test]
+    fn parses_a_well_formed_prefix() {
+        let h = parse_feature_header_bytes(&header(10, 4, 512, 1), 512 + 10 * 4 * 2).unwrap();
+        assert_eq!(h.num_nodes, 10);
+        assert_eq!(h.feature_dim, 4);
+        assert_eq!(h.dtype, FeatureDtype::F16);
+        assert_eq!(h.feature_size, 8);
+        assert_eq!(h.payload_bytes, 80);
+        assert_eq!(h.features_start_offset, 512);
+    }
+
+    #[test]
+    fn rejects_every_malformed_field() {
+        let ok = 512 + 10 * 16;
+        for (bytes, size, needle) in [
+            (header(10, 4, 512, 0)[..20].to_vec(), 20, "too small"),
+            (header(10, 4, 32, 0), ok, "must be >"),
+            (header(10, 4, 514, 0), ok + 2, "aligned"),
+            (header(10, 4, 512, 9), ok, "dtype"),
+            (header(10, 4, 512, 0), ok - 1, "truncated"),
+            (header(10, 4, 4096, 0), ok, "for file size"),
+            (header(u64::MAX, 4, 512, 0), ok, "exceeds maximum"),
+        ] {
+            let err = parse_feature_header_bytes(&bytes, size as u64).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: got {err}");
+        }
+        let mut bad = header(10, 4, 512, 0);
+        bad[0] = b'X';
+        assert!(parse_feature_header_bytes(&bad, ok as u64).is_err());
+    }
 }

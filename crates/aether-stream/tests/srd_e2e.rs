@@ -58,16 +58,19 @@ fn srd_rdma_read_loopback_bytes_match() {
     let src_ptr = src.as_mut_ptr();
     let dst_ptr = dst.as_mut_ptr();
 
-    let src_mr = ctx
-        .reg_mr(
+    // SAFETY: the buffer outlives the MR, and each READ into it is drained
+    // before the bytes are read back.
+    let src_mr = unsafe {
+        ctx.reg_mr(
             src_ptr,
             LEN,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("reg src_mr");
-    let dst_mr = ctx
-        .reg_mr(dst_ptr, LEN, IBV_ACCESS_LOCAL_WRITE)
-        .expect("reg dst_mr");
+    }
+    .expect("reg src_mr");
+    // SAFETY: the buffer outlives the MR, and each READ into it is drained
+    // before the bytes are read back.
+    let dst_mr = unsafe { ctx.reg_mr(dst_ptr, LEN, IBV_ACCESS_LOCAL_WRITE) }.expect("reg dst_mr");
 
     // -- AH pointing at ourselves -------------------------------------
     let our_gid = ctx.gid();
@@ -162,16 +165,20 @@ fn srd_four_reads_in_order() {
     let src_ptr = src.as_mut_ptr();
     let dst_ptr = dst.as_mut_ptr();
 
-    let src_mr = ctx
-        .reg_mr(
+    // SAFETY: the buffer outlives the MR, and each READ into it is drained
+    // before the bytes are read back.
+    let src_mr = unsafe {
+        ctx.reg_mr(
             src_ptr,
             src.len(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("reg src");
-    let dst_mr = ctx
-        .reg_mr(dst_ptr, dst.len(), IBV_ACCESS_LOCAL_WRITE)
-        .expect("reg dst");
+    }
+    .expect("reg src");
+    // SAFETY: the buffer outlives the MR, and each READ into it is drained
+    // before the bytes are read back.
+    let dst_mr =
+        unsafe { ctx.reg_mr(dst_ptr, dst.len(), IBV_ACCESS_LOCAL_WRITE) }.expect("reg dst");
 
     let ah = SrdAddressHandle::create(&ctx, &ctx.gid()).expect("ah");
 
@@ -405,15 +412,19 @@ fn bench_srd_rdma_read_latency() {
         let buf_len = sz as usize;
         let mut src = vec![0xAAu8; buf_len];
         let mut dst = vec![0u8; buf_len];
-        let src_mr = ctx
-            .reg_mr(
+        // SAFETY: the buffer outlives the MR, and each READ into it is drained
+        // before the bytes are read back.
+        let src_mr = unsafe {
+            ctx.reg_mr(
                 src.as_mut_ptr(),
                 buf_len,
                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
             )
-            .expect("reg src");
-        let dst_mr = ctx
-            .reg_mr(dst.as_mut_ptr(), buf_len, IBV_ACCESS_LOCAL_WRITE)
+        }
+        .expect("reg src");
+        // SAFETY: the buffer outlives the MR, and each READ into it is drained
+        // before the bytes are read back.
+        let dst_mr = unsafe { ctx.reg_mr(dst.as_mut_ptr(), buf_len, IBV_ACCESS_LOCAL_WRITE) }
             .expect("reg dst");
         let local = LocalBuf::new(&dst_mr, dst.as_ptr());
 

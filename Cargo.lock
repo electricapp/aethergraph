@@ -82,7 +82,6 @@ dependencies = [
  "half",
  "io-uring 0.7.15",
  "libc",
- "loom",
  "memmap2",
  "ndarray",
  "parking_lot",

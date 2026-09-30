@@ -10,7 +10,9 @@
 //!
 //! The seals are what make it safe to hand out: with `F_SEAL_SHRINK |
 //! F_SEAL_GROW` no holder can resize the object out from under a peer's
-//! mapping.
+//! mapping, and with `F_SEAL_WRITE`, added once the payload is copied in,
+//! no holder — owner included — can change a byte any peer reads. Workers
+//! refuse a descriptor that lacks it.
 //!
 //! The region carries the payload only; geometry (node count, dimension,
 //! dtype) travels with the fd in the handshake, so an attached worker
@@ -102,8 +104,9 @@ pub struct SharedFeatureStore {
 }
 
 impl SharedFeatureStore {
-    /// Copy the payload of the feature file at `path` into a fresh sealed
-    /// shared region. This is the one copy the whole host pays.
+    /// Copy the payload of the feature file at `path` into a fresh shared
+    /// region and seal it read-only. This is the one copy the whole host
+    /// pays.
     pub fn publish(path: impl AsRef<Path>) -> Result<Self> {
         use std::os::unix::fs::FileExt;
 
@@ -112,10 +115,7 @@ impl SharedFeatureStore {
             .with_context(|| format!("failed to open feature store {}", path.display()))?;
         let header = parse_feature_header(&file)?;
 
-        let payload_len = header
-            .num_nodes
-            .checked_mul(header.feature_size)
-            .context("feature payload size overflows usize")?;
+        let payload_len = header.payload_bytes;
         anyhow::ensure!(payload_len > 0, "feature store is empty");
 
         let mut region = SharedRegion::create(payload_len)?;
@@ -126,6 +126,7 @@ impl SharedFeatureStore {
             file.read_exact_at(dst, header.features_start_offset)
                 .context("failed to read feature payload")?;
         }
+        let region = region.seal_read_only()?;
 
         debug!(
             "Published {} nodes x {} dims ({} MiB) to shared memory",
@@ -216,10 +217,11 @@ impl SharedFeatureStore {
 
         let fd: OwnedFd = recv_fd(stream.as_raw_fd())?;
         let payload_len = usize::try_from(geometry.payload_len).context("payload_len")?;
-        // `from_fd` checks the descriptor's own size and seals against the
-        // geometry the owner just sent, so a peer that misreports either is
-        // rejected here rather than at the first faulting read.
-        let region = SharedRegion::from_fd(fd, payload_len)?;
+        // `from_sealed_fd` checks the descriptor's own size and seals against
+        // the geometry the owner just sent, so a peer that misreports either,
+        // or hands over a region someone could still write, is rejected here
+        // rather than at the first faulting or torn read.
+        let region = SharedRegion::from_sealed_fd(fd, payload_len)?;
 
         debug!(
             "Attached to shared store: {} nodes x {} dims",
@@ -366,7 +368,7 @@ mod tests {
     }
 
     /// The point of the whole module: a second holder of the memfd reads
-    /// the same physical pages, and sees a write made after it attached.
+    /// the same physical pages.
     #[test]
     fn attached_peer_shares_the_same_pages() {
         let dir = tempfile::tempdir().unwrap();

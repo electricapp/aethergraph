@@ -226,7 +226,11 @@ pub fn dlpack_capsule_from_cuda_ptr_py(
 ///
 /// The capsule can be consumed by `torch.from_dlpack()` for zero-copy access.
 /// `features` moves into the capsule's manager context, so the VRAM lives
-/// exactly as long as the consuming tensor (or the unconsumed capsule).
+/// exactly as long as the consuming tensor (or the unconsumed capsule). The
+/// rows are complete before the capsule exists, so any stream may read them;
+/// their free is ordered after work on the CUDA legacy default stream
+/// ([`aether_stream::rdma::gather::GatheredRows`]), which a consumer on a
+/// non-blocking stream must synchronize before releasing the tensor.
 pub fn create_dlpack_capsule(py: Python<'_>, features: OwnedGpuFeatures) -> PyResult<Py<PyAny>> {
     let ptr = features.device_ptr();
     let num_nodes = features.num_nodes;

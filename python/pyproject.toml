@@ -70,8 +70,10 @@ filterwarnings = [
     # Upstream issues - cannot fix from our code:
     # PyG imports deprecated torch_geometric.distributed internally
     "ignore:.*torch_geometric.distributed.*:DeprecationWarning",
-    # PyG calls deprecated torch.jit.script at import
+    # PyG calls deprecated torch.jit.script at import; torch warns with a
+    # FutureWarning (and on Python 3.14+ says it is unsupported)
     "ignore:`torch.jit.script` is deprecated:DeprecationWarning",
+    "ignore:`torch.jit.script` is:FutureWarning",
     # Ray DataContext uses deprecated config names internally
     "ignore:.*use_push_based_shuffle.*:DeprecationWarning",
     "ignore:.*use_polars.*:DeprecationWarning",

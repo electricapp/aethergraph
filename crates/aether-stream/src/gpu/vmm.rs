@@ -28,6 +28,9 @@ pub struct GrowableVram {
     reserved: usize,
     committed: usize,
     granularity: usize,
+    /// Whether chunks are created GPUDirect-RDMA-capable, so the NIC and
+    /// GDRCopy can pin them.
+    rdma_capable: bool,
     /// Physical handles, one per committed chunk, kept for unmap/release.
     chunks: Vec<(sys::CUmemGenericAllocationHandle, sys::CUdeviceptr, usize)>,
 }
@@ -46,7 +49,15 @@ impl GrowableVram {
         device: sys::CUdevice,
         max_bytes: usize,
     ) -> io::Result<Self> {
-        let prop = alloc_prop(device);
+        // Every raw driver call below acts on the thread's current context.
+        ctx.bind_to_thread()
+            .map_err(|e| io::Error::other(format!("binding the CUDA context: {e}")))?;
+        let rdma_capable = ctx
+            .attribute(
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
+            )
+            .is_ok_and(|v| v != 0);
+        let prop = alloc_prop(device, rdma_capable);
         let mut granularity: usize = 0;
         // SAFETY: `prop` is a fully initialized allocation property; the
         // granularity out-pointer is valid.
@@ -76,8 +87,15 @@ impl GrowableVram {
             reserved,
             committed: 0,
             granularity,
+            rdma_capable,
             chunks: Vec::new(),
         })
+    }
+
+    /// Whether committed chunks can be pinned for GPUDirect RDMA (and so
+    /// mapped through GDRCopy's BAR1 window).
+    pub fn rdma_capable(&self) -> bool {
+        self.rdma_capable
     }
 
     /// The stable base device pointer. Valid for the reserved range for
@@ -128,7 +146,10 @@ impl GrowableVram {
         }
         let add = target - self.committed;
 
-        let prop = alloc_prop(self.device);
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| io::Error::other(format!("binding the CUDA context: {e}")))?;
+        let prop = alloc_prop(self.device, self.rdma_capable);
         let mut handle: sys::CUmemGenericAllocationHandle = 0;
         // SAFETY: `prop` is initialized; `handle` is a valid out-pointer.
         let res = unsafe { sys::cuMemCreate(&mut handle, add, &prop, 0) };
@@ -173,7 +194,12 @@ impl GrowableVram {
 
 impl Drop for GrowableVram {
     fn drop(&mut self) {
-        let _ctx = &self.ctx;
+        // The unmaps and releases act on the dropping thread's current
+        // context, which need not be ours.
+        if let Err(e) = self.ctx.bind_to_thread() {
+            tracing::warn!(error = %e, "cannot bind the CUDA context; leaking the VRAM reservation");
+            return;
+        }
         for &(handle, at, size) in &self.chunks {
             // SAFETY: `at`/`size` is a chunk this struct mapped and still
             // owns; unmapped exactly once here.
@@ -191,8 +217,9 @@ impl Drop for GrowableVram {
 
 /// Physical-allocation properties: pinned device memory on `device`,
 /// requesting a POSIX-fd shareable handle so the block can be exported for
-/// IPC later.
-fn alloc_prop(device: sys::CUdevice) -> sys::CUmemAllocationProp {
+/// IPC later. `rdma_capable` marks it pinnable by `nvidia_p2p_get_pages`
+/// (GPUDirect RDMA, GDRCopy), which VMM allocations refuse otherwise.
+fn alloc_prop(device: sys::CUdevice, rdma_capable: bool) -> sys::CUmemAllocationProp {
     // SAFETY: `CUmemAllocationProp` is a plain C struct of integers, an
     // enum, a location, and a nullable pointer; all-zero is a valid
     // initial state that the fields below then fill in.
@@ -201,6 +228,7 @@ fn alloc_prop(device: sys::CUdevice) -> sys::CUmemAllocationProp {
     prop.requestedHandleTypes =
         sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     prop.location = mem_location(device);
+    prop.allocFlags.gpuDirectRDMACapable = u8::from(rdma_capable);
     prop
 }
 

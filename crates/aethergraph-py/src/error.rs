@@ -137,6 +137,20 @@ pub fn extract_seeds(seeds: &pyo3::Bound<'_, pyo3::PyAny>) -> PyResult<Vec<u32>>
     seeds.extract::<Vec<u32>>()
 }
 
+/// Coerce a Python seed argument (see [`extract_seeds`]) and check every ID
+/// against `num_nodes` — the graph's node count, or the seed node type's.
+///
+/// The returned [`aethergraph_core::Seeds`] is the proof the samplers take;
+/// an out-of-range ID raises [`SamplingError`] here instead of panicking the
+/// sampler's node-indexed tables.
+pub fn extract_seed_batch(
+    seeds: &pyo3::Bound<'_, pyo3::PyAny>,
+    num_nodes: usize,
+) -> PyResult<aethergraph_core::Seeds> {
+    aethergraph_core::Seeds::new(extract_seeds(seeds)?, num_nodes)
+        .map_err(|e| sampling_error(e.to_string()))
+}
+
 // Integration-level tests for `extract_seeds` live in
 // `python/tests/test_extract_seeds.py` (or equivalent) — they need a live
 // Python interpreter to construct numpy / list inputs, which the cdylib

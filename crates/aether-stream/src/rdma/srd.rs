@@ -9,29 +9,38 @@
 //! builder API.
 //!
 //! Callers pick up an `SrdContext`, create an `SrdQp`, transition it
-//! RESET → INIT → RTR → RTS, exchange endpoints (GID + QPN + AHN + QKEY)
+//! RESET → INIT → RTR → RTS, exchange endpoints (GID + QPN + QKEY)
 //! with the peer, and post RDMA READs via `SrdQp::post_rdma_read`. The
 //! actual post-and-complete dance is wrapped to a single FFI crossing by
 //! the C shim in `csrc/ibv_shim.c` (`aether_ibv_post_rdma_read_srd` +
 //! `aether_ibv_poll_cq_ex_one`) so Rust never chases `ibv_qp_ex`'s
 //! function-pointer builder at the FFI boundary.
+//!
+//! Every verbs object holds an `Arc` to what it was created on (QP → CQ →
+//! device), so teardown runs child-before-parent however handles drop.
 
 #![cfg(all(target_os = "linux", feature = "efa"))]
 
 use super::context::RegisteredMr;
+use super::control::{handshake_deadline, recv_msg, send_msg};
 use super::efa_ffi::*;
 use super::ffi::{
-    IBV_QP_PKEY_INDEX, IBV_QP_PORT, IBV_QP_QKEY, IBV_QP_SQ_PSN, IBV_QP_STATE, IBV_QPS_INIT,
-    IBV_QPS_RTR, IBV_QPS_RTS, IBV_SEND_SIGNALED, IbvAhAttr, IbvContext, IbvGid, IbvGlobalRoute,
-    IbvPd, IbvQp, IbvQpAttr, IbvQpCap,
+    IBV_ACCESS_LOCAL_WRITE, IBV_QP_PKEY_INDEX, IBV_QP_PORT, IBV_QP_QKEY, IBV_QP_SQ_PSN,
+    IBV_QP_STATE, IBV_QPS_ERR, IBV_QPS_INIT, IBV_QPS_RTR, IBV_QPS_RTS, IBV_SEND_SIGNALED,
+    IBV_WC_SUCCESS, IbvAhAttr, IbvContext, IbvGid, IbvGlobalRoute, IbvPd, IbvQp, IbvQpAttr,
+    IbvQpCap,
 };
+use super::layout::RemoteTable;
+use super::qp::next_wr_generation;
 use crate::feature_table::FeatureSchema;
 use serde::{Deserialize, Serialize};
+use std::alloc::Layout;
 use std::ffi::CStr;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{TcpListener, TcpStream};
-use std::ptr;
-use std::time::Duration;
+use std::ptr::{self, NonNull};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Default SRD QP capabilities. `max_send_sge` is capped at 2 on current
 /// EFA firmware — callers wanting longer per-WR SGLs need to chain WRs.
@@ -52,6 +61,13 @@ pub const DEFAULT_SRD_QP_CAP: IbvQpCap = IbvQpCap {
 /// but both ends must agree — we hardcode a single constant so the control
 /// plane doesn't need to carry it.
 pub const DEFAULT_SRD_QKEY: u32 = 0x1111_1111;
+
+/// Wall-clock bound on draining one posted batch before the QP is forced
+/// into the error state to flush it.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Rounds of torn-row re-reads before a gather gives up.
+const MAX_RETRIES: usize = 8;
 
 /// Everything a peer needs to address us: GID + QPN + QKEY. Exchange these
 /// out-of-band (TCP control plane) before posting reads. The peer creates
@@ -87,20 +103,66 @@ pub struct SrdAdvertisement {
 // Context
 // ---------------------------------------------------------------------------
 
+/// An open EFA device and its protection domain, kept alive by every object
+/// created on it.
+struct SrdDevice {
+    context: *mut IbvContext,
+    pd: *mut IbvPd,
+}
+
+// SAFETY: ibverbs contexts and PDs are thread-safe after creation.
+unsafe impl Send for SrdDevice {}
+// SAFETY: see Send impl above.
+unsafe impl Sync for SrdDevice {}
+
+impl Drop for SrdDevice {
+    fn drop(&mut self) {
+        // SAFETY: every object on this PD holds an `Arc<SrdDevice>`, so
+        // none is left.
+        let rc = unsafe { super::ffi::ibv_dealloc_pd(self.pd) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_dealloc_pd failed");
+        }
+        // SAFETY: opened in `SrdContext::open`; nothing created on it remains.
+        let rc = unsafe { super::ffi::ibv_close_device(self.context) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_close_device failed");
+        }
+    }
+}
+
+/// The extended CQ, kept alive by every QP created on it.
+struct SrdCq {
+    cq_ex: *mut IbvCqEx,
+    // Released after `Drop::drop` destroys the CQ.
+    _dev: Arc<SrdDevice>,
+}
+
+// SAFETY: ibverbs CQs are thread-safe after creation.
+unsafe impl Send for SrdCq {}
+// SAFETY: see Send impl above.
+unsafe impl Sync for SrdCq {}
+
+impl Drop for SrdCq {
+    fn drop(&mut self) {
+        // SAFETY: `cq_ex` was created in `SrdContext::open` and is live.
+        let cq = unsafe { aether_ibv_cq_ex_to_cq(self.cq_ex) };
+        // SAFETY: every QP on the CQ holds an `Arc<SrdCq>`, so none is left.
+        let rc = unsafe { super::ffi::ibv_destroy_cq(cq) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_destroy_cq failed");
+        }
+    }
+}
+
 /// EFA device context. Opens the first visible EFA device (`rdmap*` or
 /// `efa_*` depending on kernel naming) and allocates a PD + extended CQ.
 pub struct SrdContext {
-    context: *mut IbvContext,
-    pd: *mut IbvPd,
-    cq_ex: *mut IbvCqEx,
+    dev: Arc<SrdDevice>,
+    cq: Arc<SrdCq>,
     port_gid: IbvGid,
     gid_index: u8,
 }
-
-// SAFETY: SrdContext owns ibverbs PD/CQ handles that are thread-safe to share.
-unsafe impl Send for SrdContext {}
-// SAFETY: see Send impl above.
-unsafe impl Sync for SrdContext {}
 
 impl SrdContext {
     /// Open the first EFA device (by index 0) and allocate a PD + extended CQ.
@@ -110,7 +172,11 @@ impl SrdContext {
         let mut n: i32 = 0;
         // SAFETY: ibverbs FFI; `n` is a valid out-param.
         let list = unsafe { super::ffi::ibv_get_device_list(&mut n) };
-        if list.is_null() || n == 0 {
+        if list.is_null() || n <= 0 {
+            if !list.is_null() {
+                // SAFETY: `list` is non-null and not yet freed.
+                unsafe { super::ffi::ibv_free_device_list(list) };
+            }
             return Err(io::Error::new(io::ErrorKind::NotFound, "no RDMA devices"));
         }
         // Pick the first EFA-capable device. `efadv_query_device` returns
@@ -170,6 +236,8 @@ impl SrdContext {
             unsafe { super::ffi::ibv_close_device(context) };
             return Err(io::Error::other("ibv_alloc_pd"));
         }
+        // From here every early return unwinds through the RAII owners.
+        let dev = Arc::new(SrdDevice { context, pd });
 
         let mut cq_attr = IbvCqInitAttrEx::zeroed();
         cq_attr.cqe = cq_size;
@@ -177,68 +245,69 @@ impl SrdContext {
         // SAFETY: `context` is open; `cq_attr` is initialized above.
         let cq_ex = unsafe { ibv_create_cq_ex(context, &mut cq_attr) };
         if cq_ex.is_null() {
-            // SAFETY: `pd` and `context` are live, not yet freed.
-            unsafe { super::ffi::ibv_dealloc_pd(pd) };
-            // SAFETY: see above.
-            unsafe { super::ffi::ibv_close_device(context) };
             return Err(io::Error::other("ibv_create_cq_ex"));
         }
+        let cq = Arc::new(SrdCq {
+            cq_ex,
+            _dev: dev.clone(),
+        });
 
         // SAFETY: zeroed init of POD struct is sound.
         let mut port_gid: IbvGid = unsafe { std::mem::zeroed() };
         // SAFETY: `context` is open; `port_gid` is a valid out-param.
         let rc = unsafe { super::ffi::ibv_query_gid(context, 1, gid_index as i32, &mut port_gid) };
         if rc != 0 {
-            // Drop CQ + PD before bailing.
-            // SAFETY: `cq_ex` is the live extended CQ created above.
-            let cq_plain = unsafe { aether_ibv_cq_ex_to_cq(cq_ex) };
-            // SAFETY: all handles are live, not yet freed.
-            unsafe { super::ffi::ibv_destroy_cq(cq_plain) };
-            // SAFETY: see above.
-            unsafe { super::ffi::ibv_dealloc_pd(pd) };
-            // SAFETY: see above.
-            unsafe { super::ffi::ibv_close_device(context) };
             return Err(io::Error::other(format!(
                 "ibv_query_gid({gid_index}) rc={rc}"
             )));
         }
 
         Ok(Self {
-            context,
-            pd,
-            cq_ex,
+            dev,
+            cq,
             port_gid,
             gid_index,
         })
     }
 
     /// Register a memory region for local write (SGE destination) or remote
-    /// read (peer source). Returns an RAII wrapper; drop before the context.
-    pub fn reg_mr(&self, addr: *mut u8, len: usize, access: i32) -> io::Result<RegisteredMr> {
-        // SAFETY: `self.pd` is alive; `addr/len/access` are the caller's contract.
-        let mr = unsafe { super::ffi::ibv_reg_mr(self.pd, addr as *mut libc::c_void, len, access) };
+    /// read (peer source). The MR keeps the PD alive until it deregisters.
+    ///
+    /// # Safety
+    /// Same contract as [`super::context::RdmaContext::reg_mr`]:
+    /// `[addr, addr + len)` must stay valid until the MR drops and every WR
+    /// referencing it has completed, and no Rust reference to bytes a WR
+    /// targets may be live while that WR is in flight.
+    pub unsafe fn reg_mr(
+        &self,
+        addr: *mut u8,
+        len: usize,
+        access: i32,
+    ) -> io::Result<RegisteredMr> {
+        // SAFETY: the PD is alive; `addr/len/access` are the caller's contract.
+        let mr =
+            unsafe { super::ffi::ibv_reg_mr(self.dev.pd, addr as *mut libc::c_void, len, access) };
         if mr.is_null() {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `mr` is non-null, fresh from `ibv_reg_mr`; the wrapper
-        // takes ownership and deregisters on drop.
-        Ok(unsafe { RegisteredMr::__from_raw_mr(mr) })
+        // SAFETY: `mr` is a fresh registration on this context's PD.
+        Ok(unsafe { RegisteredMr::from_raw(mr, self.dev.clone()) })
     }
 
-    /// Raw PD pointer — needed by callers that want to register the MR
-    /// themselves or create auxiliary AHs.
+    /// Raw PD pointer. Using it is `unsafe`; it lives as long as this
+    /// context or anything created on it.
     pub fn pd(&self) -> *mut IbvPd {
-        self.pd
+        self.dev.pd
     }
 
-    /// Raw extended-CQ pointer.
+    /// Raw extended-CQ pointer; same lifetime rule as [`Self::pd`].
     pub fn cq_ex(&self) -> *mut IbvCqEx {
-        self.cq_ex
+        self.cq.cq_ex
     }
 
-    /// Raw context pointer — used by QP creation.
+    /// Raw context pointer; same lifetime rule as [`Self::pd`].
     pub fn context_ptr(&self) -> *mut IbvContext {
-        self.context
+        self.dev.context
     }
 
     /// Local GID. Peers need this to create an AH pointing at us.
@@ -257,26 +326,24 @@ impl SrdContext {
     ///   Err(_) on hard failure.
     pub fn poll_one(&self) -> io::Result<Option<AetherCqeSnapshot>> {
         let mut out = AetherCqeSnapshot::default();
-        // SAFETY: `self.cq_ex` is the live extended CQ; `out` is a valid out-param.
-        let rc = unsafe { aether_ibv_poll_cq_ex_one(self.cq_ex, &mut out) };
+        // SAFETY: the CQ is alive; `out` is a valid out-param.
+        let rc = unsafe { aether_ibv_poll_cq_ex_one(self.cq.cq_ex, &mut out) };
         match rc {
             0 => Ok(Some(out)),
-            2 => Ok(None), // ENOENT — empty CQ
+            libc::ENOENT => Ok(None),
             other => Err(io::Error::other(format!("poll_cq_ex rc={other}"))),
         }
     }
-}
 
-impl Drop for SrdContext {
-    fn drop(&mut self) {
-        // SAFETY: `self.cq_ex` was created in `open` and is live until now.
-        let cq_plain = unsafe { aether_ibv_cq_ex_to_cq(self.cq_ex) };
-        // SAFETY: handles were created in `open` and are live until now.
-        unsafe { super::ffi::ibv_destroy_cq(cq_plain) };
-        // SAFETY: see above.
-        unsafe { super::ffi::ibv_dealloc_pd(self.pd) };
-        // SAFETY: see above.
-        unsafe { super::ffi::ibv_close_device(self.context) };
+    /// Drain up to `out.len()` CQEs in one FFI crossing.
+    pub fn poll_many(&self, out: &mut [AetherCqeSnapshot]) -> io::Result<usize> {
+        let want = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        // SAFETY: the CQ is alive; `out` has room for `want` snapshots.
+        let got = unsafe { aether_ibv_poll_cq_ex_many(self.cq.cq_ex, out.as_mut_ptr(), want) };
+        if got < 0 {
+            return Err(io::Error::from_raw_os_error(-got));
+        }
+        Ok(got as usize)
     }
 }
 
@@ -288,6 +355,8 @@ impl Drop for SrdContext {
 pub struct SrdAddressHandle {
     ah: *mut IbvAh,
     ahn: u16,
+    // Released after `Drop::drop` destroys the AH.
+    _dev: Arc<SrdDevice>,
 }
 
 // SAFETY: ibverbs AH handles are thread-safe to share.
@@ -311,8 +380,8 @@ impl SrdAddressHandle {
             port_num: 1,
             ..Default::default()
         };
-        // SAFETY: `ctx.pd` is alive; `ah_attr` is fully initialized above.
-        let ah = unsafe { ibv_create_ah(ctx.pd, &mut ah_attr) };
+        // SAFETY: the PD is alive; `ah_attr` is fully initialized above.
+        let ah = unsafe { ibv_create_ah(ctx.dev.pd, &mut ah_attr) };
         if ah.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -325,7 +394,11 @@ impl SrdAddressHandle {
             unsafe { ibv_destroy_ah(ah) };
             return Err(io::Error::other(format!("efadv_query_ah rc={rc}")));
         }
-        Ok(Self { ah, ahn: efa.ahn })
+        Ok(Self {
+            ah,
+            ahn: efa.ahn,
+            _dev: ctx.dev.clone(),
+        })
     }
 
     pub fn ahn(&self) -> u16 {
@@ -339,7 +412,10 @@ impl SrdAddressHandle {
 impl Drop for SrdAddressHandle {
     fn drop(&mut self) {
         // SAFETY: `self.ah` was created in `create` and is live until now.
-        unsafe { ibv_destroy_ah(self.ah) };
+        let rc = unsafe { ibv_destroy_ah(self.ah) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_destroy_ah failed");
+        }
     }
 }
 
@@ -352,6 +428,9 @@ pub struct SrdQp {
     qp: *mut IbvQp,
     qp_ex: *mut IbvQpEx,
     qkey: u32,
+    // Released after `Drop::drop` destroys the QP.
+    _cq: Arc<SrdCq>,
+    _dev: Arc<SrdDevice>,
 }
 
 // SAFETY: ibverbs QP/QpEx handles are thread-safe after creation;
@@ -368,15 +447,15 @@ impl SrdQp {
     }
 
     pub fn create_with_qkey(ctx: &SrdContext, cap: &IbvQpCap, qkey: u32) -> io::Result<Self> {
-        // SAFETY: `ctx.cq_ex` is the live extended CQ.
-        let cq_plain = unsafe { aether_ibv_cq_ex_to_cq(ctx.cq_ex) };
+        // SAFETY: the extended CQ is alive.
+        let cq_plain = unsafe { aether_ibv_cq_ex_to_cq(ctx.cq.cq_ex) };
         let mut attr = IbvQpInitAttrEx::zeroed();
         attr.send_cq = cq_plain;
         attr.recv_cq = cq_plain;
         attr.cap = *cap;
         attr.qp_type = IBV_QPT_DRIVER;
         attr.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
-        attr.pd = ctx.pd;
+        attr.pd = ctx.dev.pd;
         attr.send_ops_flags = IBV_QP_EX_WITH_RDMA_READ;
         let mut efa = EfadvQpInitAttr {
             comp_mask: 0,
@@ -385,11 +464,11 @@ impl SrdQp {
             sl: 0,
             reserved: 0,
         };
-        // SAFETY: `ctx.context` is open; `attr` and `efa` are fully
+        // SAFETY: the context is open; `attr` and `efa` are fully
         // initialized with the sizes passed.
         let qp = unsafe {
             efadv_create_qp_ex(
-                ctx.context,
+                ctx.dev.context,
                 &mut attr,
                 &mut efa,
                 std::mem::size_of::<EfadvQpInitAttr>() as u32,
@@ -408,7 +487,13 @@ impl SrdQp {
             unsafe { super::ffi::ibv_destroy_qp(qp) };
             return Err(io::Error::other("ibv_qp_to_qp_ex failed"));
         }
-        Ok(Self { qp, qp_ex, qkey })
+        Ok(Self {
+            qp,
+            qp_ex,
+            qkey,
+            _cq: ctx.cq.clone(),
+            _dev: ctx.dev.clone(),
+        })
     }
 
     /// QP number — ship to the peer so they can target us.
@@ -478,6 +563,20 @@ impl SrdQp {
         Ok(())
     }
 
+    /// Move the QP to the error state, flushing every outstanding WR with
+    /// an error completion. The QP is unusable afterwards.
+    pub fn to_error(&self) -> io::Result<()> {
+        // SAFETY: zeroed init of POD struct is sound.
+        let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
+        attr.qp_state = IBV_QPS_ERR;
+        // SAFETY: `self.qp` is live; `attr` is initialized for the mask.
+        let rc = unsafe { super::ffi::ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE) };
+        if rc != 0 {
+            return Err(io::Error::other(format!("SRD → ERR rc={rc}")));
+        }
+        Ok(())
+    }
+
     /// Post a single signaled RDMA READ on this SRD QP, addressed by the
     /// peer's AH + QPN + QKEY. Returns after `ibv_wr_complete` succeeds —
     /// the caller must still drain the CQ to observe the result.
@@ -490,8 +589,9 @@ impl SrdQp {
         local: &LocalBuf,
         remote: RemoteBuf,
     ) -> io::Result<()> {
-        // SAFETY: `self.qp_ex` and `ah` are live; the lkey/rkey and address
-        // ranges are the caller's contract with the registered MRs.
+        // SAFETY: `self.qp_ex` and `ah` are live; the NIC bounds the local
+        // write by the lkey's MR, whose memory the (unsafe) registration
+        // vouched for.
         let rc = unsafe {
             aether_ibv_post_rdma_read_srd(
                 self.qp_ex,
@@ -517,7 +617,10 @@ impl SrdQp {
 impl Drop for SrdQp {
     fn drop(&mut self) {
         // SAFETY: `self.qp` was created in `create_with_qkey` and is live until now.
-        unsafe { super::ffi::ibv_destroy_qp(self.qp) };
+        let rc = unsafe { super::ffi::ibv_destroy_qp(self.qp) };
+        if rc != 0 {
+            tracing::warn!(rc, "ibv_destroy_qp failed");
+        }
     }
 }
 
@@ -553,43 +656,6 @@ pub struct RemoteBuf {
 // Control plane (TCP) — carries the SRD advertisement + endpoint exchange
 // ---------------------------------------------------------------------------
 
-/// Max serialized control-plane message we'll accept — guards against a
-/// malformed length prefix triggering a multi-GB allocation.
-const SRD_CONTROL_MAX_MSG: usize = 64 * 1024;
-const SRD_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn send_len_prefixed(conn: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
-    // The wire prefix is a u32; a payload ≥ 4 GiB cannot be framed. Error
-    // rather than truncate the length (which would desync the stream).
-    let len = u32::try_from(payload.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "control message too large to frame: {} bytes",
-                payload.len()
-            ),
-        )
-    })?;
-    conn.write_all(&len.to_le_bytes())?;
-    conn.write_all(payload)?;
-    Ok(())
-}
-
-fn recv_len_prefixed(conn: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    conn.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > SRD_CONTROL_MAX_MSG {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("message too large: {len} (max {SRD_CONTROL_MAX_MSG})"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    conn.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
 /// Serve the SRD advertisement over TCP. For each connecting client:
 ///   1. Receive the client's `SrdEndpoint` (GID + QPN + QKEY).
 ///   2. Create a local `ibv_ah` pointing at the client's GID — this
@@ -600,9 +666,11 @@ fn recv_len_prefixed(conn: &mut TcpStream) -> io::Result<Vec<u8>> {
 ///      `REMOTE_ERROR_UNKNOWN_PEER` on the client's completion).
 ///   3. Reply with the advertisement.
 ///
-/// Blocks forever; run in a dedicated thread. Address handles accumulate
-/// per connected client for the server's lifetime — they're small and
-/// the EFA device supports 64k+ peers.
+/// Each handshake is bounded as a whole, so a stalled client holds the
+/// single-threaded accept loop for at most that long. Blocks forever; run
+/// in a dedicated thread. Address handles accumulate per connected client
+/// for the server's lifetime — they're small and the EFA device supports
+/// 64k+ peers.
 pub fn serve_srd_control_plane(
     bind_addr: &str,
     adv: &SrdAdvertisement,
@@ -624,20 +692,14 @@ pub fn serve_srd_control_plane(
             }
         };
         let peer = conn.peer_addr().ok();
-        let _ = conn.set_read_timeout(Some(SRD_CONTROL_TIMEOUT));
-        let _ = conn.set_write_timeout(Some(SRD_CONTROL_TIMEOUT));
+        let deadline = handshake_deadline();
         // 1. Receive client endpoint.
-        let client_ep_buf = match recv_len_prefixed(&mut conn) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(?peer, error = %e, "recv client endpoint");
-                continue;
-            }
-        };
-        let client_ep: SrdEndpoint = match serde_json::from_slice(&client_ep_buf) {
+        let client_ep: SrdEndpoint = match recv_msg(&mut conn, deadline).and_then(|buf| {
+            serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        }) {
             Ok(ep) => ep,
             Err(e) => {
-                tracing::warn!(?peer, error = %e, "parse client endpoint");
+                tracing::warn!(?peer, error = %e, "recv client endpoint");
                 continue;
             }
         };
@@ -650,7 +712,7 @@ pub fn serve_srd_control_plane(
             }
         }
         // 3. Send advertisement.
-        if let Err(e) = send_len_prefixed(&mut conn, &adv_payload) {
+        if let Err(e) = send_msg(&mut conn, &adv_payload, deadline) {
             tracing::warn!(?peer, error = %e, "send advertisement");
         }
     }
@@ -659,15 +721,14 @@ pub fn serve_srd_control_plane(
 
 /// Connect to a SRD server: send our local endpoint, then receive the
 /// advertisement. Caller is expected to have an `SrdQp` already brought up
-/// so the endpoint it ships is valid.
+/// so the endpoint it ships is valid. The exchange is bounded as a whole.
 pub fn exchange_srd_endpoints(addr: &str, local: &SrdEndpoint) -> io::Result<SrdAdvertisement> {
     let mut conn = TcpStream::connect(addr)?;
-    conn.set_read_timeout(Some(SRD_CONTROL_TIMEOUT))?;
-    conn.set_write_timeout(Some(SRD_CONTROL_TIMEOUT))?;
+    let deadline = handshake_deadline();
     let local_buf =
         serde_json::to_vec(local).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    send_len_prefixed(&mut conn, &local_buf)?;
-    let buf = recv_len_prefixed(&mut conn)?;
+    send_msg(&mut conn, &local_buf, deadline)?;
+    let buf = recv_msg(&mut conn, deadline)?;
     serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -675,46 +736,116 @@ pub fn exchange_srd_endpoints(addr: &str, local: &SrdEndpoint) -> io::Result<Srd
 // SrdFeatureClient — cross-node RDMA READ gather over SRD
 // ---------------------------------------------------------------------------
 
+/// Page-aligned, zeroed heap memory the NIC writes into. Held as a raw
+/// pointer, never a `Box` or slice, so no Rust reference asserts exclusive
+/// access while a READ lands in it.
+struct DmaBuffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+// SAFETY: the buffer is uniquely owned; access is gated by `&`/`&mut`
+// borrows of the client that holds it.
+unsafe impl Send for DmaBuffer {}
+// SAFETY: see Send impl above; shared access is read-only.
+unsafe impl Sync for DmaBuffer {}
+
+impl DmaBuffer {
+    fn zeroed(len: usize) -> io::Result<Self> {
+        let layout = Layout::from_size_align(len.max(1), 4096)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: `layout` has nonzero size.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = NonNull::new(raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "DMA buffer allocation"))?;
+        Ok(Self { ptr, layout })
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for DmaBuffer {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `zeroed` with this layout.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+/// Which of the two staging regions a READ lands in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Snapshot {
+    First,
+    Second,
+}
+
 /// Gather features from a remote SRD server into a locally-registered MR.
 ///
 /// The client holds its own `SrdContext` + `SrdQp` (brought to RTS), a
 /// locally-allocated + registered destination buffer, and an AH aimed at
-/// the server's GID. `gather` issues one RDMA READ per node — each read
-/// carries the local_lkey + local_addr + server rkey + server base_addr +
-/// node_offset + slot_size — and drains all completions before returning.
+/// the server's GID. Every row is READ twice into two staging regions — the
+/// second only after the first has fully completed — and accepted only when
+/// both snapshots agree on an even version and on every payload byte, the
+/// RDMA reader contract in `feature_table.rs`; torn rows are re-read.
+/// `gather` takes `&mut self`, so no read of [`Self::dst_slice`] can overlap
+/// the NIC writing it.
+///
+/// If a drain cannot account for every posted READ, the QP is forced into
+/// the error state and the client refuses further work; should even that
+/// fail, the destination buffer is leaked rather than freed under the NIC.
 pub struct SrdFeatureClient {
-    ctx: SrdContext,
+    // Drop order: the QP stops DMA, the MR deregisters, then the buffer it
+    // covered is freed.
     qp: SrdQp,
+    dst_mr: RegisteredMr,
+    dst: Option<DmaBuffer>,
     ah: SrdAddressHandle,
+    ctx: SrdContext,
     adv: SrdAdvertisement,
-    /// Destination MR for read landing; kept alive for the client's lifetime.
-    _dst_mr: RegisteredMr,
-    dst_lkey: u32,
-    dst_ptr: *mut u8,
-    dst_len: usize,
+    table: RemoteTable,
+    /// Rows per staging region.
+    max_inflight: usize,
+    /// Tags each post's `wr_id`s so its completions are told from any other's.
+    generation: u32,
+    /// Set once the QP has been forced into the error state.
+    failed: bool,
+    /// Set when a drain could not prove the NIC finished; the buffer leaks.
+    poisoned: bool,
 }
 
-// SAFETY: all ibverbs handles inside are thread-safe to share read-only;
-// hot-path mutation (posting and draining a gather) is driven by one
-// thread at a time — `SrdShardedFeatureClient::gather` runs every shard's
-// post and drain on the calling thread.
-unsafe impl Send for SrdFeatureClient {}
-// SAFETY: see Send impl above.
-unsafe impl Sync for SrdFeatureClient {}
+impl Drop for SrdFeatureClient {
+    fn drop(&mut self) {
+        if self.poisoned
+            && let Some(buf) = self.dst.take()
+        {
+            std::mem::forget(buf);
+        }
+    }
+}
 
 impl SrdFeatureClient {
     /// Connect to `addr`: open a local SRD context + QP, ship our endpoint
     /// so the server can register us as a known EFA peer (required —
     /// otherwise the server's incoming RDMA READ handler rejects us with
     /// `REMOTE_ERROR_UNKNOWN_PEER`), then receive the advertisement and
-    /// build the destination MR sized for `max_inflight * slot_size`.
+    /// build two destination regions of `max_inflight` slots each.
     ///
     /// `gid_index`: which GID slot to use locally (typically 0 on EFA).
     pub fn connect(addr: &str, gid_index: u8, max_inflight: usize) -> io::Result<Self> {
-        let cq_size = (max_inflight as u32).max(16);
-        let ctx = SrdContext::open(cq_size, gid_index)?;
+        let depth = u32::try_from(max_inflight)
+            .ok()
+            .filter(|&d| d > 0)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("max_inflight {max_inflight} must be in 1..=u32::MAX"),
+                )
+            })?;
+        // Every READ is signaled and at most `max_inflight` are outstanding.
+        let ctx = SrdContext::open(depth.max(16), gid_index)?;
         let cap = IbvQpCap {
-            max_send_wr: (max_inflight as u32).max(64),
+            max_send_wr: depth.max(64),
             max_recv_wr: 1,
             max_send_sge: 1,
             max_recv_sge: 1,
@@ -758,31 +889,44 @@ impl SrdFeatureClient {
         adv: SrdAdvertisement,
         max_inflight: usize,
     ) -> io::Result<Self> {
+        let table = RemoteTable::parse(adv.base_addr, adv.rkey, &adv.schema)?;
+        if max_inflight == 0 || u32::try_from(max_inflight).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("max_inflight {max_inflight} must be in 1..=u32::MAX"),
+            ));
+        }
         let ah = SrdAddressHandle::create(&ctx, &adv.endpoint.gid)?;
 
-        // Per-slot destination buffer — one contiguous region so each post's
-        // SGE points at a distinct offset within a single MR.
-        let dst_len = max_inflight * adv.schema.slot_size;
-        let mut dst = vec![0u8; dst_len].into_boxed_slice();
-        let dst_ptr = dst.as_mut_ptr();
-        // Register against the still-owned allocation; its pages are valid for
-        // the duration of this call. Only leak the box AFTER registration
-        // succeeds so a `reg_mr` failure frees the buffer instead of leaking
-        // it. On success the leaked allocation stays pinned for the client's
-        // lifetime and `_dst_mr` owns the dereg via Drop.
-        let dst_mr = ctx.reg_mr(dst_ptr, dst_len, super::ffi::IBV_ACCESS_LOCAL_WRITE)?;
-        std::mem::forget(dst);
-        let dst_lkey = dst_mr.lkey();
+        // Two regions of `max_inflight` slots at the table's stride — one
+        // per snapshot — in one allocation under one MR.
+        let dst_len = max_inflight
+            .checked_mul(table.geometry().stride())
+            .and_then(|b| b.checked_mul(2))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination buffer size overflows usize",
+                )
+            })?;
+        let dst = DmaBuffer::zeroed(dst_len)?;
+        // SAFETY: `dst` is owned by the client, freed only after the MR
+        // deregisters (field order) and never while poisoned; the NIC writes
+        // it only inside `gather`, which holds `&mut self`.
+        let dst_mr = unsafe { ctx.reg_mr(dst.as_ptr(), dst_len, IBV_ACCESS_LOCAL_WRITE) }?;
 
         Ok(Self {
-            ctx,
             qp,
+            dst_mr,
+            dst: Some(dst),
             ah,
+            ctx,
             adv,
-            _dst_mr: dst_mr,
-            dst_lkey,
-            dst_ptr,
-            dst_len,
+            table,
+            max_inflight,
+            generation: 0,
+            failed: false,
+            poisoned: false,
         })
     }
 
@@ -791,167 +935,231 @@ impl SrdFeatureClient {
         &self.adv.schema
     }
 
-    /// Immutable view of the destination buffer (after `gather`).
+    /// The remote table, as parsed from the advertisement.
+    pub fn table(&self) -> &RemoteTable {
+        &self.table
+    }
+
+    fn region_ptr(&self, snap: Snapshot) -> *mut u8 {
+        let base = self.dst.as_ref().expect("present until drop").as_ptr();
+        let region = self.max_inflight * self.table.geometry().stride();
+        match snap {
+            Snapshot::First => base,
+            // In bounds: the buffer holds two regions.
+            Snapshot::Second => base.wrapping_add(region),
+        }
+    }
+
+    /// The validated rows of the last successful `gather`, back to back at
+    /// the table's slot stride: row `i` of that call at `i * slot_size`.
     pub fn dst_slice(&self) -> &[u8] {
-        // SAFETY: dst_ptr / dst_len come from the `vec![0u8; dst_len]` we
-        // built in `from_advertisement`; the allocation was leaked + pinned
-        // by `reg_mr` and is freed only when the MR's Drop runs.
-        unsafe { std::slice::from_raw_parts(self.dst_ptr, self.dst_len) }
+        let len = self.max_inflight * self.table.geometry().stride();
+        // SAFETY: the first region is `len` bytes inside the owned buffer;
+        // no READ is in flight outside `gather`, which `&self` excludes.
+        unsafe { std::slice::from_raw_parts(self.region_ptr(Snapshot::First), len) }
     }
 
-    /// Translate a node id into the remote address to READ from, validating it
-    /// against the advertised table bounds.
-    ///
-    /// Two independent guards, both required:
-    ///   1. `node < schema.node_count` — the table holds exactly `node_count`
-    ///      logical slots.
-    ///   2. `(node + 1) * slot_size <= node_count * slot_size` via checked
-    ///      arithmetic — the slot's last byte must stay inside the region the
-    ///      server registered. The server registers the whole feature table
-    ///      (`node_count` rounded up to a power of two, each slot page-rounded),
-    ///      so `node_count * slot_size` is a conservative lower bound on the
-    ///      registered MR length; staying within it guarantees the one-sided
-    ///      READ never targets memory outside the MR even for an out-of-range id.
-    fn remote_addr_for(&self, node: usize) -> io::Result<u64> {
-        let node_count = self.adv.schema.node_count as u64;
-        let slot_size = self.adv.schema.slot_size as u64;
-        let node = node as u64;
-        if node >= node_count {
+    /// Remote slot addresses for `nodes`, each checked against the table.
+    fn remote_addrs(&self, nodes: &[usize]) -> io::Result<Vec<u64>> {
+        if nodes.len() > self.max_inflight {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("node {node} out of range (node_count {node_count})"),
+                format!(
+                    "{} nodes exceed max_inflight {}",
+                    nodes.len(),
+                    self.max_inflight
+                ),
             ));
         }
-        let end_offset = node
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(slot_size))
-            .ok_or_else(|| io::Error::other("remote offset overflow"))?;
-        let region_len = node_count
-            .checked_mul(slot_size)
-            .ok_or_else(|| io::Error::other("region length overflow"))?;
-        if end_offset > region_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("node {node} slot end {end_offset} exceeds region length {region_len}"),
-            ));
-        }
-        let start_offset = node
-            .checked_mul(slot_size)
-            .ok_or_else(|| io::Error::other("remote offset overflow"))?;
-        self.adv
-            .base_addr
-            .checked_add(start_offset)
-            .ok_or_else(|| io::Error::other("remote address overflow"))
-    }
-
-    /// Post one RDMA READ per node without draining. Pair with
-    /// [`drain_gather`](Self::drain_gather); [`gather`](Self::gather)
-    /// composes the two. Split out so a sharded pool can post every
-    /// shard's batch before draining any of them — the posts are
-    /// non-blocking, so the shards' DMA runs concurrently from one thread.
-    ///
-    /// EFA SRD requires each WR to sit in its own `wr_start`/`wr_complete`
-    /// bracket and be individually signaled, so N reads produce N CQEs.
-    /// The batched shim (`aether_ibv_post_rdma_reads_srd_batch`) collapses
-    /// the post loop to one FFI crossing regardless of batch size.
-    pub fn post_gather(&self, nodes: &[usize]) -> io::Result<usize> {
-        if nodes.is_empty() {
-            return Ok(0);
-        }
-        let slot = self.adv.schema.slot_size as u32;
-        assert!(
-            nodes.len() * slot as usize <= self.dst_len,
-            "caller exceeded advertised max_inflight"
-        );
-        // Validate every node id against the advertised table bounds before
-        // turning it into a one-sided READ. An id past the table must never be
-        // translated into a read outside the server's registered region.
-        let reads: Vec<AetherSrdRead> = nodes
+        nodes
             .iter()
-            .enumerate()
-            .map(|(i, &node)| {
-                Ok(AetherSrdRead {
-                    remote_addr: self.remote_addr_for(node)?,
-                    local_addr: self.dst_ptr as u64 + (i * slot as usize) as u64,
-                    length: slot,
-                    _pad: 0,
-                })
+            .map(|&n| self.table.slot_addr(n as u64))
+            .collect()
+    }
+
+    /// Post one READ per row in `rows` into `snap`'s region. Returns how
+    /// many were accepted — each yields one completion to drain — and the
+    /// provider's refusal, if it stopped short.
+    fn post_snapshot(
+        &mut self,
+        remote: &[u64],
+        rows: &[usize],
+        snap: Snapshot,
+    ) -> (usize, Option<io::Error>) {
+        if rows.is_empty() {
+            return (0, None);
+        }
+        let stride = self.table.geometry().stride();
+        let region = self.region_ptr(snap) as u64;
+        let reads: Vec<AetherSrdRead> = rows
+            .iter()
+            .map(|&i| AetherSrdRead {
+                remote_addr: remote[i],
+                local_addr: region + (i * stride) as u64,
+                length: self.table.geometry().live_len(),
+                _pad: 0,
             })
-            .collect::<io::Result<Vec<_>>>()?;
-        // SAFETY: the QP and AH are live for `self`'s lifetime; `reads` holds
-        // `reads.len()` initialized entries; lkey/rkey and every address range
-        // come from registered MRs (bounds-checked via `remote_addr_for`).
+            .collect();
+        self.generation = next_wr_generation(self.generation);
+        let mut posted = 0u32;
+        // SAFETY: the QP and AH are live; `reads` holds `reads.len()`
+        // entries (≤ max_inflight, which fits u32); every local range is a
+        // slot inside the registered buffer and every remote one a slot the
+        // table vouched for.
         let rc = unsafe {
             aether_ibv_post_rdma_reads_srd_batch(
                 self.qp.qp_ex_ptr(),
                 self.ah.as_ptr(),
                 self.adv.endpoint.qpn,
                 self.adv.endpoint.qkey,
-                self.adv.rkey,
-                self.dst_lkey,
-                0,
+                self.table.rkey(),
+                self.dst_mr.lkey(),
+                u64::from(self.generation) << 32,
                 reads.as_ptr(),
                 reads.len() as u32,
+                &mut posted,
             )
         };
-        if rc != 0 {
-            return Err(io::Error::other(format!(
-                "post_rdma_reads_srd_batch rc={rc}"
-            )));
-        }
-        Ok(nodes.len())
+        let err = (rc != 0).then(|| io::Error::other(format!("post_rdma_reads_srd_batch rc={rc}")));
+        (posted as usize, err)
     }
 
-    /// Drain `posted` completions from this shard's CQ. Every WR posted by
-    /// [`post_gather`](Self::post_gather) is signaled, so the count must
-    /// match — leftover CQEs would be misattributed to the next gather.
-    pub fn drain_gather(&self, posted: usize) -> io::Result<()> {
+    /// Reap exactly `posted` completions of the last post. Every READ is
+    /// signaled, so the count is exact; completions tagged with another
+    /// generation are strays and are not counted. Past the deadline the QP
+    /// is forced into the error state, which flushes what is left; if even
+    /// that leaves READs unaccounted for, the client is poisoned.
+    fn drain(&mut self, posted: usize) -> io::Result<()> {
         if posted == 0 {
             return Ok(());
         }
-        // Drain via the batched poll shim (one FFI crossing per drain
-        // burst instead of one per CQE).
-        let mut batch: Vec<AetherCqeSnapshot> = vec![AetherCqeSnapshot::default(); posted];
-        let mut drained = 0usize;
-        let start = std::time::Instant::now();
-        while drained < posted {
-            let want = posted - drained;
-            // SAFETY: the CQ is live for `self`'s lifetime; `batch` has room
-            // for `want` snapshots (`want <= batch.len()`).
-            let got = unsafe {
-                aether_ibv_poll_cq_ex_many(self.ctx.cq_ex(), batch.as_mut_ptr(), want as u32)
+        let tag = u64::from(self.generation);
+        let mut batch = vec![AetherCqeSnapshot::default(); posted.min(256)];
+        let mut reaped = 0usize;
+        let mut first_err: Option<io::Error> = None;
+        let mut deadline = Instant::now() + DRAIN_DEADLINE;
+        let mut forced = false;
+        while reaped < posted {
+            let got = match self.ctx.poll_many(&mut batch) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.poisoned = true;
+                    self.failed = true;
+                    return Err(io::Error::other(format!("SRD CQ poll failed: {e}")));
+                }
             };
-            if got < 0 {
-                return Err(io::Error::other(format!("poll_cq_ex_many rc={got}")));
-            }
-            for snap in batch.iter().take(got as usize) {
-                if snap.status != super::ffi::IBV_WC_SUCCESS {
-                    return Err(io::Error::other(format!(
-                        "SRD WC failed at wr_id {}: status={} vendor_err={}",
+            for snap in &batch[..got] {
+                if snap.wr_id >> 32 != tag {
+                    tracing::debug!(wr_id = snap.wr_id, "stray SRD completion");
+                    continue;
+                }
+                reaped += 1;
+                if snap.status != IBV_WC_SUCCESS && first_err.is_none() {
+                    first_err = Some(io::Error::other(format!(
+                        "SRD WC failed at wr_id {:#x}: status={} vendor_err={}",
                         snap.wr_id, snap.status, snap.vendor_err
                     )));
                 }
             }
-            drained += got as usize;
             if got == 0 {
-                if start.elapsed() > Duration::from_secs(30) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("SRD gather drained {drained}/{posted} after 30s"),
-                    ));
+                if Instant::now() >= deadline {
+                    if forced {
+                        self.poisoned = true;
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("SRD gather reaped {reaped}/{posted} even after flushing"),
+                        ));
+                    }
+                    // Flush the rest; each flushed READ still completes.
+                    let _ = self.qp.to_error();
+                    self.failed = true;
+                    forced = true;
+                    first_err.get_or_insert_with(|| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "SRD gather stalled at {reaped}/{posted} after {DRAIN_DEADLINE:?}"
+                            ),
+                        )
+                    });
+                    deadline = Instant::now() + DRAIN_DEADLINE;
                 }
                 std::hint::spin_loop();
             }
         }
-        Ok(())
+        // Completions observed; order the payload reads after them.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// Post then drain one snapshot of `rows`, draining whatever was
+    /// accepted even when the post stopped short.
+    fn read_snapshot(&mut self, remote: &[u64], rows: &[usize], snap: Snapshot) -> io::Result<()> {
+        let (posted, post_err) = self.post_snapshot(remote, rows, snap);
+        let drained = self.drain(posted);
+        match post_err {
+            Some(e) => Err(e),
+            None => drained,
+        }
+    }
+
+    /// Rows among `rows` whose two snapshots disagree or show no stable
+    /// published version.
+    fn torn_rows(&self, rows: &[usize]) -> Vec<usize> {
+        let g = self.table.geometry();
+        let stride = g.stride();
+        let region = self.max_inflight * stride;
+        let payload = g.feature_offset()..g.feature_offset() + g.feature_dim() * 4;
+        // SAFETY: the first region lies in the owned buffer, and no READ is
+        // in flight (every post was drained before this is called).
+        let s1 = unsafe { std::slice::from_raw_parts(self.region_ptr(Snapshot::First), region) };
+        // SAFETY: as above, for the second region.
+        let s2 = unsafe { std::slice::from_raw_parts(self.region_ptr(Snapshot::Second), region) };
+        let version = |slot: &[u8], at: usize| {
+            u64::from_le_bytes(slot[at..at + 8].try_into().expect("8 bytes"))
+        };
+        rows.iter()
+            .copied()
+            .filter(|&i| {
+                let a = &s1[i * stride..(i + 1) * stride];
+                let b = &s2[i * stride..(i + 1) * stride];
+                let v = version(a, 0);
+                let consistent = v == version(a, g.tail_offset())
+                    && v == version(b, 0)
+                    && v == version(b, g.tail_offset())
+                    && aethergraph_core::cpu_seqlock_accept(v, v);
+                !(consistent && a[payload.clone()] == b[payload.clone()])
+            })
+            .collect()
     }
 
     /// Read the `nodes` slots from the server, landing them back-to-back in
-    /// the local destination buffer. Returns once every completion has
-    /// drained.
-    pub fn gather(&self, nodes: &[usize]) -> io::Result<()> {
-        let posted = self.post_gather(nodes)?;
-        self.drain_gather(posted)
+    /// the local destination buffer ([`Self::dst_slice`]). Returns once every
+    /// row has two agreeing snapshots, or errors after `MAX_RETRIES` rounds
+    /// of re-reading torn rows. Every node id is checked before anything is
+    /// posted.
+    pub fn gather(&mut self, nodes: &[usize]) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SRD QP failed on an earlier gather; reconnect",
+            ));
+        }
+        let remote = self.remote_addrs(nodes)?;
+        let mut rows: Vec<usize> = (0..nodes.len()).collect();
+        for _ in 0..=MAX_RETRIES {
+            // Snapshot 2 is posted only after snapshot 1 fully completed.
+            self.read_snapshot(&remote, &rows, Snapshot::First)?;
+            self.read_snapshot(&remote, &rows, Snapshot::Second)?;
+            rows = self.torn_rows(&rows);
+            if rows.is_empty() {
+                return Ok(());
+            }
+        }
+        Err(io::Error::other(format!(
+            "{} rows still torn after {MAX_RETRIES} re-reads",
+            rows.len()
+        )))
     }
 }
 
@@ -965,9 +1173,9 @@ impl SrdFeatureClient {
 /// Multi-QP SRD pool. Each shard is an independent `SrdFeatureClient`
 /// (its own context, QP, AH, MR) assembled via its own TCP + bidirectional
 /// endpoint exchange with the server. `gather(nodes)` splits `nodes` evenly
-/// across shards, then runs a two-phase post-then-drain on the calling
-/// thread: every shard's batch is posted before any shard's CQ is drained,
-/// so all shards' DMA is on the wire concurrently.
+/// across shards, then runs each snapshot phase as post-everywhere then
+/// drain-everywhere on the calling thread, so all shards' DMA is on the wire
+/// concurrently.
 pub struct SrdShardedFeatureClient {
     shards: Vec<SrdFeatureClient>,
     max_inflight_per_shard: usize,
@@ -982,7 +1190,12 @@ impl SrdShardedFeatureClient {
         num_shards: usize,
         max_inflight_per_shard: usize,
     ) -> io::Result<Self> {
-        assert!(num_shards > 0);
+        if num_shards == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "num_shards must be > 0",
+            ));
+        }
         let mut shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
             shards.push(SrdFeatureClient::connect(
@@ -1012,54 +1225,85 @@ impl SrdShardedFeatureClient {
         self.shards[shard_idx].dst_slice()
     }
 
-    /// Split `nodes` evenly across shards, post every shard's batch, then
-    /// drain each shard's CQ. Posting is non-blocking, so all shards' DMA
-    /// runs concurrently from the calling thread — no per-gather OS thread
-    /// spawn/join, which costs tens of microseconds and is on the order of
-    /// the gather itself. Panics if any single shard's slice exceeds
-    /// `max_inflight_per_shard`.
-    pub fn gather(&self, nodes: &[usize]) -> io::Result<()> {
+    /// Post `snap` for each shard's pending rows, then drain every shard
+    /// that posted anything — even after a post error, the READs other
+    /// shards (and a short-stopped shard) put on the wire must be reaped.
+    fn read_snapshot_all(
+        &mut self,
+        remote: &[Vec<u64>],
+        rows: &[Vec<usize>],
+        snap: Snapshot,
+    ) -> io::Result<()> {
+        let mut first_err: Option<io::Error> = None;
+        let mut posted = vec![0usize; self.shards.len()];
+        for (s, shard) in self.shards.iter_mut().enumerate() {
+            let (n, err) = shard.post_snapshot(&remote[s], &rows[s], snap);
+            posted[s] = n;
+            if let Some(e) = err {
+                first_err.get_or_insert(e);
+            }
+        }
+        for (shard, &n) in self.shards.iter_mut().zip(&posted) {
+            if let Err(e) = shard.drain(n) {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// Split `nodes` evenly across shards and read every shard's slice with
+    /// the two-snapshot protocol, re-reading torn rows. Posting is
+    /// non-blocking, so all shards' DMA runs concurrently from the calling
+    /// thread — no per-gather OS thread spawn/join, which costs tens of
+    /// microseconds and is on the order of the gather itself.
+    pub fn gather(&mut self, nodes: &[usize]) -> io::Result<()> {
         if nodes.is_empty() {
             return Ok(());
         }
+        if let Some(i) = self.shards.iter().position(|s| s.failed) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("SRD shard {i} failed on an earlier gather; reconnect"),
+            ));
+        }
         let n = self.shards.len();
         let chunk = nodes.len().div_ceil(n);
-        assert!(
-            chunk <= self.max_inflight_per_shard,
-            "shard slice {chunk} > max_inflight_per_shard {}",
-            self.max_inflight_per_shard
-        );
+        if chunk > self.max_inflight_per_shard {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "shard slice {chunk} > max_inflight_per_shard {}",
+                    self.max_inflight_per_shard
+                ),
+            ));
+        }
+        let slices: Vec<&[usize]> = (0..n)
+            .map(|i| {
+                let start = (i * chunk).min(nodes.len());
+                &nodes[start..(start + chunk).min(nodes.len())]
+            })
+            .collect();
+        let remote: Vec<Vec<u64>> = self
+            .shards
+            .iter()
+            .zip(&slices)
+            .map(|(shard, slice)| shard.remote_addrs(slice))
+            .collect::<io::Result<_>>()?;
 
-        // Phase 1: post on every shard.
-        let mut posted: Vec<usize> = Vec::with_capacity(n);
-        let mut post_err: Option<io::Error> = None;
-        for (i, shard) in self.shards.iter().enumerate() {
-            let start = (i * chunk).min(nodes.len());
-            let end = (start + chunk).min(nodes.len());
-            match shard.post_gather(&nodes[start..end]) {
-                Ok(count) => posted.push(count),
-                Err(e) => {
-                    post_err = Some(e);
-                    break;
-                }
+        let mut rows: Vec<Vec<usize>> = slices.iter().map(|s| (0..s.len()).collect()).collect();
+        for _ in 0..=MAX_RETRIES {
+            self.read_snapshot_all(&remote, &rows, Snapshot::First)?;
+            self.read_snapshot_all(&remote, &rows, Snapshot::Second)?;
+            for (shard, pending) in self.shards.iter().zip(rows.iter_mut()) {
+                *pending = shard.torn_rows(pending);
+            }
+            if rows.iter().all(Vec::is_empty) {
+                return Ok(());
             }
         }
-
-        // Phase 2: drain every shard that posted — even on a post error,
-        // earlier shards' in-flight WRs must be reaped or their CQEs would
-        // corrupt the next gather's accounting.
-        let mut first_err: Option<io::Error> = post_err;
-        for (shard, &count) in self.shards.iter().zip(posted.iter()) {
-            if let Err(e) = shard.drain_gather(count)
-                && first_err.is_none()
-            {
-                first_err = Some(e);
-            }
-        }
-
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        let torn: usize = rows.iter().map(Vec::len).sum();
+        Err(io::Error::other(format!(
+            "{torn} rows still torn after {MAX_RETRIES} re-reads"
+        )))
     }
 }

@@ -2,15 +2,18 @@
 //!
 //! File format remains fixed-width and predictable for high-throughput I/O.
 
-use crate::graph::{EdgeOffset, Graph, GraphValidationMode, NodeId};
+use crate::graph::csr::alloc_hinted;
+use crate::graph::{EdgeOffset, Graph, GraphValidationMode, MAX_NODES, NodeId};
 use anyhow::{Context, Result};
 use bytemuck::cast_slice;
 use memmap2::MmapOptions;
+use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, trace};
 
 /// Magic number to identify AetherGraph files: "AETH" in ASCII
@@ -23,9 +26,79 @@ const VERSION: u32 = 1;
 /// Use full validation below this threshold; offsets-only above it.
 const FULL_VALIDATION_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Structural upper bounds shared by both file format versions.
-const MAX_NODES: u64 = 10_000_000_000;
-const MAX_EDGES: u64 = 100_000_000_000;
+/// Structural upper bound on edges, shared by both file format versions.
+/// Nodes are bounded by the node-id width, [`MAX_NODES`].
+pub(crate) const MAX_EDGES: u64 = 100_000_000_000;
+
+/// Write `path` atomically: the bytes go to a temporary sibling that is
+/// fsynced and renamed over `path`, then the directory is fsynced.
+///
+/// Readers never see a partly written file, and a graph still mapped from
+/// `path` keeps its now-unlinked inode instead of faulting on a truncation.
+pub(crate) fn write_atomically(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+) -> Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .with_context(|| format!("output path {} has no file name", path.display()))?;
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let staged = (|| -> Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        let mut out = BufWriter::with_capacity(1 << 20, file);
+        write(&mut out)?;
+        let file = out
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)
+            .context("failed to flush output file")?;
+        file.sync_all().context("failed to sync output file")?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("failed to move output into {}", path.display()))
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged?;
+
+    // Persist the rename. Filesystems that cannot sync a directory report
+    // EINVAL; there is nothing further to persist on those.
+    match File::open(dir).and_then(|d| d.sync_all()) {
+        Err(e) if e.kind() != std::io::ErrorKind::InvalidInput => {
+            Err(e).with_context(|| format!("failed to sync directory {}", dir.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Copy a little-endian on-disk section into a fresh typed array.
+///
+/// The destination is allocated zeroed and huge-page-hinted before the copy
+/// touches it, and the copy runs in parallel chunks. Viewing the typed
+/// destination as bytes keeps the source free of any alignment requirement.
+fn copy_section<T: bytemuck::Pod>(bytes: &[u8]) -> Vec<T> {
+    const CHUNK: usize = 8 << 20;
+    let mut out: Vec<T> = alloc_hinted(bytes.len() / std::mem::size_of::<T>());
+    bytemuck::cast_slice_mut::<T, u8>(&mut out)
+        .par_chunks_mut(CHUNK)
+        .zip(bytes.par_chunks(CHUNK))
+        .for_each(|(dst, src)| dst.copy_from_slice(src));
+    out
+}
 
 /// File header for graph storage.
 ///
@@ -104,7 +177,7 @@ impl Header {
             self.version
         );
         anyhow::ensure!(
-            self.num_nodes <= MAX_NODES && self.num_edges <= MAX_EDGES,
+            self.num_nodes <= MAX_NODES as u64 && self.num_edges <= MAX_EDGES,
             "graph dimensions out of bounds: {} nodes, {} edges",
             self.num_nodes,
             self.num_edges
@@ -198,7 +271,8 @@ struct GraphFileLayout {
     checksum32: Option<u32>,
 }
 
-/// Saves a CSR graph to binary format.
+/// Saves a homogeneous CSR graph to binary format, atomically replacing
+/// any existing file at `path`.
 #[inline]
 pub fn save_graph(graph: &Graph, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
@@ -208,13 +282,10 @@ pub fn save_graph(graph: &Graph, path: impl AsRef<Path>) -> Result<()> {
         graph.num_nodes(),
         graph.num_edges()
     );
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .context("failed to create output file")?;
+    anyhow::ensure!(
+        graph.is_homogeneous(),
+        "the graph file format has one node count; a bipartite CSR belongs in a hetero graph file"
+    );
 
     let offsets_bytes = cast_slice::<EdgeOffset, u8>(graph.offsets());
     let edges_bytes = cast_slice::<NodeId, u8>(graph.edges());
@@ -227,20 +298,19 @@ pub fn save_graph(graph: &Graph, path: impl AsRef<Path>) -> Result<()> {
         checksum32,
     );
     trace!(?checksum32, "Writing graph header");
-    file.write_all(&header.to_bytes())
-        .context("failed to write header")?;
-
-    file.write_all(offsets_bytes)
-        .context("failed to write offsets")?;
-    file.write_all(edges_bytes)
-        .context("failed to write edges")?;
-
-    if let Some(weights) = graph.weights() {
-        file.write_all(cast_slice::<f32, u8>(weights))
-            .context("failed to write weights")?;
-    }
-
-    file.sync_all().context("failed to sync file")?;
+    write_atomically(path, |file| {
+        file.write_all(&header.to_bytes())
+            .context("failed to write header")?;
+        file.write_all(offsets_bytes)
+            .context("failed to write offsets")?;
+        file.write_all(edges_bytes)
+            .context("failed to write edges")?;
+        if let Some(weights) = graph.weights() {
+            file.write_all(cast_slice::<f32, u8>(weights))
+                .context("failed to write weights")?;
+        }
+        Ok(())
+    })?;
 
     let file_size = std::fs::metadata(path)?.len();
     debug!("Graph saved ({:.2} MB)", file_size as f64 / 1_000_000.0);
@@ -307,62 +377,62 @@ pub fn load_graph_mmap(path: impl AsRef<Path>, validation: GraphValidationMode) 
 
     let layout = parse_layout(&mmap)?;
 
-    // Readahead is gated on what will actually be read. Full validation
-    // streams the whole offsets+edges body (checksum + destination checks),
-    // so WILLNEED the body. OffsetsOnly/HeaderOnly never touch the edge
-    // pages at load — an unconditional body-wide WILLNEED would turn the
-    // O(1)-startup mmap of a multi-GB graph into a full sequential read.
-    // The edges array is then hinted MADV_RANDOM: sampling faults one page
-    // per useful neighbor list, and default readahead would drag in 128 KiB
-    // per fault. The offsets array gets MADV_HUGEPAGE (best-effort): random
-    // per-node lookups over a multi-GB offsets array are dTLB-bound at
-    // 4 KiB pages.
+    // Hints go on before any page is brought in, so they shape the faults
+    // rather than trail them. The offsets array gets MADV_HUGEPAGE
+    // (best-effort): random per-node lookups over a multi-GB offsets array
+    // are dTLB-bound at 4 KiB pages. Outside Full validation the edges
+    // array is hinted MADV_RANDOM: sampling faults one page per useful
+    // neighbor list, and default readahead would drag in 128 KiB per fault.
     let offsets_bytes = &mmap[layout.offsets_range.start..layout.offsets_range.end];
     let edges_bytes = &mmap[layout.edges_range.start..layout.edges_range.end];
-
-    // NUMA placement goes first: a memory policy only governs pages faulted
-    // in after it is set, and both the readahead below and `Full`
-    // validation's streaming read populate the body. Setting it afterwards
-    // would leave exactly the pages the load touched on the loading
-    // thread's node.
     let body = &mmap[layout.offsets_range.start..layout.edges_range.end];
-    if crate::internal::hint::interleave_mmap_range(body.as_ptr(), body.len()) {
-        debug!("graph body interleaved across NUMA nodes");
-    }
-
-    if validation == GraphValidationMode::Full {
-        crate::internal::hint::prefetch_mmap_range(body.as_ptr(), body.len());
-    } else {
-        // The offsets array is read on the critical path of every batch —
-        // one random lookup per frontier node — so it is worth having
-        // resident before the first batch rather than queued for
-        // readahead. Populate it synchronously; WILLNEED remains the
-        // fallback on kernels without MADV_POPULATE_READ, since it returns
-        // before the pages arrive and a first-touch fault would otherwise
-        // stall the whole frontier.
-        if !crate::internal::hint::populate_read(offsets_bytes.as_ptr(), offsets_bytes.len()) {
-            crate::internal::hint::prefetch_mmap_range(offsets_bytes.as_ptr(), offsets_bytes.len());
-        }
-        crate::internal::hint::advise_mmap_random(edges_bytes.as_ptr(), edges_bytes.len());
-    }
     crate::internal::hint::advise_hugepage(offsets_bytes.as_ptr(), offsets_bytes.len());
     crate::internal::hint::advise_hugepage(edges_bytes.as_ptr(), edges_bytes.len());
+    if validation != GraphValidationMode::Full {
+        crate::internal::hint::advise_mmap_random(edges_bytes.as_ptr(), edges_bytes.len());
+    }
+
+    // Bring in what the load will read, on this thread and under an
+    // interleaved placement so the page cache spreads across NUMA nodes.
+    // Full validation streams the whole body (checksum + destination
+    // checks), so it reads ahead the body. OffsetsOnly/HeaderOnly never
+    // touch the edge pages at load — a body-wide read would turn the
+    // O(1)-startup mmap of a multi-GB graph into a full sequential read —
+    // but the offsets array is on the critical path of every batch, so it
+    // is populated synchronously; WILLNEED remains the fallback on kernels
+    // without MADV_POPULATE_READ.
+    let ((), interleaved) = crate::internal::hint::with_interleaved_placement(|| {
+        if validation == GraphValidationMode::Full {
+            crate::internal::hint::prefetch_mmap_range(body.as_ptr(), body.len());
+        } else if !crate::internal::hint::populate_read(offsets_bytes.as_ptr(), offsets_bytes.len())
+        {
+            crate::internal::hint::prefetch_mmap_range(offsets_bytes.as_ptr(), offsets_bytes.len());
+        }
+    });
+    if interleaved {
+        debug!("graph pages brought in under interleaved NUMA placement");
+    }
 
     validate_checksum_if_present(&mmap, &layout, validation)?;
 
-    let graph = Graph::from_mapped_parts(
+    Graph::from_mapped_parts(
+        layout.num_nodes,
         layout.num_nodes,
         layout.num_edges,
         Arc::clone(&mmap),
         layout.offsets_range.clone(),
         layout.edges_range.clone(),
         layout.weights_range,
-    );
-    graph.validate_with_mode(validation)?;
-    Ok(graph)
+        validation,
+    )
 }
 
-/// Loads a graph from file as owned in-memory storage with explicit validation.
+/// Loads a graph from file as owned in-memory storage.
+///
+/// The copy into memory touches every byte, so the owned graph is always
+/// proven `Full` (monotone offsets, destinations in range) whatever
+/// `validation` asks for; `validation` selects whether the checksum is
+/// verified (`Full` only).
 #[inline]
 pub fn load_graph_owned(path: impl AsRef<Path>, validation: GraphValidationMode) -> Result<Graph> {
     let path = path.as_ref();
@@ -396,42 +466,37 @@ pub fn load_graph_from_mmap(mmap: &[u8]) -> Result<Graph> {
     load_graph_from_mmap_with_validation(mmap, GraphValidationMode::Full)
 }
 
-/// Loads a CSR graph from existing bytes with configurable validation.
+/// Loads a CSR graph from existing bytes into owned storage, proven `Full`
+/// (see [`load_graph_owned`]); `validation` selects checksum verification.
 #[inline]
 pub fn load_graph_from_mmap_with_validation(
     mmap: &[u8],
     validation: GraphValidationMode,
 ) -> Result<Graph> {
+    const {
+        assert!(
+            cfg!(target_endian = "little"),
+            "graph file is little-endian"
+        );
+    };
     let layout = parse_layout(mmap)?;
     validate_checksum_if_present(mmap, &layout, validation)?;
 
-    let offsets_bytes = &mmap[layout.offsets_range.start..layout.offsets_range.end];
-    let edges_bytes = &mmap[layout.edges_range.start..layout.edges_range.end];
+    let offsets = copy_section::<EdgeOffset>(&mmap[layout.offsets_range.clone()]);
+    let edges = copy_section::<NodeId>(&mmap[layout.edges_range.clone()]);
+    let weights = layout
+        .weights_range
+        .as_ref()
+        .map(|range| copy_section::<f32>(&mmap[range.clone()]));
 
-    // Bulk memcpy decode: allocate the typed destination and view it as
-    // bytes for the copy. On little-endian targets the on-disk bytes are
-    // already native order, and unlike a per-element `from_le_bytes` map
-    // this is a guaranteed single memcpy with no alignment requirement on
-    // the source.
-    let mut offsets: Vec<EdgeOffset> =
-        vec![0; offsets_bytes.len() / std::mem::size_of::<EdgeOffset>()];
-    bytemuck::cast_slice_mut::<EdgeOffset, u8>(&mut offsets).copy_from_slice(offsets_bytes);
-
-    let mut edges: Vec<NodeId> = vec![0; edges_bytes.len() / std::mem::size_of::<NodeId>()];
-    bytemuck::cast_slice_mut::<NodeId, u8>(&mut edges).copy_from_slice(edges_bytes);
-
-    let weights = if let Some(range) = &layout.weights_range {
-        let weights_bytes = &mmap[range.start..range.end];
-        let mut w: Vec<f32> = vec![0.0; weights_bytes.len() / std::mem::size_of::<f32>()];
-        bytemuck::cast_slice_mut::<f32, u8>(&mut w).copy_from_slice(weights_bytes);
-        Some(w)
-    } else {
-        None
-    };
-
-    let graph = Graph::from_csr_arrays(layout.num_nodes, offsets, edges, weights);
-    graph.validate_with_mode(validation)?;
-    Ok(graph)
+    Graph::from_csr_vecs(
+        layout.num_nodes,
+        layout.num_nodes,
+        offsets,
+        edges,
+        weights,
+        GraphValidationMode::Full,
+    )
 }
 
 fn parse_layout(bytes: &[u8]) -> Result<GraphFileLayout> {
@@ -439,7 +504,7 @@ fn parse_layout(bytes: &[u8]) -> Result<GraphFileLayout> {
     header.validate()?;
 
     anyhow::ensure!(
-        header.num_nodes <= MAX_NODES,
+        header.num_nodes <= MAX_NODES as u64,
         "num_nodes {} exceeds maximum {}",
         header.num_nodes,
         MAX_NODES
@@ -788,5 +853,49 @@ mod tests {
 
         let result = load_graph_from_mmap_with_validation(&bytes, GraphValidationMode::OffsetsOnly);
         assert!(result.is_ok());
+    }
+
+    /// Saving over the file a live graph is mapped from replaces it by
+    /// rename, so the mapping keeps reading the old contents instead of
+    /// faulting on a truncated file, and no temporary is left behind.
+    #[test]
+    fn test_save_over_mapped_file_keeps_mapping_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.bin");
+        let first = Graph::from_edges(3, &[(0, 1), (1, 2), (2, 0)], None).unwrap();
+        save_graph(&first, &path).unwrap();
+        let mapped = load_graph_mmap(&path, GraphValidationMode::Full).unwrap();
+
+        let second = Graph::from_edges(2, &[(1, 0)], None).unwrap();
+        save_graph(&second, &path).unwrap();
+
+        assert_eq!(mapped.neighbors(2), &[0]);
+        assert_eq!(mapped.num_edges(), 3);
+        let reloaded = load_graph_mmap(&path, GraphValidationMode::Full).unwrap();
+        assert_eq!(reloaded.num_nodes(), 2);
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "temporary file left behind");
+    }
+
+    /// Owned loads copy every byte, so they prove destinations whatever the
+    /// requested mode; mmap loads prove exactly what was asked.
+    #[test]
+    fn test_owned_load_is_full_and_mmap_load_matches_mode() {
+        let graph = Graph::from_edges(3, &[(0, 1), (1, 2)], None).unwrap();
+        let tmp = NamedTempFile::new().unwrap();
+        save_graph(&graph, tmp.path()).unwrap();
+        let owned = load_graph_owned(tmp.path(), GraphValidationMode::HeaderOnly).unwrap();
+        assert_eq!(owned.validated(), GraphValidationMode::Full);
+        let mapped = load_graph_mmap(tmp.path(), GraphValidationMode::OffsetsOnly).unwrap();
+        assert_eq!(mapped.validated(), GraphValidationMode::OffsetsOnly);
+
+        // An out-of-range destination fails the owned load in any mode.
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        let edges_start = Header::SIZE + 4 * std::mem::size_of::<EdgeOffset>();
+        bytes[edges_start..edges_start + 4].copy_from_slice(&9u32.to_le_bytes());
+        let err = load_graph_from_mmap_with_validation(&bytes, GraphValidationMode::HeaderOnly)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"), "got: {err}");
     }
 }

@@ -4,11 +4,13 @@
 //! representation optimized for GNN neighborhood sampling.
 
 mod async_graph;
-mod csr;
+pub(crate) mod csr;
 pub mod hetero;
 mod reorder;
 
 pub use async_graph::AsyncCsrGraph;
-pub use csr::{CsrView, EdgeOffset, Graph, GraphStats, GraphValidationMode, NodeId};
-pub use hetero::{EdgeTypeId, EdgeTypeMeta, HeteroGraph, NodeTypeId, NodeTypeMeta};
+pub use csr::{CsrView, EdgeOffset, Graph, GraphStats, GraphValidationMode, MAX_NODES, NodeId};
+pub use hetero::{
+    EdgeTypeId, EdgeTypeMeta, HeteroBuildError, HeteroGraph, NodeTypeId, NodeTypeMeta,
+};
 pub use reorder::partition_aligned_batches;

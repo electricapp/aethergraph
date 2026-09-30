@@ -4,11 +4,27 @@
 //! RESET → INIT → RTR → RTS, and provides batch RDMA READ
 //! with chained work requests (single doorbell).
 
-use super::context::{LinkLayer, RdmaContext};
+use super::context::{Device, LinkLayer, RdmaContext, RegisteredCq};
 use super::ffi::*;
+use super::srq::Srq;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::ptr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Path MTU both ends can carry: the smaller of the two ports' active MTUs.
+/// An unset (`0`) or out-of-range peer MTU falls back to the local one; an
+/// invalid local one to 1024, which every RoCE and IB link carries.
+fn negotiate_path_mtu(local: u32, remote: u32) -> u32 {
+    let valid = |m: u32| (IBV_MTU_256..=IBV_MTU_4096).contains(&m);
+    let local = if valid(local) { local } else { IBV_MTU_1024 };
+    if valid(remote) {
+        local.min(remote)
+    } else {
+        local
+    }
+}
 
 /// Reject an endpoint the local fabric cannot address.
 ///
@@ -41,6 +57,10 @@ pub struct QpEndpoint {
     pub gid: [u8; 16],
     /// Packet sequence number.
     pub psn: u32,
+    /// The port's active path MTU (`IBV_MTU_*`). Both ends connect at the
+    /// smaller of the two; `0` (a peer that did not send it) means unknown.
+    #[serde(default)]
+    pub mtu: u32,
 }
 
 /// A single RDMA READ descriptor for batch posting.
@@ -95,20 +115,65 @@ struct PostScratch {
 
 /// Owns an RC queue pair. Created via `RdmaQp::create`, connected
 /// via `connect`, then used for RDMA READ operations.
+///
+/// Holds its CQs, SRQ, and device, so none of them can be destroyed while
+/// the QP still references them.
 pub struct RdmaQp {
     qp: *mut IbvQp,
-    /// Send-queue depth this QP was created with. Posts are bounded against it
-    /// so an over-long chain fails fast in Rust instead of overflowing the
-    /// queue inside `ibv_post_send`.
+    /// Send-queue depth callers may use. Posts are bounded against it so an
+    /// over-long chain fails fast in Rust instead of overflowing the queue
+    /// inside `ibv_post_send`. The QP is created one deeper, reserving the
+    /// slot [`Self::quiesce`] posts its marker into.
     max_send_wr: u32,
     /// Reusable posting arrays (see [`PostScratch`]).
     post_scratch: std::sync::Mutex<PostScratch>,
+    // Released after `Drop::drop` destroys the QP.
+    _send_cq: RegisteredCq,
+    _recv_cq: RegisteredCq,
+    _srq: Option<Srq>,
+    _dev: Arc<Device>,
 }
 
-// SAFETY: QP is thread-safe after creation (single-threaded posting assumed).
+// SAFETY: ibverbs QPs are thread-safe after creation (providers serialize
+// posting internally); the scratch arrays sit behind a Mutex.
 unsafe impl Send for RdmaQp {}
 // SAFETY: see Send impl above.
 unsafe impl Sync for RdmaQp {}
+
+/// `wr_id` of the marker [`RdmaQp::quiesce`] posts behind a stopped QP.
+pub const QUIESCE_WR_ID: u64 = u64::MAX;
+
+/// Next per-batch tag for [`RdmaQp::post_reads_tagged`]'s `base_wr_id =
+/// tag << 32`: never 0 (untagged posts) and never `u32::MAX`, whose
+/// all-ones `wr_id`s include [`QUIESCE_WR_ID`].
+pub(crate) fn next_wr_generation(g: u32) -> u32 {
+    if g >= u32::MAX - 1 { 1 } else { g + 1 }
+}
+
+/// Completion-queue depth a QP with `cap` needs to itself: one CQE per send
+/// and receive WR it can have outstanding (a QP that enters the error state
+/// flushes every one of them, signaled or not), plus the quiesce marker. A
+/// shallower CQ overruns on the first transport error and loses the very
+/// completion the drain is waiting for.
+pub const fn required_cq_depth(cap: &IbvQpCap) -> i32 {
+    let depth = cap.max_send_wr as u64 + cap.max_recv_wr as u64 + 1;
+    if depth > i32::MAX as u64 {
+        i32::MAX
+    } else {
+        depth as i32
+    }
+}
+
+/// Caps for a QP that only answers peers' one-sided READs: it posts nothing,
+/// so its CQ sees no traffic, and sharing one CQ across many of them (one per
+/// connected client) is safe.
+pub const RESPONDER_QP_CAP: IbvQpCap = IbvQpCap {
+    max_send_wr: 1,
+    max_recv_wr: 1,
+    max_send_sge: 1,
+    max_recv_sge: 1,
+    max_inline_data: 0,
+};
 
 /// Default starting packet sequence number for new QPs.
 ///
@@ -136,11 +201,12 @@ pub const DEFAULT_QP_CAP: IbvQpCap = IbvQpCap {
 impl RdmaQp {
     /// Create an RC queue pair on the given context with caller-supplied caps.
     ///
-    /// Uses the context's PD and shared CQ for both send and receive. Use
+    /// Uses the context's PD and default CQ for both send and receive. Use
     /// `DEFAULT_QP_CAP` for the sane GNN-gather defaults. For sharded
     /// many-worker designs use `create_with_cqs` to pin each QP to its own CQ.
+    /// Every QP sharing a CQ needs [`required_cq_depth`] of it.
     pub fn create(ctx: &RdmaContext, cap: &IbvQpCap) -> io::Result<Self> {
-        Self::create_with_cqs(ctx, cap, ctx.cq, ctx.cq)
+        Self::create_with_cqs(ctx, cap, ctx.cq(), ctx.cq())
     }
 
     /// Create an RC queue pair on the given context with explicit send/recv
@@ -149,18 +215,43 @@ impl RdmaQp {
     pub fn create_with_cqs(
         ctx: &RdmaContext,
         cap: &IbvQpCap,
-        send_cq: *mut IbvCq,
-        recv_cq: *mut IbvCq,
+        send_cq: &RegisteredCq,
+        recv_cq: &RegisteredCq,
     ) -> io::Result<Self> {
+        Self::create_inner(ctx, cap, send_cq, recv_cq, None)
+    }
+
+    fn create_inner(
+        ctx: &RdmaContext,
+        cap: &IbvQpCap,
+        send_cq: &RegisteredCq,
+        recv_cq: &RegisteredCq,
+        srq: Option<&Srq>,
+    ) -> io::Result<Self> {
+        if cap.max_send_wr == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_send_wr must be > 0",
+            ));
+        }
         // SAFETY: zeroed init of a POD ibverbs struct is sound.
         let mut init_attr: IbvQpInitAttr = unsafe { std::mem::zeroed() };
-        init_attr.send_cq = send_cq;
-        init_attr.recv_cq = recv_cq;
+        init_attr.send_cq = send_cq.as_ptr();
+        init_attr.recv_cq = recv_cq.as_ptr();
+        if let Some(srq) = srq {
+            init_attr.srq = srq.as_ptr() as *mut libc::c_void;
+        }
         init_attr.qp_type = IBV_QPT_RC;
         init_attr.cap = *cap;
+        // One slot past what callers may post, held for the quiesce marker.
+        init_attr.cap.max_send_wr = cap
+            .max_send_wr
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "max_send_wr overflows"))?;
 
-        // SAFETY: `ctx.pd` is alive; `init_attr` is a valid out-param.
-        let qp = unsafe { ibv_create_qp(ctx.pd, &mut init_attr) };
+        // SAFETY: the PD and both CQs are alive (held below for the QP's
+        // lifetime); `init_attr` is a valid in/out param.
+        let qp = unsafe { ibv_create_qp(ctx.pd_ptr(), &mut init_attr) };
         if qp.is_null() {
             return Err(io::Error::other("ibv_create_qp failed"));
         }
@@ -172,6 +263,10 @@ impl RdmaQp {
                 sges: Vec::new(),
                 wrs: Vec::new(),
             }),
+            _send_cq: send_cq.clone(),
+            _recv_cq: recv_cq.clone(),
+            _srq: srq.cloned(),
+            _dev: ctx.device().clone(),
         })
     }
 
@@ -181,7 +276,8 @@ impl RdmaQp {
     /// The QP's own receive queue goes unused — sentinels are posted on
     /// the SRQ (`Srq::post_recv_sentinels`) and consumed by
     /// WRITE_WITH_IMM arrivals on *any* QP attached to it. Completions
-    /// still land on this QP's `recv_cq`. Drop the QP before the SRQ.
+    /// still land on this QP's `recv_cq`. The QP holds the SRQ, so the SRQ
+    /// outlives it.
     ///
     /// TODO(deferred): no product caller yet — `ShardedQpPool` uses the
     /// private-RQ [`Self::create_with_cqs`]. SRQ pays off on the *server*
@@ -192,32 +288,11 @@ impl RdmaQp {
     pub fn create_with_cqs_srq(
         ctx: &RdmaContext,
         cap: &IbvQpCap,
-        send_cq: *mut IbvCq,
-        recv_cq: *mut IbvCq,
-        srq: &super::srq::Srq,
+        send_cq: &RegisteredCq,
+        recv_cq: &RegisteredCq,
+        srq: &Srq,
     ) -> io::Result<Self> {
-        // SAFETY: zeroed init of a POD ibverbs struct is sound.
-        let mut init_attr: IbvQpInitAttr = unsafe { std::mem::zeroed() };
-        init_attr.send_cq = send_cq;
-        init_attr.recv_cq = recv_cq;
-        init_attr.srq = srq.as_ptr() as *mut libc::c_void;
-        init_attr.qp_type = IBV_QPT_RC;
-        init_attr.cap = *cap;
-
-        // SAFETY: `ctx.pd` and the SRQ are alive; `init_attr` is valid.
-        let qp = unsafe { ibv_create_qp(ctx.pd, &mut init_attr) };
-        if qp.is_null() {
-            return Err(io::Error::other("ibv_create_qp failed"));
-        }
-
-        Ok(Self {
-            qp,
-            max_send_wr: cap.max_send_wr,
-            post_scratch: std::sync::Mutex::new(PostScratch {
-                sges: Vec::new(),
-                wrs: Vec::new(),
-            }),
-        })
+        Self::create_inner(ctx, cap, send_cq, recv_cq, Some(srq))
     }
 
     /// Send-queue depth this QP was created with (`IbvQpCap::max_send_wr`).
@@ -236,6 +311,7 @@ impl RdmaQp {
             lid: ctx.port_lid,
             gid: ctx.port_gid.raw,
             psn: DEFAULT_PSN,
+            mtu: ctx.active_mtu(),
         }
     }
 
@@ -294,6 +370,22 @@ impl RdmaQp {
         reads: &[RdmaRead],
         signal_every_n: usize,
     ) -> io::Result<()> {
+        self.post_reads_tagged(reads, signal_every_n, 0)
+    }
+
+    /// [`Self::post_reads_with_signaling`] with WR `i` carrying
+    /// `wr_id = base_wr_id + i`, so a caller can tell this batch's
+    /// completions from any other's.
+    ///
+    /// On `Err` the chain may have been partly accepted, and accepted WRs
+    /// that complete unsignaled leave no completion to wait for; call
+    /// [`Self::quiesce`] before releasing any buffer the batch targets.
+    pub fn post_reads_tagged(
+        &self,
+        reads: &[RdmaRead],
+        signal_every_n: usize,
+        base_wr_id: u64,
+    ) -> io::Result<()> {
         if reads.is_empty() {
             return Ok(());
         }
@@ -337,7 +429,7 @@ impl RdmaQp {
         for (i, read) in reads.iter().enumerate() {
             // SAFETY: zeroed init of a POD ibverbs struct is sound.
             let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
-            wr.wr_id = i as u64;
+            wr.wr_id = base_wr_id.wrapping_add(i as u64);
             wr.sg_list = &mut sges[i] as *mut IbvSge;
             wr.num_sge = 1;
             wr.opcode = IBV_WR_RDMA_READ;
@@ -625,11 +717,81 @@ impl RdmaQp {
         Ok(())
     }
 
-    /// Poll the context's shared CQ for completions. Use `poll_cq_on` if this
-    /// QP was created with a dedicated CQ via `create_with_cqs`.
+    /// Poll the context's default CQ for completions. Use
+    /// [`RegisteredCq::poll`] if this QP was created with a dedicated CQ via
+    /// `create_with_cqs`.
     pub fn poll_cq(&self, ctx: &RdmaContext, wcs: &mut [IbvWc]) -> io::Result<usize> {
-        // SAFETY: `ctx.cq` is alive for as long as `ctx` is borrowed.
-        unsafe { Self::poll_cq_on(ctx.cq, wcs) }
+        ctx.cq().poll(wcs)
+    }
+
+    /// Stop the QP and wait until no work request posted on it can still
+    /// touch memory.
+    ///
+    /// Moves the QP to the error state, which flushes every outstanding WR
+    /// — signaled or not — with a completion, then posts one signaled
+    /// zero-length marker (`wr_id` [`QUIESCE_WR_ID`]) behind them into the
+    /// slot reserved at creation. An RC send queue completes in order, so
+    /// the marker's completion proves every earlier WR has finished or been
+    /// flushed. `cq` must be this QP's send CQ and used by no other QP; its
+    /// other completions are consumed. The QP is unusable afterwards.
+    ///
+    /// Aborts the process if the marker never completes within `timeout`:
+    /// returning would let the caller release buffers the NIC may still
+    /// write into.
+    pub fn quiesce(&self, cq: &RegisteredCq, timeout: Duration) {
+        // SAFETY: zeroed init of a POD ibverbs struct is sound.
+        let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
+        attr.qp_state = IBV_QPS_ERR;
+        // SAFETY: `self.qp` is alive; `attr` is valid for the STATE mask.
+        let ret = unsafe { ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE) };
+        if ret != 0 {
+            tracing::warn!(ret, "QP → ERR failed; waiting on the marker anyway");
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut posted = false;
+        let mut wcs = [IbvWc::default(); 32];
+        loop {
+            if !posted {
+                posted = self.post_marker().is_ok();
+            }
+            if posted {
+                match cq.poll(&mut wcs) {
+                    Ok(n) if wcs[..n].iter().any(|wc| wc.wr_id == QUIESCE_WR_ID) => return,
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "poll during quiesce"),
+                }
+            } else {
+                // The marker slot is taken only while flushes are still
+                // being reaped; drain and retry.
+                let _ = cq.poll(&mut wcs);
+            }
+            if Instant::now() >= deadline {
+                tracing::error!(
+                    ?timeout,
+                    posted,
+                    "RDMA QP did not quiesce; aborting so the NIC cannot write into \
+                     memory the caller is about to release"
+                );
+                std::process::abort();
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn post_marker(&self) -> io::Result<()> {
+        // SAFETY: zeroed init of a POD ibverbs struct is sound.
+        let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
+        wr.wr_id = QUIESCE_WR_ID;
+        wr.opcode = IBV_WR_RDMA_READ;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        let mut bad_wr: *mut IbvSendWr = ptr::null_mut();
+        // SAFETY: `self.qp` is alive; the zero-SGE WR references no memory.
+        let ret = unsafe { ibv_post_send(self.qp, &mut wr, &mut bad_wr) };
+        if ret != 0 {
+            return Err(io::Error::other(format!("marker post failed: {ret}")));
+        }
+        Ok(())
     }
 
     /// Poll an explicit CQ — for sharded designs where each worker thread
@@ -674,7 +836,8 @@ impl RdmaQp {
         // SAFETY: zeroed init of a POD ibverbs struct is sound.
         let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
         attr.qp_state = IBV_QPS_RTR;
-        attr.path_mtu = IBV_MTU_4096;
+        // A path MTU above either port's makes packets the link drops.
+        attr.path_mtu = negotiate_path_mtu(ctx.active_mtu(), remote.mtu);
         attr.dest_qp_num = remote.qpn;
         attr.rq_psn = remote.psn;
         attr.max_dest_rd_atomic = 16;
@@ -761,7 +924,56 @@ mod tests {
             lid,
             gid,
             psn: 0,
+            mtu: IBV_MTU_4096,
         }
+    }
+
+    /// A 1500-byte RoCE port reports 1024; connecting at 4096 would make
+    /// every READ response above ~1 KB undeliverable.
+    #[test]
+    fn path_mtu_is_the_smaller_port_mtu() {
+        assert_eq!(negotiate_path_mtu(IBV_MTU_4096, IBV_MTU_1024), IBV_MTU_1024);
+        assert_eq!(negotiate_path_mtu(IBV_MTU_1024, IBV_MTU_4096), IBV_MTU_1024);
+        assert_eq!(negotiate_path_mtu(IBV_MTU_4096, IBV_MTU_4096), IBV_MTU_4096);
+        // A peer that sent no MTU (or garbage) defers to the local port.
+        assert_eq!(negotiate_path_mtu(IBV_MTU_1024, 0), IBV_MTU_1024);
+        assert_eq!(negotiate_path_mtu(IBV_MTU_4096, 99), IBV_MTU_4096);
+        // A local port reporting nothing usable falls back to 1024.
+        assert_eq!(negotiate_path_mtu(0, 0), IBV_MTU_1024);
+    }
+
+    #[test]
+    fn endpoint_without_mtu_still_parses() {
+        let ep: QpEndpoint = serde_json::from_str(
+            r#"{"qpn":1,"lid":0,"gid":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"psn":0}"#,
+        )
+        .unwrap();
+        assert_eq!(ep.mtu, 0);
+    }
+
+    #[test]
+    fn wr_generations_skip_untagged_and_marker_values() {
+        assert_eq!(next_wr_generation(0), 1);
+        assert_eq!(next_wr_generation(1), 2);
+        assert_eq!(next_wr_generation(u32::MAX - 2), u32::MAX - 1);
+        assert_eq!(next_wr_generation(u32::MAX - 1), 1);
+        // The largest tagged wr_id a batch can carry stays below the marker.
+        let top = (u64::from(u32::MAX - 1) << 32) | u64::from(u32::MAX);
+        assert!(top < QUIESCE_WR_ID);
+    }
+
+    /// A QP in error flushes every outstanding WR, so its CQ must hold one
+    /// completion per WR plus the quiesce marker.
+    #[test]
+    fn cq_depth_covers_every_flushable_wr_and_the_marker() {
+        assert_eq!(required_cq_depth(&DEFAULT_QP_CAP), 4096 + 1 + 1);
+        assert_eq!(required_cq_depth(&RESPONDER_QP_CAP), 3);
+        let huge = IbvQpCap {
+            max_send_wr: u32::MAX,
+            max_recv_wr: u32::MAX,
+            ..DEFAULT_QP_CAP
+        };
+        assert_eq!(required_cq_depth(&huge), i32::MAX);
     }
 
     /// A GID whose top 8 bytes are the subnet prefix, as InfiniBand

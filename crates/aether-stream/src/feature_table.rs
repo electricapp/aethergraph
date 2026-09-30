@@ -9,12 +9,13 @@
 //! a row only when both snapshots carry the same even version and identical
 //! payload bytes (see the RDMA reader contract on [`FeatureTable::read_node`]).
 //!
-//! This table is backed by a separate `SharedMemoryRing` (not the UMEM).
+//! This table is backed by its own [`SlotRegion`] (not the UMEM), addressed by
+//! node ID.
 //! When RDMA is enabled, the memory is registered with the HCA so GPU nodes
 //! can do one-sided reads at <5μs without waking the CPU.
 
 use aether_mem::hooks::{MlockHook, NumaInterleaveHook};
-use aether_mem::{MemoryHook, SharedMemoryRing};
+use aether_mem::{MemoryHook, SlotRegion};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,7 +44,7 @@ const FEATURE_OFFSET: usize = aethergraph_core::FEATURE_SLOT_HEAD_BYTES;
 /// waste DRAM on dead padding. The gather reads only the live prefix of each
 /// slot (through `tail_offset_in_slot + 8`).
 pub struct FeatureTable {
-    ring: SharedMemoryRing,
+    region: SlotRegion,
     node_count: usize,
     feature_dim: usize,
     /// Byte offset from slot start to the tail_version field.
@@ -99,7 +100,7 @@ fn compute_tail_offset(feature_dim: usize) -> usize {
     aethergraph_core::feature_slot_tail_offset(feature_dim)
 }
 
-/// Compute raw slot size (before stride-rounding by SharedMemoryRing).
+/// Compute raw slot size (before stride-rounding by the region).
 #[inline]
 fn compute_slot_size(feature_dim: usize) -> usize {
     aethergraph_core::feature_slot_size(feature_dim)
@@ -155,9 +156,9 @@ unsafe fn volatile_store_payload(src: &[f32], dst: *mut f32) {
 #[inline]
 unsafe fn volatile_load_payload(src: *const f32, dst: &mut [f32]) {
     let src64 = src as *const u64;
-    // `chunks_exact_mut` carries the pair length in the type, so the two
-    // lane stores need no bounds check and the tail is what remains.
-    for (i, lanes) in dst.chunks_exact_mut(2).enumerate() {
+    // `as_chunks_mut` carries the pair length in the type, so the two lane
+    // stores need no bounds check and the tail is what remains.
+    for (i, lanes) in dst.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         // SAFETY: the chunk iterator yields one pair per 8-byte word of the
         // payload, so `i` stays within it.
         let p = unsafe { src64.add(i) };
@@ -178,9 +179,7 @@ unsafe fn volatile_load_payload(src: *const f32, dst: &mut [f32]) {
 }
 
 impl FeatureTable {
-    /// Allocate a new feature table.
-    ///
-    /// `node_count` is rounded up to the next power of two.
+    /// Allocate a new feature table of exactly `node_count` slots.
     /// `feature_dim` is the number of f32 features per node.
     ///
     /// Returns `None` if `node_count == 0`, `feature_dim == 0`, or the
@@ -194,7 +193,6 @@ impl FeatureTable {
             return None;
         }
 
-        let slot_count = node_count.next_power_of_two();
         let tail_offset = compute_tail_offset(feature_dim);
         let slot_size = compute_slot_size(feature_dim);
 
@@ -214,8 +212,8 @@ impl FeatureTable {
         // registers one MR and addresses slots by offset, so per-slot page
         // alignment would only round a 3096-byte dim-768 slot up to 4096 —
         // ~25% of table DRAM spent on dead padding.
-        let (ring, hook_failures) = SharedMemoryRing::new_with_slot_align(
-            slot_count,
+        let (region, hook_failures) = SlotRegion::new(
+            node_count,
             slot_size,
             NonZeroUsize::new(aethergraph_core::FEATURE_SLOT_STRIDE_ALIGN),
             hooks,
@@ -225,10 +223,8 @@ impl FeatureTable {
             tracing::warn!(error = %failure, "feature table memory hook failed");
         }
 
-        // We access slots positionally by node ID, not via the free list;
-        // the ring is used for its allocation + hooks only.
         Some(Self {
-            ring,
+            region,
             node_count,
             feature_dim,
             tail_offset,
@@ -281,8 +277,7 @@ impl FeatureTable {
         // Step 1: head even→odd via CAS. Same-node writers serialize here:
         // while another writer holds the head odd, spin until it releases.
         // AcqRel on success: Release orders prior writes before head goes
-        // odd; Acquire prevents the feature copy below from being reordered
-        // before this RMW.
+        // odd; Acquire orders this writer after the previous one's release.
         let mut prev = head.load(Ordering::Relaxed);
         let prev = loop {
             if prev & 1 != 0 {
@@ -296,6 +291,11 @@ impl FeatureTable {
             }
         };
         let target = prev + 2;
+        // A release RMW orders only what precedes it: nothing keeps the
+        // payload stores below from becoming visible before the odd head.
+        // This fence does, for CPUs (pairing with the reader's acquire
+        // fence) and for DMA readers alike.
+        aether_mem::dma_release_fence();
 
         // Arm the panic-recovery guard. From here through the explicit
         // disarm below, ANY panic poisons the slot to version 0 (even),
@@ -318,7 +318,9 @@ impl FeatureTable {
             volatile_store_payload(features, feat_ptr);
         }
 
-        // Step 3: tail → target.
+        // Step 3: tail → target. The fence extends the Release ordering of
+        // payload-before-version to DMA readers.
+        aether_mem::dma_release_fence();
         tail.store(target, Ordering::Release);
 
         // Step 4: head → target. Disarm the guard so its Drop is a
@@ -331,15 +333,14 @@ impl FeatureTable {
     /// written at least once, `false` if uninitialized.
     ///
     /// Local readers MUST detect torn writes that complete during the feature
-    /// copy. Naively just `head == tail` is insufficient — the writer's plain
-    /// `Release` stores can sit in its CPU's store buffer, so the reader can
-    /// observe both the old `tail` AND the old `head` even though the writer's
-    /// `RMW` (head→odd) has already taken effect. The standard fix (used by
-    /// the Linux kernel seqlock) is to RE-LOAD HEAD after the data copy:
-    /// because the writer's first action is a LOCK-prefixed RMW that drains
-    /// its store buffer and is globally visible immediately, any writer that
-    /// touched the slot during our copy is guaranteed to leave a head value
-    /// different from the snapshot we started with.
+    /// copy. Naively just `head == tail` is insufficient — a writer that
+    /// starts after the reader's version loads leaves both versions
+    /// unchanged while it rewrites the payload under the copy. The standard
+    /// fix (used by the Linux kernel seqlock) is to RE-LOAD HEAD after the
+    /// data copy: the writer fences between its head→odd RMW and its
+    /// payload stores, and the reader fences between its payload loads and
+    /// the re-load, so a copy that read any byte of a concurrent write sees
+    /// that write's odd head (or a later version) on the re-load.
     ///
     /// We keep the `head == tail` check too — the RDMA path relies on the
     /// same version comparison within each of its slot snapshots, and it
@@ -359,11 +360,12 @@ impl FeatureTable {
     ///   - the common version is even and nonzero, and
     ///   - the payload bytes of the two snapshots are identical.
     ///
-    /// Soundness rests on three properties: (1) the writer's head→odd
-    /// transition is a LOCK-prefixed RMW, globally ordered across the
-    /// coherence fabric (which the HCA's DMA reads participate in), so it is
-    /// visible to every coherent observer before any of the writer's payload
-    /// stores; (2) per-location visibility is monotone — once a snapshot has
+    /// Soundness rests on three properties: (1) the writer fences with
+    /// [`aether_mem::dma_release_fence`] between its head→odd RMW and its
+    /// payload stores, and again between the payload and the version
+    /// stores, so every coherent observer — the HCA's DMA reads included —
+    /// sees the odd head before any of the write's payload bytes and the
+    /// payload before the new even versions; (2) per-location visibility is monotone — once a snapshot has
     /// observed a value at a location, a later snapshot observes that value
     /// or a newer one; (3) snapshot 2 begins strictly after snapshot 1 ends.
     /// A writer whose payload stores land during either snapshot leaves
@@ -424,10 +426,10 @@ impl FeatureTable {
             //   1. h1 == t  — RDMA-compatible, catches torn writes whose
             //      tail.store has propagated.
             //   2. h1 == h2 — local-only, catches writers that started a
-            //      new generation during our copy. Since the writer's
-            //      first op is a LOCK-RMW that's immediately globally
-            //      visible, h2 cannot equal the old even h1 if a writer
-            //      ran concurrently.
+            //      new generation during our copy: if the copy read any of
+            //      their payload, the acquire fence above synchronizes
+            //      with the writer's fence after its head→odd RMW, so h2
+            //      cannot be the old even h1.
             let t = tail.load(Ordering::Acquire);
             let h2 = head.load(Ordering::Acquire);
             if h1 == t && h1 == h2 {
@@ -442,7 +444,7 @@ impl FeatureTable {
         self.feature_dim
     }
 
-    /// Number of nodes this table can hold (original, before rounding to power-of-two).
+    /// Number of nodes this table holds.
     pub fn node_count(&self) -> usize {
         self.node_count
     }
@@ -452,7 +454,7 @@ impl FeatureTable {
         FeatureSchema {
             node_count: self.node_count,
             feature_dim: self.feature_dim,
-            slot_size: self.ring.slot_size(),
+            slot_size: self.region.slot_size(),
             feature_offset_in_slot: FEATURE_OFFSET,
             tail_offset_in_slot: self.tail_offset,
         }
@@ -460,18 +462,18 @@ impl FeatureTable {
 
     /// Base address of the table (for RDMA registration).
     pub fn base_addr(&self) -> u64 {
-        self.ring.base_addr() as u64
+        self.region.base_addr() as u64
     }
 
     /// Total allocated size.
     pub fn total_size(&self) -> usize {
-        self.ring.total_size()
+        self.region.total_size()
     }
 
     /// Raw pointer to a node's slot.
     #[inline]
     fn slot_ptr(&self, node: usize) -> *mut u8 {
-        self.ring.slot_ptr_for_ffi(node)
+        self.region.slot_ptr(node)
     }
 }
 

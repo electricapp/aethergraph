@@ -1,14 +1,20 @@
 #![no_main]
 //! Fuzz target: feed arbitrary bytes to the CSR graph loader and assert it
-//! either returns a structurally valid `Graph` or an `Err`. The loader must
-//! NEVER panic or produce a graph that violates its invariants
-//! (`offsets.len() == num_nodes + 1`, monotonic offsets, edges in bounds).
+//! either returns a graph that upholds its invariants or an `Err`. The
+//! loader must NEVER panic, and a graph loaded under a weaker validation
+//! mode must stay memory-safe: guarded accessors agree with each other,
+//! and whole-graph rebuilds (`permute`, Rabbit Order) either prove the
+//! graph first or refuse it.
 //!
 //! Run:  cargo +nightly fuzz run csr_loader_bytes
 
 use libfuzzer_sys::fuzz_target;
 
-use aethergraph_core::{GraphValidationMode, load_graph_with_validation};
+use aethergraph_core::{GraphValidationMode, NodeId, load_graph_owned, load_graph_with_validation};
+
+/// Graphs above this size skip the O(V + E) rebuilds, keeping each fuzz
+/// iteration cheap.
+const REBUILD_LIMIT: usize = 1 << 12;
 
 fuzz_target!(|data: &[u8]| {
     // Write the fuzz input to a temp file (the loader is path-based).
@@ -25,17 +31,37 @@ fuzz_target!(|data: &[u8]| {
         GraphValidationMode::OffsetsOnly,
         GraphValidationMode::Full,
     ] {
-        match load_graph_with_validation(tmp.to_str().unwrap(), mode) {
-            Ok(graph) => {
-                // Touch invariants. A successful Ok must mean the graph is
-                // structurally consistent.
-                let _ = graph.num_nodes();
-                let _ = graph.num_edges();
-                for v in 0..graph.num_nodes().min(64) {
-                    let _ = graph.degree(v as u32);
-                }
-            }
-            Err(_) => { /* expected for most random inputs */ }
+        if let Ok(graph) = load_graph_with_validation(&tmp, mode) {
+            assert!(graph.validated() >= mode);
+            exercise(&graph);
+        }
+        if let Ok(graph) = load_graph_owned(&tmp, mode) {
+            assert_eq!(graph.validated(), GraphValidationMode::Full);
+            exercise(&graph);
         }
     }
 });
+
+fn exercise(graph: &aethergraph_core::Graph) {
+    let degrees = graph.degrees();
+    assert_eq!(degrees.len(), graph.num_nodes());
+    for v in 0..graph.num_nodes().min(64) as NodeId {
+        assert_eq!(graph.degree(v), graph.neighbors(v).len());
+        assert_eq!(degrees[v as usize] as usize, graph.degree(v));
+    }
+    let _ = graph.stats();
+    if graph.num_nodes() > REBUILD_LIMIT || graph.num_edges() > REBUILD_LIMIT * 16 {
+        return;
+    }
+    let identity: Vec<NodeId> = (0..graph.num_nodes() as NodeId).collect();
+    match graph.permute(&identity) {
+        Ok(permuted) => {
+            // A successful permute proved the source Full.
+            assert_eq!(graph.validated(), GraphValidationMode::Full);
+            assert_eq!(permuted.edges(), graph.edges());
+            let perm = graph.reorder_rabbit().expect("a Full graph reorders");
+            assert_eq!(perm.len(), graph.num_nodes());
+        }
+        Err(_) => assert!(graph.validate().is_err()),
+    }
+}

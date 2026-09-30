@@ -62,13 +62,16 @@ fn main() {
     );
 
     let ctx = SrdContext::open(256, EFA_GID_INDEX).expect("SrdContext::open");
-    let mr = ctx
-        .reg_mr(
+    // SAFETY: `table` lives to the end of main, past every READ the
+    // served clients issue against the MR.
+    let mr = unsafe {
+        ctx.reg_mr(
             table.base_addr() as *mut u8,
             table.total_size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ,
         )
-        .expect("reg_mr");
+    }
+    .expect("reg_mr");
     let qp = SrdQp::create(&ctx, &DEFAULT_SRD_QP_CAP).expect("qp create");
     qp.bring_up().expect("bring_up");
     let ep = qp.endpoint(&ctx);

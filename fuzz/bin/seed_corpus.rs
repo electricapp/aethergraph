@@ -87,6 +87,27 @@ fn build_csr_header(num_nodes: u64, num_edges: u64, has_weights: bool) -> [u8; C
     hdr
 }
 
+// ─── compressed_loader_bytes ──────────────────────────────────────────────
+//
+// A version-2 file is the 32-byte header followed by an Elias-Fano offsets
+// record, a StreamVByte edges record, and raw f32 weights when flagged. The
+// seeds are built through the codecs' own serializers so they parse; the
+// checksum field is zero (absent), letting mutations reach the decoders.
+
+const COMPRESSED_VERSION: u32 = 2;
+
+fn build_compressed(offsets: &[u64], edges: &[u32], weights: Option<&[f32]>) -> Vec<u8> {
+    let num_nodes = offsets.len().saturating_sub(1) as u64;
+    let mut out = build_csr_header(num_nodes, edges.len() as u64, weights.is_some()).to_vec();
+    out[4..8].copy_from_slice(&COMPRESSED_VERSION.to_le_bytes());
+    aethergraph_core::EliasFano::encode(offsets).write_into(&mut out);
+    aethergraph_core::StreamVByte::encode_deltas(edges).write_into(&mut out);
+    for w in weights.unwrap_or(&[]) {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 fn seed_filename(bytes: &[u8]) -> String {
@@ -197,11 +218,50 @@ fn build_csr_corpus() -> std::io::Result<usize> {
     Ok(count)
 }
 
+fn build_compressed_corpus() -> std::io::Result<usize> {
+    let dir = corpus_root().join("corpus/compressed_loader_bytes");
+    reset_dir(&dir)?;
+
+    let mut count = 0;
+
+    // Empty graph.
+    write_seed(&dir, &build_compressed(&[0], &[], None))?;
+    count += 1;
+
+    // Two triangles joined by one edge, sorted neighbor lists.
+    let offsets = [0u64, 2, 4, 7, 9, 11, 13];
+    let edges = [1u32, 2, 0, 2, 0, 1, 3, 2, 4, 3, 5, 3, 4];
+    write_seed(&dir, &build_compressed(&offsets, &edges, None))?;
+    count += 1;
+
+    // The same graph with weights.
+    let weights: Vec<f32> = (0..edges.len()).map(|i| i as f32 * 0.25).collect();
+    write_seed(&dir, &build_compressed(&offsets, &edges, Some(&weights)))?;
+    count += 1;
+
+    // A hub with unsorted, repeated neighbors (wrapping deltas).
+    write_seed(
+        &dir,
+        &build_compressed(&[0, 6, 6, 6], &[2, 0, 2, 1, 0, 1], None),
+    )?;
+    count += 1;
+
+    // Header only: counts promise records that are missing.
+    let mut header_only = build_csr_header(4, 6, false).to_vec();
+    header_only[4..8].copy_from_slice(&COMPRESSED_VERSION.to_le_bytes());
+    write_seed(&dir, &header_only)?;
+    count += 1;
+
+    Ok(count)
+}
+
 fn main() -> std::io::Result<()> {
     let ctree = build_ctree_corpus()?;
     let csr = build_csr_corpus()?;
+    let compressed = build_compressed_corpus()?;
     println!("seeded ctree_insert_sequences: {ctree} files");
     println!("seeded csr_loader_bytes:        {csr} files");
+    println!("seeded compressed_loader_bytes: {compressed} files");
     println!("RNG seed: 0x{SEED:016x} (change deliberately and review the diff)");
     Ok(())
 }

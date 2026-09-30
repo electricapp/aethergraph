@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -53,23 +53,26 @@ class SamplingConfig:
             For example, [25, 10] samples 25 neighbors at hop 1 and 10 at hop 2.
         replace: Whether to sample with replacement.
         seed: Random seed for reproducibility. None uses random seed.
-        max_degree: Maximum degree to process for hub nodes. None means no limit.
-        cumulative: Whether to use cumulative sampling (PyG-style). When True,
-            samples from all nodes seen so far at each hop (larger subgraphs).
-            When False, samples only from new frontier at each hop (smaller).
+        max_degree: Degree above which a node counts as a hub. Uniform draws
+            never cap; weighted and uniform-temporal sampling draw from
+            ``max_degree`` random positions of a hub's row. None never caps.
+        cumulative: When ``False`` (the default, PyG semantics), each hop
+            expands only the nodes the previous hop discovered. When
+            ``True``, each hop re-expands every node seen so far, adding only
+            edges no earlier hop emitted.
         weighted: Whether to use edge weights for weighted sampling.
-        subgraph_type: Type of subgraph to extract.
-            Must be one of {"directional", "induced", "bidirectional"}.
+        subgraph_type: ``"directional"`` keeps the sampled edges,
+            ``"induced"`` every graph edge between sampled nodes, and
+            ``"bidirectional"`` the sampled edges plus their reverses, each
+            ordered pair once.
         track_edge_ids: Whether to track original edge IDs in sampled subgraph.
         temporal_strategy: ``"uniform"`` or ``"last"`` to enable temporal
             sampling; ``None`` disables it. Requires `Graph.set_timestamps`.
         disjoint: When ``True``, each seed produces its own isolated subgraph
             (no node dedup across seeds). The returned subgraph carries a
             ``batch`` vector mapping each node to its seed index.
-        deterministic: When ``True``, sampling is bit-deterministic given a
-            ``seed`` (at some throughput cost). When ``False``, output is
-            statistically reproducible given a ``seed`` but the exact node
-            ordering may vary across parallel runs.
+        deterministic: Has no effect: a fixed ``seed`` already gives
+            bit-identical output across runs and thread counts.
         telemetry: Optional :class:`SamplingTelemetry` collector. When set,
             per-sample metrics are recorded into it; ``None`` disables
             collection.
@@ -78,7 +81,7 @@ class SamplingConfig:
         >>> config = SamplingConfig(num_neighbors=[25, 10], replace=False)
         >>> config = SamplingConfig(num_neighbors=[15, 10, 5], replace=True, seed=42)
         >>> config = SamplingConfig(num_neighbors=[25, 10], max_degree=10000)
-        >>> config = SamplingConfig(num_neighbors=[25, 10], cumulative=False)
+        >>> config = SamplingConfig(num_neighbors=[25, 10], cumulative=True)
         >>> config = SamplingConfig(num_neighbors=[25, 10], disjoint=True)
     """
 
@@ -86,7 +89,7 @@ class SamplingConfig:
     replace: bool = False
     seed: int | None = None
     max_degree: int | None = None
-    cumulative: bool = True
+    cumulative: bool = False
     weighted: bool = False
     subgraph_type: SubgraphType = "directional"
     track_edge_ids: bool = True
@@ -96,29 +99,14 @@ class SamplingConfig:
     telemetry: SamplingTelemetry | None = None
 
     def __post_init__(self) -> None:
-        """Validate configuration parameters.
+        """Validate every field through the Rust constructor.
 
         Raises:
-            ValueError: If num_neighbors is empty, contains negative values,
-                or max_degree is non-positive when specified.
+            ValueError: If num_neighbors is empty or has a negative value,
+                max_degree is non-positive, or subgraph_type /
+                temporal_strategy is not a known value.
         """
-        if not self.num_neighbors:
-            raise ValueError("num_neighbors must be a non-empty list")
-        if any(n < 0 for n in self.num_neighbors):
-            raise ValueError(f"num_neighbors values must be non-negative, got {self.num_neighbors}")
-        if self.max_degree is not None and self.max_degree <= 0:
-            raise ValueError(f"max_degree must be > 0 if specified, got {self.max_degree}")
-        subgraph_types = get_args(SubgraphType)
-        if self.subgraph_type not in subgraph_types:
-            raise ValueError(
-                f"subgraph_type must be one of {subgraph_types}, got '{self.subgraph_type}'"
-            )
-        temporal_strategies = get_args(TemporalStrategy)
-        if self.temporal_strategy is not None and self.temporal_strategy not in temporal_strategies:
-            raise ValueError(
-                f"temporal_strategy must be one of {temporal_strategies} or None, "
-                f"got '{self.temporal_strategy}'"
-            )
+        self._to_rust()
 
     def _to_rust(self) -> _SamplingConfig:
         """Convert to Rust SamplingConfig.
@@ -189,12 +177,16 @@ class SampledSubgraph:
 
     @property
     def edge_index(self) -> npt.NDArray[np.int64]:
-        """Edge index `[2, num_edges]` with global node IDs (dtype=int64)."""
+        """Edge index `[2, num_edges]` with global node IDs (dtype=int64).
+
+        PyG's source-to-target order: row 0 is the sampled neighbor, row 1
+        the node that sampled it, so messages flow toward the seeds.
+        """
         return self._inner.edge_index
 
     @property
     def edge_index_local(self) -> npt.NDArray[np.int64]:
-        """Edge index `[2, num_edges]` with local IDs in `[0, num_nodes)` (dtype=int64)."""
+        """`edge_index` with local IDs in `[0, num_nodes)` (dtype=int64)."""
         return self._inner.edge_index_local
 
     @property
@@ -214,12 +206,12 @@ class SampledSubgraph:
 
     @property
     def num_sampled_nodes_per_hop(self) -> list[int]:
-        """PyG-compatible: new nodes added at each hop."""
+        """PyG's layout: ``[seed nodes, hop 1 new nodes, ..., hop k new nodes]``."""
         return self._inner.num_sampled_nodes_per_hop
 
     @property
     def num_sampled_edges_per_hop(self) -> list[int]:
-        """PyG-compatible: edges added at each hop."""
+        """PyG's layout: edges each hop sampled, one entry per hop."""
         return self._inner.num_sampled_edges_per_hop
 
     def to_dict(self) -> dict[str, Any]:
@@ -311,14 +303,18 @@ class Sampler:
 
         Args:
             seeds: Seed node IDs. Accepts numpy `uint32` arrays (copied
-                directly), numpy `int64` arrays (range-checked, then copied),
-                or any Python sequence of ints. Dispatch happens at the FFI
-                boundary, not here.
-            input_times: Per-seed timestamps (`float64`), required when
-                `config.temporal_strategy` is set.
+                directly), numpy `int64` arrays, or any Python sequence of
+                ints; every ID must be below the graph's node count. Dispatch
+                and range checks happen at the FFI boundary, not here.
+            input_times: Per-seed time bounds (`float64`, one per seed) under
+                temporal sampling. ``None`` leaves every seed unbounded.
 
         Returns:
             SampledSubgraph containing the sampled nodes and edges.
+
+        Raises:
+            SamplingError: A seed is outside the graph, or `input_times` is
+                given without a temporal strategy or with the wrong length.
 
         Example:
             >>> sampler = Sampler(graph, SamplingConfig(num_neighbors=[25, 10]))

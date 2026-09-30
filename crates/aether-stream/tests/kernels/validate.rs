@@ -1,5 +1,7 @@
 use aether_stream::gpu::kernels::SeqlockValidator;
 use aether_stream::gpu::kernels::harness::cuda_or_skip;
+use aether_stream::gpu::kernels::validate::StagingRegions;
+use aether_stream::rdma::layout::SlotGeometry;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut};
 use std::sync::Arc;
 
@@ -56,8 +58,11 @@ fn compacts_exactly(dim: usize) {
     let stride = aethergraph_core::feature_slot_stride(dim);
 
     let (_dev, p1, p2) = stage(&stream, &snap, &snap);
-    let mut v = SeqlockValidator::new(&ctx, &stream, ROWS, dim).expect("nvrtc");
-    assert_eq!(v.validate(p1, p2, stride, ROWS).unwrap(), 0, "dim {dim}");
+    let geometry = SlotGeometry::new(dim, stride).unwrap();
+    let mut v = SeqlockValidator::new(&ctx, &stream, ROWS, &geometry).expect("nvrtc");
+    // SAFETY: `_dev` holds both regions of ROWS slots at `stride`.
+    let staging = unsafe { StagingRegions::new(p1, p2, ROWS, geometry) }.unwrap();
+    assert_eq!(v.validate(&staging, ROWS).unwrap(), 0, "dim {dim}");
 
     stream.synchronize().unwrap();
     let mut got = vec![0f32; ROWS * dim];
@@ -127,8 +132,11 @@ fn flags_payload_mismatch_in_the_vector_body() {
         .collect();
 
     let (_dev, p1, p2) = stage(&stream, &snap1, &snap2);
-    let mut v = SeqlockValidator::new(&ctx, &stream, ROWS, DIM).expect("nvrtc");
-    assert_eq!(v.validate(p1, p2, stride, ROWS).unwrap(), 2);
+    let geometry = SlotGeometry::new(DIM, stride).unwrap();
+    let mut v = SeqlockValidator::new(&ctx, &stream, ROWS, &geometry).expect("nvrtc");
+    // SAFETY: `_dev` holds both regions of ROWS slots at `stride`.
+    let staging = unsafe { StagingRegions::new(p1, p2, ROWS, geometry) }.unwrap();
+    assert_eq!(v.validate(&staging, ROWS).unwrap(), 2);
     assert_eq!(v.retry_indices(ROWS).unwrap(), vec![1, 2]);
 }
 
@@ -141,16 +149,26 @@ fn rejects_staging_that_breaks_the_vector_alignment_contract() {
     const DIM: usize = 128;
     let snap = vec![pack_slot(2, &row(0, DIM), 2)];
     let (_dev, p1, p2) = stage(&stream, &snap, &snap);
-    let mut v = SeqlockValidator::new(&ctx, &stream, 1, DIM).expect("nvrtc");
     // A compact slot size is 8-aligned but not 16-aligned, so slot n's
-    // payload would land off a vector boundary.
+    // payload would land off a vector boundary: no geometry admits it.
     let compact = aethergraph_core::feature_slot_size(DIM);
     assert_eq!(compact % 16, 8, "the case this contract exists for");
-    assert!(v.validate(p1, p2, compact, 1).is_err());
-    assert!(
-        v.validate(p1 + 8, p2, aethergraph_core::feature_slot_stride(DIM), 1)
-            .is_err()
-    );
+    assert!(SlotGeometry::new(DIM, compact).is_err());
+
+    let geometry = SlotGeometry::packed(DIM).unwrap();
+    // SAFETY: construction is refused before the pointer is ever used.
+    assert!(unsafe { StagingRegions::new(p1 + 8, p2, 1, geometry) }.is_err());
+
+    // Staging laid out for another dim, or shorter than the batch, is
+    // refused at the launch site rather than read out of bounds.
+    let mut v = SeqlockValidator::new(&ctx, &stream, 4, &geometry).expect("nvrtc");
+    let other = SlotGeometry::packed(DIM + 4).unwrap();
+    // SAFETY: `_dev` holds one slot per region; neither staging is launched.
+    let wrong_dim = unsafe { StagingRegions::new(p1, p2, 1, other) }.unwrap();
+    assert!(v.validate(&wrong_dim, 1).is_err());
+    // SAFETY: as above.
+    let one_row = unsafe { StagingRegions::new(p1, p2, 1, geometry) }.unwrap();
+    assert!(v.validate(&one_row, 2).is_err());
 }
 
 #[test]
@@ -164,9 +182,12 @@ fn validate_graph_replay_skips_without_cuda() {
     let stride = aethergraph_core::feature_slot_stride(DIM);
     let snap = vec![pack_slot(2, &[1.0, 2.0, 3.0, 4.0], 2); BATCH];
     let (_dev, p1, p2) = stage(&stream, &snap, &snap);
-    let mut v = SeqlockValidator::new(&ctx, &stream, BATCH, DIM).expect("nvrtc");
-    assert_eq!(v.validate(p1, p2, stride, BATCH).unwrap(), 0);
+    let geometry = SlotGeometry::new(DIM, stride).unwrap();
+    let mut v = SeqlockValidator::new(&ctx, &stream, BATCH, &geometry).expect("nvrtc");
+    // SAFETY: `_dev` holds both regions of BATCH slots at `stride`.
+    let staging = unsafe { StagingRegions::new(p1, p2, BATCH, geometry) }.unwrap();
+    assert_eq!(v.validate(&staging, BATCH).unwrap(), 0);
     // Capture is best-effort; a stack that refuses it falls back to eager
     // launch and must still validate.
-    assert_eq!(v.validate(p1, p2, stride, BATCH).unwrap(), 0);
+    assert_eq!(v.validate(&staging, BATCH).unwrap(), 0);
 }

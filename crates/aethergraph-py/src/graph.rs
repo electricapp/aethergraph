@@ -56,47 +56,28 @@ impl PyCsrGraph {
         storage: &str,
         validation: &str,
     ) -> PyResult<Self> {
-        let storage_norm = storage.to_ascii_lowercase();
-        let validation_norm = validation.to_ascii_lowercase();
+        let storage = Storage::parse(storage)?;
+        let validation = Validation::parse(validation)?;
 
         // Reading + validating the file is O(E) I/O and touches no Python
         // state; release the GIL so other Python threads keep running.
         // `load_graph*` functions take `impl AsRef<Path>` so `&path` works
         // directly — no string round-trip needed.
         let graph = py.detach(|| -> PyResult<_> {
-            let result = match storage_norm.as_str() {
-                "auto" => {
-                    if validation_norm == "auto" {
-                        load_graph(&path)
-                    } else {
-                        let mode = parse_validation_mode(&validation_norm)?;
-                        load_graph_with_validation(&path, mode)
-                    }
+            let result = match (storage, validation) {
+                (Storage::Auto, Validation::Auto) => load_graph(&path),
+                (Storage::Auto, Validation::Mode(mode)) => load_graph_with_validation(&path, mode),
+                (Storage::Mmap, Validation::Auto) => {
+                    load_graph_mmap(&path, GraphValidationMode::OffsetsOnly)
                 }
-                "mmap" => {
-                    let mode = if validation_norm == "auto" {
-                        GraphValidationMode::OffsetsOnly
-                    } else {
-                        parse_validation_mode(&validation_norm)?
-                    };
-                    load_graph_mmap(&path, mode)
+                (Storage::Mmap, Validation::Mode(mode)) => load_graph_mmap(&path, mode),
+                (Storage::Owned, Validation::Auto) => {
+                    load_graph_owned(&path, auto_validation_mode(&path)?)
                 }
-                "owned" => {
-                    let mode = if validation_norm == "auto" {
-                        auto_validation_mode(&path)?
-                    } else {
-                        parse_validation_mode(&validation_norm)?
-                    };
-                    load_graph_owned(&path, mode)
-                }
-                other => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid storage mode '{other}'. Must be one of: auto, mmap, owned"
-                    )));
-                }
+                (Storage::Owned, Validation::Mode(mode)) => load_graph_owned(&path, mode),
             };
             result.map_err(|e| {
-                graph_load_error(format!("Failed to load graph ({storage_norm}): {e}"))
+                graph_load_error(format!("Failed to load graph ({}): {e}", storage.name()))
             })
         })?;
 
@@ -147,9 +128,47 @@ impl PyCsrGraph {
     ///
     /// Returns:
     ///     numpy.ndarray: uint32 array where perm[new_id] = old_id.
-    fn reorder_rabbit<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
-        let perm = py.detach(|| self.inner.reorder_rabbit());
-        PyArray1::from_vec(py, perm)
+    ///
+    /// Raises:
+    ///     GraphLoadError: If the graph's edges fail validation.
+    fn reorder_rabbit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let perm = py
+            .detach(|| self.inner.reorder_rabbit())
+            .map_err(|e| graph_load_error(format!("Rabbit Order failed: {e}")))?;
+        Ok(PyArray1::from_vec(py, perm))
+    }
+
+    /// Rabbit Order community of every node.
+    ///
+    /// Returns:
+    ///     numpy.ndarray: uint32 partition id per node, dense from 0.
+    ///
+    /// Raises:
+    ///     GraphLoadError: If the graph's edges fail validation.
+    fn rabbit_partitions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let parts = py
+            .detach(|| self.inner.rabbit_partitions())
+            .map_err(|e| graph_load_error(format!("Rabbit Order failed: {e}")))?;
+        Ok(PyArray1::from_vec(py, parts))
+    }
+
+    /// Rabbit Order permutation and partitions from one community pass.
+    ///
+    /// Returns:
+    ///     tuple[numpy.ndarray, numpy.ndarray]: (perm, partitions), as from
+    ///     `reorder_rabbit()` and `rabbit_partitions()`.
+    ///
+    /// Raises:
+    ///     GraphLoadError: If the graph's edges fail validation.
+    #[allow(clippy::type_complexity)]
+    fn reorder_rabbit_with_partitions<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<u32>>)> {
+        let (perm, parts) = py
+            .detach(|| self.inner.reorder_rabbit_with_partitions())
+            .map_err(|e| graph_load_error(format!("Rabbit Order failed: {e}")))?;
+        Ok((PyArray1::from_vec(py, perm), PyArray1::from_vec(py, parts)))
     }
 
     /// Apply a node permutation to create a reordered graph.
@@ -381,17 +400,54 @@ impl PyCsrGraph {
     }
 }
 
-fn parse_validation_mode(value: &str) -> PyResult<GraphValidationMode> {
-    match value {
-        "header_only" => Ok(GraphValidationMode::HeaderOnly),
-        "offsets_only" => Ok(GraphValidationMode::OffsetsOnly),
-        "full" => Ok(GraphValidationMode::Full),
-        "auto" => Err(pyo3::exceptions::PyValueError::new_err(
-            "'auto' validation is only resolved by CsrGraph.load(); call sites here expect a concrete mode",
-        )),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Invalid validation mode '{value}'. Must be one of: auto, header_only, offsets_only, full"
-        ))),
+/// `CsrGraph.load`'s `storage` argument, parsed once at the FFI edge.
+#[derive(Clone, Copy)]
+enum Storage {
+    Auto,
+    Mmap,
+    Owned,
+}
+
+impl Storage {
+    fn parse(value: &str) -> PyResult<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "mmap" => Ok(Self::Mmap),
+            "owned" => Ok(Self::Owned),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid storage mode '{value}'. Must be one of: auto, mmap, owned"
+            ))),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Mmap => "mmap",
+            Self::Owned => "owned",
+        }
+    }
+}
+
+/// `CsrGraph.load`'s `validation` argument, parsed once at the FFI edge.
+/// `Auto` resolves per storage mode.
+#[derive(Clone, Copy)]
+enum Validation {
+    Auto,
+    Mode(GraphValidationMode),
+}
+
+impl Validation {
+    fn parse(value: &str) -> PyResult<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "header_only" => Ok(Self::Mode(GraphValidationMode::HeaderOnly)),
+            "offsets_only" => Ok(Self::Mode(GraphValidationMode::OffsetsOnly)),
+            "full" => Ok(Self::Mode(GraphValidationMode::Full)),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid validation mode '{value}'. Must be one of: auto, header_only, offsets_only, full"
+            ))),
+        }
     }
 }
 

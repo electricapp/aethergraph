@@ -44,6 +44,7 @@ static inline float __shfl_sync(unsigned int, float v, int, int = 32) { return v
 static inline unsigned int __shfl_up_sync(unsigned int, unsigned int v, unsigned int, int = 32) {
     return v;
 }
+static inline float __shfl_down_sync(unsigned int, float v, unsigned int, int = 32) { return v; }
 static inline unsigned long long __shfl_sync(
     unsigned int, unsigned long long v, int, int = 32
 ) {

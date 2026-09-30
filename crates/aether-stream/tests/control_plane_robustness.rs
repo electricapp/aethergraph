@@ -1,7 +1,7 @@
 //! Control-plane robustness: the server accepts connections forever and
 //! must not be knocked over by a peer that sends a malformed length prefix,
 //! a short-read, or a close mid-handshake. Guards that `MAX_MSG_SIZE` /
-//! `TCP_TIMEOUT` enforcement keeps the listener alive and subsequent valid
+//! `HANDSHAKE_TIMEOUT` enforcement keeps the listener alive and subsequent valid
 //! clients can still complete the QP exchange.
 
 #![cfg(all(target_os = "linux", feature = "rdma"))]
@@ -109,9 +109,9 @@ fn server_survives_client_immediate_close() {
 
     // Well-formed client should still succeed.
     let client_ctx = RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("client open");
-    let (got_adv, _qp) = connect_with_qp(&addr, &client_ctx).expect("good client");
-    assert_eq!(got_adv.base_addr, adv.base_addr);
-    assert_eq!(got_adv.rkey, adv.rkey);
+    let (got, _qp) = connect_with_qp(&addr, &client_ctx).expect("good client");
+    assert_eq!(got.base_addr(), adv.base_addr);
+    assert_eq!(got.rkey(), adv.rkey);
 }
 
 /// Client: send an over-sized length prefix. `recv_msg` must reject it
@@ -135,12 +135,12 @@ fn server_rejects_oversized_length_prefix() {
     }
 
     let client_ctx = RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("client open");
-    let (got_adv, _qp) = connect_with_qp(&addr, &client_ctx).expect("good client after bad");
-    assert_eq!(got_adv.base_addr, adv.base_addr);
+    let (got, _qp) = connect_with_qp(&addr, &client_ctx).expect("good client after bad");
+    assert_eq!(got.base_addr(), adv.base_addr);
 }
 
 /// Client: send a length prefix then never the body. Server's read_exact
-/// must time out via TCP_TIMEOUT, log, and loop to the next peer.
+/// must time out via HANDSHAKE_TIMEOUT, log, and loop to the next peer.
 #[test]
 fn server_survives_truncated_body() {
     skip_if_no_rdma!();
@@ -157,16 +157,16 @@ fn server_survives_truncated_body() {
         let _ = s.write_all(&[0xAA; 10]);
         drop(s);
     }
-    // The server's TCP_TIMEOUT is 10s; we don't wait for it in this test
+    // The server's HANDSHAKE_TIMEOUT is 10s; we don't wait for it in this test
     // since the server's accept loop is per-connection. We just move on and
     // attempt a good handshake — it should succeed even while the bad
     // connections are still timing out in the server's handler for them.
     let client_ctx = RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("client open");
-    let (got_adv, _qp) = connect_with_qp(&addr, &client_ctx).expect("good client");
-    assert_eq!(got_adv.base_addr, adv.base_addr);
+    let (got, _qp) = connect_with_qp(&addr, &client_ctx).expect("good client");
+    assert_eq!(got.base_addr(), adv.base_addr);
     let elapsed = start_bad.elapsed();
     // Accept loop should not be held hostage by bad peers beyond a few
-    // seconds total; if this exceeds TCP_TIMEOUT + buffer (12s) the accept
+    // seconds total; if this exceeds HANDSHAKE_TIMEOUT + buffer (12s) the accept
     // loop isn't resilient.
     assert!(
         elapsed < Duration::from_secs(12),
@@ -193,8 +193,8 @@ fn server_rejects_malformed_client_hello_json() {
     }
 
     let client_ctx = RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("client open");
-    let (got_adv, _qp) = connect_with_qp(&addr, &client_ctx).expect("good client");
-    assert_eq!(got_adv.base_addr, adv.base_addr);
+    let (got, _qp) = connect_with_qp(&addr, &client_ctx).expect("good client");
+    assert_eq!(got.base_addr(), adv.base_addr);
 }
 
 /// Happy path: 10 sequential good clients all complete a QP exchange.
@@ -207,9 +207,9 @@ fn server_handles_many_sequential_clients() {
 
     for i in 0..10 {
         let client_ctx = RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("client open");
-        let (got_adv, _qp) =
+        let (got, _qp) =
             connect_with_qp(&addr, &client_ctx).unwrap_or_else(|e| panic!("client {i}: {e}"));
-        assert_eq!(got_adv.base_addr, adv.base_addr);
-        assert_eq!(got_adv.rkey, adv.rkey);
+        assert_eq!(got.base_addr(), adv.base_addr);
+        assert_eq!(got.rkey(), adv.rkey);
     }
 }

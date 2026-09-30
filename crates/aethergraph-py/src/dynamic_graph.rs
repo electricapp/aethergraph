@@ -85,6 +85,35 @@ impl PyDynamicGraph {
         }
     }
 
+    /// Parse the graph dimensions at the edge: vertex ids are u32, and the
+    /// arena is 1 MiB up to [`aether_graph::Arena::MAX_CAPACITY`].
+    fn parse_dims(num_vertices: usize, arena_mb: usize) -> PyResult<usize> {
+        if num_vertices > u32::MAX as usize {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "num_vertices {num_vertices} exceeds the u32 vertex id range"
+            )));
+        }
+        let max_mb = aether_graph::Arena::MAX_CAPACITY >> 20;
+        if arena_mb == 0 || arena_mb > max_mb {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "arena_mb must be in 1..={max_mb}, got {arena_mb}"
+            )));
+        }
+        Ok(arena_mb << 20)
+    }
+
+    /// Pair two equal-length id arrays into edges.
+    fn edge_pairs(src: &[u32], dst: &[u32]) -> PyResult<Vec<(u32, u32)>> {
+        if src.len() != dst.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "src and dst must have the same length, got {} and {}",
+                src.len(),
+                dst.len()
+            )));
+        }
+        Ok(src.iter().copied().zip(dst.iter().copied()).collect())
+    }
+
     /// Bounds-check a vertex id against `num_vertices` so out-of-range reads
     /// raise `ValueError` instead of panicking inside the Rust core.
     fn check_vertex(&self, vertex: u32) -> PyResult<()> {
@@ -108,13 +137,13 @@ impl PyDynamicGraph {
     ///     arena_mb: Arena capacity in megabytes (default 256).
     #[new]
     #[pyo3(signature = (num_vertices, arena_mb = 256))]
-    fn new(num_vertices: usize, arena_mb: usize) -> Self {
-        let arena_bytes = arena_mb * 1024 * 1024;
-        Self {
+    fn new(num_vertices: usize, arena_mb: usize) -> PyResult<Self> {
+        let arena_bytes = Self::parse_dims(num_vertices, arena_mb)?;
+        Ok(Self {
             inner: Arc::new(aether_graph::DynamicGraph::new(num_vertices, arena_bytes)),
             write_lock: Mutex::new(()),
             buf: Mutex::new(Vec::new()),
-        }
+        })
     }
 
     /// Build a DynamicGraph from numpy edge arrays.
@@ -126,33 +155,28 @@ impl PyDynamicGraph {
     ///     arena_mb: Arena capacity in megabytes (default 256).
     ///
     /// Returns:
-    ///     DynamicGraph with all edges inserted.
+    ///     DynamicGraph with all edges inserted (duplicates collapse).
+    ///
+    /// Raises:
+    ///     ValueError: Mismatched lengths, an edge referencing a vertex
+    ///         >= num_vertices, or dimensions out of range.
+    ///     RuntimeError: The arena filled up.
     #[staticmethod]
     #[pyo3(signature = (num_vertices, src, dst, arena_mb = 256))]
     fn from_edges(
+        py: Python<'_>,
         num_vertices: usize,
         src: PyReadonlyArray1<u32>,
         dst: PyReadonlyArray1<u32>,
         arena_mb: usize,
     ) -> PyResult<Self> {
-        let src_slice = src.as_slice()?;
-        let dst_slice = dst.as_slice()?;
-        if src_slice.len() != dst_slice.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "src and dst must have the same length, got {} and {}",
-                src_slice.len(),
-                dst_slice.len()
-            )));
-        }
-
-        let arena_bytes = arena_mb * 1024 * 1024;
-        let edges: Vec<(u32, u32)> = src_slice
-            .iter()
-            .zip(dst_slice.iter())
-            .map(|(&s, &d)| (s, d))
-            .collect();
-        let graph = aether_graph::DynamicGraph::from_edges(num_vertices, &edges, arena_bytes);
-
+        let arena_bytes = Self::parse_dims(num_vertices, arena_mb)?;
+        let mut edges = Self::edge_pairs(src.as_slice()?, dst.as_slice()?)?;
+        let graph = py
+            .detach(move || {
+                aether_graph::DynamicGraph::try_from_edges(num_vertices, &mut edges, arena_bytes)
+            })
+            .map_err(Self::map_insert_err)?;
         Ok(Self {
             inner: Arc::new(graph),
             write_lock: Mutex::new(()),
@@ -180,9 +204,15 @@ impl PyDynamicGraph {
     ///     RuntimeError: WAL is corrupt past the recoverable prefix.
     #[staticmethod]
     #[pyo3(signature = (path, num_vertices, arena_mb = 256))]
-    fn open_with_wal(path: PathBuf, num_vertices: usize, arena_mb: usize) -> PyResult<Self> {
-        let arena_bytes = arena_mb * 1024 * 1024;
-        let graph = aether_graph::DynamicGraph::open_with_wal(&path, num_vertices, arena_bytes)
+    fn open_with_wal(
+        py: Python<'_>,
+        path: PathBuf,
+        num_vertices: usize,
+        arena_mb: usize,
+    ) -> PyResult<Self> {
+        let arena_bytes = Self::parse_dims(num_vertices, arena_mb)?;
+        let graph = py
+            .detach(|| aether_graph::DynamicGraph::open_with_wal(&path, num_vertices, arena_bytes))
             .map_err(Self::map_wal_err)?;
         Ok(Self {
             inner: Arc::new(graph),
@@ -220,6 +250,8 @@ impl PyDynamicGraph {
     ///     Number of new edges inserted (duplicates are skipped).
     ///
     /// Raises:
+    ///     ValueError: Mismatched lengths, or an edge referencing a vertex
+    ///         >= num_vertices (nothing is inserted).
     ///     RuntimeError: If the arena is full.
     fn insert_edges(
         &self,
@@ -227,42 +259,17 @@ impl PyDynamicGraph {
         src: PyReadonlyArray1<u32>,
         dst: PyReadonlyArray1<u32>,
     ) -> PyResult<usize> {
-        let src_slice = src.as_slice()?;
-        let dst_slice = dst.as_slice()?;
-        if src_slice.len() != dst_slice.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "src and dst must have the same length, got {} and {}",
-                src_slice.len(),
-                dst_slice.len()
-            )));
-        }
-
-        // Pack (src, dst) into one u64 per edge: a single sort groups the
-        // batch by source so each source's destinations go through the bulk
-        // merge path (one tree walk per source) instead of one path-copying
-        // insert per edge.
-        let mut packed: Vec<u64> = src_slice
-            .iter()
-            .zip(dst_slice)
-            .map(|(&s, &d)| (u64::from(s) << 32) | u64::from(d))
-            .collect();
+        let mut edges = Self::edge_pairs(src.as_slice()?, dst.as_slice()?)?;
         let inner = Arc::clone(&self.inner);
-
+        // The writer groups the batch by source, so each source's tree is
+        // updated once — merged and rebuilt, or path-copied when the batch
+        // is small next to the tree.
         py.detach(move || {
             let _guard = self.write_lock.lock();
             let mut writer = inner.writer().map_err(Self::map_writer_err)?;
-            packed.sort_unstable();
-            packed.dedup();
-            let mut count = 0u64;
-            let mut dsts: Vec<u32> = Vec::new();
-            for run in packed.chunk_by(|a, b| (a >> 32) == (b >> 32)) {
-                let s = (run[0] >> 32) as u32;
-                dsts.clear();
-                dsts.extend(run.iter().map(|&p| p as u32));
-                count += writer
-                    .insert_edges_sorted(s, &dsts)
-                    .map_err(Self::map_insert_err)?;
-            }
+            let count = writer
+                .insert_edges(&mut edges)
+                .map_err(Self::map_insert_err)?;
             Ok(count as usize)
         })
     }
@@ -360,17 +367,19 @@ impl PyDynamicGraph {
     ///
     /// Collects all edges from the C-tree neighbor lists into a static CSR
     /// graph. O(V + E) time — call once per epoch, not per batch.
-    fn snapshot(&self, py: Python<'_>) -> PyCsrGraph {
+    fn snapshot(&self, py: Python<'_>) -> PyResult<PyCsrGraph> {
         let inner = Arc::clone(&self.inner);
         // The O(V + E) collection touches no Python state; release the GIL so
         // other Python threads (e.g. concurrent inserters) keep running.
-        let graph = py.detach(move || {
-            let (offsets, edges) = inner.snapshot_csr();
-            Graph::from_csr_arrays(inner.num_vertices(), offsets, edges, None)
-        });
-        PyCsrGraph {
+        let graph = py
+            .detach(move || {
+                let (offsets, edges) = inner.snapshot_csr();
+                Graph::from_csr_arrays(inner.num_vertices(), offsets, edges, None)
+            })
+            .map_err(|e| crate::error::graph_load_error(format!("snapshot failed: {e}")))?;
+        Ok(PyCsrGraph {
             inner: Arc::new(graph),
-        }
+        })
     }
 
     fn __len__(&self) -> usize {
@@ -480,16 +489,18 @@ impl PyGraphSnapshot {
 
     /// Freeze this snapshot into a static CSR graph — an atomic cut at
     /// its commit, unlike DynamicGraph.snapshot() which reads live roots.
-    fn to_static(&self, py: Python<'_>) -> PyCsrGraph {
+    fn to_static(&self, py: Python<'_>) -> PyResult<PyCsrGraph> {
         let graph = Arc::clone(&self.graph);
         let snap = self.snap.clone();
-        let built = py.detach(move || {
-            let (offsets, edges) = snap.snapshot_csr(&graph);
-            Graph::from_csr_arrays(graph.num_vertices(), offsets, edges, None)
-        });
-        PyCsrGraph {
+        let built = py
+            .detach(move || {
+                let (offsets, edges) = snap.snapshot_csr(&graph);
+                Graph::from_csr_arrays(graph.num_vertices(), offsets, edges, None)
+            })
+            .map_err(|e| crate::error::graph_load_error(format!("snapshot failed: {e}")))?;
+        Ok(PyCsrGraph {
             inner: Arc::new(built),
-        }
+        })
     }
 
     fn __len__(&self) -> usize {

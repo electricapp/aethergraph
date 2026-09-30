@@ -52,10 +52,21 @@ use std::os::unix::io::AsRawFd;
 /// - O_DIRECT: Bypass page cache, requires aligned buffers
 /// - Registered FDs: Pre-register file descriptor for faster access
 pub struct AsyncFeatureStore {
-    /// File descriptor for the feature file (may be O_DIRECT on Linux)
+    /// Buffered descriptor the header was validated on. Every positional
+    /// read goes through it: an O_DIRECT descriptor would demand aligned
+    /// buffers that a plain `Vec` does not provide.
     file: Arc<File>,
 
-    /// Path to feature file
+    /// The same inode opened O_DIRECT, when the payload layout allows it.
+    /// Only the io_uring lanes read through it, into aligned landing slots.
+    #[cfg(target_os = "linux")]
+    direct: Option<Arc<File>>,
+
+    /// Set once the ring has failed in a way only positional reads can
+    /// serve — polled I/O the filesystem refuses (`EOPNOTSUPP`), or an
+    /// O_DIRECT alignment the device rejects (`EINVAL`).
+    #[cfg(target_os = "linux")]
+    ring_disabled: std::sync::atomic::AtomicBool,
 
     /// Number of nodes
     num_nodes: usize,
@@ -74,16 +85,12 @@ pub struct AsyncFeatureStore {
     #[cfg(target_os = "linux")]
     uring_pool: Option<Arc<crate::internal::uring::RingPool<crate::internal::uring::UringLane>>>,
 
-    /// Whether O_DIRECT is enabled (required for IOPOLL)
-    #[cfg(target_os = "linux")]
-    direct_io: bool,
-
     /// Optional NVMe passthrough backend. `Some` only when the feature is
     /// built, the store lives on an `/dev/ng*`-backed namespace, and its
     /// extents are stably mapped; consulted before the io_uring gather and
     /// silently skipped otherwise.
     #[cfg(all(target_os = "linux", feature = "nvme-passthru"))]
-    nvme: Option<Arc<parking_lot::Mutex<super::gather::NvmeGather>>>,
+    nvme: Option<Arc<super::gather::NvmeGather>>,
 
     /// Optional telemetry collector
     telemetry: Option<Arc<TelemetryCells>>,
@@ -106,59 +113,41 @@ impl AsyncFeatureStore {
                 .context("spawn_blocking failed")??
         };
         let header = parse_feature_header(&header_file)?;
+        let file_arc = Arc::new(header_file);
 
-        // On Linux, check if layout is O_DIRECT compatible before trying O_DIRECT
+        // On Linux, open a second, O_DIRECT descriptor for the ring when
+        // the layout allows it. Positional reads stay on the buffered one.
         #[cfg(target_os = "linux")]
-        let (std_file, direct_io) = {
-            use crate::internal::uring::{
-                DIRECT_IO_OFFSET_ALIGNMENT, direct_io_offset_alignment,
-                is_layout_direct_io_compatible_with,
-            };
+        let direct = {
+            use crate::internal::uring::{DirectIoAlignment, is_layout_direct_io_compatible_with};
 
-            // The device's real requirement, not the 512-byte floor — see
-            // `direct_io_offset_alignment`.
-            let alignment =
-                direct_io_offset_alignment(&header_file).unwrap_or(DIRECT_IO_OFFSET_ALIGNMENT);
-            let layout_compatible = is_layout_direct_io_compatible_with(
+            let alignment = DirectIoAlignment::probe(&file_arc);
+            if is_layout_direct_io_compatible_with(
                 header.features_start_offset,
                 header.feature_size,
                 alignment,
-            );
-
-            if layout_compatible {
-                // Layout is aligned, try O_DIRECT
-                drop(header_file);
+            ) {
                 let path_owned = path.to_path_buf();
-                let (f, direct) = tokio::task::spawn_blocking(move || {
-                    use crate::internal::uring::open_direct_or_fallback;
-                    open_direct_or_fallback(&path_owned)
-                })
-                .await
-                .context("spawn_blocking failed")??;
-                if direct {
-                    debug!(
-                        "Feature layout is O_DIRECT compatible (offset={}, size={})",
-                        header.features_start_offset, header.feature_size
-                    );
-                }
-                (f, direct)
+                let validated = Arc::clone(&file_arc);
+                tokio::task::spawn_blocking(move || open_direct_twin(&path_owned, &validated))
+                    .await
+                    .context("spawn_blocking failed")??
+                    .map(Arc::new)
             } else {
-                // Layout not aligned, O_DIRECT won't work. Use buffered I/O with SQPOLL only.
                 debug!(
                     "Feature layout not O_DIRECT compatible: offset={}, size={}",
                     header.features_start_offset, header.feature_size
                 );
-                (header_file, false)
+                None
             }
         };
-
-        #[cfg(not(target_os = "linux"))]
-        let std_file = header_file;
 
         #[cfg(target_os = "linux")]
         debug!(
             "Feature metadata: nodes={}, dims={}, O_DIRECT={}",
-            header.num_nodes, header.feature_dim, direct_io
+            header.num_nodes,
+            header.feature_dim,
+            direct.is_some()
         );
 
         #[cfg(not(target_os = "linux"))]
@@ -167,42 +156,35 @@ impl AsyncFeatureStore {
             header.num_nodes, header.feature_dim
         );
 
-        let file_arc = Arc::new(std_file);
-
         // Initialize io_uring pool (Linux only)
         #[cfg(target_os = "linux")]
-        let uring_pool = Self::setup_uring(&file_arc, direct_io);
+        let uring_pool = Self::setup_uring(direct.as_ref().unwrap_or(&file_arc));
 
         // Try the NVMe passthrough backend (feature-gated, runtime-probed).
         // Only meaningful for the O_DIRECT layout: the device reads share
         // the same LBA-alignment the direct path already guarantees.
         #[cfg(all(target_os = "linux", feature = "nvme-passthru"))]
-        let nvme = if direct_io {
-            match super::gather::NvmeGather::build(&file_arc) {
-                Ok(Some(g)) => {
-                    debug!("NVMe passthrough gather enabled");
-                    Some(Arc::new(parking_lot::Mutex::new(g)))
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    debug!("NVMe passthrough unavailable: {e}");
-                    None
-                }
-            }
+        let nvme = if let Some(direct_file) = &direct {
+            super::gather::NvmeGather::build(direct_file).map(|g| {
+                debug!("NVMe passthrough gather enabled");
+                Arc::new(g)
+            })
         } else {
             None
         };
 
         Ok(Self {
             file: file_arc,
+            #[cfg(target_os = "linux")]
+            direct,
+            #[cfg(target_os = "linux")]
+            ring_disabled: std::sync::atomic::AtomicBool::new(false),
             num_nodes: header.num_nodes,
             feature_dim: header.feature_dim,
             features_start_offset: header.features_start_offset,
             dtype: header.dtype,
             #[cfg(target_os = "linux")]
             uring_pool,
-            #[cfg(target_os = "linux")]
-            direct_io,
             #[cfg(all(target_os = "linux", feature = "nvme-passthru"))]
             nvme,
             telemetry: None,
@@ -221,7 +203,6 @@ impl AsyncFeatureStore {
     #[cfg(target_os = "linux")]
     fn setup_uring(
         file: &Arc<File>,
-        direct_io: bool,
     ) -> Option<Arc<crate::internal::uring::RingPool<crate::internal::uring::UringLane>>> {
         use crate::internal::uring::{RingPool, UringLane, create_owned_feature_uring};
 
@@ -230,7 +211,7 @@ impl AsyncFeatureStore {
             .unwrap_or(1);
         let file = Arc::clone(file);
         let pool = RingPool::new(pool_size, "aethergraph-feat-ring", move |idx| {
-            let mut handle = create_owned_feature_uring(direct_io)?;
+            let mut handle = create_owned_feature_uring(&file)?;
             if let Err(e) = handle.register_fd(&file) {
                 warn!("Failed to register FD on handle {}: {}", idx, e);
             }
@@ -341,14 +322,28 @@ impl AsyncFeatureStore {
         {
             // The pool round-robins across its own lanes, so there is no
             // index to carry here.
-            if let Some(ref uring_pool) = self.uring_pool {
-                all_features = self
+            let ring = self
+                .uring_pool
+                .as_ref()
+                .filter(|_| !self.ring_disabled.load(Ordering::Relaxed));
+            all_features = match ring {
+                Some(uring_pool) => match self
                     .batch_read_uring_blocking(nodes, feature_size, uring_pool)
-                    .await?;
-            } else {
-                self.prefetch_batch_range(nodes, feature_size);
-                all_features = self.batch_read_tokio(nodes, feature_size).await?;
-            }
+                    .await
+                {
+                    Ok(features) => features,
+                    Err(e) if crate::internal::uring::is_ring_unsupported(&e) => {
+                        warn!("io_uring cannot serve this feature file ({e:#}); using pread");
+                        self.ring_disabled.store(true, Ordering::Relaxed);
+                        self.batch_read_tokio(nodes, feature_size).await?
+                    }
+                    Err(e) => return Err(e),
+                },
+                None => {
+                    self.prefetch_batch_range(nodes, feature_size);
+                    self.batch_read_tokio(nodes, feature_size).await?
+                }
+            };
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -437,11 +432,12 @@ impl AsyncFeatureStore {
             );
         }
 
-        // Clone what the lane thread needs to own.
-        let file = Arc::clone(&self.file);
+        // Clone what the lane thread needs to own. The ring reads through
+        // the descriptor its lanes registered at setup.
+        let file = Arc::clone(self.direct.as_ref().unwrap_or(&self.file));
         let nodes = nodes.to_vec();
         let features_start_offset = self.features_start_offset;
-        let direct_io = self.direct_io;
+        let direct_io = self.direct.is_some();
         let dtype = self.dtype;
         let feature_dim = self.feature_dim;
         #[cfg(feature = "nvme-passthru")]
@@ -452,23 +448,22 @@ impl AsyncFeatureStore {
         let features = pool
             .submit(move |lane| {
                 // NVMe passthrough first when available: it lands rows in the
-                // lane's own aligned pool, so a fall-through to the io_uring
-                // gather reuses the same buffers. `Ok(None)` means a row wasn't
-                // LBA-resolvable — take the io_uring path for the whole batch.
+                // lane's own aligned pool through the lane's own reader, so a
+                // fall-through to the io_uring gather reuses the same buffers.
+                // `Ok(None)` sends the whole batch down the io_uring path.
                 #[cfg(feature = "nvme-passthru")]
-                if direct_io && let Some(nvme) = &nvme {
-                    let slots = lane.direct_pool(nodes.len(), feature_size)?;
-                    let mut backend = nvme.lock();
-                    if let Some(features) = backend.gather(
-                        slots,
+                if direct_io
+                    && let Some(nvme) = &nvme
+                    && let Some(features) = nvme.gather(
+                        lane,
                         &nodes,
                         features_start_offset,
                         feature_size,
                         dtype,
                         feature_dim,
-                    )? {
-                        return Ok(features);
-                    }
+                    )?
+                {
+                    return Ok(features);
                 }
 
                 super::gather::uring_gather_rows(
@@ -566,5 +561,109 @@ impl AsyncFeatureStore {
         }
 
         Ok(all_features)
+    }
+}
+
+/// Open `path` O_DIRECT as a second descriptor on the inode `validated`
+/// refers to. `None` when the filesystem refuses O_DIRECT; an error when
+/// the path now names a different file than the one whose header was
+/// parsed, since the parsed geometry would not describe it.
+#[cfg(target_os = "linux")]
+fn open_direct_twin(path: &Path, validated: &File) -> Result<Option<File>> {
+    use std::os::unix::fs::MetadataExt;
+    let (file, direct) = crate::internal::uring::open_direct_or_fallback(path)?;
+    if !direct {
+        return Ok(None);
+    }
+    let (want, got) = (validated.metadata()?, file.metadata()?);
+    anyhow::ensure!(
+        want.dev() == got.dev() && want.ino() == got.ino(),
+        "feature file {} was replaced while it was being opened",
+        path.display()
+    );
+    Ok(Some(file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::{save_features, save_features_bf16, save_features_f16};
+
+    fn rows(num_nodes: usize, dim: usize) -> Vec<f32> {
+        (0..num_nodes * dim)
+            .map(|i| i as f32 * 0.25 - 7.0)
+            .collect()
+    }
+
+    /// Every read path — single rows, batches with repeats, and whichever
+    /// tier the host selects (io_uring + O_DIRECT, buffered ring, pread) —
+    /// must agree with the source rows for every on-disk dtype.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gathers_match_the_source_for_every_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        // 128 f32 lanes = 512-byte rows: the O_DIRECT-compatible layout,
+        // so on Linux this also covers the aligned ring path.
+        let (num_nodes, dim) = (700usize, 128usize);
+        let src = rows(num_nodes, dim);
+        let nodes: Vec<NodeId> = vec![0, 699, 3, 3, 350, 1, 2, 698];
+
+        for (name, tol) in [("f32", 0.0f32), ("f16", 0.01), ("bf16", 0.05)] {
+            let path = dir.path().join(format!("{name}.bin"));
+            match name {
+                "f32" => save_features(&path, &src, num_nodes, dim).unwrap(),
+                "f16" => save_features_f16(&path, &src, num_nodes, dim).unwrap(),
+                _ => save_features_bf16(&path, &src, num_nodes, dim).unwrap(),
+            }
+            let store = AsyncFeatureStore::load(&path).await.unwrap();
+            assert_eq!((store.num_nodes(), store.feature_dim()), (num_nodes, dim));
+
+            let close = |got: &[f32], node: NodeId| {
+                let want = &src[node as usize * dim..(node as usize + 1) * dim];
+                got.iter()
+                    .zip(want)
+                    .all(|(g, w)| (g - w).abs() <= tol * w.abs().max(1.0))
+            };
+            for &node in &nodes {
+                let row = store.get(node).await.unwrap();
+                assert!(close(&row, node), "{name}: single row {node}");
+            }
+            let batch = store.get_batch(&nodes).await.unwrap();
+            assert_eq!(batch.len(), nodes.len() * dim);
+            for (i, &node) in nodes.iter().enumerate() {
+                assert!(
+                    close(&batch[i * dim..(i + 1) * dim], node),
+                    "{name}: batch row {i} (node {node})"
+                );
+            }
+        }
+    }
+
+    /// Rows that are not a multiple of any O_DIRECT alignment take the
+    /// buffered paths and must still read correctly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unaligned_rows_read_through_the_buffered_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let (num_nodes, dim) = (300usize, 3usize);
+        let src = rows(num_nodes, dim);
+        let path = dir.path().join("odd.bin");
+        save_features(&path, &src, num_nodes, dim).unwrap();
+
+        let store = AsyncFeatureStore::load(&path).await.unwrap();
+        assert_eq!(store.get(17).await.unwrap(), &src[51..54]);
+        let batch = store.get_batch(&[299, 0, 299]).await.unwrap();
+        assert_eq!(&batch[0..3], &src[897..900]);
+        assert_eq!(&batch[3..6], &src[0..3]);
+        assert_eq!(&batch[6..9], &src[897..900]);
+        assert!(store.get_batch(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn out_of_range_nodes_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        save_features(&path, rows(10, 128), 10, 128).unwrap();
+        let store = AsyncFeatureStore::load(&path).await.unwrap();
+        assert!(store.get(10).await.is_err());
+        assert!(store.get_batch(&[0, 10]).await.is_err());
     }
 }

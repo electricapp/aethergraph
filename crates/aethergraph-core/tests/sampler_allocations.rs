@@ -12,7 +12,7 @@
 //! same-shaped batches, a steady-state call performs no output-buffer regrowth
 //! at all.
 
-use aethergraph_core::{Graph, NeighborSampler, NodeId, SamplingConfig};
+use aethergraph_core::{Graph, NeighborSampler, NodeId, SamplingConfig, SubgraphType};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -80,48 +80,60 @@ fn build_graph() -> Graph {
 /// would not achieve that: sampling is randomized, so a call that produces one
 /// more element than the last would pay a full-array copy, on roughly half of
 /// all calls. The reserved headroom is what drives this to zero.
+///
+/// Bidirectional and induced subgraphs rewrite the edge arrays after
+/// sampling, so their buffers are sized from the rewritten length. One test
+/// covers all three because the realloc counter is process-global.
 #[test]
 fn steady_state_sampling_does_not_regrow_output_buffers() {
     let graph = build_graph();
-    let config = SamplingConfig {
-        fanout: vec![15, 10],
-        replace: false,
-        seed: Some(42),
-        ..Default::default()
-    };
-    let mut sampler = NeighborSampler::new(&graph, config);
+    let seeds: Vec<NodeId> = (0..2048).map(|i| (i * 97) % NUM_NODES as NodeId).collect();
 
-    let seeds: Vec<NodeId> = (0..1024).map(|i| (i * 97) % NUM_NODES as NodeId).collect();
+    for subgraph_type in [
+        SubgraphType::Directional,
+        SubgraphType::Bidirectional,
+        SubgraphType::Induced,
+    ] {
+        let config = SamplingConfig {
+            fanout: vec![15, 10],
+            replace: false,
+            seed: Some(42),
+            subgraph_type,
+            ..Default::default()
+        };
+        let mut sampler = NeighborSampler::new(&graph, config);
 
-    // Warm up outside the measured window. The output buffers are sized from
-    // the previous call and settle after one, but the internal scratch the
-    // sampler keeps across calls (the accumulating frontier) only reaches its
-    // high-water mark after a few batches have varied around it.
-    let warm = sampler.sample_neighbors(&seeds);
-    assert!(
-        warm.num_edges() > 50_000,
-        "batch too small to exercise regrowth: {} edges",
-        warm.num_edges(),
-    );
-    for _ in 0..8 {
-        let _ = sampler.sample_neighbors(&seeds);
+        // Warm up outside the measured window. The output buffers are sized
+        // from the previous call and settle after one, but the internal
+        // scratch the sampler keeps across calls (the frontiers) only
+        // reaches its high-water mark after a few batches have varied around
+        // it.
+        let warm = sampler.sample_neighbors(&seeds);
+        assert!(
+            warm.num_edges() > 50_000,
+            "{subgraph_type:?}: batch too small to exercise regrowth: {} edges",
+            warm.num_edges(),
+        );
+        for _ in 0..8 {
+            let _ = sampler.sample_neighbors(&seeds);
+        }
+
+        COUNTING.store(true, Ordering::Relaxed);
+        REALLOCS.store(0, Ordering::Relaxed);
+        let subgraph = sampler.sample_neighbors(&seeds);
+        COUNTING.store(false, Ordering::Relaxed);
+
+        let reallocs = REALLOCS.load(Ordering::Relaxed);
+        assert!(
+            subgraph.num_edges() > 50_000,
+            "{subgraph_type:?}: steady-state batch shrank unexpectedly: {} edges",
+            subgraph.num_edges(),
+        );
+        assert_eq!(
+            reallocs, 0,
+            "{subgraph_type:?}: steady-state sampling regrew output buffers \
+             {reallocs} times; the per-call buffers are not being sized from \
+             the previous call plus headroom",
+        );
     }
-
-    COUNTING.store(true, Ordering::Relaxed);
-    REALLOCS.store(0, Ordering::Relaxed);
-    let subgraph = sampler.sample_neighbors(&seeds);
-    COUNTING.store(false, Ordering::Relaxed);
-
-    let reallocs = REALLOCS.load(Ordering::Relaxed);
-    assert!(
-        subgraph.num_edges() > 50_000,
-        "steady-state batch shrank unexpectedly: {} edges",
-        subgraph.num_edges(),
-    );
-    assert_eq!(
-        reallocs, 0,
-        "steady-state sampling regrew output buffers {reallocs} times; the \
-         per-call buffers are not being sized from the previous call plus \
-         headroom",
-    );
 }

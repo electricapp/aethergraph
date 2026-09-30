@@ -45,6 +45,25 @@ pub trait MemoryHook: Send + Sync {
 
     /// Called once before the memory region is freed.
     fn on_dealloc(&self, ptr: *mut u8, size: usize);
+
+    /// Which byte range [`Self::on_alloc`] and [`Self::on_dealloc`] cover.
+    fn span(&self) -> HookSpan {
+        HookSpan::Slots
+    }
+}
+
+/// The range a [`MemoryHook`] is handed.
+///
+/// The huge-page path rounds the mapping up to 2 MiB, past the last slot.
+/// Registration (pinning, MRs) should cover only the slots; a policy that
+/// splits the VMA at the range's ends (`mbind`) must cover the whole
+/// mapping, because a hugetlb VMA cannot split inside a huge page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookSpan {
+    /// `[base, base + addressable_size)`: the slots.
+    Slots,
+    /// `[base, base + total_size)`: the whole mapping.
+    Mapping,
 }
 
 /// Error reported by a [`MemoryHook::on_alloc`] implementation.
@@ -413,28 +432,27 @@ impl FreeList {
     }
 }
 
-/// Ring buffer with pre-allocated slots.
+/// A page-aligned region of fixed-size slots addressed by position.
 ///
-/// Each slot can hold one frame of data. Slots are assigned from a free list
-/// and only recycled after explicit release.
+/// Owns the allocation (huge pages when the kernel grants them, regular
+/// pages otherwise) and the [`MemoryHook`]s registered on it. Tables that
+/// address slots by index — the RDMA feature table — use it directly; a
+/// [`SharedMemoryRing`] layers a free list on top for lease/release use.
 ///
 /// # Invariants
-/// - `slot_count` is always a power of two (for correct overflow handling)
-/// - `slot_size` is always a multiple of the slot alignment the ring was
-///   built with: the page size for [`SharedMemoryRing::new`] (the default,
-///   which UMEM/DMA callers rely on), or the caller's power-of-two stride
-///   for [`SharedMemoryRing::new_with_slot_align`]
-/// - `total_size` reflects the actual byte count passed to mmap/alloc, which
-///   may exceed `slot_count * slot_size` on the huge-page path due to the
-///   2 MiB rounding. Callers using `total_size` for FFI registration must
-///   pass the same value to deregistration.
+/// - `slot_size` is a multiple of the slot alignment the region was built
+///   with: the page size by default (which UMEM/DMA callers rely on), or the
+///   caller's power-of-two stride
+/// - `total_size` is the byte count passed to mmap/alloc, which may exceed
+///   `slot_count * slot_size` on the huge-page path due to the 2 MiB
+///   rounding. Callers using `total_size` for FFI registration must pass the
+///   same value to deregistration.
 ///
 /// # Thread Safety
-/// `Send + Sync` is derived from `SyncPtr`. The actual thread safety comes from:
-/// - The ring owns its memory exclusively
-/// - Slot access is controlled by free list + backpressure
-/// - Each slot is accessed by exactly one request at a time
-pub struct SharedMemoryRing {
+/// `Send + Sync` is derived from `SyncPtr`: the region owns its memory
+/// exclusively, and what callers store in the slots is theirs to
+/// synchronize.
+pub struct SlotRegion {
     /// Base pointer to the allocated memory region.
     ptr: SyncPtr,
     /// Bytes the OS gave us. May exceed `slot_count * slot_size` on the
@@ -443,53 +461,21 @@ pub struct SharedMemoryRing {
     /// Bytes covered by addressable slots. Always == `slot_count * slot_size`.
     addressable_size: usize,
     /// Actual slot size after alignment (>= requested size, a multiple of
-    /// the ring's slot alignment)
+    /// the region's slot alignment)
     slot_size: usize,
     /// Page alignment used for the allocation (`max(sysconf page, PAGE_SIZE)`).
     /// Stored so `Drop` reconstructs the exact `Layout` passed to `alloc`.
     page_align: usize,
-    /// Always a power of two
     slot_count: usize,
-    /// Lock-free index allocator over the slots.
-    free_list: FreeList,
     #[cfg(target_os = "linux")]
     uses_huge_pages: bool,
     /// Post-allocation hooks (CUDA pinning, mlock, etc.)
     hooks: Vec<Box<dyn MemoryHook>>,
 }
 
-/// Guard providing access to a specific ring buffer slot.
-///
-/// Implements [`Drop`]: releasing back to the free list happens automatically
-/// when the guard is dropped, so a panic between `acquire_slot` and the next
-/// `release_index` no longer leaks the slot.
-#[must_use = "RingSlot provides access to a pre-allocated buffer slot"]
-pub struct RingSlot<'a> {
-    ring: &'a SharedMemoryRing,
-    slot_index: usize,
-    data_len: usize,
-}
-
-impl SharedMemoryRing {
-    /// Create a new ring buffer.
-    ///
-    /// `slot_size` is rounded up to the OS page boundary (resolved via
-    /// `sysconf(_SC_PAGESIZE)`, never below 4 KiB). Total memory =
-    /// `slot_count * aligned_slot_size`.
-    ///
-    /// Returns the allocated ring along with a list of hook failures (if any
-    /// hook returned an error during registration). Hook failures do not
-    /// prevent allocation; callers can decide based on the failures.
-    pub fn new(
-        slot_count: usize,
-        slot_size: usize,
-        hooks: Vec<Box<dyn MemoryHook>>,
-    ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
-        Self::new_with_slot_align(slot_count, slot_size, None, hooks)
-    }
-
-    /// Create a ring whose slots are packed at `slot_align` stride instead
-    /// of page stride.
+impl SlotRegion {
+    /// Allocate `slot_count` slots of `slot_size` bytes, packed at
+    /// `slot_align` stride (`None` for page stride).
     ///
     /// Per-slot page alignment matters for DMA descriptors that address
     /// whole chunks (AF_XDP UMEM); a table that registers the region once
@@ -498,7 +484,11 @@ impl SharedMemoryRing {
     /// spent on dead padding. Pass `Some` power-of-two `slot_align` (e.g.
     /// 64 for cache-line slots), or `None` to use the page size. The
     /// backing allocation base remains page-aligned either way.
-    pub fn new_with_slot_align(
+    ///
+    /// Returns the region along with a list of hook failures (if any hook
+    /// returned an error during registration). Hook failures do not prevent
+    /// allocation; callers can decide based on the failures.
+    pub fn new(
         slot_count: usize,
         slot_size: usize,
         slot_align: Option<NonZeroUsize>,
@@ -506,16 +496,6 @@ impl SharedMemoryRing {
     ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
         if slot_count == 0 {
             return Err(RingBuilderError::InvalidSlotCount("slot_count must be > 0"));
-        }
-        if !slot_count.is_power_of_two() {
-            return Err(RingBuilderError::InvalidSlotCount(
-                "slot_count must be a power of two for correct overflow handling",
-            ));
-        }
-        if slot_count > u32::MAX as usize {
-            return Err(RingBuilderError::InvalidSlotCount(
-                "slot_count must fit in u32",
-            ));
         }
         if slot_size == 0 {
             return Err(RingBuilderError::InvalidSlotSize("slot_size must be > 0"));
@@ -551,7 +531,7 @@ impl SharedMemoryRing {
             requested_slot_size = slot_size,
             aligned_slot_size,
             total_mb = addressable_size / (1024 * 1024),
-            "Allocating shared memory ring buffer"
+            "Allocating shared memory region"
         );
 
         // Try huge pages on Linux; fall back to regular pages. Skipped under
@@ -583,27 +563,6 @@ impl SharedMemoryRing {
             page_align,
             hooks,
         )
-    }
-
-    /// Convenience: panics on builder error. Hook failures are non-fatal and
-    /// logged at `warn` level (when the `tracing` feature is enabled) so a
-    /// silently-unlocked or unpinned region is still observable. Callers that
-    /// must react to a failure should use [`Self::new`] and inspect the returned
-    /// list instead.
-    pub fn new_or_panic(
-        slot_count: usize,
-        slot_size: usize,
-        hooks: Vec<Box<dyn MemoryHook>>,
-    ) -> Self {
-        let (ring, failures) =
-            Self::new(slot_count, slot_size, hooks).expect("SharedMemoryRing::new failed");
-        for failure in &failures {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(error = %failure, "memory hook failed; region not registered");
-            #[cfg(not(feature = "tracing"))]
-            let _ = failure;
-        }
-        ring
     }
 
     /// Try to allocate using huge pages (Linux only).
@@ -659,37 +618,25 @@ impl SharedMemoryRing {
             prefault_pages(ptr.0.as_ptr(), num_pages, HUGE_PAGE_SIZE);
         }
 
-        // Pass `addressable_size` to hooks, NOT `alloc_size` — the slop bytes
-        // beyond addressable_size are not user-visible memory.
-        let mut failures = Vec::new();
-        for hook in &hooks {
-            if let Err(e) = hook.on_alloc(ptr.0.as_ptr(), addressable_size) {
-                failures.push(e);
-            }
-        }
-
         #[cfg(feature = "tracing")]
         tracing::info!(
             alloc_size,
             addressable_size,
-            "Ring buffer allocated with huge pages"
+            "Region allocated with huge pages"
         );
 
-        let free_list = FreeList::new(slot_count);
-        Ok((
-            Self {
-                ptr,
-                total_size: alloc_size,
-                addressable_size,
-                slot_size,
-                page_align,
-                slot_count,
-                free_list,
-                uses_huge_pages: true,
-                hooks,
-            },
-            failures,
-        ))
+        let region = Self {
+            ptr,
+            total_size: alloc_size,
+            addressable_size,
+            slot_size,
+            page_align,
+            slot_count,
+            uses_huge_pages: true,
+            hooks,
+        };
+        let failures = region.run_alloc_hooks();
+        Ok((region, failures))
     }
 
     /// Allocate using regular pages.
@@ -720,32 +667,234 @@ impl SharedMemoryRing {
         let num_pages = addressable_size / page_align;
         prefault_pages(ptr.0.as_ptr(), num_pages, page_align);
 
-        let mut failures = Vec::new();
-        for hook in &hooks {
-            if let Err(e) = hook.on_alloc(ptr.0.as_ptr(), addressable_size) {
-                failures.push(e);
-            }
+        #[cfg(feature = "tracing")]
+        tracing::info!(addressable_size, "Region allocated with regular pages");
+
+        let region = Self {
+            ptr,
+            total_size: addressable_size,
+            addressable_size,
+            slot_size,
+            page_align,
+            slot_count,
+            #[cfg(target_os = "linux")]
+            uses_huge_pages: false,
+            hooks,
+        };
+        let failures = region.run_alloc_hooks();
+        Ok((region, failures))
+    }
+
+    /// Bytes a hook of `span` covers.
+    fn span_len(&self, span: HookSpan) -> usize {
+        match span {
+            HookSpan::Slots => self.addressable_size,
+            HookSpan::Mapping => self.total_size,
+        }
+    }
+
+    fn run_alloc_hooks(&self) -> Vec<HookError> {
+        self.hooks
+            .iter()
+            .filter_map(|hook| {
+                hook.on_alloc(self.ptr.0.as_ptr(), self.span_len(hook.span()))
+                    .err()
+            })
+            .collect()
+    }
+
+    /// Pointer to slot `index`, unchecked.
+    #[inline]
+    fn slot_ptr_unchecked(&self, index: usize) -> *mut u8 {
+        debug_assert!(index < self.slot_count);
+        // SAFETY: callers pass `index < slot_count`, so the offset stays
+        // within the allocation.
+        unsafe { self.ptr.0.as_ptr().add(index * self.slot_size) }
+    }
+
+    /// Raw pointer to slot `index`.
+    ///
+    /// The full `slot_size` bytes are addressable and initialized (zeroed at
+    /// allocation). The pointer must not be used after the region drops.
+    ///
+    /// # Panics
+    /// Panics if `index >= slot_count`.
+    #[inline]
+    pub fn slot_ptr(&self, index: usize) -> *mut u8 {
+        assert!(
+            index < self.slot_count,
+            "slot index {index} out of range (slot_count {})",
+            self.slot_count
+        );
+        self.slot_ptr_unchecked(index)
+    }
+
+    /// Base address of the entire allocation.
+    #[inline]
+    pub fn base_addr(&self) -> *mut u8 {
+        self.ptr.0.as_ptr()
+    }
+
+    /// Total allocated byte count (may include alignment slop on huge pages).
+    /// For the user-visible region, see [`Self::addressable_size`].
+    pub fn total_size(&self) -> usize {
+        self.total_size
+    }
+
+    /// Bytes covered by addressable slots (`slot_count * slot_size`).
+    pub fn addressable_size(&self) -> usize {
+        self.addressable_size
+    }
+
+    /// Size of each slot (rounded up to the region's slot alignment, may be
+    /// larger than requested).
+    pub fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
+    /// Number of slots.
+    pub fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+}
+
+impl std::fmt::Debug for SlotRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotRegion")
+            .field("slot_count", &self.slot_count)
+            .field("slot_size", &self.slot_size)
+            .field("addressable_size", &self.addressable_size)
+            .field("total_size", &self.total_size)
+            .field("hooks", &self.hooks.len())
+            .finish()
+    }
+}
+
+#[allow(clippy::expect_used)]
+impl Drop for SlotRegion {
+    fn drop(&mut self) {
+        // Run pre-deallocation hooks (reverse order for LIFO cleanup)
+        for hook in self.hooks.iter().rev() {
+            hook.on_dealloc(self.ptr.0.as_ptr(), self.span_len(hook.span()));
         }
 
-        #[cfg(feature = "tracing")]
-        tracing::info!(addressable_size, "Ring buffer allocated with regular pages");
+        #[cfg(target_os = "linux")]
+        if self.uses_huge_pages {
+            // SAFETY: ptr was returned by mmap with `total_size` bytes.
+            unsafe {
+                libc::munmap(self.ptr.0.as_ptr() as *mut libc::c_void, self.total_size);
+            }
+            return;
+        }
 
-        let free_list = FreeList::new(slot_count);
+        let layout = std::alloc::Layout::from_size_align(self.addressable_size, self.page_align)
+            .expect("Invalid layout");
+        // SAFETY: ptr was allocated with this exact layout in try_alloc_regular.
+        unsafe {
+            std::alloc::dealloc(self.ptr.0.as_ptr(), layout);
+        }
+    }
+}
+
+/// Ring buffer with pre-allocated slots.
+///
+/// Each slot can hold one frame of data. Slots are assigned from a free list
+/// and only recycled after explicit release. The memory is a [`SlotRegion`].
+///
+/// # Invariants
+/// - `slot_count` is always a power of two (for correct overflow handling)
+///   and fits in `u32` (the free list's index width)
+/// - the region's invariants (slot alignment, `total_size`)
+///
+/// # Thread Safety
+/// Slot access is controlled by the free list + backpressure: each slot is
+/// accessed by exactly one lessee at a time.
+pub struct SharedMemoryRing {
+    region: SlotRegion,
+    /// Lock-free index allocator over the slots.
+    free_list: FreeList,
+}
+
+/// Guard providing access to a specific ring buffer slot.
+///
+/// Implements [`Drop`]: releasing back to the free list happens automatically
+/// when the guard is dropped, so a panic after `acquire_slot` can't leak the
+/// slot.
+#[must_use = "RingSlot provides access to a pre-allocated buffer slot"]
+pub struct RingSlot<'a> {
+    ring: &'a SharedMemoryRing,
+    slot_index: usize,
+    data_len: usize,
+}
+
+impl SharedMemoryRing {
+    /// Create a new ring buffer.
+    ///
+    /// `slot_size` is rounded up to the OS page boundary (resolved via
+    /// `sysconf(_SC_PAGESIZE)`, never below 4 KiB). Total memory =
+    /// `slot_count * aligned_slot_size`.
+    ///
+    /// Returns the allocated ring along with a list of hook failures (if any
+    /// hook returned an error during registration). Hook failures do not
+    /// prevent allocation; callers can decide based on the failures.
+    pub fn new(
+        slot_count: usize,
+        slot_size: usize,
+        hooks: Vec<Box<dyn MemoryHook>>,
+    ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
+        Self::new_with_slot_align(slot_count, slot_size, None, hooks)
+    }
+
+    /// Create a ring whose slots are packed at `slot_align` stride instead
+    /// of page stride. See [`SlotRegion::new`].
+    pub fn new_with_slot_align(
+        slot_count: usize,
+        slot_size: usize,
+        slot_align: Option<NonZeroUsize>,
+        hooks: Vec<Box<dyn MemoryHook>>,
+    ) -> Result<(Self, Vec<HookError>), RingBuilderError> {
+        if slot_count == 0 {
+            return Err(RingBuilderError::InvalidSlotCount("slot_count must be > 0"));
+        }
+        if !slot_count.is_power_of_two() {
+            return Err(RingBuilderError::InvalidSlotCount(
+                "slot_count must be a power of two for correct overflow handling",
+            ));
+        }
+        if slot_count > u32::MAX as usize {
+            return Err(RingBuilderError::InvalidSlotCount(
+                "slot_count must fit in u32",
+            ));
+        }
+        let (region, failures) = SlotRegion::new(slot_count, slot_size, slot_align, hooks)?;
         Ok((
             Self {
-                ptr,
-                total_size: addressable_size,
-                addressable_size,
-                slot_size,
-                page_align,
-                slot_count,
-                free_list,
-                #[cfg(target_os = "linux")]
-                uses_huge_pages: false,
-                hooks,
+                region,
+                free_list: FreeList::new(slot_count),
             },
             failures,
         ))
+    }
+
+    /// Convenience: panics on builder error. Hook failures are non-fatal and
+    /// logged at `warn` level (when the `tracing` feature is enabled) so a
+    /// silently-unlocked or unpinned region is still observable. Callers that
+    /// must react to a failure should use [`Self::new`] and inspect the returned
+    /// list instead.
+    pub fn new_or_panic(
+        slot_count: usize,
+        slot_size: usize,
+        hooks: Vec<Box<dyn MemoryHook>>,
+    ) -> Self {
+        let (ring, failures) =
+            Self::new(slot_count, slot_size, hooks).expect("SharedMemoryRing::new failed");
+        for failure in &failures {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(error = %failure, "memory hook failed; region not registered");
+            #[cfg(not(feature = "tracing"))]
+            let _ = failure;
+        }
+        ring
     }
 
     /// Acquire a slot. Returns a guard that auto-releases on drop.
@@ -786,14 +935,10 @@ impl SharedMemoryRing {
         self.free_list.release_many(indices);
     }
 
-    /// Get pointer to a specific slot.
+    /// Get pointer to a leased slot.
     #[inline]
     fn slot_ptr(&self, index: usize) -> *mut u8 {
-        debug_assert!(index < self.slot_count);
-        // SAFETY: callers pass indices leased from the free list (or already
-        // asserted in range by `slot_ptr_for_ffi`), so `index < slot_count`
-        // and the offset stays within the allocation.
-        unsafe { self.ptr.0.as_ptr().add(index * self.slot_size) }
+        self.region.slot_ptr_unchecked(index)
     }
 
     /// Get raw pointer to a specific slot for FFI use.
@@ -819,40 +964,35 @@ impl SharedMemoryRing {
     /// ```
     #[inline]
     pub fn slot_ptr_for_ffi(&self, index: usize) -> *mut u8 {
-        assert!(
-            index < self.slot_count,
-            "slot index {index} out of range (slot_count {})",
-            self.slot_count
-        );
-        self.slot_ptr(index)
+        self.region.slot_ptr(index)
     }
 
     /// Base address of the entire allocation.
     #[inline]
     pub fn base_addr(&self) -> *mut u8 {
-        self.ptr.0.as_ptr()
+        self.region.base_addr()
     }
 
     /// Total allocated byte count (may include alignment slop on huge pages).
     /// For the user-visible region, see [`Self::addressable_size`].
     pub fn total_size(&self) -> usize {
-        self.total_size
+        self.region.total_size()
     }
 
     /// Bytes covered by addressable slots (`slot_count * slot_size`).
     pub fn addressable_size(&self) -> usize {
-        self.addressable_size
+        self.region.addressable_size()
     }
 
     /// Size of each slot (rounded up to the ring's slot alignment, may be
     /// larger than requested).
     pub fn slot_size(&self) -> usize {
-        self.slot_size
+        self.region.slot_size()
     }
 
     /// Number of slots (always a power of two).
     pub fn slot_count(&self) -> usize {
-        self.slot_count
+        self.region.slot_count()
     }
 }
 
@@ -886,38 +1026,8 @@ fn prefault_pages(base: *mut u8, num_pages: usize, page_size: usize) {
 impl std::fmt::Debug for SharedMemoryRing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedMemoryRing")
-            .field("slot_count", &self.slot_count)
-            .field("slot_size", &self.slot_size)
-            .field("addressable_size", &self.addressable_size)
-            .field("total_size", &self.total_size)
-            .field("hooks", &self.hooks.len())
+            .field("region", &self.region)
             .finish()
-    }
-}
-
-#[allow(clippy::expect_used)]
-impl Drop for SharedMemoryRing {
-    fn drop(&mut self) {
-        // Run pre-deallocation hooks (reverse order for LIFO cleanup)
-        for hook in self.hooks.iter().rev() {
-            hook.on_dealloc(self.ptr.0.as_ptr(), self.addressable_size);
-        }
-
-        #[cfg(target_os = "linux")]
-        if self.uses_huge_pages {
-            // SAFETY: ptr was returned by mmap with `total_size` bytes.
-            unsafe {
-                libc::munmap(self.ptr.0.as_ptr() as *mut libc::c_void, self.total_size);
-            }
-            return;
-        }
-
-        let layout = std::alloc::Layout::from_size_align(self.addressable_size, self.page_align)
-            .expect("Invalid layout");
-        // SAFETY: ptr was allocated with this exact layout in try_alloc_regular.
-        unsafe {
-            std::alloc::dealloc(self.ptr.0.as_ptr(), layout);
-        }
     }
 }
 
@@ -927,10 +1037,10 @@ impl<'a> RingSlot<'a> {
     /// Copy data into this slot. Returns `Err` if `data.len() > slot_size`.
     #[inline]
     pub fn copy_from_slice(&mut self, data: &[u8]) -> Result<(), SlotOverflow> {
-        if data.len() > self.ring.slot_size {
+        if data.len() > self.ring.slot_size() {
             return Err(SlotOverflow {
                 requested: data.len(),
-                capacity: self.ring.slot_size,
+                capacity: self.ring.slot_size(),
             });
         }
         self.write_with(data.len(), |dst| {
@@ -955,10 +1065,10 @@ impl<'a> RingSlot<'a> {
     where
         F: FnOnce(*mut u8),
     {
-        if len > self.ring.slot_size {
+        if len > self.ring.slot_size() {
             return Err(SlotOverflow {
                 requested: len,
-                capacity: self.ring.slot_size,
+                capacity: self.ring.slot_size(),
             });
         }
 
@@ -1016,7 +1126,7 @@ impl<'a> RingSlot<'a> {
     /// Byte offset from ring start.
     #[inline]
     pub fn offset(&self) -> usize {
-        self.slot_index * self.ring.slot_size
+        self.slot_index * self.ring.slot_size()
     }
 
     /// Detach from automatic release; pass the returned [`DetachedSlot`] to
@@ -1509,6 +1619,85 @@ mod tests {
         }
 
         assert!(dealloc_called.load(Ordering::SeqCst));
+    }
+
+    /// Each hook sees the range its span names, on alloc and dealloc alike:
+    /// the slots for registration, the whole mapping for placement.
+    #[test]
+    fn hooks_receive_their_span() {
+        use std::sync::{Arc, Mutex};
+
+        struct SpanHook {
+            span: HookSpan,
+            seen: Arc<Mutex<Vec<usize>>>,
+        }
+
+        impl MemoryHook for SpanHook {
+            fn on_alloc(&self, _ptr: *mut u8, size: usize) -> Result<(), HookError> {
+                self.seen.lock().unwrap().push(size);
+                Ok(())
+            }
+
+            fn on_dealloc(&self, _ptr: *mut u8, size: usize) {
+                self.seen.lock().unwrap().push(size);
+            }
+
+            fn span(&self) -> HookSpan {
+                self.span
+            }
+        }
+
+        let slots = Arc::new(Mutex::new(Vec::new()));
+        let mapping = Arc::new(Mutex::new(Vec::new()));
+        let (addressable, total) = {
+            let (region, failures) = SlotRegion::new(
+                3,
+                100,
+                NonZeroUsize::new(64),
+                vec![
+                    Box::new(SpanHook {
+                        span: HookSpan::Slots,
+                        seen: slots.clone(),
+                    }),
+                    Box::new(SpanHook {
+                        span: HookSpan::Mapping,
+                        seen: mapping.clone(),
+                    }),
+                ],
+            )
+            .unwrap();
+            assert!(failures.is_empty());
+            (region.addressable_size(), region.total_size())
+        };
+        assert_eq!(addressable, 3 * 128);
+        assert!(total >= addressable);
+        assert_eq!(*slots.lock().unwrap(), vec![addressable, addressable]);
+        assert_eq!(*mapping.lock().unwrap(), vec![total, total]);
+    }
+
+    /// A positional region takes any slot count and packs it exactly — no
+    /// power-of-two rounding and no free list.
+    #[test]
+    fn slot_region_is_exactly_sized() {
+        let (region, _) = SlotRegion::new(5, 100, NonZeroUsize::new(64), vec![]).unwrap();
+        assert_eq!(region.slot_count(), 5);
+        assert_eq!(region.slot_size(), 128);
+        assert_eq!(region.addressable_size(), 5 * 128);
+        let base = region.base_addr() as usize;
+        for i in 0..5 {
+            assert_eq!(region.slot_ptr(i) as usize, base + i * 128);
+        }
+        // Zeroed at allocation.
+        // SAFETY: slot 4 is in range and `slot_size` bytes long.
+        let last = unsafe { std::slice::from_raw_parts(region.slot_ptr(4), 128) };
+        assert!(last.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn slot_region_bounds_positional_access() {
+        let (region, _) = SlotRegion::new(5, 100, NonZeroUsize::new(64), vec![]).unwrap();
+        let _ = region.slot_ptr(5);
     }
 
     #[test]

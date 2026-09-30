@@ -18,6 +18,10 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream, sys};
 
+/// Unit prefetch spans round out to: the GPU's big-page size, the smallest
+/// unit the UVM driver migrates as one piece on the device side.
+const PREFETCH_GRANULE: usize = 64 * 1024;
+
 /// A managed (unified-memory) feature matrix. Rows are `row_bytes` wide;
 /// a node ID maps to a byte range arithmetically. The whole matrix has a
 /// single virtual address valid on both host and device; the driver (and
@@ -54,6 +58,7 @@ impl ManagedFeatures {
             return Err(io::Error::other("managed features must be non-empty"));
         }
 
+        bind(ctx)?;
         let mut ptr: sys::CUdeviceptr = 0;
         // CU_MEM_ATTACH_GLOBAL = 1: the allocation is accessible from any
         // stream on any device.
@@ -99,13 +104,11 @@ impl ManagedFeatures {
     /// Prefetch the pages backing `rows` onto the device on `stream`, so
     /// they are resident before a kernel on the same stream reads them.
     ///
-    /// Rows are merged into contiguous runs and one prefetch is issued per
-    /// run. A feature row is far smaller than the migration granularity, so
-    /// a call per row would ask the driver to move the same page several
-    /// times over, and a sampled batch of thousands of rows would become
-    /// thousands of driver calls to migrate a handful of distinct pages.
-    /// Sorting first is what makes neighbouring rows adjacent; the batch is
-    /// usually near-sorted already, so it costs little.
+    /// Each row's span is rounded out to the migration granule and touching
+    /// spans merge, so one prefetch covers every row in a run of granules.
+    /// A feature row is far smaller than a granule and a sampled batch is
+    /// sparse, so merging only back-to-back rows would still issue about a
+    /// driver call per row and migrate shared granules several times over.
     ///
     /// Call this from the loader with the *next* batch's node IDs while the
     /// current batch computes.
@@ -113,6 +116,7 @@ impl ManagedFeatures {
         if rows.is_empty() {
             return Ok(());
         }
+        bind(&self.ctx)?;
         let cu_stream = stream.cu_stream();
 
         // Bounds-check every row before issuing anything: a rejection
@@ -130,7 +134,9 @@ impl ManagedFeatures {
             }
             sorted.push(start);
         }
-        for (start, len) in crate::span::coalesce_runs(&mut sorted, self.row_bytes) {
+        for (start, len) in
+            crate::span::coalesce_spans(&mut sorted, self.row_bytes, PREFETCH_GRANULE, self.len)
+        {
             self.prefetch_span(start, len, cu_stream)?;
         }
         Ok(())
@@ -148,6 +154,7 @@ impl ManagedFeatures {
     }
 
     fn advise(&self, advice: sys::CUmem_advise, device: sys::CUdevice) -> io::Result<()> {
+        bind(&self.ctx)?;
         // SAFETY: the range is the full managed allocation; `advice` and
         // `device` are valid enum / device values.
         let res = unsafe { sys::cuMemAdvise(self.ptr, self.len, advice, device) };
@@ -157,14 +164,23 @@ impl ManagedFeatures {
 
 impl Drop for ManagedFeatures {
     fn drop(&mut self) {
-        // Keep the context alive until after the free.
-        let _ctx = &self.ctx;
+        // The free needs this context current; a drop can land on any thread.
+        if let Err(e) = bind(&self.ctx) {
+            tracing::warn!(error = %e, "managed features: binding context for free failed");
+        }
         // SAFETY: `ptr` came from cuMemAllocManaged and is freed once.
         let res = unsafe { sys::cuMemFree_v2(self.ptr) };
         if res != sys::CUresult::CUDA_SUCCESS {
             tracing::warn!(?res, "cuMemFree on managed features failed");
         }
     }
+}
+
+/// Make `ctx` current on the calling thread. Raw driver calls act on the
+/// current context, and a call from Python can arrive on any thread.
+fn bind(ctx: &CudaContext) -> io::Result<()> {
+    ctx.bind_to_thread()
+        .map_err(|e| io::Error::other(format!("cuCtxSetCurrent failed: {e:?}")))
 }
 
 fn cuda_ok(res: sys::CUresult, what: &str) -> io::Result<()> {

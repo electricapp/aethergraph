@@ -81,6 +81,7 @@ impl ImportedVram {
         fd: OwnedFd,
         size: usize,
     ) -> io::Result<Self> {
+        bind(ctx)?;
         let mut handle: sys::CUmemGenericAllocationHandle = 0;
         // SAFETY: `fd` is a valid CUDA POSIX-fd shareable handle per the
         // caller's contract; `handle` is a valid out-pointer.
@@ -165,15 +166,34 @@ impl ImportedVram {
 
 impl Drop for ImportedVram {
     fn drop(&mut self) {
-        let _ctx = &self.ctx;
+        // Teardown needs this context current; a drop can land on any thread.
+        if let Err(e) = bind(&self.ctx) {
+            tracing::warn!(error = %e, "imported VRAM: binding context for teardown failed");
+        }
         // SAFETY: `base`/`size` is the mapped range this struct owns;
         // unmapped once.
-        unsafe { sys::cuMemUnmap(self.base, self.size) };
+        let unmap = unsafe { sys::cuMemUnmap(self.base, self.size) };
         // SAFETY: `base`/`size` is this struct's reservation; freed once.
-        unsafe { sys::cuMemAddressFree(self.base, self.size) };
+        let free = unsafe { sys::cuMemAddressFree(self.base, self.size) };
         // SAFETY: `handle` is the imported allocation; released once.
-        unsafe { sys::cuMemRelease(self.handle) };
+        let release = unsafe { sys::cuMemRelease(self.handle) };
+        for (what, res) in [
+            ("cuMemUnmap", unmap),
+            ("cuMemAddressFree", free),
+            ("cuMemRelease", release),
+        ] {
+            if let Err(e) = cuda_ok(res, what) {
+                tracing::warn!(error = %e, "imported VRAM teardown");
+            }
+        }
     }
+}
+
+/// Make `ctx` current on the calling thread. Raw driver calls act on the
+/// current context, and a call from Python can arrive on any thread.
+fn bind(ctx: &CudaContext) -> io::Result<()> {
+    ctx.bind_to_thread()
+        .map_err(|e| io::Error::other(format!("cuCtxSetCurrent failed: {e:?}")))
 }
 
 fn cuda_ok(res: sys::CUresult, what: &str) -> io::Result<()> {

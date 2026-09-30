@@ -92,7 +92,7 @@ def train_batch(
 
     optimizer.zero_grad()
     out = model(data.x, data.edge_index)
-    seed_idx = data.input_id
+    seed_idx = data.seed_index
     loss = F.cross_entropy(out[seed_idx], batch_labels[seed_idx])
     loss.backward()  # type: ignore[no-untyped-call]
     optimizer.step()
@@ -217,7 +217,7 @@ def main() -> None:
             data = collate_to_pyg(batch).to(device)
             batch_labels = labels[data.n_id].to(device)
             logits = model(data.x, data.edge_index)
-            seed_idx = data.input_id
+            seed_idx = data.seed_index
             pred = logits[seed_idx].argmax(dim=1)
             correct += (pred == batch_labels[seed_idx]).sum().item()
             total += int(seed_idx.numel())

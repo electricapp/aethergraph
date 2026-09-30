@@ -5,6 +5,11 @@ use super::rings::{RxTxDesc, UmemDesc, XdpMmapOffsets, XdpRing};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// UMEM registration struct passed to `setsockopt(XDP_UMEM_REG)`.
+///
+/// Mirrors the kernel's full `struct xdp_umem_reg`, trailing field included:
+/// the size we pass tells the kernel which layout to read, and a kernel that
+/// knows `tx_metadata_len` reads it from those bytes, so they must be a
+/// real zero rather than padding.
 #[repr(C)]
 #[derive(Debug)]
 pub struct XdpUmemReg {
@@ -18,7 +23,11 @@ pub struct XdpUmemReg {
     pub headroom: u32,
     /// Flags (reserved, set to 0).
     pub flags: u32,
+    /// TX metadata area reserved ahead of each frame (0: none).
+    pub tx_metadata_len: u32,
 }
+
+const _: () = assert!(size_of::<XdpUmemReg>() == 32);
 
 /// Address passed to `bind()` for AF_XDP.
 #[repr(C)]
@@ -114,6 +123,7 @@ impl XdpSocket {
             chunk_size: frame_size,
             headroom: 0,
             flags: 0,
+            tx_metadata_len: 0,
         };
         setsockopt_xdp(
             fd.as_raw_fd(),

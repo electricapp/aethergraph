@@ -298,13 +298,13 @@ fn t1_5_control_plane_qp_exchange() {
     }
 
     let client_ctx = RdmaContext::open(64, ROCE_V2_GID_INDEX).expect("client open");
-    let (got_adv, _client_qp) = connect_with_qp(&bind_addr, &client_ctx).expect("connect_with_qp");
+    let (remote, _client_qp) = connect_with_qp(&bind_addr, &client_ctx).expect("connect_with_qp");
 
-    assert_eq!(got_adv.base_addr, adv.base_addr, "advertised base_addr");
-    assert_eq!(got_adv.rkey, adv.rkey, "advertised rkey");
-    assert_eq!(got_adv.schema.node_count, NODE_COUNT);
-    assert_eq!(got_adv.schema.feature_dim, FEATURE_DIM);
-    assert_eq!(got_adv.schema.slot_size, adv.schema.slot_size);
+    assert_eq!(remote.base_addr(), adv.base_addr, "advertised base_addr");
+    assert_eq!(remote.rkey(), adv.rkey, "advertised rkey");
+    assert_eq!(remote.node_count(), NODE_COUNT as u64);
+    assert_eq!(remote.geometry().feature_dim(), FEATURE_DIM);
+    assert_eq!(remote.geometry().stride(), adv.schema.slot_size);
 
     drop(server_mr); // explicit dereg before context goes out of scope
     // Server thread is left running (listener loop). It dies with the process.
@@ -768,16 +768,16 @@ fn srq_shared_sentinel_pool_across_qps() {
     let server_qp_a = RdmaQp::create_with_cqs_srq(
         &server_ctx,
         &DEFAULT_QP_CAP,
-        server_ctx.cq,
-        server_ctx.cq,
+        server_ctx.cq(),
+        server_ctx.cq(),
         &srq,
     )
     .expect("server qp a");
     let server_qp_b = RdmaQp::create_with_cqs_srq(
         &server_ctx,
         &DEFAULT_QP_CAP,
-        server_ctx.cq,
-        server_ctx.cq,
+        server_ctx.cq(),
+        server_ctx.cq(),
         &srq,
     )
     .expect("server qp b");
@@ -905,8 +905,7 @@ fn cq_event_channel_wakeup() {
 
     let server_qp = RdmaQp::create(&server_ctx, &DEFAULT_QP_CAP).expect("server qp");
     let client_qp =
-        RdmaQp::create_with_cqs(&client_ctx, &DEFAULT_QP_CAP, ev_cq.as_ptr(), ev_cq.as_ptr())
-            .expect("client qp");
+        RdmaQp::create_with_cqs(&client_ctx, &DEFAULT_QP_CAP, &ev_cq, &ev_cq).expect("client qp");
     server_qp
         .connect(&server_ctx, &client_qp.endpoint(&client_ctx))
         .unwrap();
@@ -1026,9 +1025,12 @@ fn odp_caps_probe_and_on_demand_read() {
 
     // Implicit ODP where offered: whole-address-space registration.
     if caps.implicit() {
-        let implicit_mr = server_ctx
-            .reg_mr_implicit_odp(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ)
-            .expect("implicit ODP reg_mr");
+        // SAFETY: no WR is posted against the implicit MR, and its rkey
+        // never leaves this test.
+        let implicit_mr = unsafe {
+            server_ctx.reg_mr_implicit_odp(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ)
+        }
+        .expect("implicit ODP reg_mr");
         assert_ne!(implicit_mr.rkey(), 0);
         drop(implicit_mr);
     }

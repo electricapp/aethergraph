@@ -18,6 +18,8 @@
 #![cfg(all(target_os = "linux", feature = "gpudirect"))]
 
 use aether_stream::gpu::kernel::SeqlockValidator;
+use aether_stream::gpu::kernels::validate::StagingRegions;
+use aether_stream::rdma::layout::SlotGeometry;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtrMut};
 
 /// feature_dim chosen small so the test is easy to read. Geometry comes from
@@ -86,12 +88,15 @@ fn seqlock_kernel_flags_torn_and_compacts_valid() {
     };
     let staging2_ptr = staging1_ptr + (SLOT_SIZE * BATCH) as u64;
 
-    let mut validator = SeqlockValidator::new(&ctx, &stream, BATCH, FEATURE_DIM)
+    let geometry = SlotGeometry::new(FEATURE_DIM, SLOT_SIZE).expect("slot geometry");
+    // SAFETY: `staging` holds both regions of BATCH slots at SLOT_SIZE and
+    // outlives every validate below.
+    let regions = unsafe { StagingRegions::new(staging1_ptr, staging2_ptr, BATCH, geometry) }
+        .expect("staging regions");
+    let mut validator = SeqlockValidator::new(&ctx, &stream, BATCH, &geometry)
         .expect("SeqlockValidator nvrtc compile");
 
-    let retry_count = validator
-        .validate(staging1_ptr, staging2_ptr, SLOT_SIZE, BATCH)
-        .expect("kernel launch");
+    let retry_count = validator.validate(&regions, BATCH).expect("kernel launch");
     assert_eq!(retry_count, 3, "expected 3 torn slots flagged");
 
     let retry_indices = validator
@@ -123,8 +128,10 @@ fn seqlock_kernel_flags_torn_and_compacts_valid() {
 #[test]
 fn seqlock_kernel_replays_cuda_graph_on_second_validate() {
     // K5.0: first validate captures; second with the same signature replays.
+    // Capture needs a real stream; the legacy default stream cannot be
+    // captured.
     let ctx = CudaContext::new(0).expect("CUDA init — check nvidia-smi + driver");
-    let stream = ctx.default_stream();
+    let stream = ctx.new_stream().expect("stream");
 
     let snap = pack_slot(2, [1.0, 2.0, 3.0, 4.0], 2);
     let mut host = Vec::with_capacity(SLOT_SIZE * BATCH * 2);
@@ -145,12 +152,17 @@ fn seqlock_kernel_replays_cuda_graph_on_second_validate() {
     };
     let staging2_ptr = staging1_ptr + (SLOT_SIZE * BATCH) as u64;
 
-    let mut validator = SeqlockValidator::new(&ctx, &stream, BATCH, FEATURE_DIM)
+    let geometry = SlotGeometry::new(FEATURE_DIM, SLOT_SIZE).expect("slot geometry");
+    // SAFETY: `staging` holds both regions of BATCH slots at SLOT_SIZE and
+    // outlives every validate below.
+    let regions = unsafe { StagingRegions::new(staging1_ptr, staging2_ptr, BATCH, geometry) }
+        .expect("staging regions");
+    let mut validator = SeqlockValidator::new(&ctx, &stream, BATCH, &geometry)
         .expect("SeqlockValidator nvrtc compile");
     assert!(!validator.has_captured_graph());
 
     let r1 = validator
-        .validate(staging1_ptr, staging2_ptr, SLOT_SIZE, BATCH)
+        .validate(&regions, BATCH)
         .expect("first validate (capture)");
     assert_eq!(r1, 0);
     // Capture is best-effort — mapped host retry_count and some driver stacks
@@ -159,7 +171,7 @@ fn seqlock_kernel_replays_cuda_graph_on_second_validate() {
     if !validator.has_captured_graph() {
         eprintln!("note: CUDA graph capture fell back to eager validate");
         let r2 = validator
-            .validate(staging1_ptr, staging2_ptr, SLOT_SIZE, BATCH)
+            .validate(&regions, BATCH)
             .expect("second validate (eager)");
         assert_eq!(r2, 0);
         return;
@@ -167,7 +179,7 @@ fn seqlock_kernel_replays_cuda_graph_on_second_validate() {
     let _ = validator.has_mapped_retry_count();
 
     let r2 = validator
-        .validate(staging1_ptr, staging2_ptr, SLOT_SIZE, BATCH)
+        .validate(&regions, BATCH)
         .expect("second validate (replay)");
     assert_eq!(r2, 0);
     assert!(validator.has_captured_graph());

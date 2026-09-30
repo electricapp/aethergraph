@@ -234,11 +234,18 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
 
     let umem_for_ingest = Arc::clone(&umem);
     let tx_for_ingest = tx.clone();
-    let _ingest = std::thread::spawn(move || {
+    let stop_for_ingest = Arc::clone(&stop);
+    let ingest = std::thread::spawn(move || {
         let config = IngestConfig::default();
-        // ingest_loop returns when the channel disconnects — we drop `tx`
-        // after the test body to trigger that.
-        ingest_loop(&mut socket, &umem_for_ingest, &tx_for_ingest, &config);
+        // Returns once `stop` is raised after the test body, even with the
+        // queue idle.
+        ingest_loop(
+            &mut socket,
+            &umem_for_ingest,
+            &tx_for_ingest,
+            &config,
+            &stop_for_ingest,
+        );
     });
     // Let the ingest thread run its initial FILL-ring pass before frames
     // start arriving; anything redirected before that is silently dropped.
@@ -307,6 +314,7 @@ fn udp_packets_flow_through_xdp_into_feature_table() {
 
     stop.store(true, Ordering::Relaxed);
     drop(tx);
+    ingest.join().expect("ingest thread");
 
     assert_eq!(
         received, NUM_PACKETS,

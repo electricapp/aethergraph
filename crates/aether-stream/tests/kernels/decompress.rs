@@ -1,5 +1,7 @@
 use aether_stream::gpu::kernels::harness::cuda_or_skip;
-use aether_stream::gpu::kernels::{EliasFanoDecoder, EliasFanoDeviceParts, StreamVByteDecoder};
+use aether_stream::gpu::kernels::{
+    EliasFanoDecoder, EliasFanoDeviceParts, StreamVByteDecoder, StreamVByteDevice,
+};
 use aethergraph_core::{EliasFano, StreamVByte};
 
 #[test]
@@ -8,25 +10,14 @@ fn streamvbyte_device_matches_cpu() {
         eprintln!("skipping: no CUDA device");
         return;
     };
-    let values = [10u32, 11, 311, 313];
+    // Crosses a 32-delta wave and mixes 1- to 4-byte deltas.
+    let values: Vec<u32> = (0..100u32).map(|i| i * i * 997 + (i << 20)).collect();
     let svb = StreamVByte::encode_deltas(&values);
     let expect = svb.decode();
 
-    // SAFETY: `alloc` returns uninitialized device memory; the memcpys below
-    // fill both buffers before the decoder reads them, and neither is read
-    // host-side.
-    let mut d_ctrl = unsafe { stream.alloc::<u8>(svb.control().len().max(1)).unwrap() };
-    // SAFETY: as above.
-    let mut d_data = unsafe { stream.alloc::<u8>(svb.data().len().max(1)).unwrap() };
-    if !svb.control().is_empty() {
-        stream.memcpy_htod(svb.control(), &mut d_ctrl).unwrap();
-    }
-    if !svb.data().is_empty() {
-        stream.memcpy_htod(svb.data(), &mut d_data).unwrap();
-    }
+    let src = StreamVByteDevice::upload(&stream, &svb).unwrap();
     let mut dec = StreamVByteDecoder::new(&ctx, &stream, values.len()).unwrap();
-    dec.decode(&d_ctrl, &d_data, values.len(), svb.first())
-        .unwrap();
+    dec.decode(&src).unwrap();
     stream.synchronize().unwrap();
     let mut got = vec![0u32; values.len()];
     stream

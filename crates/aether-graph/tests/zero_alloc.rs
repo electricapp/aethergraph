@@ -20,14 +20,17 @@ use aether_graph::DynamicGraph;
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static HEAP_OPS: Cell<usize> = const { Cell::new(0) };
+    static HEAP_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Count one heap operation against the current thread when it is armed.
-/// Const-initialized thread-locals never allocate on first access, so this is
-/// safe to call from inside the global allocator without re-entry.
-fn record() {
+/// Count one heap operation of `bytes` against the current thread when it
+/// is armed. Const-initialized thread-locals never allocate on first
+/// access, so this is safe to call from inside the global allocator
+/// without re-entry.
+fn record(bytes: usize) {
     if ARMED.with(Cell::get) {
         HEAP_OPS.with(|c| c.set(c.get() + 1));
+        HEAP_BYTES.with(|c| c.set(c.get() + bytes));
     }
 }
 
@@ -39,7 +42,7 @@ struct CountingAllocator;
 // allocation soundness.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        record();
+        record(layout.size());
         // SAFETY: `layout` is forwarded unchanged from the caller.
         unsafe { System.alloc(layout) }
     }
@@ -51,7 +54,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        record();
+        record(new_size);
         // SAFETY: arguments are forwarded unchanged from the caller.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -72,6 +75,47 @@ fn assert_no_alloc<R>(what: &str, f: impl FnOnce() -> R) -> R {
         "{what} performed {observed} heap allocation(s)"
     );
     out
+}
+
+/// Run `f` with allocation counting armed and return the bytes it allocated.
+fn bytes_allocated<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    let start = HEAP_BYTES.with(Cell::get);
+    ARMED.with(|a| a.set(true));
+    let out = f();
+    ARMED.with(|a| a.set(false));
+    (out, HEAP_BYTES.with(Cell::get) - start)
+}
+
+/// A guard that commits nothing reuses the graph's parked writer buffers.
+#[test]
+fn empty_guard_lifecycle_is_allocation_free() {
+    let g = DynamicGraph::new(1 << 20, 1 << 20);
+    // The first guard may warm anything lazily initialized.
+    drop(g.writer().unwrap());
+    assert_no_alloc("writer acquire + commit", || {
+        for _ in 0..100 {
+            drop(g.writer().unwrap());
+        }
+    });
+}
+
+/// A one-edge commit copies the root-table path it touched, not a share of
+/// the whole table: its heap traffic must not scale with the vertex count.
+#[test]
+fn one_edge_commit_cost_is_independent_of_vertex_count() {
+    let g = DynamicGraph::new(8 << 20, 1 << 20);
+    {
+        let mut w = g.writer().unwrap();
+        w.insert_edge(0, 1).unwrap();
+    }
+    let ((), bytes) = bytes_allocated(|| {
+        let mut w = g.writer().unwrap();
+        w.insert_edge(4_000_000, 7).unwrap();
+    });
+    assert!(
+        bytes < 16 << 10,
+        "one-edge commit allocated {bytes} bytes on an 8M-vertex graph"
+    );
 }
 
 /// The guard itself must observe allocations, otherwise the other tests are

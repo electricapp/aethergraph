@@ -1,0 +1,21 @@
+# K5.3: a reader that copies a payload word from a new write must see that
+# write's odd head when it re-loads head after the copy.
+#
+# x = head (published 2, writer takes it odd to 3), d = payload word. The
+# writer fences between its odd head and its payload store; the reader
+# fences between its payload load and its head re-load. Accepting r1=1 with
+# an unchanged head (r2=2) is exactly a torn row.
+
+AetherSeqlockPayloadRecheck
+
+{
+  x=2; d=0;
+}
+
+P0          | P1          ;
+wrlx x 3    | racq r0 x   ;
+fence.rel   | rrlx r1 d   ;
+wrlx d 1    | fence.acq   ;
+wrel x 4    | racq r2 x   ;
+
+exists (P1:r0=2 /\ P1:r1=1 /\ P1:r2=2)

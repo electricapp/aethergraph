@@ -17,7 +17,8 @@
 //! Note: We don't use O_DIRECT/IOPOLL for graph reads since adjacency lists are
 //! variable-sized, making buffer alignment complex. SQPOLL still provides benefits.
 
-use super::csr::{EdgeOffset, NodeId};
+use super::csr::{EdgeOffset, MAX_NODES, NodeId, alloc_hinted};
+use crate::internal::mmap::MAX_EDGES;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs::File;
@@ -38,10 +39,6 @@ const HEADER_SIZE: usize = 32;
 const GRAPH_MAGIC: u32 = 0x4145_5448;
 /// Supported graph file format version.
 const GRAPH_VERSION: u32 = 1;
-/// Defensive cap against malformed headers.
-const MAX_NODES: u64 = 10_000_000_000;
-/// Defensive cap against malformed headers.
-const MAX_EDGES: u64 = 100_000_000_000;
 
 /// Async CSR graph backed by NVMe storage with io_uring.
 ///
@@ -87,17 +84,22 @@ pub struct AsyncCsrGraph {
 impl AsyncCsrGraph {
     /// Load graph from disk for async access.
     ///
-    /// Reads the offsets array into memory (small), keeps file open for
-    /// async neighbor reads via io_uring.
+    /// Reads the offsets array into memory, keeps the file open for async
+    /// neighbor reads via io_uring. The open, the offsets read (8 GB for a
+    /// billion nodes), its validation, and the ring setup all run on the
+    /// blocking pool, never on a runtime worker.
     pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || Self::load_blocking(&path))
+            .await
+            .context("graph load task failed")?
+    }
+
+    fn load_blocking(path: &Path) -> Result<Self> {
         debug!("Loading async graph from {}", path.display());
 
-        // Open file (regular, not O_DIRECT - variable-sized reads make alignment complex)
-        let path_owned = path.to_path_buf();
-        let std_file = tokio::task::spawn_blocking(move || File::open(&path_owned))
-            .await
-            .context("spawn_blocking failed")??;
+        // Regular open, not O_DIRECT: variable-sized reads make alignment complex.
+        let std_file = File::open(path).context("failed to open graph file")?;
 
         // Read header using pread
         let mut header = [0u8; HEADER_SIZE];
@@ -121,7 +123,7 @@ impl AsyncCsrGraph {
         let num_edges_u64 = u64::from_le_bytes(header[16..24].try_into()?);
         let _has_weights = u32::from_le_bytes(header[24..28].try_into()?) != 0;
         anyhow::ensure!(
-            num_nodes_u64 <= MAX_NODES,
+            num_nodes_u64 <= MAX_NODES as u64,
             "num_nodes {num_nodes_u64} exceeds maximum {MAX_NODES}"
         );
         anyhow::ensure!(
@@ -174,7 +176,7 @@ impl AsyncCsrGraph {
                 "graph file is little-endian"
             );
         };
-        let mut offsets: Vec<EdgeOffset> = vec![0; num_nodes + 1];
+        let mut offsets: Vec<EdgeOffset> = alloc_hinted(num_nodes + 1);
         {
             let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut offsets[..]);
             debug_assert_eq!(bytes.len(), offsets_size);
@@ -310,9 +312,8 @@ impl AsyncCsrGraph {
         if idx >= self.num_nodes {
             return 0;
         }
-        // saturating_sub mirrors the sync `Graph::degree`: it keeps a
-        // non-monotonic offsets pair from underflowing into a huge degree.
-        self.offsets[idx + 1].saturating_sub(self.offsets[idx]) as usize
+        // Offsets were proven monotone at load.
+        (self.offsets[idx + 1] - self.offsets[idx]) as usize
     }
 
     /// Async read neighbors for a single node from NVMe.
@@ -327,7 +328,7 @@ impl AsyncCsrGraph {
 
         let start_edge = self.offsets[idx] as usize;
         let end_edge = self.offsets[idx + 1] as usize;
-        let num_neighbors = end_edge.saturating_sub(start_edge);
+        let num_neighbors = end_edge - start_edge;
 
         if num_neighbors == 0 {
             return Ok(Vec::new());
@@ -415,7 +416,7 @@ impl AsyncCsrGraph {
 
                     let start_edge = offsets[idx] as usize;
                     let end_edge = offsets[idx + 1] as usize;
-                    let num_neighbors = end_edge.saturating_sub(start_edge);
+                    let num_neighbors = end_edge - start_edge;
 
                     if num_neighbors == 0 {
                         results.push(Vec::new());
@@ -442,7 +443,7 @@ impl AsyncCsrGraph {
                 // allocation, which lives until this closure returns;
                 // batch_read reaps every submitted completion before returning
                 // — on success AND on error.
-                crate::internal::uring::batch_read(handle, fd, &reads)?;
+                unsafe { crate::internal::uring::batch_read(handle, fd, &reads)? };
                 trace!("Completed {} reads via io_uring", reads.len());
 
                 Ok::<_, anyhow::Error>(results)
@@ -494,7 +495,7 @@ impl AsyncCsrGraph {
 
                         let start_edge = offsets[idx] as usize;
                         let end_edge = offsets[idx + 1] as usize;
-                        let num_neighbors = end_edge.saturating_sub(start_edge);
+                        let num_neighbors = end_edge - start_edge;
 
                         if num_neighbors == 0 {
                             out.push(Vec::new());

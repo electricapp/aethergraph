@@ -52,9 +52,14 @@ pub struct BamQueuePair {
 }
 
 impl BamQueuePair {
-    /// `depth` must be a non-zero power of two (NVMe queue size = depth).
+    /// Largest NVMe I/O queue a controller can expose (`CAP.MQES` is a
+    /// zero-based 16-bit field).
+    pub const MAX_DEPTH: u32 = 1 << 16;
+
+    /// `depth` must be a non-zero power of two no larger than
+    /// [`Self::MAX_DEPTH`] (NVMe queue size = depth).
     pub fn new(qid: u16, depth: u32) -> Option<Self> {
-        if depth == 0 || !depth.is_power_of_two() {
+        if depth == 0 || !depth.is_power_of_two() || depth > Self::MAX_DEPTH {
             return None;
         }
         Some(Self {
@@ -106,12 +111,41 @@ impl BamQueuePair {
         self.cq_head.fetch_add(n, Ordering::Release);
     }
 
-    /// Masked doorbell value (NVMe uses the raw tail counter modulo 2^16
-    /// for queue sizes ≤ 64K; we keep the full counter and let callers
-    /// truncate).
+    /// The SQ tail doorbell value for the current tail counter.
     pub fn doorbell_tail(&self) -> u16 {
-        (self.sq_tail.load(Ordering::Acquire) & 0xffff) as u16
+        self.doorbell_value(self.sq_tail.load(Ordering::Acquire))
     }
+
+    /// The doorbell value for tail counter `tail`: the slot index the next
+    /// submission will use. NVMe requires it to be below the queue size;
+    /// the controller treats anything else as an invalid doorbell write
+    /// and disables the queue.
+    fn doorbell_value(&self, tail: u32) -> u16 {
+        // `depth <= MAX_DEPTH`, so the masked slot fits 16 bits.
+        (tail & (self.depth - 1)) as u16
+    }
+}
+
+/// Order every prior store — the SQE, in DMA-visible memory — before a
+/// following MMIO doorbell store, as seen by the device.
+///
+/// An atomic release fence orders stores for other CPUs only; on aarch64
+/// it is `dmb ish`, which does not cover a device reading memory. This is
+/// the kernel's `wmb()`.
+#[inline(always)]
+fn device_write_barrier() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `sfence` has no preconditions.
+    unsafe {
+        core::arch::x86_64::_mm_sfence();
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `dsb st` has no preconditions; it only waits for prior stores.
+    unsafe {
+        core::arch::asm!("dsb st", options(nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    core::sync::atomic::fence(Ordering::SeqCst);
 }
 
 /// Host-visible BaM controller view: BAR0 + doorbell layout + one I/O QP.
@@ -170,11 +204,11 @@ impl BamController {
         unsafe {
             core::ptr::write_volatile(dst, sqe);
         }
-        // Ensure the SQE is visible to the controller before the doorbell.
-        core::sync::atomic::fence(Ordering::Release);
-        let tail = prev.wrapping_add(1);
-        self.ring_sq_doorbell((tail & 0xffff) as u16)?;
-        Ok((tail & 0xffff) as u16)
+        // The controller fetches the SQE by DMA once the doorbell lands.
+        device_write_barrier();
+        let doorbell = self.qp.doorbell_value(prev.wrapping_add(1));
+        self.ring_sq_doorbell(doorbell)?;
+        Ok(doorbell)
     }
 
     /// Retire completed CQ entries so new submits can reuse SQ slots.
@@ -258,5 +292,33 @@ mod tests {
         ctl.retire_completions(2);
         // SAFETY: as above.
         assert!(unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) }.is_ok());
+    }
+
+    /// The tail doorbell is a slot index, always below the queue size: the
+    /// fifth submission to a depth-4 queue rings 1, not 5.
+    #[test]
+    fn doorbell_wraps_at_the_queue_depth() {
+        let mut ctl = BamController::new(0, 4, NvmeDoorbellLayout::legacy()).unwrap();
+        let mut bar = [0u8; 0x2000];
+        // SAFETY: `bar` covers every legacy doorbell offset and outlives `ctl`.
+        unsafe { ctl.attach_bar0(bar.as_mut_ptr(), bar.len()) };
+        let mut ring = [NvmeRwSqe::read(1, 0, 0, 0, NvmeDataPointer::Prp { prp1: 0, prp2: 0 }); 4];
+        let mut rung = Vec::new();
+        for _ in 0..6 {
+            // SAFETY: `ring` outlives the call and has the queue's slot count.
+            rung.push(unsafe { ctl.submit_sqe(ring.as_mut_ptr(), ring[0]) }.unwrap());
+            ctl.retire_completions(1);
+        }
+        assert_eq!(rung, [1, 2, 3, 0, 1, 2]);
+        assert_eq!(ctl.qp.doorbell_tail(), 2);
+        let off = ctl.doorbells.sq_tdbl_offset(0) as usize;
+        assert_eq!(u32::from_ne_bytes(bar[off..off + 4].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn queue_depth_is_bounded_by_the_spec() {
+        assert!(BamQueuePair::new(0, 1 << 16).is_some());
+        assert!(BamQueuePair::new(0, 1 << 17).is_none());
+        assert!(BamQueuePair::new(0, 3).is_none());
     }
 }

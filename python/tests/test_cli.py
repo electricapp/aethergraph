@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from aethergraph import Graph
@@ -215,6 +216,54 @@ class TestConvertCommand:
 
         assert result.exit_code == 1
         assert result.output.lower().count("exceeds") >= 2
+
+    def test_convert_streams_across_chunks(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Edges spanning many parse chunks, comments included, all arrive."""
+        from aethergraph import cli
+
+        monkeypatch.setattr(cli, "_CHUNK_LINES", 3)
+        input_file = temp_dir / "edges.tsv"
+        output_file = temp_dir / "graph.bin"
+        lines = ["src\tdst", "# a comment", ""]
+        lines += [f"{i % 7}\t{(i * 3) % 7}" for i in range(20)]
+        lines += ["# trailing"]
+        input_file.write_text("\n".join(lines) + "\n")
+
+        result = runner.invoke(
+            app,
+            ["-q", "convert", "-i", str(input_file), "-o", str(output_file), "-n", "7"]
+            + ["--skip-lines", "1"],
+        )
+
+        assert result.exit_code == 0, f"CLI failed: {result.output}"
+        graph = Graph.load(output_file)
+        assert graph.num_edges == 20
+        assert sorted(graph.neighbors(1).tolist()) == sorted(
+            (i * 3) % 7 for i in range(20) if i % 7 == 1
+        )
+
+    def test_convert_names_the_bad_line_in_a_later_chunk(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aethergraph import cli
+
+        monkeypatch.setattr(cli, "_CHUNK_LINES", 4)
+        input_file = temp_dir / "edges.csv"
+        output_file = temp_dir / "graph.bin"
+        rows = [f"{i % 3},{(i + 1) % 3}" for i in range(9)]
+        rows[6] = "2,x"
+        input_file.write_text("\n".join(rows) + "\n")
+
+        result = runner.invoke(
+            app,
+            ["-q", "convert", "-i", str(input_file), "-o", str(output_file), "-n", "3"],
+        )
+
+        assert result.exit_code == 1
+        assert "line 7" in result.output
+        assert not output_file.exists()
 
 
 class TestInfoCommand:

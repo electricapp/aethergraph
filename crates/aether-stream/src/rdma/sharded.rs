@@ -14,6 +14,12 @@
 //! GPU integration lives in `gpu/buffer.rs` + `client.rs`; this module is the
 //! pure-RDMA half so it's testable on SoftRoCE without CUDA.
 //!
+//! A shard whose QP fails (an error completion, a post failure, or a stall
+//! past a ten-second deadline) is quiesced — every WR it was given has finished
+//! or been flushed before its caller sees the error — and marked dead; the
+//! pool stops routing to it. An RC QP in the error state cannot rejoin
+//! without a fresh endpoint exchange with the peer.
+//!
 //! ## MR cross-thread usage
 //!
 //! `RegisteredMr` is `Send` — allocate + `reg_mr` on any thread, ship to any
@@ -27,23 +33,34 @@
 
 use super::context::{RdmaContext, RegisteredCq};
 use super::event::CompletionChannel;
-use super::qp::{QpEndpoint, RdmaQp, RdmaRead};
+use super::qp::{QpEndpoint, RdmaQp, RdmaRead, next_wr_generation, required_cq_depth};
 use crate::rdma::ffi::{IBV_WC_SUCCESS, IbvQpCap, IbvWc};
 use crossbeam_channel::{Sender, bounded};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Wall-clock bound on one window's signaled completion. RC retries give up
+/// well inside it (timeout 14 × retry_cnt 7 ≈ 0.5 s) and flush the QP, so
+/// only a hung device reaches it.
+const POLL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Bound on draining a stopped QP; see [`RdmaQp::quiesce`].
+const QUIESCE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Configuration for a `ShardedQpPool`.
+///
+/// Each shard's CQ is sized from `qp_cap` ([`required_cq_depth`]) — a CQ
+/// too shallow for the QP's worst-case flush would drop the completion a
+/// drain waits on.
 pub struct ShardedConfig {
     /// Number of shards (= QPs = worker threads).
     pub num_shards: usize,
-    /// CQ depth per shard. Must be ≥ the largest single-batch read count.
-    pub cq_size: i32,
     /// QP capabilities. Use `super::qp::DEFAULT_QP_CAP` for the typical
     /// gather workload; for sustained pipelining bump `max_send_wr` higher.
+    /// A gather larger than `max_send_wr` streams through in windows.
     pub qp_cap: IbvQpCap,
     /// Optional core IDs to pin each worker to. Length must equal
     /// `num_shards`, or be empty (no pinning). Cross-NUMA pinning hurts.
@@ -68,7 +85,6 @@ impl Default for ShardedConfig {
     fn default() -> Self {
         Self {
             num_shards: 1,
-            cq_size: 256,
             qp_cap: super::qp::DEFAULT_QP_CAP,
             worker_cores: Vec::new(),
             spin_before_block: Some(Duration::from_micros(200)),
@@ -93,26 +109,23 @@ enum WorkerMsg {
 struct ShardHandle {
     work_tx: Sender<WorkerMsg>,
     join: Option<thread::JoinHandle<()>>,
+    dead: Arc<AtomicBool>,
 }
 
 /// Pool of N (QP, CQ, worker thread) shards.
 ///
 /// Use `endpoints()` to pull each QP's endpoint for the control-plane
 /// exchange, then `connect_all()` once you have the matching remote
-/// endpoints. From then on `gather(reads)` round-robins across shards.
+/// endpoints. From then on `gather(reads)` round-robins across live shards.
+///
+/// Every QP holds its CQ, channel, and device, so dropping the pool (or a
+/// failed `new`) tears them down only after the workers holding them exit.
 pub struct ShardedQpPool {
     /// QPs are kept here so `endpoints()` and `connect_all()` can see them
     /// without going through the worker. Each QP is owned by exactly one
-    /// worker for posting; lifetime-wise we hand the QP to the worker via
-    /// the shared Arc, and use it from this struct only for connect.
+    /// worker for posting.
     qps: Vec<Arc<RdmaQp>>,
-    /// CQs held in the pool to keep them alive for the worker threads.
-    /// Drop order: workers join first (handles), then CQs drop.
-    _cqs: Vec<Arc<RegisteredCq>>,
-    /// Completion channels, one per shard. Held so they outlive the CQs
-    /// created on them; drop order is workers, then CQs, then channels.
-    _channels: Vec<Arc<CompletionChannel>>,
-    /// Worker handles. `Option` so we can `take()` them in `Drop` to join.
+    /// Worker handles. `Option` join handles so `Drop` can take and join.
     handles: Vec<ShardHandle>,
     /// Round-robin selector for `gather()`.
     next_shard: AtomicUsize,
@@ -134,11 +147,15 @@ impl ShardedQpPool {
                 "worker_cores must be empty or have length == num_shards",
             ));
         }
+        let cq_depth = required_cq_depth(&cfg.qp_cap);
 
-        let mut qps = Vec::with_capacity(cfg.num_shards);
-        let mut cqs = Vec::with_capacity(cfg.num_shards);
-        let mut channels = Vec::with_capacity(cfg.num_shards);
-        let mut handles = Vec::with_capacity(cfg.num_shards);
+        // Built in place so a failure part-way drops through `Drop`, which
+        // shuts down and joins every worker already spawned.
+        let mut pool = Self {
+            qps: Vec::with_capacity(cfg.num_shards),
+            handles: Vec::with_capacity(cfg.num_shards),
+            next_shard: AtomicUsize::new(0),
+        };
 
         // Workers prefer the NIC's NUMA node for their allocations so
         // per-shard scratch lands where the device DMAs. Preference, not
@@ -148,23 +165,23 @@ impl ShardedQpPool {
         for shard_idx in 0..cfg.num_shards {
             // Every shard gets its own completion channel, so a blocking
             // wait wakes only the shard whose completion arrived.
-            let channel = Arc::new(CompletionChannel::create(ctx)?);
-            let cq = Arc::new(channel.create_cq(ctx, cfg.cq_size)?);
-            let qp = Arc::new(RdmaQp::create_with_cqs(
-                ctx,
-                &cfg.qp_cap,
-                cq.as_ptr(),
-                cq.as_ptr(),
-            )?);
+            let channel = CompletionChannel::create(ctx)?;
+            let cq = channel.create_cq(ctx, cq_depth)?;
+            let qp = Arc::new(RdmaQp::create_with_cqs(ctx, &cfg.qp_cap, &cq, &cq)?);
 
             // Bounded channel keeps backpressure visible to the caller —
             // an overloaded shard slows submitters before queue grows.
             let (work_tx, work_rx) = bounded::<WorkerMsg>(64);
+            let dead = Arc::new(AtomicBool::new(false));
 
-            let qp_for_worker = Arc::clone(&qp);
-            let cq_for_worker = Arc::clone(&cq);
-            let channel_for_worker = Arc::clone(&channel);
-            let spin_budget = cfg.spin_before_block;
+            let shard = Shard {
+                qp: Arc::clone(&qp),
+                cq,
+                channel,
+                spin_budget: cfg.spin_before_block,
+                dead: Arc::clone(&dead),
+                generation: 0,
+            };
             let core_id = cfg.worker_cores.get(shard_idx).copied();
 
             let join = thread::Builder::new()
@@ -176,32 +193,19 @@ impl ShardedQpPool {
                     if let Some(node) = nic_node {
                         let _ = aether_mem::numa::prefer_current_thread(node);
                     }
-                    worker_loop(
-                        qp_for_worker,
-                        cq_for_worker,
-                        channel_for_worker,
-                        spin_budget,
-                        work_rx,
-                    );
+                    shard.run(work_rx);
                 })
                 .map_err(|e| io::Error::other(format!("spawn shard: {e}")))?;
 
-            qps.push(qp);
-            cqs.push(cq);
-            channels.push(channel);
-            handles.push(ShardHandle {
+            pool.qps.push(qp);
+            pool.handles.push(ShardHandle {
                 work_tx,
                 join: Some(join),
+                dead,
             });
         }
 
-        Ok(Self {
-            qps,
-            _cqs: cqs,
-            _channels: channels,
-            handles,
-            next_shard: AtomicUsize::new(0),
-        })
+        Ok(pool)
     }
 
     /// Local endpoints for the control-plane exchange. Pass each one to the
@@ -233,18 +237,31 @@ impl ShardedQpPool {
         Ok(())
     }
 
-    /// Submit a gather batch — picks the next shard round-robin, sends the
-    /// work over the shard's channel, and blocks on the reply.
+    /// Submit a gather batch to the next live shard, round-robin, and block
+    /// on the reply. Errors when every shard is dead.
     pub fn gather(&self, reads: Vec<RdmaRead>) -> io::Result<()> {
-        let idx = self.next_shard.fetch_add(1, Ordering::Relaxed) % self.handles.len();
-        self.gather_on_shard(idx, reads)
+        let n = self.handles.len();
+        let start = self.next_shard.fetch_add(1, Ordering::Relaxed);
+        let live = (0..n)
+            .map(|k| (start + k) % n)
+            .find(|&i| !self.handles[i].dead.load(Ordering::Acquire))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "every shard's QP has failed")
+            })?;
+        self.gather_on_shard(live, reads)
     }
 
     /// Submit to a specific shard — useful when the caller already knows
     /// which shard's MR / staging buffer this batch should land in.
     pub fn gather_on_shard(&self, shard: usize, reads: Vec<RdmaRead>) -> io::Result<()> {
+        let handle = self.handles.get(shard).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("shard {shard} out of range ({})", self.handles.len()),
+            )
+        })?;
         let (tx, rx) = bounded::<io::Result<()>>(1);
-        self.handles[shard]
+        handle
             .work_tx
             .send(WorkerMsg::Job(GatherJob { reads, reply: tx }))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "shard worker died"))?;
@@ -256,15 +273,21 @@ impl ShardedQpPool {
     pub fn num_shards(&self) -> usize {
         self.handles.len()
     }
+
+    /// Shards still accepting work.
+    pub fn live_shards(&self) -> usize {
+        self.handles
+            .iter()
+            .filter(|h| !h.dead.load(Ordering::Acquire))
+            .count()
+    }
 }
 
 impl Drop for ShardedQpPool {
     fn drop(&mut self) {
-        // Tell every worker to exit its loop, then join. Order matters:
-        // workers must release their QP/CQ refs before the Arcs in `qps` /
-        // `_cqs` drop, otherwise the destructors race against an in-flight
-        // poll.
-        for handle in &mut self.handles {
+        // Tell every worker to exit its loop, then join, so no poll is in
+        // flight when the QPs, CQs, and channels release.
+        for handle in &self.handles {
             let _ = handle.work_tx.send(WorkerMsg::Shutdown);
         }
         for handle in &mut self.handles {
@@ -275,88 +298,119 @@ impl Drop for ShardedQpPool {
     }
 }
 
-fn worker_loop(
+/// One shard's worker state. The QP and CQ are exclusive to it.
+struct Shard {
     qp: Arc<RdmaQp>,
-    cq: Arc<RegisteredCq>,
-    channel: Arc<CompletionChannel>,
+    cq: RegisteredCq,
+    channel: CompletionChannel,
     spin_budget: Option<Duration>,
-    rx: crossbeam_channel::Receiver<WorkerMsg>,
-) {
-    while let Ok(msg) = rx.recv() {
-        let job = match msg {
-            WorkerMsg::Shutdown => return,
-            WorkerMsg::Job(j) => j,
-        };
-        let result = post_and_drain(&qp, &cq, &channel, spin_budget, &job.reads);
-        let _ = job.reply.send(result);
-    }
+    dead: Arc<AtomicBool>,
+    /// Tags each window's `wr_id`s so a completion is matched to the window
+    /// that posted it.
+    generation: u32,
 }
 
-/// Post the batch (chained WRs, only the last signaled) and wait for the
-/// signaled completion. Mirrors the production
-/// `RdmaFeatureClient::post_and_wait` loop in client.rs.
-///
-/// The wait spins first, then — once `spin_budget` is spent — arms the CQ
-/// and blocks on the completion channel, so an idle shard stops consuming
-/// its core. `spin_budget: None` keeps the original pure busy-poll.
-fn post_and_drain(
-    qp: &RdmaQp,
-    cq: &RegisteredCq,
-    channel: &CompletionChannel,
-    spin_budget: Option<Duration>,
-    reads: &[RdmaRead],
-) -> io::Result<()> {
-    if reads.is_empty() {
-        return Ok(());
+impl Shard {
+    fn run(mut self, rx: crossbeam_channel::Receiver<WorkerMsg>) {
+        while let Ok(msg) = rx.recv() {
+            let job = match msg {
+                WorkerMsg::Shutdown => return,
+                WorkerMsg::Job(j) => j,
+            };
+            let result = if self.dead.load(Ordering::Acquire) {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "shard QP has failed",
+                ))
+            } else {
+                self.gather(&job.reads)
+            };
+            let _ = job.reply.send(result);
+        }
     }
-    qp.post_reads(reads)?;
-    let signaled_wr_id = (reads.len() - 1) as u64;
-    let mut wcs = [IbvWc::default(); 32];
-    let mut first_error: Option<(u32, u32)> = None;
-    let started = Instant::now();
-    let mut armed = false;
 
-    loop {
-        // SAFETY: `cq` is the live CQ borrowed for this gather batch.
-        let n = unsafe { RdmaQp::poll_cq_on(cq.as_ptr(), &mut wcs) }?;
-        for wc in wcs.iter().take(n) {
-            if wc.status != IBV_WC_SUCCESS && first_error.is_none() {
-                first_error = Some((wc.status, wc.vendor_err));
+    /// Stream `reads` through the QP in send-queue-sized windows. On any
+    /// failure the QP is quiesced before the error returns, so the caller's
+    /// buffers are no longer targeted, and the shard is retired.
+    fn gather(&mut self, reads: &[RdmaRead]) -> io::Result<()> {
+        let window = self.qp.max_send_wr() as usize;
+        for chunk in reads.chunks(window) {
+            if let Err(e) = self.post_and_drain(chunk) {
+                self.qp.quiesce(&self.cq, QUIESCE_DEADLINE);
+                self.dead.store(true, Ordering::Release);
+                return Err(e);
             }
-            if wc.wr_id == signaled_wr_id {
-                if let Some((status, vendor_err)) = first_error {
+        }
+        Ok(())
+    }
+
+    /// Post one window (chained WRs, only the last signaled) and wait for
+    /// its signaled completion.
+    ///
+    /// The wait spins first, then — once `spin_budget` is spent — arms the
+    /// CQ and blocks on the completion channel, so an idle shard stops
+    /// consuming its core. `spin_budget: None` keeps a pure busy-poll.
+    fn post_and_drain(&mut self, reads: &[RdmaRead]) -> io::Result<()> {
+        if reads.is_empty() {
+            return Ok(());
+        }
+        self.generation = next_wr_generation(self.generation);
+        let base = u64::from(self.generation) << 32;
+        self.qp.post_reads_tagged(reads, reads.len(), base)?;
+        let signaled_wr_id = base + (reads.len() - 1) as u64;
+
+        let mut wcs = [IbvWc::default(); 32];
+        let started = Instant::now();
+        let deadline = started + POLL_DEADLINE;
+        let mut armed = false;
+
+        loop {
+            let n = self.cq.poll(&mut wcs)?;
+            for wc in &wcs[..n] {
+                if wc.status != IBV_WC_SUCCESS {
+                    // The QP is in the error state now; the caller
+                    // quiesces it, which reaps the flushed remainder.
                     return Err(io::Error::other(format!(
-                        "RDMA READ failed: status={status}, vendor_err={vendor_err}"
+                        "RDMA READ failed: status={}, vendor_err={}, wr_id={:#x}",
+                        wc.status, wc.vendor_err, wc.wr_id
                     )));
                 }
-                return Ok(());
-            }
-        }
-        if n > 0 {
-            continue;
-        }
-
-        match spin_budget {
-            None => std::hint::spin_loop(),
-            Some(budget) if started.elapsed() < budget && !armed => std::hint::spin_loop(),
-            Some(_) => {
-                if !armed {
-                    // Arm before the next poll, never after: arming only
-                    // covers completions that arrive from here on, so a
-                    // completion landing between the last poll and the arm
-                    // would otherwise be missed and the wait would hang.
-                    channel.arm(cq, false)?;
-                    armed = true;
-                    // Re-poll immediately — the arm closes the race by
-                    // making this poll authoritative for everything before
-                    // it, and the block below only for what comes after.
-                    continue;
+                if wc.wr_id == signaled_wr_id {
+                    return Ok(());
                 }
-                // A timeout is not an error: loop back and re-poll. The
-                // NIC may have raced the block, and a spurious wakeup or a
-                // quiet period both just mean "look again".
-                channel.wait(Some(Duration::from_millis(100)))?;
-                armed = false;
+            }
+            if n > 0 {
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("RDMA READ completion timed out after {POLL_DEADLINE:?}"),
+                ));
+            }
+
+            match self.spin_budget {
+                None => std::hint::spin_loop(),
+                Some(budget) if started.elapsed() < budget && !armed => std::hint::spin_loop(),
+                Some(_) => {
+                    if !armed {
+                        // Arm before the next poll, never after: arming only
+                        // covers completions that arrive from here on, so a
+                        // completion landing between the last poll and the arm
+                        // would otherwise be missed and the wait would hang.
+                        self.channel.arm(&self.cq, false)?;
+                        armed = true;
+                        // Re-poll immediately — the arm closes the race by
+                        // making this poll authoritative for everything before
+                        // it, and the block below only for what comes after.
+                        continue;
+                    }
+                    // A timeout is not an error: loop back and re-poll. The
+                    // NIC may have raced the block, and a spurious wakeup or a
+                    // quiet period both just mean "look again".
+                    self.channel.wait(Some(Duration::from_millis(100)))?;
+                    armed = false;
+                }
             }
         }
     }

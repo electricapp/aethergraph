@@ -2,61 +2,52 @@
 //!
 //! Host publishes a doorbell record and BlueFlame/DBR mapping; GPU warps
 //! (see `aether-stream` `kernels/ibgda`) write [`super::Mlx5RdmaReadWqe`]
-//! into the QP ring at **64-byte basic-block** stride and bump the doorbell
-//! record monotonically.
+//! into the QP ring at **64-byte basic-block** stride and publish them
+//! through the doorbell record in claim order.
 
 use super::Mlx5RdmaReadWqe;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 /// mlx5 WQE basic-block size (bytes). One RDMA READ WQE occupies one BB
 /// (48-byte payload + 16-byte pad).
 pub const MLX5_WQE_BB: usize = 64;
 
-/// mlx5 doorbell record: 8 bytes, `recv_db` then `send_db`.
-///
-/// Logical indices are stored **host-endian** in the atomics for CPU oracles.
-/// Use [`Mlx5DoorbellRecord::send_db_be`] when writing a HCA-mapped DBR /
-/// BlueFlame record (device expects BE16).
+/// mlx5 doorbell record: two big-endian 32-bit words, receive counter then
+/// send counter (`__be32 dbrec[2]`; the HCA reads `dbrec[1]` as
+/// `htobe32(sq_cur_post & 0xffff)`).
 #[repr(C, align(8))]
 #[derive(Debug, Default)]
 pub struct Mlx5DoorbellRecord {
-    pub recv_db: AtomicU16,
-    pub send_db: AtomicU16,
+    recv_db: AtomicU32,
+    send_db: AtomicU32,
 }
 
+const _: () = assert!(core::mem::offset_of!(Mlx5DoorbellRecord, send_db) == 4);
+const _: () = assert!(core::mem::size_of::<Mlx5DoorbellRecord>() == 8);
+
 impl Mlx5DoorbellRecord {
-    /// Monotonically advance the send doorbell to at least `wqe_index`.
-    ///
-    /// Multi-producer safe: a stale lower index never overwrites a newer one
-    /// (wrapping half-range compare).
-    pub fn ring_send_monotonic(&self, wqe_index: u16) {
-        let mut cur = self.send_db.load(Ordering::Acquire);
-        loop {
-            let ahead = wqe_index.wrapping_sub(cur);
-            // Equal or more than half the u16 space behind → do not store.
-            if ahead == 0 || ahead > 0x8000 {
-                return;
-            }
-            match self.send_db.compare_exchange_weak(
-                cur,
-                wqe_index,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(v) => cur = v,
-            }
-        }
+    /// Publish `posted` — the count of WQEs the HCA may now fetch — as the
+    /// send counter. Callers publish in claim order (see
+    /// [`IbgdaQueue::post_rdma_read`]), so the value only ever moves past
+    /// WQEs that are fully written.
+    fn publish_send(&self, posted: u16) {
+        self.send_db
+            .store(u32::from(posted).to_be(), Ordering::Release);
     }
 
-    /// Host-endian send index (CPU oracle / tests).
+    /// Host-endian send counter (CPU oracle / tests).
     pub fn send_index(&self) -> u16 {
+        u32::from_be(self.send_db.load(Ordering::Acquire)) as u16
+    }
+
+    /// The send word exactly as the HCA reads it.
+    pub fn send_db_raw(&self) -> u32 {
         self.send_db.load(Ordering::Acquire)
     }
 
-    /// Big-endian send index for a device-mapped DBR dword.
-    pub fn send_db_be(&self) -> u16 {
-        self.send_index().to_be()
+    /// Host-endian receive counter.
+    pub fn recv_index(&self) -> u16 {
+        u32::from_be(self.recv_db.load(Ordering::Acquire)) as u16
     }
 }
 
@@ -68,11 +59,18 @@ pub enum IbgdaError {
 }
 
 /// Host-side IBGDA queue view used as the CPU oracle for GPU producers.
+///
+/// Producers claim indices concurrently but publish in claim order: a
+/// producer rings the doorbell only once every lower index is written, so
+/// the HCA never fetches a slot that is still stale.
 #[derive(Debug)]
 pub struct IbgdaQueue {
     pub qpn: u32,
     pub depth: u16,
+    /// Next index to claim.
     pub next_wqe: AtomicU16,
+    /// Count of WQEs written and published through the doorbell record.
+    pub ready: AtomicU16,
     /// Lowest incomplete WQE index (advanced by [`Self::retire`]).
     pub cq_head: AtomicU16,
     pub dbr: Mlx5DoorbellRecord,
@@ -87,6 +85,7 @@ impl IbgdaQueue {
             qpn,
             depth,
             next_wqe: AtomicU16::new(0),
+            ready: AtomicU16::new(0),
             cq_head: AtomicU16::new(0),
             dbr: Mlx5DoorbellRecord::default(),
         })
@@ -124,7 +123,9 @@ impl IbgdaQueue {
         }
     }
 
-    /// CPU-path: build WQE, write into `ring` at 64-byte BB stride, ring DBR.
+    /// CPU-path: build WQE, write into `ring` at 64-byte BB stride, then
+    /// publish it through the doorbell record once every earlier claim is
+    /// published.
     ///
     /// # Safety
     /// `ring` must be a byte buffer of at least `depth * MLX5_WQE_BB` bytes.
@@ -154,8 +155,17 @@ impl IbgdaQueue {
         unsafe {
             core::ptr::write_volatile(dst, wqe);
         }
-        core::sync::atomic::fence(Ordering::Release);
-        self.dbr.ring_send_monotonic(idx.wrapping_add(1));
+        // Publish in claim order: wait until every lower index is out, so
+        // the doorbell never covers a slot another producer is still
+        // writing. The producer holding `ready` has already claimed, so it
+        // is running and will get there.
+        while self.ready.load(Ordering::Acquire) != idx {
+            core::hint::spin_loop();
+        }
+        let next = idx.wrapping_add(1);
+        // Release: the WQE write above is visible before the doorbell.
+        self.dbr.publish_send(next);
+        self.ready.store(next, Ordering::Release);
         Ok(idx)
     }
 }
@@ -204,14 +214,52 @@ mod tests {
         assert!(unsafe { q.post_rdma_read(ring.as_mut_ptr(), 0, 0, 0, 0, 0) }.is_ok());
     }
 
+    /// The HCA reads `dbrec[1]` as a big-endian 32-bit counter.
     #[test]
-    fn doorbell_monotonic_ignores_stale_index() {
+    fn doorbell_record_is_two_big_endian_words() {
         let dbr = Mlx5DoorbellRecord::default();
-        dbr.ring_send_monotonic(5);
-        dbr.ring_send_monotonic(3);
-        assert_eq!(dbr.send_index(), 5);
-        dbr.ring_send_monotonic(7);
-        assert_eq!(dbr.send_index(), 7);
-        assert_eq!(dbr.send_db_be(), 7u16.to_be());
+        dbr.publish_send(0x1234);
+        assert_eq!(dbr.send_db_raw(), 0x1234u32.to_be());
+        assert_eq!(dbr.send_index(), 0x1234);
+        assert_eq!(dbr.recv_index(), 0);
+        // SAFETY: the record is 8 bytes of two u32 words.
+        let words: [u32; 2] = unsafe { core::mem::transmute_copy(&dbr) };
+        assert_eq!(words[1], 0x1234u32.to_be());
+        assert_eq!(words[0], 0);
+    }
+
+    /// Concurrent producers: however their writes interleave, the doorbell
+    /// ends at the total posted and never runs ahead of a written slot.
+    #[test]
+    fn concurrent_producers_publish_contiguously() {
+        const THREADS: usize = 4;
+        const PER: usize = 16;
+        let q = IbgdaQueue::new(0x42, 128).unwrap();
+        let ring = std::sync::Mutex::new(vec![0u8; 128 * MLX5_WQE_BB]);
+        let base = ring.lock().unwrap().as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let q = &q;
+                s.spawn(move || {
+                    for k in 0..PER {
+                        let tag = (t * PER + k) as u64 + 1;
+                        // SAFETY: the ring holds `depth` BBs and outlives the scope;
+                        // producers write disjoint claimed slots.
+                        unsafe { q.post_rdma_read(base as *mut u8, tag, 1, 8, tag, 2) }.unwrap();
+                        // Whatever is published is fully written.
+                        let published = q.dbr.send_index() as usize;
+                        for slot in 0..published {
+                            // SAFETY: published slots are written and no longer mutated.
+                            let w =
+                                unsafe { *((base + slot * MLX5_WQE_BB) as *const Mlx5RdmaReadWqe) };
+                            assert_eq!(w.wqe_index() as usize, slot);
+                            assert_ne!(u64::from_be_bytes(w.local_address), 0);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(q.dbr.send_index() as usize, THREADS * PER);
+        assert_eq!(q.ready.load(Ordering::Acquire) as usize, THREADS * PER);
     }
 }

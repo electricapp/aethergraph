@@ -42,6 +42,9 @@ pub mod qp;
 pub mod control;
 
 #[cfg(feature = "rdma")]
+pub mod layout;
+
+#[cfg(feature = "rdma")]
 pub mod event;
 
 #[cfg(feature = "rdma")]

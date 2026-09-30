@@ -52,6 +52,35 @@ fn shared_clock_observed_from_outside() {
 }
 
 #[test]
+fn commit_takes_its_epoch_from_a_shared_clock() {
+    let clock = Arc::new(EpochClock::new());
+    let g = DynamicGraph::new_with_epoch(8, 1 << 20, Arc::clone(&clock));
+    let pre = g.acquire();
+    {
+        let mut w = g.writer().unwrap();
+        w.insert_edge(0, 1).unwrap();
+        // Another subsystem sharing the clock commits mid-guard.
+        clock.advance();
+    }
+    assert!(!g.is_poisoned());
+    let snap = g.acquire();
+    assert_eq!(
+        snap.epoch(),
+        clock.current(),
+        "snapshot carries the commit's own epoch"
+    );
+    assert_eq!(snap.degree(&g, 0), 1);
+    assert_eq!(pre.degree(&g, 0), 0);
+    // The writer slot was released; later commits keep working.
+    {
+        let mut w = g.writer().unwrap();
+        w.insert_edge(0, 2).unwrap();
+    }
+    assert_eq!(g.acquire().degree(&g, 0), 2);
+    assert_eq!(pre.degree(&g, 0), 0);
+}
+
+#[test]
 fn panic_poisoned_drop_does_not_advance_epoch() {
     let g = Arc::new(DynamicGraph::new(64, 1 << 20));
     let before = g.current_epoch().as_u64();

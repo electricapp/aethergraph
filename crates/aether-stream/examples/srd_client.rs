@@ -51,7 +51,7 @@ fn main() {
 
 #[cfg(all(target_os = "linux", feature = "efa"))]
 fn run_single(server: &str, iters: usize, batch: usize, warmup: usize) {
-    let client =
+    let mut client =
         SrdFeatureClient::connect(server, EFA_GID_INDEX, batch).expect("SrdFeatureClient::connect");
     let schema = client.schema().clone();
     eprintln!(
@@ -84,7 +84,7 @@ fn run_single(server: &str, iters: usize, batch: usize, warmup: usize) {
 fn run_sharded(server: &str, iters: usize, batch: usize, warmup: usize, shards: usize) {
     assert!(batch.is_multiple_of(shards), "--batch must divide --shards");
     let per_shard = batch / shards;
-    let client = SrdShardedFeatureClient::connect(server, EFA_GID_INDEX, shards, per_shard)
+    let mut client = SrdShardedFeatureClient::connect(server, EFA_GID_INDEX, shards, per_shard)
         .expect("SrdShardedFeatureClient::connect");
     let schema = client.schema().clone();
     eprintln!(

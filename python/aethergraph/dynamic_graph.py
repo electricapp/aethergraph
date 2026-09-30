@@ -55,6 +55,10 @@ class DynamicGraph:
                 nodes are recycled once no reader or snapshot can observe
                 them, so steady-state usage tracks live edges plus a
                 bounded recycling lag.
+
+        Raises:
+            ValueError: ``num_vertices`` exceeds the uint32 id range, or
+                ``arena_mb`` is outside 1..32768.
         """
         self._inner = _DynamicGraph(num_vertices=num_vertices, arena_mb=arena_mb)
 
@@ -115,11 +119,13 @@ class DynamicGraph:
             arena_mb: Arena capacity in megabytes.
 
         Returns:
-            DynamicGraph with all edges inserted.
+            DynamicGraph with all edges inserted (duplicates collapse).
 
         Raises:
-            ValueError: If src and dst have different lengths, or an ID is
-                negative or exceeds the uint32 range.
+            ValueError: If src and dst have different lengths, an ID is
+                negative or exceeds the uint32 range, or an edge references
+                a vertex >= num_vertices.
+            RuntimeError: If the arena fills up.
         """
         src_arr = _to_uint32_ids(src, "src")
         dst_arr = _to_uint32_ids(dst, "dst")

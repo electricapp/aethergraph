@@ -48,7 +48,8 @@ fn prefetch_read<T>(ptr: *const T) {
     unsafe {
         core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0)
     };
-    #[cfg(target_arch = "aarch64")]
+    // Miri cannot interpret inline asm; the hint has no semantics to lose.
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     // SAFETY: prfm has no memory effects; any address is safe.
     unsafe {
         core::arch::asm!(
@@ -57,7 +58,7 @@ fn prefetch_read<T>(ptr: *const T) {
             options(nostack, preserves_flags),
         );
     };
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(miri)))))]
     let _ = ptr;
 }
 

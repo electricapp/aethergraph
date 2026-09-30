@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
+import numpy.typing as npt
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -29,6 +30,26 @@ from aethergraph._core import (
 
 app = typer.Typer(help="Heterogeneous graph sampling benchmarks.")
 console = Console()
+
+Ids = npt.NDArray[np.uint32]
+
+
+# Per-hop fanout of every relation for a `fanout` budget: user seeds draw
+# posts and comments through the reverse relations; later hops walk the
+# forward ones, with reply_to at half and belongs_to at a third to reflect
+# realistic asymmetric fanout.
+def relation_fanouts(fanout: list[int]) -> dict[tuple[str, str, str], list[int]]:
+    """Map each relation of the benchmark graph to its per-hop fanout."""
+    third = [max(1, f // 3) for f in fanout]
+    return {
+        ("post", "rev_votes", "user"): fanout,
+        ("comment", "rev_writes", "user"): fanout,
+        ("user", "votes", "post"): fanout,
+        ("user", "writes", "comment"): fanout,
+        ("comment", "reply_to", "comment"): [f // 2 for f in fanout],
+        ("post", "belongs_to", "subreddit"): third,
+        ("subreddit", "rev_belongs_to", "post"): third,
+    }
 
 
 class Scale(str, Enum):
@@ -93,9 +114,12 @@ def build_graph(scale: dict[str, int]) -> HeteroCsrGraph:
     """Build a Reddit-shaped heterogeneous graph with synthetic edges.
 
     Creates four node types (user, post, comment, subreddit) and four edge
-    types (votes, writes, reply_to, belongs_to) with random connectivity.
-    Edge counts scale linearly with user count: 20 votes/user, 30 writes/user,
-    0.5 replies/comment, 1 belongs_to/post.
+    types (votes, writes, reply_to, belongs_to) with random connectivity, plus
+    the reverse of each cross-type relation. Sampling expands a node along the
+    relations that point into its type, as PyG does, so the reverse relations
+    are what give user seeds neighbors. Edge counts scale linearly with user
+    count: 20 votes/user, 30 writes/user, 0.5 replies/comment, 1
+    belongs_to/post.
 
     Args:
         scale: Dict with keys "users", "posts", "comments", "subs" mapping to
@@ -107,6 +131,17 @@ def build_graph(scale: dict[str, int]) -> HeteroCsrGraph:
     rng = np.random.default_rng(42)
     u, p, c, s = scale["users"], scale["posts"], scale["comments"], scale["subs"]
 
+    def relation(n_src: int, n_dst: int, count: int) -> tuple[Ids, Ids]:
+        return (
+            rng.integers(0, n_src, count).astype(np.uint32),
+            rng.integers(0, n_dst, count).astype(np.uint32),
+        )
+
+    votes = relation(u, p, u * 20)
+    writes = relation(u, c, u * 30)
+    reply_to = relation(c, c, c // 2)
+    belongs_to = relation(p, s, p)
+
     with console.status(
         f"Building graph: {u:,} users, {p:,} posts, {c:,} comments, {s:,} subreddits..."
     ):
@@ -114,34 +149,13 @@ def build_graph(scale: dict[str, int]) -> HeteroCsrGraph:
         graph = HeteroCsrGraph.from_edge_arrays(
             node_types={"user": u, "post": p, "comment": c, "subreddit": s},
             edge_types=[
-                (
-                    "user",
-                    "votes",
-                    "post",
-                    rng.integers(0, u, u * 20).astype(np.uint32),
-                    rng.integers(0, p, u * 20).astype(np.uint32),
-                ),
-                (
-                    "user",
-                    "writes",
-                    "comment",
-                    rng.integers(0, u, u * 30).astype(np.uint32),
-                    rng.integers(0, c, u * 30).astype(np.uint32),
-                ),
-                (
-                    "comment",
-                    "reply_to",
-                    "comment",
-                    rng.integers(0, c, c // 2).astype(np.uint32),
-                    rng.integers(0, c, c // 2).astype(np.uint32),
-                ),
-                (
-                    "post",
-                    "belongs_to",
-                    "subreddit",
-                    rng.integers(0, p, p).astype(np.uint32),
-                    rng.integers(0, s, p).astype(np.uint32),
-                ),
+                ("user", "votes", "post", *votes),
+                ("user", "writes", "comment", *writes),
+                ("comment", "reply_to", "comment", *reply_to),
+                ("post", "belongs_to", "subreddit", *belongs_to),
+                ("post", "rev_votes", "user", votes[1], votes[0]),
+                ("comment", "rev_writes", "user", writes[1], writes[0]),
+                ("subreddit", "rev_belongs_to", "post", belongs_to[1], belongs_to[0]),
             ],
         )
         build_ms = (time.perf_counter() - t0) * 1000
@@ -166,24 +180,15 @@ def bench_sample(
 
     Args:
         graph: The heterogeneous graph to sample from.
-        fanout: Per-hop fanout list (e.g. ``[15, 10]`` for 2-hop).
-            Applied to user edge types directly; reply_to gets half, belongs_to
-            gets one-third to reflect realistic asymmetric fanout.
+        fanout: Per-hop fanout list (e.g. ``[15, 10]`` for 2-hop), spread
+            over the relations by :func:`relation_fanouts`.
         batch_size: Number of seed user nodes per sample call.
         iters: Number of timed iterations.
 
     Returns:
         A ``BenchResult`` with per-iteration latency and node throughput.
     """
-    config = HeteroSamplingConfig(
-        num_neighbors={
-            ("user", "votes", "post"): fanout,
-            ("user", "writes", "comment"): fanout,
-            ("comment", "reply_to", "comment"): [f // 2 for f in fanout],
-            ("post", "belongs_to", "subreddit"): [max(1, f // 3) for f in fanout],
-        },
-        seed=42,
-    )
+    config = HeteroSamplingConfig(num_neighbors=relation_fanouts(fanout), seed=42)
     sampler = HeteroNeighborSampler(graph, config)
     users = graph.num_nodes("user")
     rng = np.random.default_rng(99)
@@ -225,15 +230,7 @@ def bench_edge_index_local(graph: HeteroCsrGraph, iters: int) -> BenchResult:
     Returns:
         A ``BenchResult`` with per-iteration latency and remap throughput.
     """
-    config = HeteroSamplingConfig(
-        num_neighbors={
-            ("user", "votes", "post"): [15, 10],
-            ("user", "writes", "comment"): [15, 10],
-            ("comment", "reply_to", "comment"): [5, 5],
-            ("post", "belongs_to", "subreddit"): [3, 3],
-        },
-        seed=42,
-    )
+    config = HeteroSamplingConfig(num_neighbors=relation_fanouts([15, 10]), seed=42)
     sampler = HeteroNeighborSampler(graph, config)
     seeds = np.arange(128, dtype=np.uint32)
     sub = sampler.sample("user", seeds)

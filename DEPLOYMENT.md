@@ -102,3 +102,6 @@ sysctl vm.unprivileged_userfaultfd    # want 1, else grant CAP_SYS_PTRACE
 
 It raises rather than degrading silently, so a deployment that expects paging
 finds out at open time; `FeatureStore.load` is the fallback.
+
+The pager lives in the process that opened the store. Open it after forking — in
+each DataLoader worker, not before `fork` — since a forked copy's gathers raise.
