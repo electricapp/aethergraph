@@ -49,10 +49,10 @@ jobs:
             curl build-essential pkg-config clang \
             libibverbs-dev libnuma-dev ca-certificates \
             python3 python3-dev
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: gpudirect-check
       - run: scripts/cu-syntax-check.sh
@@ -96,7 +96,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.label }}
 
@@ -263,7 +263,7 @@ jobs:
         run: |
           rustup toolchain install nightly --profile minimal --component miri --no-self-update
           rustup default nightly
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: miri
       - run: cargo +nightly miri test -p aether-graph --test miri_smoke
@@ -297,7 +297,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: wal
       - run: cargo test -p aether-graph --features wal
@@ -331,7 +331,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: numa
       - run: cargo clippy -p aethergraph-core --features numa --all-targets -- -D warnings
@@ -364,7 +364,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: uffd
       - name: Enable unprivileged userfaultfd
@@ -399,10 +399,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: perf
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Relax perf_event_paranoid (best effort)
@@ -464,7 +464,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: loom
       - run: cargo test -p aether-graph --features loom --test loom_writer_guard
@@ -496,7 +496,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: supply-chain
       - name: Install cargo-deny + cargo-audit
@@ -518,7 +518,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-machete
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-machete
       - name: Check for unused dependencies
@@ -538,7 +538,7 @@ jobs:
         run: |
           rustup toolchain install nightly --profile minimal --no-self-update
           rustup default nightly
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: fuzz
       - run: cargo install cargo-fuzz --locked
@@ -573,10 +573,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: python-${{ matrix.os }}
       - name: Sync test deps
@@ -629,10 +629,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: wheel-${{ matrix.level }}
       - name: Sync build deps
@@ -644,7 +644,7 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           OUT_DIR: ${{ matrix.out_dir }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aethergraph-wheel-${{ matrix.level }}
           path: python/${{ matrix.out_dir }}/*.whl
@@ -663,7 +663,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Provision free-threaded 3.14t venv
@@ -671,7 +671,7 @@ jobs:
           uv venv --python 3.14t "$RUNNER_TEMP/ft-venv"
           echo "$RUNNER_TEMP/ft-venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$RUNNER_TEMP/ft-venv" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: wheel-freethreaded
       - name: Confirm free-threaded interpreter
@@ -695,7 +695,7 @@ jobs:
           uv pip install numpy
           uv pip install --no-index --find-links dist-ft --no-deps aethergraph
           python tests/free_threaded_smoke.py
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aethergraph-wheel-cp314t
           path: python/dist-ft/*.whl
@@ -714,10 +714,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component llvm-tools --no-self-update
           rustup default stable
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: wheel-pgo
       - name: Install BOLT
@@ -732,7 +732,7 @@ jobs:
           fi
       - name: Build PGO wheel
         run: scripts/pgo-wheel.sh
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aethergraph-wheel-x86-64-pgo
           path: python/dist-pgo/*.whl
@@ -753,10 +753,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: rdma-hw
       - name: Verify rxe module
