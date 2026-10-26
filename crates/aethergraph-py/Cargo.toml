@@ -94,7 +94,7 @@ anyhow = "1.0"
 mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 
 # Other utilities
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 [dependencies.aether-stream]
 path = "../aether-stream"
