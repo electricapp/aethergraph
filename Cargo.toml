@@ -46,7 +46,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Performance - HPC-grade optimizations
-parking_lot = "0.12"
+parking_lot = "0.13"
 rand = "0.10"
 rustc-hash = "2.1"  # Faster hashing than std HashMap
 ahash = "0.8"       # Alternative fast hasher
